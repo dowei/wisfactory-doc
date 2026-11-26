@@ -1,0 +1,159 @@
+commit ef7a84d81ecf7836d73bdd314a98fcffed037ec6
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 06:48:28 2026 +0800
+
+    fix(iot): 覆盖配对校验扩为结果行四列口径——缺省列取行内现值参与配对封 partial 两步绕过（TASK-0014 修订轮 I-1，评审 Critical 0/Important 1/Minor 6）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+index a4fddb6..d3b00c8 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+@@ -77,8 +77,10 @@ public interface IotDataItemService {
+      * <p>覆盖语义=仅写实例行四列 valid_min/valid_max/alarm_low/alarm_high（0013 已交付列），
+      * 运行时继承不改模板、不复制规则行（状态规则门限载体归 FEAT-0016/模板配置）。partial
+      * 逐字段生效：null=清除覆盖回归继承（写 NULL）、数值=覆盖；四字段全 null=清除覆盖
+-     * （合法）。校验 fail-closed（PARAM_ERROR）：min&lt;=max（valid 对与 alarm 对各自成立）、
+-     * 负值与超 decimal(20,6) 范围拒绝。
++     * （合法）。校验 fail-closed（PARAM_ERROR）：负值与超 decimal(20,6) 范围拒绝；
++     * min&lt;=max 配对校验扩为「结果行四列」口径（TASK-0014 修订轮 I-1）——本次提交缺省的
++     * 列取当前行已有值参与配对（form 与行内均空 → 该列 NULL 不参与比较），valid 对与
++     * alarm 对各自成立；与模板默认的配对关系仍归计算引擎运行期判定。
+      *
+      * <p>防线顺序照 0012 修订轮写路径范式：存在性→数据权限（目标实例 ∈ 可见集，403 文案
+      * 不泄露实例标识）→数据项归属→参数校验。保存成功后同事务调用
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index c749b0f..2806026 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -103,7 +103,8 @@ import java.util.stream.Collectors;
+  * partial 逐字段生效（null=清除覆盖回归继承）；不改模板、不复制规则行——运行时继承
+  * （{@link #getEffectiveParams}：实例值→INSTANCE / 模板 default_→TEMPLATE / 双空→NONE），
+  * 模板默认值变更按 ADR-0008 二档随发布对未覆盖实例生效。防线顺序照 0012 修订轮口径
+- * （存在性→数据权限 403→归属→校验 fail-closed）。保存成功后同事务调时间线钩子
++ * （存在性→数据权限 403→归属→校验 fail-closed）；配对校验为「结果行四列」口径（修订轮
++ * I-1：缺省列取行内现值参与配对，封 partial 两步绕过）。保存成功后同事务调时间线钩子
+  * {@link IotDataItemHistoryService#recordParamChange}（change_type=PARAM，REQ-0018 语义；
+  * 本期为 NoOp 占位，TASK-0039 交付真实实现后零改动接线）。
+  *
+@@ -409,7 +410,7 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+         if (item == null || !instanceId.equals(item.getInstanceId())) {
+             throw paramError("数据项不存在或不属于该实例: " + itemId);
+         }
+-        validateThresholds(form);
++        validateThresholds(form, item);
+ 
+         // 覆盖语义=仅写实例行四列（brief 契约）：LambdaUpdateWrapper 显式 set 四列——partial
+         // 逐字段生效，null 值也必须落 SET（写 NULL 清除覆盖回归继承），updateById 空值忽略
+@@ -494,21 +495,29 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+ 
+     /**
+      * 四字段校验（fail-closed，PARAM_ERROR）：负值与小数位超 6、整数位超 14（decimal(20,6)
+-     * 上限 9999999999.999999）拒绝；min&lt;=max 在 valid 对与 alarm 对各自成立（仅双方均提交
+-     * 数值时校验——单侧清除后另一侧与模板默认的配对关系由计算引擎运行期判定，不在保存期）。
++     * 上限 9999999999.999999）拒绝；min&lt;=max 配对校验扩为「结果行四列」口径（TASK-0014
++     * 修订轮 I-1）：本次提交缺省的列取当前行已有值参与配对（form 与行内均空 → 该列结果为
++     * NULL 不参与比较），valid 对与 alarm 对各自成立——封堵 partial 两步绕过（先 PUT
++     * {validMin:5000} 再 PUT {validMax:100}，第二步按行内现值配对即拒）；与模板默认的配对
++     * 关系仍归计算引擎运行期判定（该部分口径维持不变）。
+      */
+-    private void validateThresholds(IotItemParamOverrideForm form) {
++    private void validateThresholds(IotItemParamOverrideForm form, IotDataItem item) {
+         validateThreshold(form.getValidMin(), "有效范围下限 valid_min");
+         validateThreshold(form.getValidMax(), "有效范围上限 valid_max");
+         validateThreshold(form.getAlarmLow(), "告警低阈值 alarm_low");
+         validateThreshold(form.getAlarmHigh(), "告警高阈值 alarm_high");
+-        if (form.getValidMin() != null && form.getValidMax() != null
+-                && form.getValidMin().compareTo(form.getValidMax()) > 0) {
+-            throw paramError("有效范围下限不能大于上限（valid_min > valid_max）");
+-        }
+-        if (form.getAlarmLow() != null && form.getAlarmHigh() != null
+-                && form.getAlarmLow().compareTo(form.getAlarmHigh()) > 0) {
+-            throw paramError("告警低阈值不能大于高阈值（alarm_low > alarm_high）");
++        // 配对输入=提交值优先、缺省列取行内现值（结果行四列口径，修订轮 I-1）
++        BigDecimal resultValidMin = form.getValidMin() != null ? form.getValidMin() : item.getValidMin();
++        BigDecimal resultValidMax = form.getValidMax() != null ? form.getValidMax() : item.getValidMax();
++        if (resultValidMin != null && resultValidMax != null
++                && resultValidMin.compareTo(resultValidMax) > 0) {
++            throw paramError("阈值配对非法：结果行 valid_min > valid_max（本次提交缺省列取行内现值参与配对）");
++        }
++        BigDecimal resultAlarmLow = form.getAlarmLow() != null ? form.getAlarmLow() : item.getAlarmLow();
++        BigDecimal resultAlarmHigh = form.getAlarmHigh() != null ? form.getAlarmHigh() : item.getAlarmHigh();
++        if (resultAlarmLow != null && resultAlarmHigh != null
++                && resultAlarmLow.compareTo(resultAlarmHigh) > 0) {
++            throw paramError("阈值配对非法：结果行 alarm_low > alarm_high（本次提交缺省列取行内现值参与配对）");
+         }
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java
+index 943b561..cda2d66 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java
+@@ -450,8 +450,11 @@ class IotDataItemServiceImplParamOverrideTest {
+                 dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("100000000000000"), null, null, null)));
+         assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
+ 
+-        // 边界内（14 位整数 + 6 位小数）合法
+-        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("9999999999.999999"), null, null, null));
++        // 边界内（14 位整数 + 6 位小数）合法——修订轮 I-1 后配对校验为「结果行四列」口径：
++        // 缺省列取行内现值参与配对（行内 valid_max=5000），单提交 validMin 边界值会与 5000
++        // 比较超限被拒，故边界合法性按整对提交取证
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID,
++                form(new BigDecimal("9999999999.999999"), new BigDecimal("9999999999.999999"), null, null));
+         verify(baseMapper, times(1)).update(any(), any());
+     }
+ 
+@@ -488,6 +491,54 @@ class IotDataItemServiceImplParamOverrideTest {
+         verify(baseMapper, never()).update(any(), any());
+     }
+ 
++    // ---------- 配对校验「结果行四列」口径（修订轮 I-1） ----------
++
++    @Test
++    @DisplayName("修订轮 I-1 - 两步绕过拒（valid 对）：行内 valid_min=5000 时 PUT 仅 {validMax:100} → 400 阈值配对非法")
++    void testOverride_TwoStepBypassRejectedValidPair() {
++        stubTargetInstance();
++        // 行内状态 = 先 PUT {validMin:5000} 后的结果（valid_max 已清空）
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY,
++                new BigDecimal("5000"), null, null, null));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, new BigDecimal("100"), null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("阈值配对非法"),
++                () -> "文案应含「阈值配对非法」: " + ex.getMessage());
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 - 两步绕过拒（alarm 对）：行内 alarm_low=5000 时 PUT 仅 {alarmHigh:100} → 400 阈值配对非法")
++    void testOverride_TwoStepBypassRejectedAlarmPair() {
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY,
++                null, null, new BigDecimal("5000"), null));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, null, null, new BigDecimal("100"))));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("阈值配对非法"));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 - 不误伤：行内已有合法对 (0,100000)，partial 覆盖另一侧仍合法 → 200")
++    void testOverride_PartialOnLegalRowStillPasses() {
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY,
++                new BigDecimal("0"), new BigDecimal("100000"), new BigDecimal("1"), new BigDecimal("99")));
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, new BigDecimal("100"), null, null));
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(new BigDecimal("100"), setParamValue("valid_max"), "提交数值的列=覆盖");
++        verify(dataItemHistoryService, times(1)).recordParamChange(any());
++    }
++
+     // ---------- 数据权限（0012 写路径范式） ----------
+ 
+     @Test

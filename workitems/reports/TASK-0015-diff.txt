@@ -1,0 +1,2898 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+index 477344f..e9bf93d 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+@@ -72,6 +72,14 @@ public class PublishProperties {
+      */
+     private Integer changesMaxSpan = 10;
+ 
++    /**
++     * 二次确认凭据 TTL（秒，默认 300；{@code ot.publish.confirm-token-ttl-seconds}，
++     * TASK-0015）。影响预览 previewToken 的 Redis 有效期——键
++     * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}，value=
++     * 待发布内容摘要哈希；过期后发布需重新预览重新确认（5002 下发未确认）。
++     */
++    private Integer confirmTokenTtlSeconds = 300;
++
+     /**
+      * config.changed 通知配置（TASK-0026；{@code ot.publish.notify.*}）。
+      *
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java
+index 33195f9..daeca09 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java
+@@ -8,17 +8,21 @@ import lombok.Data;
+ 
+ /**
+  * 配置发布请求表单（TASK-0024，brief D4——POST /iot/publish/publish，body:
+- * scopeType/scopeId）。
++ * scopeType/scopeId；TASK-0015 扩展 confirmToken——二档模板变更发布的二次确认凭据）。
+  *
+  * <p>scopeType=2（计算范围）时 scopeId 由服务层归一为 0（租户粒度——Schema v1.0.1 派生
+  * 规则 7「scopeId=0」口径，请求携带值不参与存储键）；scopeType=1 时 scopeId 必须是存在
+  * 启用的网关（服务层校验）。tenantId 服务层从会话覆盖、禁前端传参。
+  *
++ * <p>confirmToken（TASK-0015）：影响预览 GET /iot/template/impact-preview 下发的
++ * previewToken 原样回传。一档/三档发布不要求凭据（可缺省）；二档变更发布缺失/过期/
++ * 内容漂移 → 确认门拒绝（5002 PUBLISH_NOT_CONFIRMED，重取预览重新确认后可发布）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ @Data
+-@Schema(description = "配置发布表单（TASK-0024）")
++@Schema(description = "配置发布表单（TASK-0024；TASK-0015 扩 confirmToken）")
+ public class PublishForm {
+ 
+     @NotNull(message = "scopeType 不能为空")
+@@ -31,4 +35,8 @@ public class PublishForm {
+     @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）",
+             requiredMode = Schema.RequiredMode.REQUIRED)
+     private Long scopeId;
++
++    @Schema(description = "二次确认凭据（TASK-0015：二档模板变更发布必携——影响预览 "
++            + "previewToken 原样回传；缺失/过期/内容漂移报 5002 下发未确认）")
++    private String confirmToken;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java
+index 5ac0392..6a7e55c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java
+@@ -1,26 +1,22 @@
+ package net.otlab.admin.module.iot.publish.gate;
+ 
+-import org.springframework.stereotype.Component;
+-
+ /**
+- * 发布确认门 NoOp 实现（TASK-0024 占位——恒放行，<b>本期发布不阻断</b>，brief 裁决 D7）。
++ * 发布确认门 NoOp 实现（TASK-0024 占位——<b>已于 TASK-0015 退役为测试替身</b>）。
+  *
+- * <p>TASK-0015（模板变更控制——第二档强制影响预览+二次确认）未交付，本类仅占住发布
+- * 流程的调用接缝：发布服务在版本落库前调用 {@link #requireConfirm}，NoOp 恒返回 true
+- * 使流程直通。0015 交付后以强制确认实现替换本 Bean（同类型唯一 Bean 覆盖或在配置类
+- * 显式装配），发布流程其余件不动——接口 {@link PublishConfirmGate} javadoc 载明完整
+- * 接线义务（含 5002 专用码的登记归属）。
++ * <p>TASK-0015（模板变更控制——第二档强制影响预览+二次确认）已交付真实现
++ * {@link TemplateAwarePublishConfirmGate}（生产唯一 Bean）；本类<b>去掉 Bean 装配</b>
++ * （不再 {@code @Component}），保留为发布链单测的显式构造替身（IotPublishServiceImplTest
++ * 等以 {@code new NoOpPublishConfirmGate()} 注入恒放行语义，隔离模板域判档依赖）。
++ * 接口 {@link PublishConfirmGate} javadoc 载明完整接线义务（TASK-0015 已履行）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+  */
+-@Component
+ public class NoOpPublishConfirmGate implements PublishConfirmGate {
+ 
+     @Override
+     public boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
+-        // 占位恒放行：TASK-0015 交付后替换为强制影响预览+二次确认实现（ADR-0008 第二档）。
+-        // 本期发布不阻断（brief 裁决 D7）；接线义务已在接口 javadoc 与任务报告登记。
++        // 测试替身恒放行：生产装配=TemplateAwarePublishConfirmGate（TASK-0015 交付）。
+         return true;
+     }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java
+index 56e15e1..f40e85f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java
+@@ -1,41 +1,65 @@
+ package net.otlab.admin.module.iot.publish.gate;
+ 
+ /**
+- * 发布确认门接口（TASK-0024 预留接线位——TASK-0015「模板第二档变更强制影响预览+二次
+- * 确认」未交付，本任务以接口 + NoOp 占位，<b>本期发布不阻断</b>，brief 裁决 D7）。
++ * 发布确认门接口（TASK-0024 预留接线位——TASK-0015 交付真实现
++ * {@link TemplateAwarePublishConfirmGate} 替换 NoOp：识别第二档模板变更、校验二次确认
++ * 凭据；NoOp 实现保留为测试替身，生产装配唯一 Bean=真实现）。
+  *
+  * <p>ADR-0008 三档裁决：第二档（语义变更类——改默认公式/有效范围默认值/计算周期/状态
+  * 规则门限等）随发布生效，但发布<b>强制影响预览（受影响实例数+变更 diff）+二次确认</b>。
+  * 该强制确认的动作位即本接口：发布流程在「组装 → 哈希 → 存储 → 落库」之前调用
+- * {@link #requireConfirm}，返回 false 即拒绝发布。
++ * {@code requireConfirm}，返回 false 即拒绝发布（BusinessException，5002 下发未确认）。
+  *
+- * <p><b>接线义务（TASK-0015 交付时）</b>：
++ * <p><b>接线义务（TASK-0015 已交付）</b>：
+  * <ol>
+- * <li>实现强制确认版 gate（NoOp 实现替换为真实现）：识别第二档模板变更、产出影响预览、
+- *     校验二次确认凭据；</li>
+- * <li>拒绝语义：gate 返回 false 时发布流程以 BusinessException 拒绝（当前占位文案
+- *     「发布未通过确认门」）；如需专用错误码 5002「下发未确认」（FEAT-0008 业务规则
+- *     提及），由 0015 在 ot-core ResultCode 登记扩展——本任务不动 ot-core；</li>
+- * <li>本期实现 {@link NoOpPublishConfirmGate} 恒放行（javadoc 声明接线点，报告登记
+- *     接线义务）。</li>
++ * <li>实现强制确认版 gate（NoOp 实现替换为真实现）：识别第二档模板变更、产出影响预览
++ *     （GET /iot/template/impact-preview）、校验二次确认凭据 previewToken（Redis 键
++ *     iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}，value=待发布内容
++ *     摘要哈希）；</li>
++ * <li>拒绝语义：gate 返回 false 时发布流程以 BusinessException 拒绝，专用错误码
++ *     5002 PUBLISH_NOT_CONFIRMED（ot-core ResultCode，TASK-0015 登记交付）；</li>
++ * <li>0024 占位 NoOp 实现退役为测试替身（去掉 Bean 装配，保留类供单测显式构造）。</li>
+  * </ol>
+  *
+  * <p>第一档（纯新增/装饰类）与第三档（结构破坏类，逐台确认迁移）不走本门（ADR-0008
+  * 各自政策）；gate 实现内部自行判档，发布流程无感。
+  *
++ * <p><b>签名纪律（brief 明文「保持接口签名不动」）</b>：四参 {@link #requireConfirm(Long,
++ * Integer, Long, Long)} 为 0024 原签名保持不变；二次确认凭据（PublishForm.confirmToken，
++ * 0015 扩展字段）经五参重载进入实现——默认实现委托四参原语义（0024 调用方/测试零改动
++ * 兼容），发布服务按 brief「仅 gate 调用点如需适配，最小改动」改调五参。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ public interface PublishConfirmGate {
+ 
+     /**
+-     * 发布前确认门（占位语义——本期 NoOp 恒 true，0015 交付后替换为强制实现）
++     * 发布前确认门（0024 原签名，保持不动——五参重载缺省委托本方法）
+      *
+-     * @param tenantId     发布租户 id（服务层从会话取，禁请求携带）
+-     * @param scopeType    范围 1 网关 2 计算
+-     * @param scopeId      范围对象 ID（1=网关 id；2=0 租户粒度）
++     * @param tenantId      发布租户 id（服务层从会话取，禁请求携带）
++     * @param scopeType     范围 1 网关 2 计算
++     * @param scopeId       范围对象 ID（1=网关 id；2=0 租户粒度）
+      * @param targetVersion 本次发布将写入的版本号（末版+1，供影响预览与确认凭据锚定）
+-     * @return true=放行继续发布；false=拒绝发布（发布流程抛 BusinessException）
++     * @return true=放行继续发布；false=拒绝发布（发布流程抛 BusinessException 5002）
+      */
+     boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion);
++
++    /**
++     * 发布前确认门（TASK-0015 扩展：携带二次确认凭据）。默认委托四参原签名——0024 语义
++     * 兼容；真实现覆写本方法完成「token 存在+内容摘要一致」校验（缺失/过期/内容漂移
++     * → false）。
++     *
++     * @param tenantId      发布租户 id（服务层从会话取，禁请求携带）
++     * @param scopeType     范围 1 网关 2 计算
++     * @param scopeId       范围对象 ID（1=网关 id；2=0 租户粒度）
++     * @param targetVersion 本次发布将写入的版本号（末版+1，供影响预览与确认凭据锚定）
++     * @param confirmToken  二次确认凭据（影响预览 previewToken 原样回传；可为 null——
++     *                      一档/三档路径不要求凭据，二档缺失即拒绝）
++     * @return true=放行继续发布；false=拒绝发布（发布流程抛 BusinessException 5002）
++     */
++    default boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId,
++                                   Long targetVersion, String confirmToken) {
++        return requireConfirm(tenantId, scopeType, scopeId, targetVersion);
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java
+new file mode 100644
+index 0000000..5967630
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java
+@@ -0,0 +1,112 @@
++package net.otlab.admin.module.iot.publish.gate;
++
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.RedisUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++import java.nio.charset.StandardCharsets;
++
++/**
++ * 发布确认门真实现（TASK-0015——ADR-0008 第二档「随发布生效，强制影响预览+二次确认」的
++ * 动作位；替换 0024 NoOp 占位成为生产唯一 Bean）。
++ *
++ * <p><b>判档（内部完成，发布流程无感——brief「实现内部判档，仅二档触发确认」）</b>：
++ * 委托 {@link IotTemplateVersionService#hasPendingTier2Confirm}（存在待确认二档模板变更
++ * 的窗口判定+滞后跟随实例判定，规则见该服务 javadoc）。
++ * <ul>
++ * <li>网关 scope（scopeType=1）恒放行：模板内容（数据项/公式/指标）只经计算域快照进入
++ *     发布链——网关域快照仅点位/通道（ConfigSnapshotAssembler 装载口径），不存在二档
++ *     待确认变更；</li>
++ * <li>计算 scope 无待确认二档变更 → 放行（一档路径/三档不经本门——ADR-0008：三档逐台
++ *     确认迁移走 0016 待升级清单，快照按实例 applied_template_version 组装天然不包含
++ *     未升级实例，0024 已按实例有效版本组装，gate 不重复处理）；</li>
++ * <li>存在待确认二档变更 → 校验二次确认凭据（见下），false 即拒绝发布。</li>
++ * </ul>
++ *
++ * <p><b>二次确认凭据校验（brief 协议）</b>：影响预览 GET /iot/template/impact-preview 下发
++ * previewToken 并落 Redis 键 {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:
++ * {targetVersion}}（value=待发布内容摘要哈希——与发布流程同一组装/确定性序列化/SHA-256
++ * 链路，TTL=ot.publish.confirm-token-ttl-seconds 默认 300）。发布请求 PublishForm.
++ * confirmToken 原样回传，本实现校验：<b>token 非空 + Redis 凭据存在 + Redis 哈希与当前
++ * 待发布内容摘要一致</b>——缺失（未预览）/过期（TTL 逾时）/内容漂移（预览后配置又变更）
++ * → false，发布流程抛 BusinessException 5002 PUBLISH_NOT_CONFIRMED（ot-core ResultCode，
++ * FEAT-0008「未确认 5002」），重取预览重新确认后可发布。
++ *
++ * <p>签名纪律：四参 {@link PublishConfirmGate#requireConfirm(Long, Integer, Long, Long)}
++ * 为 0024 原签名（本实现按判档语义覆写——凭据校验需要 token，经五参进入；四参路径在
++ * 无凭据上下文下同判档，凭据缺失按「未确认」拒绝——与五参 null token 同语义）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Slf4j
++@Component
++public class TemplateAwarePublishConfirmGate implements PublishConfirmGate {
++
++    /** 计算域 scope（1 网关 2 计算——网关域快照不含模板内容，见类注释判档第一则） */
++    private static final int SCOPE_GATEWAY = 1;
++
++    /** 确认凭据 Redis 键前缀（与 IotTemplateVersionServiceImpl 下发侧同源常量） */
++    private static final String CONFIRM_KEY_PREFIX = "iot:pub:confirm:";
++
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
++    @Autowired
++    private ConfigSnapshotAssembler assembler;
++
++    @Override
++    public boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
++        return requireConfirm(tenantId, scopeType, scopeId, targetVersion, null);
++    }
++
++    @Override
++    public boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId,
++                                  Long targetVersion, String confirmToken) {
++        // 网关 scope：模板内容不经网关域发布（快照仅点位/通道）——无二档确认面，恒放行
++        if (scopeType == null || scopeType == SCOPE_GATEWAY) {
++            return true;
++        }
++        // 判档（内部完成——仅二档触发确认；一档放行；三档不经本门，ADR-0008 各自政策）
++        if (!templateVersionService.hasPendingTier2Confirm(tenantId)) {
++            return true;
++        }
++        // ---- 二档待确认：凭据校验（缺失/过期/内容漂移 → false → 5002 下发未确认） ----
++        if (confirmToken == null || confirmToken.isBlank()) {
++            log.warn("[CONFIRM-GATE] publish rejected (token missing) tenant={} scope=2-{} targetVersion={}",
++                    tenantId, scopeId, targetVersion);
++            return false;
++        }
++        String key = CONFIRM_KEY_PREFIX + tenantId + ":" + scopeType + ":" + scopeId + ":" + targetVersion;
++        Object stored = RedisUtils.get(key);
++        if (stored == null) {
++            log.warn("[CONFIRM-GATE] publish rejected (token expired/missing) tenant={} scope=2-{} "
++                    + "targetVersion={} key={}", tenantId, scopeId, targetVersion, key);
++            return false;
++        }
++        String expected = contentHash(tenantId, scopeType, scopeId, targetVersion);
++        if (!expected.equals(String.valueOf(stored))) {
++            // 内容漂移：预览后待发布内容已变更（预览→发布窗口内配置又改动）——旧凭据失效
++            log.warn("[CONFIRM-GATE] publish rejected (content drifted since preview) tenant={} scope={}-{} "
++                    + "targetVersion={} expectedHash={} storedHash={}", tenantId, scopeType, scopeId,
++                    targetVersion, expected, stored);
++            return false;
++        }
++        log.info("[CONFIRM-GATE] tier2 publish confirmed tenant={} scope={}-{} targetVersion={}",
++                tenantId, scopeType, scopeId, targetVersion);
++        return true;
++    }
++
++    /** 当前待发布内容摘要哈希（与发布流程/影响预览同一组装+确定性序列化+SHA-256 链路） */
++    private String contentHash(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
++        ConfigSnapshot snapshot = assembler.assemble(tenantId, scopeType, scopeId, targetVersion);
++        String json = assembler.serialize(snapshot);
++        return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index 6f72616..7971c03 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -84,8 +84,9 @@ import java.util.stream.Collectors;
+  * 回滚目标的快照行内容（取回解析）所含点位/数据项回写 config_version=新版本号——「随
+  * 配置发布递增」对回滚版本同样成立。
+  *
+- * <p><b>确认门（brief D7）</b>：发布流程调用 {@link PublishConfirmGate}
+- * （TASK-0015 接线位——NoOp 占位恒放行，本期不阻断）。
++     * <p><b>确认门（brief D7，TASK-0015 已接线）</b>：发布流程调用
++     * {@link PublishConfirmGate} 真实现 {@link net.otlab.admin.module.iot.publish.gate.TemplateAwarePublishConfirmGate}
++     * （仅二档模板变更触发确认；一档放行、三档不经本门；拒绝=5002 下发未确认）。
+  *
+  * <p><b>下发记录落行（TASK-0025）</b>：版本落库后同事务调用
+  * {@link IotPublishLogService#recordDispatch}——按 scope 派生目标插入
+@@ -176,11 +177,13 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         Long lastVersion = baseMapper.selectMaxVersion(tenantId, scopeType, scopeId);
+         Long version = (lastVersion == null ? 0L : lastVersion) + 1;
+ 
+-        // 确认门（TASK-0015 接线位——NoOp 恒放行，本期不阻断；false 分支为 0015 强制实现
+-        // 交付后的拒绝路径，占位文案，专用码归 0015 登记）
+-        if (!confirmGate.requireConfirm(tenantId, scopeType, scopeId, version)) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
+-                    "发布未通过确认门（TASK-0015：强制影响预览+二次确认）");
++        // 确认门（TASK-0015 已接线真实现 TemplateAwarePublishConfirmGate——仅二档模板
++        // 变更触发确认；一档放行、三档不经本门。false 分支=token 缺失/过期/内容漂移，
++        // 5002 下发未确认；重取影响预览重新确认后可发布）
++        if (!confirmGate.requireConfirm(tenantId, scopeType, scopeId, version, form.getConfirmToken())) {
++            throw new BusinessException(ResultCode.PUBLISH_NOT_CONFIRMED.getCode(),
++                    "发布未通过确认门：存在待确认的第二档模板变更，请先获取影响预览并二次确认"
++                            + "（token 缺失/过期/内容漂移——重新预览后携 confirmToken 发布）");
+         }
+ 
+         // 组装（Schema v1.0.1）→ 终检（fail-closed）→ 确定性序列化 → SHA-256
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java
+index 36c3050..66fc373 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java
+@@ -7,7 +7,9 @@ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
+ import net.otlab.admin.module.iot.template.entity.dto.IotModelTemplateDetailVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO;
+ import net.otlab.admin.module.iot.template.service.IotModelTemplateService;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.annotation.OperateLog;
+ import net.otlab.core.constant.BusinessType;
+ import net.otlab.core.result.Result;
+@@ -41,6 +43,10 @@ public class IotModelTemplateController {
+     @Autowired
+     private IotModelTemplateService templateService;
+ 
++    /** 版本历史服务（TASK-0015：影响预览——二档发布强制确认的数据来源） */
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
+     @Operation(summary = "分页查询模型模板")
+     @GetMapping("/list")
+     @SaCheckPermission("iot:template:list")
+@@ -59,6 +65,20 @@ public class IotModelTemplateController {
+         return Result.success(templateService.getTemplateDetail(id, withItems));
+     }
+ 
++    /**
++     * 模板变更影响预览（TASK-0015，ADR-0008 二档「发布强制影响预览+二次确认」数据来源）：
++     * 受影响实例数（引用且启用，locked 子集单列）+ 待生效 diff + previewToken（发布请求
++     * confirmToken 原样回传；TTL=ot.publish.confirm-token-ttl-seconds 默认 300）。
++     * 权限复用既有模板查询权限 iot:template:query（brief 明文不新增 iot:template:* 种子）。
++     */
++    @Operation(summary = "模板变更影响预览（TASK-0015：受影响实例数+变更 diff+previewToken "
++            + "二次确认凭据——二档变更发布必经；权限复用 iot:template:query）")
++    @GetMapping("/impact-preview")
++    @SaCheckPermission("iot:template:query")
++    public Result<TemplateImpactPreviewVO> impactPreview(@RequestParam("templateId") Long templateId) {
++        return Result.success(templateVersionService.previewImpact(templateId));
++    }
++
+     @OperateLog(title = "模型模板", businessType = BusinessType.INSERT)
+     @Operation(summary = "新增模板（template_code 租户内唯一，重复报 4002；tenant_id 会话覆盖，平台预置模板走 SQL 种子）")
+     @PostMapping
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplateVersion.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplateVersion.java
+new file mode 100644
+index 0000000..50469dd
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplateVersion.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.template.entity;
++
++import com.baomidou.mybatisplus.annotation.FieldFill;
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableField;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++
++import java.io.Serializable;
++import java.time.LocalDateTime;
++
++/**
++ * 模板版本历史实体类（TASK-0015 / ADR-0008 落地件，升级脚本 20261123_iot_template_version.sql）。
++ *
++ * <p><b>不可变快照行</b>：只插不改不删（「历史保留可查」，ADR-0008 落地件纪律）——服务层
++ * 不提供任何 UPDATE/DELETE 通道，本实体亦不提供 update_time/update_by/deleted 映射
++ * （DDL 无此四列，故不继承 {@link net.otlab.core.base.BaseEntity}；createTime/createBy
++ * 保留并挂 INSERT 填充，审计口径一致）。
++ *
++ * <p>content = 该版本模板全量内容快照（模板头 + 数据项清单 + 状态规则清单的 canonical
++ * JSON——键序确定性，键序契约见 {@code IotTemplateVersionService#buildContentJson}）；
++ * tier_summary = 相对上一版本的档位摘要（如 "T2:2,T3:1"，仅非零档位段，分档规则表驱动
++ * 判定）。(tenant_id, template_id, version) 物理唯一（uk_template_version）。
++ *
++ * <p>与上游差异：附录 A 无此表——ADR-0008「可回滚」无表支撑的落地基座，升级脚本头注
++ * 登记差异（建议随上游修订清单回写）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode
++@TableName("iot_model_template_version")
++@Schema(description = "模板版本历史（TASK-0015，不可变快照行）")
++public class IotModelTemplateVersion implements Serializable {
++    private static final long serialVersionUID = 1L;
++
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "版本快照 ID")
++    private Long id;
++
++    @Schema(description = "租户ID（服务层从会话覆盖；插件自动注入条件）")
++    private Long tenantId;
++
++    @Schema(description = "模板ID")
++    private Long templateId;
++
++    @Schema(description = "模板版本号（模板内单调递增）")
++    private Integer version;
++
++    @Schema(description = "该版本模板全量内容快照（canonical JSON）")
++    private String content;
++
++    @Schema(description = "相对上一版本的档位摘要（如 T2:2,T3:1；基线快照为 NULL）")
++    private String tierSummary;
++
++    @TableField(fill = FieldFill.INSERT)
++    @Schema(description = "创建时间")
++    private LocalDateTime createTime;
++
++    @TableField(fill = FieldFill.INSERT)
++    @Schema(description = "创建者 ID")
++    private Long createBy;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateChangeEntryVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateChangeEntryVO.java
+new file mode 100644
+index 0000000..058e730
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateChangeEntryVO.java
+@@ -0,0 +1,49 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeTier;
++
++/**
++ * 模板变更条目 VO（TASK-0015 影响预览响应 diff 元素——brief 字段面「对象类型/dataCode/
++ * 字段/旧值/新值/档位」）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "模板变更条目（对象类型/业务键/变更形态/字段/旧值/新值/档位）")
++public class TemplateChangeEntryVO {
++
++    @Schema(description = "对象类型：template 模板头 / dataItem 模板数据项 / statusRule 状态规则")
++    private String objectType;
++
++    @Schema(description = "对象业务键（dataItem=dataCode；statusRule=priority；template=templateCode）")
++    private String objectKey;
++
++    @Schema(description = "变更形态：ADDED 新增 / REMOVED 删除 / CHANGED 修改")
++    private String changeType;
++
++    @Schema(description = "变更字段（对象级新增/删除为 null）")
++    private String field;
++
++    @Schema(description = "旧值（新增为 null）")
++    private String oldValue;
++
++    @Schema(description = "新值（删除为 null）")
++    private String newValue;
++
++    @Schema(description = "档位：T1 随发布自动生效 / T2 强制影响预览+二次确认 / T3 逐台确认迁移 / FORBIDDEN 禁止")
++    private String tier;
++
++    public static TemplateChangeEntryVO from(TemplateChangeEntry entry) {
++        return new TemplateChangeEntryVO(entry.getObjectType(), entry.getObjectKey(),
++                entry.getChangeType(), entry.getField(), entry.getOldValue(),
++                entry.getNewValue(), entry.getTier().getCode());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateImpactPreviewVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateImpactPreviewVO.java
+new file mode 100644
+index 0000000..e9873dc
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateImpactPreviewVO.java
+@@ -0,0 +1,65 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 模板变更影响预览 VO（TASK-0015——GET /iot/template/impact-preview 响应体）。
++ *
++ * <p>brief 响应面：{@code {targetVersion, diff:[...], affectedInstanceCount,
++ * lockedInstanceCount}} + previewToken（二次确认凭据）。附加字段（tierSummary /
++ * currentTemplateVersion / confirmScopeType / confirmScopeId / confirmTokenTtlSeconds）
++ * 为前端构造发布请求与展示所需的纯增量信息。
++ *
++ * <p>计数口径（ADR-0008 锁定口径）：affectedInstanceCount = 同租户引用该模板且启用中的
++ * 实例总数（未锁定实例跟随发布）；lockedInstanceCount = 其中 locked=1 子集（单列不跟随，
++ * 进待升级清单逐台确认——TASK-0016）。
++ *
++ * <p>previewToken 二次确认协议：Redis key
++ * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}，value=待发布
++ * 内容摘要哈希（计算域快照 SHA-256），TTL=ot.publish.confirm-token-ttl-seconds（默认 300）；
++ * 发布请求携带 confirmToken，确认门校验「token 存在+内容摘要一致」，缺失/过期/内容漂移
++ * 拒发布（5002 PUBLISH_NOT_CONFIRMED）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "模板变更影响预览（TASK-0015）")
++public class TemplateImpactPreviewVO {
++
++    @Schema(description = "模板 ID")
++    private Long templateId;
++
++    @Schema(description = "模板当前版本号（变更后的版本）")
++    private Integer currentTemplateVersion;
++
++    @Schema(description = "确认凭据锚定的发布版本号（计算域末版+1——与确认门 requireConfirm 的 targetVersion 同源）")
++    private Long targetVersion;
++
++    @Schema(description = "待生效变更条目列表（相对未锁定跟随实例的有效版本）")
++    private List<TemplateChangeEntryVO> diff;
++
++    @Schema(description = "档位摘要（如 T1:1,T2:1；空变更 null）")
++    private String tierSummary;
++
++    @Schema(description = "受影响实例数（同租户引用该模板且启用中——未锁定跟随+锁定单列）")
++    private Long affectedInstanceCount;
++
++    @Schema(description = "锁定实例数（locked=1 子集，不跟随发布、进待升级清单）")
++    private Long lockedInstanceCount;
++
++    @Schema(description = "二次确认凭据（发布请求 confirmToken 原样回传；TTL 见 confirmTokenTtlSeconds）")
++    private String previewToken;
++
++    @Schema(description = "确认凭据锚定的发布范围（模板内容经计算域快照进入发布链——恒 2 计算）")
++    private Integer confirmScopeType;
++
++    @Schema(description = "确认凭据锚定的范围对象 ID（计算域租户粒度——恒 0）")
++    private Long confirmScopeId;
++
++    @Schema(description = "凭据有效期（秒，ot.publish.confirm-token-ttl-seconds）")
++    private Integer confirmTokenTtlSeconds;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateVersionMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateVersionMapper.java
+new file mode 100644
+index 0000000..4f2afb8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateVersionMapper.java
+@@ -0,0 +1,17 @@
++package net.otlab.admin.module.iot.template.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++
++/**
++ * 模板版本历史 Mapper（TASK-0015）。
++ *
++ * <p>iot_model_template_version 属 iot_ 前缀表——多租户插件（OtTenantLineHandler 前缀规则）
++ * 自动按会话租户注入条件；租户内 (template_id, version) 物理唯一（uk_template_version）。
++ * 快照行不可变：仅 insert 与 select 语义（无 update/delete 通道，实体/服务层同约束）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface IotModelTemplateVersionMapper extends BaseMapper<IotModelTemplateVersion> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+new file mode 100644
+index 0000000..50def9c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+@@ -0,0 +1,74 @@
++package net.otlab.admin.module.iot.template.service;
++
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO;
++
++import java.util.List;
++
++/**
++ * 模板版本历史服务（TASK-0015 / ADR-0008 落地件）。
++ *
++ * <p>职责面（brief 三件事）：
++ * <ol>
++ * <li><b>升版留痕</b>：模板内容（模板头/数据项/状态规则）发生变更时自动升版——与上一
++ *     版本内容快照对比生成 diff，逐条目判档（分档规则表），新版本行落
++ *     iot_model_template_version（content 全量快照 + tier_summary 档位摘要）；无变化
++ *     不升版（连 no-op 都不产生版本噪声）；</li>
++ * <li><b>影响预览</b>：受影响实例数（引用且启用，锁定子集单列）+ 待生效 diff +
++ *     previewToken 二次确认凭据（Redis，TTL 可配）——二档发布强制确认的数据来源；</li>
++ * <li><b>确认门判档</b>：供 PublishConfirmGate 真实现判定「本次发布是否存在待确认的
++ *     二档变更」（仅二档触发确认；一档放行；三档不经本门——ADR-0008 各自政策）。</li>
++ * </ol>
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface IotTemplateVersionService {
++
++    /**
++     * 建模基线留痕（insertTemplate 落库后同事务调用）：首版内容快照入版本历史
++     * （tier_summary=NULL——基线无相对变更）。重复调用幂等（同模板已有历史行即跳过）。
++     *
++     * @param template 已落库的模板行（含最终 version/tenantId）
++     */
++    void recordBaseline(IotModelTemplate template);
++
++    /**
++     * 内容变更留痕（模板头/数据项/状态规则写路径落库后同事务调用）：重建当前内容快照，
++     * 与最新版本历史行对比——无变化返回 null（不升版）；有变化则生成逐条目 diff、
++     * 升版（模板 version=末版+1）并落新版本历史行（content + tier_summary）。
++     *
++     * @param templateId 模板 id（变更内容以库内当前行为准——钩子在变更落库之后调用）
++     * @return 本轮变更条目（按对象类型/业务键/字段排序）；无变化返回 null
++     */
++    List<TemplateChangeEntryVO> recordContentChange(Long templateId);
++
++    /**
++     * 影响预览（GET /iot/template/impact-preview，复用 iot:template:query 查询权限）：
++     * 受影响实例数（引用且启用，locked 子集单列）+ 待生效 diff（相对未锁定跟随实例的
++     * 有效版本）+ previewToken（Redis 键 iot:pub:confirm:{tenantId}:2:0:{targetVersion}，
++     * value=待发布内容摘要哈希，TTL=ot.publish.confirm-token-ttl-seconds）。
++     *
++     * @param templateId 模板 id
++     * @return 预览响应（brief 字段面 + previewToken）
++     */
++    TemplateImpactPreviewVO previewImpact(Long templateId);
++
++    /**
++     * 确认门判档（PublishConfirmGate 真实现消费）：本租户是否存在「待确认的二档模板
++     * 变更」——判定两条件（同时成立）：
++     * <ol>
++     * <li>存在 tier_summary 含 T2 条目的版本历史行 R，且 R 尚未经计算域发布关闭窗口
++     *     （R.create_time 晚于计算域末版 publish_time；计算域从未发布则窗口开启）；</li>
++     * <li>该模板存在滞后跟随的未锁定启用实例（locked=0 且 status=1 且
++     *     applied_template_version &lt; R.version——实例未升级到该版本）。</li>
++     * </ol>
++     * 一档-only 变更、窗口已关闭（T2 变更已经过一次计算域发布）、或无滞后实例 → false
++     * （放行，不要求确认凭据）。
++     *
++     * @param tenantId 租户 id
++     * @return true=存在待确认二档变更（发布须携带有效 confirmToken）
++     */
++    boolean hasPendingTier2Confirm(Long tenantId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+index 4559de1..b2c9b57 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+@@ -10,6 +10,7 @@ import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
+ import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
+ import net.otlab.admin.module.iot.template.service.IotDataItemTemplateService;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -63,6 +64,10 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+     @Autowired
+     private IotDataDictService dictService;
+ 
++    /** 版本历史服务（TASK-0015）：数据项写路径触发模板内容变更升版+diff 判档留痕 */
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
+     @Override
+     public List<IotDataItemTemplate> selectItemsByTemplateId(Long templateId) {
+         requireTemplateExists(templateId);
+@@ -155,6 +160,9 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+             // rollbackFor=Exception 整批回滚——批量口径统一 4002
+             throw duplicateDataCode("模板数据项编码并发冲突，整批未入库，请重试");
+         }
++        // 版本历史留痕（TASK-0015）：新增数据项=一档变更（ADR-0008「新增模板数据项」），
++        // 与上一版本快照对比 diff 判档升版（同事务）
++        templateVersionService.recordContentChange(templateId);
+         return items.size();
+     }
+ 
+@@ -194,7 +202,11 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+         upd.setDefaultValidMax(item.getDefaultValidMax());
+         upd.setDefaultAlarmLow(item.getDefaultAlarmLow());
+         upd.setDefaultAlarmHigh(item.getDefaultAlarmHigh());
+-        return this.updateById(upd);
++        boolean updated = this.updateById(upd);
++        // 版本历史留痕（TASK-0015）：字段级修改逐条目判档（公式/阈值=二档、类型/取值方式=
++        // 三档、名称/类别=一档——ADR-0008 分档规则表），与上一版本快照对比 diff 升版（同事务）
++        templateVersionService.recordContentChange(existing.getTemplateId());
++        return updated;
+     }
+ 
+     @Override
+@@ -203,9 +215,18 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+         if (ids == null || ids.isEmpty()) {
+             throw paramError("请选择要删除的数据项");
+         }
++        // 删除前先取归属模板（删除后行不可见，留痕需 templateId；批内跨模板逐模板留痕）
++        List<IotDataItemTemplate> rows = this.listByIds(ids);
+         // 逻辑删（@TableLogic）；模板数据项无外部引用方（实例数据项由 TASK-0012 生成时
+         // 独立落行不回指模板数据项），无删除保护
+-        return this.removeByIds(ids);
++        boolean removed = this.removeByIds(ids);
++        // 版本历史留痕（TASK-0015）：删除模板数据项=三档变更（ADR-0008「删除模板数据项」，
++        // 结构破坏类——不经发布确认门，逐台确认迁移归 TASK-0016 待升级清单）
++        rows.stream()
++                .map(IotDataItemTemplate::getTemplateId)
++                .distinct()
++                .forEach(templateVersionService::recordContentChange);
++        return removed;
+     }
+ 
+     // ---------- 内部辅助 ----------
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+index e07ef37..6d9a7a0 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+@@ -12,6 +12,7 @@ import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
+ import net.otlab.admin.module.iot.template.service.IotModelTemplateService;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -72,6 +73,10 @@ public class IotModelTemplateServiceImpl extends ServiceImpl<IotModelTemplateMap
+     @Autowired
+     private IotDataItemTemplateMapper dataItemTemplateMapper;
+ 
++    /** 版本历史服务（TASK-0015）：建模基线留痕 / 内容变更自动升版+diff 判档 */
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
+     @Override
+     public Page<IotModelTemplate> selectTemplateList(Page<IotModelTemplate> page, IotModelTemplate query) {
+         LambdaQueryWrapper<IotModelTemplate> wrapper = new LambdaQueryWrapper<>();
+@@ -145,7 +150,11 @@ public class IotModelTemplateServiceImpl extends ServiceImpl<IotModelTemplateMap
+             throw duplicateTemplateCode(entity.getTemplateCode());
+         }
+         try {
+-            return this.save(entity);
++            boolean saved = this.save(entity);
++            // 版本历史基线（TASK-0015）：首版内容快照入 iot_model_template_version
++            // （tier_summary=NULL——基线无相对变更）；同事务，基线失败则建模整体回滚
++            templateVersionService.recordBaseline(entity);
++            return saved;
+         } catch (DuplicateKeyException e) {
+             // 兜底：并发插入或已删除行仍占用编码（物理唯一索引不被逻辑删除释放）
+             throw duplicateTemplateCode(entity.getTemplateCode());
+@@ -180,24 +189,26 @@ public class IotModelTemplateServiceImpl extends ServiceImpl<IotModelTemplateMap
+         if (template.getStatus() != null && template.getStatus() != 0 && template.getStatus() != 1) {
+             throw paramError("模板状态仅允许 0 禁用 / 1 启用");
+         }
+-        if (template.getVersion() != null && template.getVersion() < 1) {
+-            throw paramError("模板版本号必须为正整数");
+-        }
+ 
+         // 字段白名单构建更新（不直接 updateById 请求实体；不可变字段不回写、连 no-op 都不进 SET）：
+-        // 1) 仅 templateName/nodeType/version/status/remark 可变——templateCode 经上方不可改校验
++        // 1) 仅 templateName/nodeType/status/remark 可变——templateCode 经上方不可改校验
+         //    后不进更新集（库内值本就不变，SET 不含不可变字段，语义更干净）；
+-        // 2) tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写；模板不可跨租户挪移）；
+-        // 3) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
++        // 2) version 不进更新集（TASK-0015 起版本号由版本历史服务权威管理：内容变更经
++        //    「与上一版本快照对比 diff → 升版=末版+1」自动留痕，REQ-0006「模板 version 字段
++        //    递增留痕」——请求携带的 version 不再参与更新，防手填跳号/回退破坏快照链）；
++        // 3) tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写；模板不可跨租户挪移）；
++        // 4) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
+         //    杜绝客户端 mass assignment（updateBy/updateTime 由 MetaObjectHandler 按当前登录者回填）。
+         IotModelTemplate upd = new IotModelTemplate();
+         upd.setId(existing.getId());
+         upd.setTemplateName(template.getTemplateName());
+         upd.setNodeType(template.getNodeType());
+-        upd.setVersion(template.getVersion());
+         upd.setStatus(template.getStatus());
+         upd.setRemark(template.getRemark());
+-        return this.updateById(upd);
++        boolean updated = this.updateById(upd);
++        // 版本历史留痕（TASK-0015）：与上一版本内容快照对比，有变化才升版（无变化零版本噪声）
++        templateVersionService.recordContentChange(existing.getId());
++        return updated;
+     }
+ 
+     @Override
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+new file mode 100644
+index 0000000..93ecac8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+@@ -0,0 +1,409 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializationFeature;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRuleMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeTier;
++import net.otlab.admin.module.iot.template.tier.TemplateContentDiffEngine;
++import net.otlab.admin.module.iot.template.tier.TemplateTierRuleTable;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.RedisUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.UUID;
++import java.util.concurrent.TimeUnit;
++import java.util.stream.Collectors;
++
++/**
++ * 模板版本历史服务实现（TASK-0015 / ADR-0008 落地件）。
++ *
++ * <p><b>升版留痕</b>（{@link #recordBaseline} / {@link #recordContentChange}）：模板内容
++ * =模板头+数据项清单+状态规则清单的 canonical JSON 快照（TreeMap 键序 + 清单按业务键排序
++ * + NON_NULL，两次构建逐字节一致——diff 相等性判断的直接前提）。内容变更 → 与最新版本
++ * 历史行对比 → {@link TemplateContentDiffEngine} 逐条目判档 → 模板 version=末版+1（
++ * {@code uk_template_version} 物理唯一兜底）+ 新历史行落库（content + tier_summary 摘要）。
++ * 无变化零版本噪声（连 no-op 都不产生新行）；无基线的存量模板首次编辑补录基线快照（不误计
++ * 全量 ADDED）。钩子由模板头/数据项写路径落库后同事务调用（基线失败则整体回滚）。
++ *
++ * <p><b>影响预览</b>（{@link #previewImpact}）：计数口径=同租户引用该模板且启用中的实例
++ * （affectedInstanceCount），locked=1 子集单列（lockedInstanceCount，不跟随发布、进待升级
++ * 清单——ADR-0008 锁定口径）；diff 相对<b>未锁定跟随实例的最小有效版本</b>（锁定实例不跟随，
++ * 其滞后归待升级清单 TASK-0016 逐台展示）；previewToken 落 Redis 键
++ * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}（value=待发布
++ * 内容摘要哈希——与发布确认门同一组装/序列化/哈希链路，内容漂移即拒绝；TTL=
++ * {@code ot.publish.confirm-token-ttl-seconds} 默认 300）。锚定 scope 恒计算域
++ * (2,0)：模板内容（数据项/公式/指标）只经计算域快照进入发布链（网关域快照仅点位/通道，
++ * 不含模板内容——ConfigSnapshotAssembler 装载口径），确认凭据唯一锚定面。
++ *
++ * <p><b>确认门判档</b>（{@link #hasPendingTier2Confirm}）：「待确认二档变更」两条件同时
++ * 成立——①存在含 T2 条目的版本历史行且其窗口未关闭（行 create_time 晚于计算域末版
++ * publish_time；计算域从未发布则窗口开启——T2 变更尚未经过任何一次计算域发布）；②该模板
++ * 存在滞后跟随的未锁定启用实例（locked=0 且 status=1 且 applied_template_version < 行
++ * version）。一档-only、窗口已关闭（该 T2 变更已经过一次确认发布落地）、或无滞后实例
++ * → false（放行）。三档不经本门（ADR-0008：逐台确认迁移归 TASK-0016 待升级清单——快照按
++ * 实例有效版本组装天然不包含未升级实例）。窗口关闭判定用时间戳（datetime 秒精度——
++ * save 与 publish 同秒的边界按「已发布」处理，误差窗口 1 秒内不影响二档确认的主语义，
++ * 报告登记）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Slf4j
++@Service
++public class IotTemplateVersionServiceImpl implements IotTemplateVersionService {
++
++    /** 计算域 scope 常量（附录 A p33：1 网关 2 计算；模板内容只经计算域进入发布链） */
++    private static final int SCOPE_COMPUTE = 2;
++    private static final long SCOPE_COMPUTE_ID = 0L;
++
++    /** 确认凭据 Redis 键前缀（brief 二次确认协议：iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}） */
++    private static final String CONFIRM_KEY_PREFIX = "iot:pub:confirm:";
++
++    /** 内容快照 canonical 序列化（NON_NULL + Map 键序排序——两次构建逐字节一致） */
++    private static final JsonMapper CANONICAL_MAPPER = JsonMapper.builder()
++            .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
++            .build();
++
++    /** 历史快照行解析用（与发布域 diff 链路同源 com.fasterxml） */
++    private static final ObjectMapper PARSE_MAPPER = new ObjectMapper();
++
++    @Autowired
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Autowired
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Autowired
++    private IotStatusRuleMapper statusRuleMapper;
++
++    @Autowired
++    private IotModelTemplateVersionMapper versionMapper;
++
++    @Autowired
++    private IotModelInstanceMapper instanceMapper;
++
++    @Autowired
++    private IotConfigVersionMapper configVersionMapper;
++
++    @Autowired
++    private ConfigSnapshotAssembler assembler;
++
++    @Autowired
++    private PublishProperties properties;
++
++    // ---------- 基线留痕 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void recordBaseline(IotModelTemplate template) {
++        LambdaQueryWrapper<IotModelTemplateVersion> wrapper = new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .eq(IotModelTemplateVersion::getTemplateId, template.getId())
++                .last("LIMIT 1");
++        if (!versionMapper.selectList(wrapper).isEmpty()) {
++            return;
++        }
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setTenantId(TenantContext.getTenantId());
++        row.setTemplateId(template.getId());
++        row.setVersion(template.getVersion());
++        row.setContent(buildContentJson(template, loadItems(template.getId()), loadRules(template.getId())));
++        row.setTierSummary(null);
++        versionMapper.insert(row);
++        log.info("[TEMPLATE-VERSION] baseline recorded templateId={} version={}", template.getId(), template.getVersion());
++    }
++
++    // ---------- 内容变更升版 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public List<TemplateChangeEntryVO> recordContentChange(Long templateId) {
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            // 模板已被并发删除——无内容可留痕（写路径钩子在删除保护之后调用，此为防御分支）
++            return null;
++        }
++        String currentContent = buildContentJson(template, loadItems(templateId), loadRules(templateId));
++        IotModelTemplateVersion latest = versionMapper.selectOne(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .eq(IotModelTemplateVersion::getTemplateId, templateId)
++                .orderByDesc(IotModelTemplateVersion::getVersion)
++                .last("LIMIT 1"));
++        if (latest == null) {
++            // 无基线（存量模板/补录）：首录基线快照，不计 diff——避免「首次编辑误计全量 ADDED」
++            IotModelTemplateVersion baseline = new IotModelTemplateVersion();
++            baseline.setTenantId(TenantContext.getTenantId());
++            baseline.setTemplateId(templateId);
++            baseline.setVersion(template.getVersion());
++            baseline.setContent(currentContent);
++            baseline.setTierSummary(null);
++            versionMapper.insert(baseline);
++            log.info("[TEMPLATE-VERSION] baseline backfilled templateId={} version={}", templateId, template.getVersion());
++            return null;
++        }
++        if (latest.getContent() != null && latest.getContent().equals(currentContent)) {
++            // 内容与最新快照一致——零版本噪声（重存同值不升版）
++            return null;
++        }
++        JsonNode prev = parse(latest.getContent());
++        JsonNode cur = parse(currentContent);
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        int newVersion = Math.max(latest.getVersion() == null ? 0 : latest.getVersion(),
++                template.getVersion() == null ? 0 : template.getVersion()) + 1;
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setTenantId(TenantContext.getTenantId());
++        row.setTemplateId(templateId);
++        row.setVersion(newVersion);
++        row.setContent(currentContent);
++        row.setTierSummary(TemplateTierRuleTable.formatSummary(entries));
++        versionMapper.insert(row);
++        // 模板 version 回写=末版+1（uk_template_version 物理唯一兜底；REQ-0006「模板 version 字段递增留痕」）
++        modelTemplateMapper.update(null, new LambdaUpdateWrapper<IotModelTemplate>()
++                .eq(IotModelTemplate::getId, templateId)
++                .set(IotModelTemplate::getVersion, newVersion));
++        log.info("[TEMPLATE-VERSION] template upgraded templateId={} {} -> {} summary={} entries={}",
++                templateId, latest.getVersion(), newVersion, row.getTierSummary(), entries);
++        return entries.stream().map(TemplateChangeEntryVO::from).collect(Collectors.toList());
++    }
++
++    // ---------- 影响预览 ----------
++
++    @Override
++    public TemplateImpactPreviewVO previewImpact(Long templateId) {
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("模板不存在或已删除");
++        }
++        List<IotDataItemTemplate> items = loadItems(templateId);
++        List<IotStatusRule> rules = loadRules(templateId);
++
++        // 受影响实例：同租户引用该模板且启用中（租户条件由插件注入）；locked 子集单列
++        List<IotModelInstance> instances = instanceMapper.selectList(new LambdaQueryWrapper<IotModelInstance>()
++                .eq(IotModelInstance::getTemplateId, templateId)
++                .eq(IotModelInstance::getStatus, 1));
++        long affected = instances.size();
++        long locked = instances.stream()
++                .filter(i -> i.getLocked() != null && i.getLocked() == 1)
++                .count();
++
++        // diff 基线 = 未锁定跟随实例的最小有效版本（锁定实例不跟随——其滞后归待升级清单 TASK-0016）
++        Integer minApplied = instances.stream()
++                .filter(i -> i.getLocked() == null || i.getLocked() != 1)
++                .map(IotModelInstance::getAppliedTemplateVersion)
++                .filter(v -> v != null)
++                .min(Comparator.naturalOrder())
++                .orElse(null);
++        JsonNode baselineNode = null;
++        if (minApplied != null) {
++            IotModelTemplateVersion baselineRow = versionMapper.selectOne(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                    .eq(IotModelTemplateVersion::getTemplateId, templateId)
++                    .ge(IotModelTemplateVersion::getVersion, minApplied)
++                    .orderByAsc(IotModelTemplateVersion::getVersion)
++                    .last("LIMIT 1"));
++            if (baselineRow != null) {
++                baselineNode = parse(baselineRow.getContent());
++            }
++        }
++        JsonNode currentNode = parse(buildContentJson(template, items, rules));
++        // 待生效 diff = 相对未锁定跟随实例有效版本的内容变更；无跟随实例或历史基线缺失
++        // （存量模板 0015 前建库无快照）时无从对比，diff 留空（不误计全量 ADDED——
++        // 「空数据=模板无实例提示即可」FEAT-0005 边界口径）
++        List<TemplateChangeEntry> entries = (minApplied != null && baselineNode != null)
++                ? TemplateContentDiffEngine.diff(baselineNode, currentNode)
++                : List.of();
++
++        // previewToken（二次确认凭据）：锚定计算域发布（模板内容只经计算域快照进入发布链）
++        Long tenantId = TenantContext.getTenantId();
++        Long lastVersion = configVersionMapper.selectMaxVersion(tenantId, SCOPE_COMPUTE, SCOPE_COMPUTE_ID);
++        long targetVersion = (lastVersion == null ? 0L : lastVersion) + 1;
++        String contentHash = computePublishContentHash(tenantId, targetVersion);
++        String token = UUID.randomUUID().toString().replace("-", "");
++        int ttlSeconds = properties.getConfirmTokenTtlSeconds() == null ? 300 : properties.getConfirmTokenTtlSeconds();
++        RedisUtils.set(CONFIRM_KEY_PREFIX + tenantId + ":" + SCOPE_COMPUTE + ":" + SCOPE_COMPUTE_ID
++                + ":" + targetVersion, contentHash, ttlSeconds, TimeUnit.SECONDS);
++        log.info("[TEMPLATE-VERSION] impact preview templateId={} targetVersion={} affected={} locked={} "
++                + "summary={}", templateId, targetVersion, affected, locked, TemplateTierRuleTable.formatSummary(entries));
++
++        TemplateImpactPreviewVO vo = new TemplateImpactPreviewVO();
++        vo.setTemplateId(templateId);
++        vo.setCurrentTemplateVersion(template.getVersion());
++        vo.setTargetVersion(targetVersion);
++        vo.setDiff(entries.stream().map(TemplateChangeEntryVO::from).collect(Collectors.toList()));
++        vo.setTierSummary(TemplateTierRuleTable.formatSummary(entries));
++        vo.setAffectedInstanceCount(affected);
++        vo.setLockedInstanceCount(locked);
++        vo.setPreviewToken(token);
++        vo.setConfirmScopeType(SCOPE_COMPUTE);
++        vo.setConfirmScopeId(SCOPE_COMPUTE_ID);
++        vo.setConfirmTokenTtlSeconds(ttlSeconds);
++        return vo;
++    }
++
++    // ---------- 确认门判档 ----------
++
++    @Override
++    public boolean hasPendingTier2Confirm(Long tenantId) {
++        // 计算域末版发布（窗口判定锚点；计算域从未发布=null → 任意 T2 行窗口开启）
++        IotConfigVersion latestPublish = configVersionMapper.selectOne(new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, SCOPE_COMPUTE)
++                .eq(IotConfigVersion::getScopeId, SCOPE_COMPUTE_ID)
++                .orderByDesc(IotConfigVersion::getVersion)
++                .last("LIMIT 1"));
++        List<IotModelTemplateVersion> tier2Rows = versionMapper.selectList(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .like(IotModelTemplateVersion::getTierSummary, TemplateChangeTier.TIER_2.getCode() + ":"));
++        for (IotModelTemplateVersion row : tier2Rows) {
++            if (TemplateTierRuleTable.countTier(row.getTierSummary(), TemplateChangeTier.TIER_2) <= 0) {
++                continue;
++            }
++            // 窗口判定：行 create_time 晚于计算域末版 publish_time → 该 T2 变更尚未经过发布；
++            // publish_time 缺省（异常行）按未发布处理（fail-closed——宁可多要求一次确认）
++            if (latestPublish != null && latestPublish.getPublishTime() != null
++                    && !row.getCreateTime().isAfter(latestPublish.getPublishTime())) {
++                continue;
++            }
++            // 滞后跟随实例：未锁定且启用中、有效版本未达该 T2 行（插件注入租户条件）
++            Long lagging = instanceMapper.selectCount(new LambdaQueryWrapper<IotModelInstance>()
++                    .eq(IotModelInstance::getTemplateId, row.getTemplateId())
++                    .eq(IotModelInstance::getLocked, 0)
++                    .eq(IotModelInstance::getStatus, 1)
++                    .lt(IotModelInstance::getAppliedTemplateVersion, row.getVersion()));
++            if (lagging != null && lagging > 0) {
++                log.info("[TEMPLATE-VERSION] pending tier2 detected tenant={} templateId={} version={} "
++                        + "laggingInstances={}", tenantId, row.getTemplateId(), row.getVersion(), lagging);
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // ---------- 内容快照构建（canonical 形态） ----------
++
++    /**
++     * 构建模板全量内容快照 JSON（canonical：TreeMap 键序 + dataItems 按 dataCode 排序 +
++     * statusRules 按 priority 排序 + NON_NULL——两次构建逐字节一致，diff 相等性与键序确定性
++     * 的直接前提；brief DDL content 注释「数据项/状态规则等」）。
++     */
++    private String buildContentJson(IotModelTemplate template,
++                                    List<IotDataItemTemplate> items,
++                                    List<IotStatusRule> rules) {
++        try {
++            Map<String, Object> content = new TreeMap<>();
++            Map<String, Object> header = new TreeMap<>();
++            header.put("templateCode", template.getTemplateCode());
++            header.put("templateName", template.getTemplateName());
++            header.put("nodeType", template.getNodeType());
++            header.put("remark", template.getRemark());
++            header.put("status", template.getStatus());
++            content.put("template", header);
++            List<Map<String, Object>> itemMaps = new ArrayList<>();
++            for (IotDataItemTemplate item : sortBy(items, IotDataItemTemplate::getDataCode)) {
++                Map<String, Object> map = new TreeMap<>();
++                map.put("dataCode", item.getDataCode());
++                map.put("dataName", item.getDataName());
++                map.put("category", item.getCategory());
++                map.put("valueKind", item.getValueKind());
++                map.put("unit", item.getUnit());
++                map.put("defaultSourceType", item.getDefaultSourceType());
++                map.put("defaultFormula", item.getDefaultFormula());
++                map.put("aggMethod", item.getAggMethod());
++                map.put("defaultCalcPeriod", item.getDefaultCalcPeriod());
++                map.put("defaultValidMin", item.getDefaultValidMin());
++                map.put("defaultValidMax", item.getDefaultValidMax());
++                map.put("defaultAlarmLow", item.getDefaultAlarmLow());
++                map.put("defaultAlarmHigh", item.getDefaultAlarmHigh());
++                itemMaps.add(map);
++            }
++            content.put("dataItems", itemMaps);
++            List<Map<String, Object>> ruleMaps = new ArrayList<>();
++            for (IotStatusRule rule : sortBy(rules, IotStatusRule::getPriority)) {
++                Map<String, Object> map = new TreeMap<>();
++                map.put("priority", rule.getPriority());
++                map.put("conditionExpr", rule.getConditionExpr());
++                map.put("statusCode", rule.getStatusCode());
++                map.put("statusName", rule.getStatusName());
++                map.put("color", rule.getColor());
++                map.put("enabled", rule.getEnabled());
++                map.put("bindingMap", rule.getBindingMap());
++                ruleMaps.add(map);
++            }
++            content.put("statusRules", ruleMaps);
++            return CANONICAL_MAPPER.writeValueAsString(content);
++        } catch (Exception e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "模板内容快照序列化失败: " + e.getMessage());
++        }
++    }
++
++    /** 待发布内容摘要哈希（与发布流程同一组装/确定性序列化/SHA-256 链路——内容漂移检测基准） */
++    private String computePublishContentHash(Long tenantId, long targetVersion) {
++        ConfigSnapshot snapshot = assembler.assemble(tenantId, SCOPE_COMPUTE, SCOPE_COMPUTE_ID, targetVersion);
++        String json = assembler.serialize(snapshot);
++        return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++    }
++
++    private List<IotDataItemTemplate> loadItems(Long templateId) {
++        return dataItemTemplateMapper.selectList(new LambdaQueryWrapper<IotDataItemTemplate>()
++                .eq(IotDataItemTemplate::getTemplateId, templateId));
++    }
++
++    private List<IotStatusRule> loadRules(Long templateId) {
++        return statusRuleMapper.selectList(new LambdaQueryWrapper<IotStatusRule>()
++                .eq(IotStatusRule::getTemplateId, templateId));
++    }
++
++    private <T, U extends Comparable<? super U>> List<T> sortBy(List<T> rows,
++                                                                java.util.function.Function<T, U> key) {
++        if (rows == null) {
++            return List.of();
++        }
++        return rows.stream()
++                .sorted(Comparator.comparing(key, Comparator.nullsLast(Comparator.naturalOrder())))
++                .toList();
++    }
++
++    private JsonNode parse(String json) {
++        if (json == null || json.isBlank()) {
++            return null;
++        }
++        try {
++            return PARSE_MAPPER.readTree(json);
++        } catch (Exception e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "模板内容快照解析失败: " + e.getMessage());
++        }
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeEntry.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeEntry.java
+new file mode 100644
+index 0000000..124c821
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeEntry.java
+@@ -0,0 +1,106 @@
++package net.otlab.admin.module.iot.template.tier;
++
++import java.util.Objects;
++
++/**
++ * 模板变更条目（TASK-0015 diff 生成产物——「对象类型/dataCode/字段/旧值/新值/档位」，
++ * brief 明文字段面）。
++ *
++ * <p>一次保存含多类变更时每条 diff 独立判档（不取最高档合并）；条目列表随版本历史行
++ * 存储为 tier_summary 摘要（{@link TemplateTierRuleTable#formatSummary}），全量条目仅在
++ * 影响预览响应中展开。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public class TemplateChangeEntry {
++
++    /** 变更对象类型：template（模板头）/ dataItem（模板数据项）/ statusRule（状态规则） */
++    public static final String OBJECT_TEMPLATE = "template";
++    public static final String OBJECT_DATA_ITEM = "dataItem";
++    public static final String OBJECT_STATUS_RULE = "statusRule";
++
++    /** 变更形态：ADDED（对象级新增）/ REMOVED（对象级删除）/ CHANGED（字段级修改） */
++    public static final String CHANGE_ADDED = "ADDED";
++    public static final String CHANGE_REMOVED = "REMOVED";
++    public static final String CHANGE_CHANGED = "CHANGED";
++
++    private final String objectType;
++    private final String objectKey;
++    private final String changeType;
++    private final String field;
++    private final String oldValue;
++    private final String newValue;
++    private final TemplateChangeTier tier;
++
++    public TemplateChangeEntry(String objectType, String objectKey, String changeType,
++                               String field, String oldValue, String newValue,
++                               TemplateChangeTier tier) {
++        this.objectType = objectType;
++        this.objectKey = objectKey;
++        this.changeType = changeType;
++        this.field = field;
++        this.oldValue = oldValue;
++        this.newValue = newValue;
++        this.tier = tier;
++    }
++
++    public String getObjectType() {
++        return objectType;
++    }
++
++    public String getObjectKey() {
++        return objectKey;
++    }
++
++    public String getChangeType() {
++        return changeType;
++    }
++
++    public String getField() {
++        return field;
++    }
++
++    public String getOldValue() {
++        return oldValue;
++    }
++
++    public String getNewValue() {
++        return newValue;
++    }
++
++    public TemplateChangeTier getTier() {
++        return tier;
++    }
++
++    @Override
++    public boolean equals(Object o) {
++        if (this == o) {
++            return true;
++        }
++        if (!(o instanceof TemplateChangeEntry)) {
++            return false;
++        }
++        TemplateChangeEntry that = (TemplateChangeEntry) o;
++        return Objects.equals(objectType, that.objectType)
++                && Objects.equals(objectKey, that.objectKey)
++                && Objects.equals(changeType, that.changeType)
++                && Objects.equals(field, that.field)
++                && Objects.equals(oldValue, that.oldValue)
++                && Objects.equals(newValue, that.newValue)
++                && tier == that.tier;
++    }
++
++    @Override
++    public int hashCode() {
++        return Objects.hash(objectType, objectKey, changeType, field, oldValue, newValue, tier);
++    }
++
++    @Override
++    public String toString() {
++        return objectType + "[" + objectKey + "] " + changeType
++                + (field == null ? "" : "." + field)
++                + (changeType.equals(CHANGE_CHANGED) ? " " + oldValue + " -> " + newValue : "")
++                + " (" + tier.getCode() + ")";
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeTier.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeTier.java
+new file mode 100644
+index 0000000..f390039
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateChangeTier.java
+@@ -0,0 +1,57 @@
++package net.otlab.admin.module.iot.template.tier;
++
++/**
++ * 模板变更档位（TASK-0015 / ADR-0008 三档权威）。
++ *
++ * <p>分档判据（ADR-0008）：「变更是否改变已有值的含义」——
++ * <ul>
++ * <li>{@link #TIER_1} 纯新增/装饰类：不改变任何已有值的含义（新增模板数据项、改名称/
++ *     说明等展示属性、新增只兜底的状态规则）——随发布自动生效；</li>
++ * <li>{@link #TIER_2} 语义变更类：键和历史不动、未来值含义全队一起变（改默认公式/有效
++ *     范围默认值/计算周期/状态规则门限/优先级/可覆盖参数默认值/告警阈值默认值）——随发布
++ *     生效，但强制影响预览+二次确认（PublishConfirmGate + previewToken + 5002）；</li>
++ * <li>{@link #TIER_3} 结构破坏类：动键、动历史、动引用（删除模板数据项、改数据类型
++ *     瞬时↔累计、改取值方式直绑↔公式↔汇总）——永不自动，逐台确认迁移（TASK-0016
++ *     待升级清单），不经发布确认门；</li>
++ * <li>{@link #FORBIDDEN} 直接禁止：data_code 修改（与点位/网关编码不可改同原则；换编码=
++ *     新增一项+停用旧项，REQ-0004 核心规则）。写路径既有校验（IotDataItemTemplateServiceImpl
++ *     updateItem）已拒，本档位在规则表中登记供引擎完备性与测试锁定。</li>
++ * </ul>
++ *
++ * <p>逐条目判档：一次保存含多类变更时每条 diff 独立判档（不取最高档合并，brief 明文）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public enum TemplateChangeTier {
++
++    /** 一档（纯新增/装饰类，不改变任何已有值的含义）——随发布自动生效 */
++    TIER_1("T1", "一档（随发布自动生效）"),
++
++    /** 二档（语义变更类，未来值含义全队一起变）——随发布生效，强制影响预览+二次确认 */
++    TIER_2("T2", "二档（发布强制影响预览+二次确认）"),
++
++    /** 三档（结构破坏类，动键/动历史/动引用）——永不自动，逐台确认迁移（不经发布门） */
++    TIER_3("T3", "三档（逐台确认迁移，不经发布门）"),
++
++    /** 直接禁止（data_code 修改——换编码=新增一项+停用旧项，REQ-0004） */
++    FORBIDDEN("FORBIDDEN", "直接禁止（400）");
++
++    /** 摘要码（tier_summary 段前缀，如 "T2:2,T3:1"） */
++    private final String code;
++
++    private final String label;
++
++    TemplateChangeTier(String code, String label) {
++        this.code = code;
++        this.label = label;
++    }
++
++    public String getCode() {
++        return code;
++    }
++
++    public String getLabel() {
++        return label;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngine.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngine.java
+new file mode 100644
+index 0000000..d06777c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngine.java
+@@ -0,0 +1,175 @@
++package net.otlab.admin.module.iot.template.tier;
++
++import com.fasterxml.jackson.databind.JsonNode;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++/**
++ * 模板内容 diff 引擎（TASK-0015：「diff 由模板前后版本对比生成」）。
++ *
++ * <p>输入 = 两个版本的内容快照 JSON（{@code IotTemplateVersionService#buildContentJson}
++ * canonical 形态：顶层 template/dataItems/statusRules 三键；dataItems 按 dataCode 索引、
++ * statusRules 按 priority 索引、模板头单对象）。输出 = 变更条目列表
++ * （{@link TemplateChangeEntry}——对象类型/业务键/变更形态/字段/旧值/新值/档位），
++ * 每条独立判档（{@link TemplateTierRuleTable}）。
++ *
++ * <p>判空口径：JSON 缺键与 JSON null 等价（NON_NULL 序列化下 null 即缺键）——
++ * 「defaultAlarmLow 从 5 改为不填」与「改为 null」同判。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public final class TemplateContentDiffEngine {
++
++    private TemplateContentDiffEngine() {
++    }
++
++    /**
++     * 对比两版内容快照，产出逐条目档位化变更清单（条目排序：objectType → objectKey →
++     * field，输出确定性）。
++     *
++     * @param prev 上一版内容 JSON（null/缺顶层键按空对象处理——首版无基线时全量计 ADDED）
++     * @param cur  当前版内容 JSON
++     */
++    public static List<TemplateChangeEntry> diff(JsonNode prev, JsonNode cur) {
++        List<TemplateChangeEntry> entries = new ArrayList<>();
++        diffHeader(nodeAt(prev, "template"), nodeAt(cur, "template"), entries);
++        diffObjectArray(nodeAt(prev, "dataItems"), nodeAt(cur, "dataItems"),
++                TemplateChangeEntry.OBJECT_DATA_ITEM, "dataCode", entries);
++        diffObjectArray(nodeAt(prev, "statusRules"), nodeAt(cur, "statusRules"),
++                TemplateChangeEntry.OBJECT_STATUS_RULE, "priority", entries);
++        entries.sort((a, b) -> {
++            int c = a.getObjectType().compareTo(b.getObjectType());
++            if (c != 0) {
++                return c;
++            }
++            c = a.getObjectKey().compareTo(b.getObjectKey());
++            if (c != 0) {
++                return c;
++            }
++            return String.valueOf(a.getField()).compareTo(String.valueOf(b.getField()));
++        });
++        return entries;
++    }
++
++    /** 模板头单对象 diff（objectKey=templateCode；ADDED/REMOVED 仅在整头缺失时出现） */
++    private static void diffHeader(JsonNode prev, JsonNode cur, List<TemplateChangeEntry> entries) {
++        String objectKey = cur != null && cur.hasNonNull("templateCode")
++                ? cur.get("templateCode").asText()
++                : (prev != null && prev.hasNonNull("templateCode")
++                        ? prev.get("templateCode").asText() : "template");
++        if (prev == null || prev.isNull() || !prev.isObject()) {
++            if (cur != null && cur.isObject() && cur.size() > 0) {
++                entries.add(new TemplateChangeEntry(TemplateChangeEntry.OBJECT_TEMPLATE,
++                        objectKey, TemplateChangeEntry.CHANGE_ADDED, null, null, null,
++                        TemplateTierRuleTable.tierOfAdded(TemplateChangeEntry.OBJECT_TEMPLATE)));
++            }
++            return;
++        }
++        if (cur == null || cur.isNull() || !cur.isObject()) {
++            entries.add(new TemplateChangeEntry(TemplateChangeEntry.OBJECT_TEMPLATE,
++                    objectKey, TemplateChangeEntry.CHANGE_REMOVED, null, null, null,
++                    TemplateTierRuleTable.tierOfRemoved(TemplateChangeEntry.OBJECT_TEMPLATE)));
++            return;
++        }
++        diffObjectFields(TemplateChangeEntry.OBJECT_TEMPLATE, objectKey, prev, cur, entries);
++    }
++
++    /** 对象数组 diff（按业务键索引：added/removed 对象级一条；changed 逐字段一条） */
++    private static void diffObjectArray(JsonNode prev, JsonNode cur, String objectType,
++                                        String keyField, List<TemplateChangeEntry> entries) {
++        Map<String, JsonNode> prevMap = indexBy(prev, keyField);
++        Map<String, JsonNode> curMap = indexBy(cur, keyField);
++        TreeSet<String> keys = new TreeSet<>();
++        keys.addAll(prevMap.keySet());
++        keys.addAll(curMap.keySet());
++        for (String key : keys) {
++            JsonNode oldObj = prevMap.get(key);
++            JsonNode newObj = curMap.get(key);
++            if (oldObj == null) {
++                entries.add(new TemplateChangeEntry(objectType, key,
++                        TemplateChangeEntry.CHANGE_ADDED, null, null, null,
++                        TemplateTierRuleTable.tierOfAdded(objectType)));
++            } else if (newObj == null) {
++                entries.add(new TemplateChangeEntry(objectType, key,
++                        TemplateChangeEntry.CHANGE_REMOVED, null, null, null,
++                        TemplateTierRuleTable.tierOfRemoved(objectType)));
++            } else {
++                diffObjectFields(objectType, key, oldObj, newObj, entries);
++            }
++        }
++    }
++
++    /** 对象字段级 diff：值不等（null 归一）即逐字段一条 CHANGED，档位查规则表 */
++    private static void diffObjectFields(String objectType, String objectKey,
++                                         JsonNode prevObj, JsonNode curObj,
++                                         List<TemplateChangeEntry> entries) {
++        Map<String, JsonNode> prevFields = fieldMap(prevObj);
++        Map<String, JsonNode> curFields = fieldMap(curObj);
++        TreeSet<String> fields = new TreeSet<>();
++        fields.addAll(prevFields.keySet());
++        fields.addAll(curFields.keySet());
++        for (String field : fields) {
++            JsonNode oldVal = prevFields.get(field);
++            JsonNode newVal = curFields.get(field);
++            if (!normalizedEquals(oldVal, newVal)) {
++                entries.add(new TemplateChangeEntry(objectType, objectKey,
++                        TemplateChangeEntry.CHANGE_CHANGED, field,
++                        oldVal == null ? null : oldVal.asText(),
++                        newVal == null ? null : newVal.asText(),
++                        TemplateTierRuleTable.tierOfChangedField(objectType, field)));
++            }
++        }
++    }
++
++    /** 数组按业务键索引（非对象/缺键元素跳过） */
++    private static Map<String, JsonNode> indexBy(JsonNode array, String keyField) {
++        Map<String, JsonNode> map = new TreeMap<>();
++        if (array == null || !array.isArray()) {
++            return map;
++        }
++        for (JsonNode element : array) {
++            if (element.isObject() && element.hasNonNull(keyField)) {
++                map.put(element.get(keyField).asText(), element);
++            }
++        }
++        return map;
++    }
++
++    /** 对象展平为字段 Map（TreeMap——字段遍历序确定性） */
++    private static Map<String, JsonNode> fieldMap(JsonNode object) {
++        Map<String, JsonNode> map = new TreeMap<>();
++        if (object != null && object.isObject()) {
++            Iterator<Map.Entry<String, JsonNode>> it = object.fields();
++            while (it.hasNext()) {
++                Map.Entry<String, JsonNode> e = it.next();
++                map.put(e.getKey(), e.getValue().isNull() ? null : e.getValue());
++            }
++        }
++        return map;
++    }
++
++    /** null 归一相等（缺键 ≡ null ≡ JSON null） */
++    private static boolean normalizedEquals(JsonNode a, JsonNode b) {
++        if (a == null || a.isNull()) {
++            return b == null || b.isNull();
++        }
++        if (b == null || b.isNull()) {
++            return false;
++        }
++        return a.equals(b);
++    }
++
++    private static JsonNode nodeAt(JsonNode root, String key) {
++        if (root == null || root.isNull() || !root.isObject()) {
++            return null;
++        }
++        JsonNode node = root.get(key);
++        return (node == null || node.isNull()) ? null : node;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java
+new file mode 100644
+index 0000000..625a8f5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java
+@@ -0,0 +1,163 @@
++package net.otlab.admin.module.iot.template.tier;
++
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * 模板变更分档规则表（TASK-0015 技术要点「分档规则表驱动——便于演进」）。
++ *
++ * <p>ADR-0008 三档裁决的逐字段落地映射（判据=「变更是否改变已有值的含义」）：
++ * <ul>
++ * <li>一档（纯新增/装饰）：新增模板数据项；改 dataName（名称）/ category（类别）；
++ *     新增只兜底的状态规则；状态规则的 statusName（状态名）/ color（状态颜色）。</li>
++ * <li>二档（语义变更）：改 defaultFormula（默认公式）/ aggMethod（缺省聚合——聚合口径
++ *     全队一起变）/ defaultCalcPeriod（默认计算周期）/ defaultValidMin/defaultValidMax
++ *     （有效范围默认值，影响质量码判定）/ defaultAlarmLow/defaultAlarmHigh（告警阈值
++ *     默认值——只影响标红展示，ADR-0008 明文「归本档、影响最小」）/ unit（单位——值的
++ *     计量解释口径 kWh↔MWh 改变已有值含义，判据推论）；状态规则 conditionExpr（门限）/
++ *     priority（优先级）/ enabled（启停改变判定流）/ bindingMap（直绑映射语义）；
++ *     删除状态规则（既有已知状态判定结果改变）。</li>
++ * <li>三档（结构破坏）：删除模板数据项；改 valueKind（数据类型 瞬时↔累计↔增量）；
++ *     改 defaultSourceType（取值方式 直绑↔公式↔汇总）。</li>
++ * <li>禁止：改 dataCode（换编码=新增一项+停用旧项，REQ-0004）；改 templateCode
++ *     （模板编码创建后不可改，既有口径）。</li>
++ * </ul>
++ *
++ * <p>未登记字段保守默认二档（fail-closed——「需要人工确认」比「静默放行」安全；
++ * 表驱动演进点：新字段登记进表即改变其档位，无需改引擎）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public final class TemplateTierRuleTable {
++
++    /** 对象级新增档位（objectType → tier） */
++    private static final Map<String, TemplateChangeTier> ADD_TIERS = Map.of(
++            TemplateChangeEntry.OBJECT_DATA_ITEM, TemplateChangeTier.TIER_1,
++            TemplateChangeEntry.OBJECT_STATUS_RULE, TemplateChangeTier.TIER_1);
++
++    /** 对象级删除档位（objectType → tier）：删除模板数据项=三档（ADR-0008 明文）；
++     *  删除状态规则=二档（既有已知状态判定结果改变——语义变更类） */
++    private static final Map<String, TemplateChangeTier> REMOVE_TIERS = Map.of(
++            TemplateChangeEntry.OBJECT_DATA_ITEM, TemplateChangeTier.TIER_3,
++            TemplateChangeEntry.OBJECT_STATUS_RULE, TemplateChangeTier.TIER_2);
++
++    /** 字段级修改档位表（objectType.field → tier） */
++    private static final Map<String, TemplateChangeTier> FIELD_TIERS = buildFieldTiers();
++
++    private static Map<String, TemplateChangeTier> buildFieldTiers() {
++        Map<String, TemplateChangeTier> table = new HashMap<>();
++        // ---- 模板头（展示/装饰类，均一档；templateCode 不可改=禁止） ----
++        put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "templateCode", TemplateChangeTier.FORBIDDEN);
++        put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "templateName", TemplateChangeTier.TIER_1);
++        put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "nodeType", TemplateChangeTier.TIER_1);
++        put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "remark", TemplateChangeTier.TIER_1);
++        put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "status", TemplateChangeTier.TIER_1);
++        // ---- 模板数据项 ----
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "dataCode", TemplateChangeTier.FORBIDDEN);
++        // 一档：名称/类别（装饰属性，不改变值的含义）
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "dataName", TemplateChangeTier.TIER_1);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "category", TemplateChangeTier.TIER_1);
++        // 二档：单位（值的计量解释口径改变）/公式/聚合/周期/有效范围/告警阈值
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "unit", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultFormula", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "aggMethod", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultCalcPeriod", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultValidMin", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultValidMax", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultAlarmLow", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultAlarmHigh", TemplateChangeTier.TIER_2);
++        // 三档：数据类型（瞬时↔累计）/取值方式（直绑↔公式↔汇总）
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "valueKind", TemplateChangeTier.TIER_3);
++        put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultSourceType", TemplateChangeTier.TIER_3);
++        // ---- 状态规则 ----
++        // 一档：状态名/颜色（展示属性）
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "statusName", TemplateChangeTier.TIER_1);
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "color", TemplateChangeTier.TIER_1);
++        // 二档：条件表达式（门限）/优先级/启停/直绑映射
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "conditionExpr", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "priority", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "enabled", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "bindingMap", TemplateChangeTier.TIER_2);
++        put(table, TemplateChangeEntry.OBJECT_STATUS_RULE, "statusCode", TemplateChangeTier.TIER_2);
++        return Map.copyOf(table);
++    }
++
++    private static void put(Map<String, TemplateChangeTier> table, String objectType,
++                            String field, TemplateChangeTier tier) {
++        table.put(objectType + "." + field, tier);
++    }
++
++    private TemplateTierRuleTable() {
++    }
++
++    /**
++     * 字段级修改判档（objectType=template/dataItem/statusRule；field=内容 JSON 字段名）。
++     * 未登记字段保守默认二档（fail-closed，类注释）。
++     */
++    public static TemplateChangeTier tierOfChangedField(String objectType, String field) {
++        TemplateChangeTier tier = FIELD_TIERS.get(objectType + "." + field);
++        return tier != null ? tier : TemplateChangeTier.TIER_2;
++    }
++
++    /** 对象级新增判档（未知对象类型默认一档——新增对象不改变任何已有值的含义） */
++    public static TemplateChangeTier tierOfAdded(String objectType) {
++        return ADD_TIERS.getOrDefault(objectType, TemplateChangeTier.TIER_1);
++    }
++
++    /** 对象级删除判档（未知对象类型默认三档——删除是结构破坏的最保守归类） */
++    public static TemplateChangeTier tierOfRemoved(String objectType) {
++        return REMOVE_TIERS.getOrDefault(objectType, TemplateChangeTier.TIER_3);
++    }
++
++    /**
++     * 档位摘要格式化（brief DDL 口径「如 T2:2,T3:1」——仅非零档位段，按 T1/T2/T3 固定
++     * 顺序；FORBIDDEN 不入摘要——禁止档变更不可能经写路径产生）。空清单返回 null
++     * （版本历史行基线快照无变更，tier_summary 落 NULL）。
++     */
++    public static String formatSummary(List<TemplateChangeEntry> entries) {
++        if (entries == null || entries.isEmpty()) {
++            return null;
++        }
++        Map<TemplateChangeTier, Integer> counts = new LinkedHashMap<>();
++        for (TemplateChangeEntry entry : entries) {
++            counts.merge(entry.getTier(), 1, Integer::sum);
++        }
++        StringBuilder sb = new StringBuilder();
++        for (TemplateChangeTier tier : List.of(TemplateChangeTier.TIER_1,
++                TemplateChangeTier.TIER_2, TemplateChangeTier.TIER_3)) {
++            Integer count = counts.get(tier);
++            if (count != null && count > 0) {
++                if (sb.length() > 0) {
++                    sb.append(',');
++                }
++                sb.append(tier.getCode()).append(':').append(count);
++            }
++        }
++        return sb.length() > 0 ? sb.toString() : null;
++    }
++
++    /**
++     * 从 tier_summary 解析指定档位条数（存储格式 "T2:2,T3:1"；null/空白/畸形段按 0
++     * 容错——摘要仅供判定与展示，解析失败不得使确认门误放行二档之外的路径）。
++     */
++    public static int countTier(String tierSummary, TemplateChangeTier tier) {
++        if (tierSummary == null || tierSummary.isBlank()) {
++            return 0;
++        }
++        int total = 0;
++        for (String segment : tierSummary.split(",")) {
++            String[] kv = segment.split(":");
++            if (kv.length == 2 && kv[0].trim().equals(tier.getCode())) {
++                try {
++                    total += Integer.parseInt(kv[1].trim());
++                } catch (NumberFormatException ignored) {
++                    // 畸形计数段按 0 容错（摘要可读性辅助，不阻塞主流程）
++                }
++            }
++        }
++        return total;
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index b7d466b..00dcee3 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -52,6 +52,7 @@ ot:
+     target-ingest-id: ${OT_PUBLISH_TARGET_INGEST_ID:ingest}   # 接入服务下发目标标识（TASK-0025）：网关 scope 发布落行的 target_type=2 行 target_id；接入服务按 (versionId, targetType=2, 本值) 回执
+     target-calc-id: ${OT_PUBLISH_TARGET_CALC_ID:calc}   # 计算引擎下发目标标识（TASK-0025）：计算 scope 发布落行的 target_type=3 行 target_id；计算引擎按 (versionId, targetType=3, 本值) 回执
+     changes-max-span: ${OT_PUBLISH_CHANGES_MAX_SPAN:10}   # 增量摘要最大跨度（TASK-0026）：/internal/v1/config/changes 的 latestVersion-sinceVersion 严格大于本值 → needFullSync=true（只给 latest 摘要——下游全量重拉）；中间版本快照文件缺失同样 needFullSync=true
++    confirm-token-ttl-seconds: ${OT_PUBLISH_CONFIRM_TOKEN_TTL_SECONDS:300}   # 二次确认凭据 TTL（秒，TASK-0015）：影响预览 previewToken 的 Redis 有效期（键 iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}，value=待发布内容摘要哈希）；二档模板变更发布校验 token 存在+内容摘要一致，缺失/过期/内容漂移报 5002 下发未确认
+     notify:
+       enabled: ${OT_PUBLISH_NOTIFY_ENABLED:false}   # config.changed MQTT 通知开关（TASK-0026 默认 false——未启用走 NoOp 语义路径，发布/重发不阻断；通知丢失靠下游拉取对账哈希兜底，REQ-0033 验收 2）
+       broker-url: ${OT_PUBLISH_NOTIFY_BROKER_URL:}   # EMQX broker 地址（如 tcp://127.0.0.1:1883）；enabled=true 但本值空 → 每次发送 WARN fail-soft（不阻断发布）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java
+new file mode 100644
+index 0000000..2b87c94
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java
+@@ -0,0 +1,135 @@
++package net.otlab.admin.module.iot.publish.gate;
++
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.core.utils.RedisUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.charset.StandardCharsets;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 发布确认门真实现单元测试（TASK-0015 测试口径：二档变更发布无 token→拒绝红→带 token 绿、
++ * token 过期/内容漂移拒绝、一档/三档放行、网关 scope 放行）。
++ *
++ * <p>判档委托 {@code IotTemplateVersionService#hasPendingTier2Confirm}（mock——其判定逻辑
++ * 由 IotTemplateVersionServiceImplTest 锁定）；凭据校验=Redis 键
++ * iot:pub:confirm:{tenant}:{scopeType}:{scopeId}:{targetVersion} 与待发布内容摘要哈希比对。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class TemplateAwarePublishConfirmGateTest {
++
++    private static final long TENANT = 1L;
++    private static final String SNAPSHOT_JSON = "SNAPSHOT_JSON";
++    private static final String EXPECTED_HASH = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
++            .sha256Hex(SNAPSHOT_JSON.getBytes(StandardCharsets.UTF_8));
++
++    @Mock
++    private IotTemplateVersionService versionService;
++
++    @Mock
++    private ConfigSnapshotAssembler assembler;
++
++    private TemplateAwarePublishConfirmGate gate;
++
++    private AutoCloseable mocks;
++
++    private MockedStatic<RedisUtils> redisUtils;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        redisUtils = Mockito.mockStatic(RedisUtils.class);
++        gate = new TemplateAwarePublishConfirmGate();
++        ReflectionTestUtils.setField(gate, "templateVersionService", versionService);
++        ReflectionTestUtils.setField(gate, "assembler", assembler);
++        when(assembler.assemble(anyLong(), any(), anyLong(), anyLong())).thenReturn(new ConfigSnapshot());
++        when(assembler.serialize(any(ConfigSnapshot.class))).thenReturn(SNAPSHOT_JSON);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++        redisUtils.close();
++    }
++
++    private String key(int scopeType, long scopeId, long targetVersion) {
++        return "iot:pub:confirm:" + TENANT + ":" + scopeType + ":" + scopeId + ":" + targetVersion;
++    }
++
++    @Test
++    @DisplayName("网关 scope 放行 - 模板内容不经网关域发布（快照仅点位/通道），无判档无凭据校验")
++    void gatewayScopeAlwaysPasses() {
++        assertTrue(gate.requireConfirm(TENANT, 1, 88L, 3L, null));
++        verify(versionService, never()).hasPendingTier2Confirm(anyLong());
++        redisUtils.verify(() -> RedisUtils.get(any()), Mockito.never());
++    }
++
++    @Test
++    @DisplayName("一档/三档放行 - 计算域无待确认二档变更 → true（不查 Redis）")
++    void noPendingTier2Passes() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(false);
++        assertTrue(gate.requireConfirm(TENANT, 2, 0L, 3L, null));
++        redisUtils.verify(() -> RedisUtils.get(any()), Mockito.never());
++    }
++
++    @Test
++    @DisplayName("二档红 - 存在待确认二档变更且未携 token → false（发布流程抛 5002）")
++    void pendingTier2WithoutTokenRejected() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, null));
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "  "));
++    }
++
++    @Test
++    @DisplayName("二档过期/缺失 - token 在 Redis 无凭据行（过期或键漂移）→ false")
++    void pendingTier2ExpiredTokenRejected() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn(null);
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
++    }
++
++    @Test
++    @DisplayName("二档内容漂移 - Redis 凭据哈希与当前待发布内容摘要不一致 → false（预览后内容变更）")
++    void pendingTier2ContentDriftRejected() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn("stale-hash");
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
++    }
++
++    @Test
++    @DisplayName("二档绿 - token 存在且内容摘要一致 → true（影响预览后内容未漂移）")
++    void pendingTier2ValidTokenPasses() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn(EXPECTED_HASH);
++        assertTrue(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
++        verify(assembler).assemble(eq(TENANT), eq(2), eq(0L), eq(3L));
++    }
++
++    @Test
++    @DisplayName("0024 兼容 - 四参原签名缺省委托（NoOp 语义兼容，旧调用方零改动）")
++    void fourArgSignatureStillSupported() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(false);
++        PublishConfirmGate g = gate;
++        assertTrue(g.requireConfirm(TENANT, 2, 0L, 3L));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java
+index 1778ff5..d1104ce 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java
+@@ -55,6 +55,9 @@ class IotModelTemplateControllerTest {
+     @Mock
+     private IotModelTemplateService templateService;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.template.service.IotTemplateVersionService templateVersionService;
++
+     private IotModelTemplateController templateController;
+ 
+     @BeforeEach
+@@ -62,6 +65,7 @@ class IotModelTemplateControllerTest {
+         MockitoAnnotations.openMocks(this);
+         templateController = new IotModelTemplateController();
+         ReflectionTestUtils.setField(templateController, "templateService", templateService);
++        ReflectionTestUtils.setField(templateController, "templateVersionService", templateVersionService);
+         objectMapper = new ObjectMapper();
+         mockMvc = MockMvcBuilders.standaloneSetup(templateController)
+                 .setControllerAdvice(new GlobalExceptionHandler())
+@@ -91,6 +95,9 @@ class IotModelTemplateControllerTest {
+         assertEquals("iot:template:query", IotModelTemplateController.class
+                 .getMethod("getById", Long.class, boolean.class)
+                 .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:query", IotModelTemplateController.class
++                .getMethod("impactPreview", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
+         assertEquals("iot:template:add", IotModelTemplateController.class
+                 .getMethod("add", IotModelTemplate.class)
+                 .getAnnotation(SaCheckPermission.class).value()[0]);
+@@ -102,6 +109,36 @@ class IotModelTemplateControllerTest {
+                 .getAnnotation(SaCheckPermission.class).value()[0]);
+     }
+ 
++    @Test
++    @DisplayName("影响预览 - GET /iot/template/impact-preview?templateId= 返回 diff/计数/previewToken（TASK-0015）")
++    void testImpactPreview() throws Exception {
++        net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO vo =
++                new net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO();
++        vo.setTemplateId(1L);
++        vo.setCurrentTemplateVersion(2);
++        vo.setTargetVersion(5L);
++        vo.setDiff(java.util.List.of(new net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO(
++                "dataItem", "ELEC_CONS", "CHANGED", "defaultFormula", "a", "b", "T2")));
++        vo.setTierSummary("T2:1");
++        vo.setAffectedInstanceCount(3L);
++        vo.setLockedInstanceCount(1L);
++        vo.setPreviewToken("tok-123");
++        vo.setConfirmScopeType(2);
++        vo.setConfirmScopeId(0L);
++        vo.setConfirmTokenTtlSeconds(300);
++        when(templateVersionService.previewImpact(1L)).thenReturn(vo);
++
++        mockMvc.perform(get("/iot/template/impact-preview").param("templateId", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.affectedInstanceCount").value(3))
++                .andExpect(jsonPath("$.data.lockedInstanceCount").value(1))
++                .andExpect(jsonPath("$.data.targetVersion").value(5))
++                .andExpect(jsonPath("$.data.previewToken").value("tok-123"))
++                .andExpect(jsonPath("$.data.diff[0].tier").value("T2"));
++        verify(templateVersionService).previewImpact(1L);
++    }
++
+     @Test
+     @DisplayName("操作日志注解 - 三个写操作（新增/编辑/删除）均有 @OperateLog 且业务类型正确")
+     void testOperateLogAnnotations() throws Exception {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+index 19abe63..b966eea 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+@@ -71,6 +71,9 @@ class IotDataItemTemplateServiceImplTest {
+     @Mock
+     private IotDataDictService dictService;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.template.service.IotTemplateVersionService templateVersionService;
++
+     private IotDataItemTemplateServiceImpl itemService;
+ 
+     @BeforeAll
+@@ -87,6 +90,7 @@ class IotDataItemTemplateServiceImplTest {
+         ReflectionTestUtils.setField(itemService, "baseMapper", baseMapper);
+         ReflectionTestUtils.setField(itemService, "modelTemplateMapper", modelTemplateMapper);
+         ReflectionTestUtils.setField(itemService, "dictService", dictService);
++        ReflectionTestUtils.setField(itemService, "templateVersionService", templateVersionService);
+     }
+ 
+     private IotModelTemplate existingTemplate() {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+index 9c7e8f3..8a684a5 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+@@ -62,6 +62,9 @@ class IotModelTemplateServiceImplTest {
+     @Mock
+     private IotDataItemTemplateMapper dataItemTemplateMapper;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.template.service.IotTemplateVersionService templateVersionService;
++
+     private IotModelTemplateServiceImpl templateService;
+ 
+     @BeforeAll
+@@ -81,6 +84,7 @@ class IotModelTemplateServiceImplTest {
+         ReflectionTestUtils.setField(templateService, "baseMapper", baseMapper);
+         ReflectionTestUtils.setField(templateService, "modelInstanceMapper", modelInstanceMapper);
+         ReflectionTestUtils.setField(templateService, "dataItemTemplateMapper", dataItemTemplateMapper);
++        ReflectionTestUtils.setField(templateService, "templateVersionService", templateVersionService);
+     }
+ 
+     private IotModelTemplate newTemplate() {
+@@ -184,7 +188,8 @@ class IotModelTemplateServiceImplTest {
+     // ---------- 编辑 ----------
+ 
+     @Test
+-    @DisplayName("编辑模板 - 正常情况：白名单构建更新，template_code/tenant_id/审计字段不进更新集")
++    @DisplayName("编辑模板 - 正常情况：白名单构建更新，template_code/tenant_id/version/审计字段不进更新集"
++            + "（TASK-0015 起版本号由版本历史服务权威管理：内容变更自动升版，请求携带 version 不参与更新）")
+     void testUpdateTemplate_Success() {
+         IotModelTemplate existing = newTemplate();
+         existing.setId(1L);
+@@ -211,10 +216,11 @@ class IotModelTemplateServiceImplTest {
+         assertEquals("空压机模板 V2", upd.getTemplateName());
+         assertEquals(Integer.valueOf(4), upd.getNodeType());
+         assertEquals(Integer.valueOf(0), upd.getStatus(), "编辑可启停模板（接口清单无独立 changeStatus）");
+-        assertEquals(Integer.valueOf(2), upd.getVersion());
++        assertNull(upd.getVersion(), "version 不进更新集（TASK-0015：升版由版本历史服务按 diff 自动管理）");
+         assertNull(upd.getTemplateCode(), "template_code 创建后不可改：校验通过后也不进更新集（SET 不含不可变字段）");
+         assertNull(upd.getTenantId(), "tenant_id 不进更新集");
+         assertNull(upd.getRemark(), "未携带的 remark 不进更新集（null 列 MP 自动跳过，保持库内原值）");
++        verify(templateVersionService).recordContentChange(1L);
+     }
+ 
+     @Test
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+new file mode 100644
+index 0000000..e359b98
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+@@ -0,0 +1,442 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRuleMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateImpactPreviewVO;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.RedisUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.time.LocalDateTime;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 模板版本历史服务单元测试（TASK-0015，brief 测试口径：升版留痕/diff 生成/影响预览计数
++ * 未锁定与 locked 分列/previewToken/确认门判档窗口）。
++ *
++ * <p>standalone Mockito 范式：Mapper/组装器全 mock；RedisUtils/TenantContext static mock。
++ * 基线内容复用技巧：先经 recordBaseline 落基线并捕获 content 字符串，再以该串作「最新
++ * 历史行」驱动无变化/有变化两分支——content 由服务自身 canonical 序列化产出，测试不重复
++ * 实现序列化（契约=服务自洽）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotTemplateVersionServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long TEMPLATE_ID = 9L;
++
++    @Mock
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Mock
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Mock
++    private IotStatusRuleMapper statusRuleMapper;
++
++    @Mock
++    private IotModelTemplateVersionMapper versionMapper;
++
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private IotConfigVersionMapper configVersionMapper;
++
++    @Mock
++    private ConfigSnapshotAssembler assembler;
++
++    private IotTemplateVersionServiceImpl service;
++
++    private AutoCloseable mocks;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private MockedStatic<RedisUtils> redisUtils;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplateVersion.class);
++        TableInfoHelper.initTableInfo(assistant, IotStatusRule.class);
++        TableInfoHelper.initTableInfo(assistant, IotConfigVersion.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        redisUtils = Mockito.mockStatic(RedisUtils.class);
++        service = new IotTemplateVersionServiceImpl();
++        ReflectionTestUtils.setField(service, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(service, "dataItemTemplateMapper", dataItemTemplateMapper);
++        ReflectionTestUtils.setField(service, "statusRuleMapper", statusRuleMapper);
++        ReflectionTestUtils.setField(service, "versionMapper", versionMapper);
++        ReflectionTestUtils.setField(service, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(service, "configVersionMapper", configVersionMapper);
++        ReflectionTestUtils.setField(service, "assembler", assembler);
++        ReflectionTestUtils.setField(service, "properties", new net.otlab.admin.module.iot.publish.config.PublishProperties());
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++        tenantContext.close();
++        redisUtils.close();
++    }
++
++    // ---------- 数据工厂 ----------
++
++    private IotModelTemplate template(int version) {
++        IotModelTemplate template = new IotModelTemplate();
++        template.setId(TEMPLATE_ID);
++        template.setTenantId(TENANT);
++        template.setTemplateCode("AIR_COMPRESSOR");
++        template.setTemplateName("空压机模板");
++        template.setNodeType(4);
++        template.setRemark("smoke");
++        template.setStatus(1);
++        template.setVersion(version);
++        return template;
++    }
++
++    private IotDataItemTemplate item(String code, String formula) {
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setTemplateId(TEMPLATE_ID);
++        item.setTenantId(TENANT);
++        item.setDataCode(code);
++        item.setDataName("项-" + code);
++        item.setCategory("ELEC");
++        item.setValueKind(2);
++        item.setUnit("kWh");
++        item.setDefaultSourceType(2);
++        item.setDefaultFormula(formula);
++        item.setAggMethod("SUM");
++        item.setDefaultCalcPeriod("DAY");
++        item.setDefaultValidMin(new BigDecimal("0"));
++        item.setDefaultValidMax(new BigDecimal("100"));
++        item.setDefaultAlarmLow(new BigDecimal("1"));
++        item.setDefaultAlarmHigh(new BigDecimal("90"));
++        return item;
++    }
++
++    private IotModelInstance instance(long id, Integer applied, int locked) {
++        IotModelInstance instance = new IotModelInstance();
++        instance.setId(id);
++        instance.setTenantId(TENANT);
++        instance.setInstanceCode("F01.EQ" + id);
++        instance.setTemplateId(TEMPLATE_ID);
++        instance.setNodeType(4);
++        instance.setStatus(1);
++        instance.setAppliedTemplateVersion(applied);
++        instance.setLocked(locked);
++        return instance;
++    }
++
++    private IotModelTemplateVersion historyRow(int version, String content, String tierSummary,
++                                               LocalDateTime createTime) {
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setId((long) version);
++        row.setTenantId(TENANT);
++        row.setTemplateId(TEMPLATE_ID);
++        row.setVersion(version);
++        row.setContent(content);
++        row.setTierSummary(tierSummary);
++        row.setCreateTime(createTime);
++        return row;
++    }
++
++    private void stubTemplateAndItems(int version, List<IotDataItemTemplate> items) {
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(version));
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(items);
++        when(statusRuleMapper.selectList(any())).thenReturn(List.of());
++    }
++
++    // ---------- 基线留痕 ----------
++
++    @Test
++    @DisplayName("基线 - 首版内容快照落历史行：version=模板当前版本、tier_summary=NULL（基线无相对变更）")
++    void recordBaselineInsertsSnapshot() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++
++        service.recordBaseline(template(1));
++
++        ArgumentCaptor<IotModelTemplateVersion> captor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(captor.capture());
++        IotModelTemplateVersion row = captor.getValue();
++        assertEquals(TEMPLATE_ID, row.getTemplateId());
++        assertEquals(Integer.valueOf(1), row.getVersion());
++        assertNull(row.getTierSummary(), "基线无相对变更——tier_summary 落 NULL");
++        assertTrue(row.getContent().contains("\"templateCode\""));
++        assertTrue(row.getContent().contains("ELEC_CONS"));
++    }
++
++    @Test
++    @DisplayName("基线幂等 - 已有历史行不再重复落基线")
++    void recordBaselineIdempotent() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "f")));
++        when(versionMapper.selectList(any())).thenReturn(
++                List.of(historyRow(1, "{\"template\":{}}", null, LocalDateTime.now())));
++
++        service.recordBaseline(template(1));
++
++        verify(versionMapper, never()).insert(any(IotModelTemplateVersion.class));
++    }
++
++    // ---------- 内容变更升版 ----------
++
++    @Test
++    @DisplayName("无变化 - 内容与最新历史快照一致 → 返回 null、不升版、不落新历史行（零版本噪声）")
++    void recordContentChangeNoChange() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        // 同一内容再次保存（recordContentChange 取最新历史行走 selectOne）
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        assertNull(service.recordContentChange(TEMPLATE_ID));
++        verify(versionMapper, Mockito.times(1)).insert(any(IotModelTemplateVersion.class));
++        verify(modelTemplateMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("二档升版 - 改默认公式：升版=末版+1、新历史行 tier_summary=T2:1、模板 version 回写")
++    void recordContentChangeFormulaTier2() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        // 修改公式后保存（最新历史行走 selectOne）
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}*3+{ELEC_P2}")));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        List<TemplateChangeEntryVO> entries = service.recordContentChange(TEMPLATE_ID);
++        assertNotNull(entries);
++        assertEquals(1, entries.size());
++        assertEquals("dataItem", entries.get(0).getObjectType());
++        assertEquals("ELEC_CONS", entries.get(0).getObjectKey());
++        assertEquals("CHANGED", entries.get(0).getChangeType());
++        assertEquals("defaultFormula", entries.get(0).getField());
++        assertEquals("T2", entries.get(0).getTier());
++
++        // 升版：模板 version 回写 2；新历史行 version=2、tier_summary=T2:1
++        verify(modelTemplateMapper).update(any(), any());
++        ArgumentCaptor<IotModelTemplateVersion> rowCaptor = ArgumentCaptor.captor();
++        verify(versionMapper, Mockito.times(2)).insert(rowCaptor.capture());
++        IotModelTemplateVersion newRow = rowCaptor.getAllValues().get(1);
++        assertEquals(Integer.valueOf(2), newRow.getVersion());
++        assertEquals("T2:1", newRow.getTierSummary());
++    }
++
++    @Test
++    @DisplayName("混合保存逐条目判档 - 新增一档+改公式二档并存：tier_summary=T1:1,T2:1（不取最高档合并）")
++    void recordContentChangeMixedTiers() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "f0"), item("ELEC_P1", "p0")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        stubTemplateAndItems(1, List.of(
++                item("ELEC_CONS", "f1"),                    // 公式变更（二档）
++                item("ELEC_P1", "p0"),                      // 未变
++                item("ELEC_NEW", "n0")));                   // 新增（一档）
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        List<TemplateChangeEntryVO> entries = service.recordContentChange(TEMPLATE_ID);
++        assertEquals(2, entries.size());
++        ArgumentCaptor<IotModelTemplateVersion> rowCaptor = ArgumentCaptor.captor();
++        verify(versionMapper, Mockito.times(2)).insert(rowCaptor.capture());
++        assertEquals("T1:1,T2:1", rowCaptor.getAllValues().get(1).getTierSummary());
++    }
++
++    @Test
++    @DisplayName("无基线补录 - 存量模板（无历史行）首次编辑：补录基线快照返回 null（不误计全量 ADDED）")
++    void recordContentChangeBackfillsBaseline() {
++        stubTemplateAndItems(3, List.of(item("ELEC_CONS", "f")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++
++        assertNull(service.recordContentChange(TEMPLATE_ID));
++        ArgumentCaptor<IotModelTemplateVersion> captor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(captor.capture());
++        assertEquals(Integer.valueOf(3), captor.getValue().getVersion());
++        assertNull(captor.getValue().getTierSummary());
++        verify(modelTemplateMapper, never()).update(any(), any());
++    }
++
++    // ---------- 影响预览 ----------
++
++    @Test
++    @DisplayName("影响预览 - 实例数分列（affected=3、locked=1）+ diff 相对未锁定跟随实例有效版本 + "
++            + "previewToken 落 Redis（键 iot:pub:confirm:{tenant}:2:0:{targetVersion}，TTL=300）")
++    void previewImpactCountsAndToken() {
++        // 模板 v2（公式已改），历史行 v1（基线）；实例：2 台未锁定 @v1 + 1 台锁定 @v1
++        stubTemplateAndItems(2, List.of(item("ELEC_CONS", "{ELEC_P1}*3")));
++        when(instanceMapper.selectList(any())).thenReturn(List.of(
++                instance(101, 1, 0), instance(102, 1, 0), instance(103, 1, 1)));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineJsonOf("{ELEC_P1}+{ELEC_P2}"), null, LocalDateTime.now()));
++        when(configVersionMapper.selectMaxVersion(TENANT, 2, 0L)).thenReturn(4L);
++        when(assembler.assemble(eq(TENANT), eq(2), eq(0L), eq(5L)))
++                .thenReturn(new ConfigSnapshot());
++        when(assembler.serialize(any(ConfigSnapshot.class))).thenReturn("SNAPSHOT_JSON");
++
++        TemplateImpactPreviewVO vo = service.previewImpact(TEMPLATE_ID);
++
++        assertEquals(3L, vo.getAffectedInstanceCount(), "受影响=引用且启用（未锁定跟随+锁定单列）");
++        assertEquals(1L, vo.getLockedInstanceCount(), "锁定子集单列（ADR-0008 锁定口径）");
++        assertEquals(Integer.valueOf(2), vo.getCurrentTemplateVersion());
++        assertEquals(Long.valueOf(5L), vo.getTargetVersion(), "targetVersion=计算域末版+1（确认凭据锚定）");
++        assertEquals(Integer.valueOf(2), vo.getConfirmScopeType());
++        assertEquals(Long.valueOf(0L), vo.getConfirmScopeId());
++        assertNotNull(vo.getPreviewToken());
++        assertFalse(vo.getPreviewToken().isBlank());
++        assertTrue(vo.getDiff().stream().anyMatch(e -> "T2".equals(e.getTier())
++                && "defaultFormula".equals(e.getField())), "diff 含相对实例有效版本的公式变更");
++        // previewToken 落 Redis：value=待发布内容摘要哈希（sha256("SNAPSHOT_JSON")），TTL=300s
++        String expectedHash = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
++                .sha256Hex("SNAPSHOT_JSON".getBytes(java.nio.charset.StandardCharsets.UTF_8));
++        redisUtils.verify(() -> RedisUtils.set(
++                eq("iot:pub:confirm:" + TENANT + ":2:0:5"), eq(expectedHash), eq(300L), eq(TimeUnit.SECONDS)));
++    }
++
++    @Test
++    @DisplayName("影响预览 - 模板不存在 400；全部锁定（无未锁定跟随实例）→ diff 空、计数仍分列")
++    void previewImpactEdgeCases() {
++        when(modelTemplateMapper.selectById(999L)).thenReturn(null);
++        assertThrows(BusinessException.class, () -> service.previewImpact(999L));
++
++        stubTemplateAndItems(2, List.of(item("ELEC_CONS", "f1")));
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(201, 1, 1)));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineJsonOf("f0"), null, LocalDateTime.now()));
++        when(configVersionMapper.selectMaxVersion(TENANT, 2, 0L)).thenReturn(0L);
++        when(assembler.assemble(eq(TENANT), eq(2), eq(0L), eq(1L))).thenReturn(new ConfigSnapshot());
++        when(assembler.serialize(any(ConfigSnapshot.class))).thenReturn("SNAPSHOT_JSON");
++
++        TemplateImpactPreviewVO vo = service.previewImpact(TEMPLATE_ID);
++        assertEquals(1L, vo.getAffectedInstanceCount());
++        assertEquals(1L, vo.getLockedInstanceCount());
++        assertTrue(vo.getDiff().isEmpty(), "无未锁定跟随实例 → 无待生效 diff（锁定实例归待升级清单 TASK-0016）");
++    }
++
++    /** 构造基线内容 JSON（测试侧以字面 JSON 提供历史行——diff 引擎只依赖内容结构） */
++    private String baselineJsonOf(String formula) {
++        return "{\"template\":{\"nodeType\":4,\"remark\":\"smoke\",\"status\":1,"
++                + "\"templateCode\":\"AIR_COMPRESSOR\",\"templateName\":\"空压机模板\"},"
++                + "\"dataItems\":[{\"aggMethod\":\"SUM\",\"category\":\"ELEC\",\"dataCode\":\"ELEC_CONS\","
++                + "\"dataName\":\"项-ELEC_CONS\",\"defaultAlarmHigh\":90,\"defaultAlarmLow\":1,"
++                + "\"defaultCalcPeriod\":\"DAY\",\"defaultFormula\":\"" + formula + "\","
++                + "\"defaultSourceType\":2,\"defaultValidMax\":100,\"defaultValidMin\":0,"
++                + "\"unit\":\"kWh\",\"valueKind\":2}],\"statusRules\":[]}";
++    }
++
++    // ---------- 确认门判档 ----------
++
++    @Test
++    @DisplayName("判档 true - 存在含 T2 的历史行：窗口开启（计算域从未发布）+ 存在滞后跟随实例")
++    void pendingTier2Detected() {
++        when(configVersionMapper.selectOne(any())).thenReturn(null); // 计算域从未发布 → 窗口开启
++        when(versionMapper.selectList(any())).thenReturn(List.of(
++                historyRow(2, "{}", "T1:1,T2:1", LocalDateTime.now())));
++        when(instanceMapper.selectCount(any())).thenReturn(2L); // 2 台未锁定启用实例滞后
++
++        assertTrue(service.hasPendingTier2Confirm(TENANT));
++    }
++
++    @Test
++    @DisplayName("判档 false - 窗口已关闭（T2 变更已经过一次计算域发布：行 create_time 早于末版 publish_time）")
++    void pendingTier2WindowClosed() {
++        IotConfigVersion latestPublish = new IotConfigVersion();
++        latestPublish.setVersion(7L);
++        latestPublish.setPublishTime(LocalDateTime.now().plusMinutes(5));
++        when(configVersionMapper.selectOne(any())).thenReturn(latestPublish);
++        when(versionMapper.selectList(any())).thenReturn(List.of(
++                historyRow(2, "{}", "T2:1", LocalDateTime.now())));
++        when(instanceMapper.selectCount(any())).thenReturn(2L);
++
++        assertFalse(service.hasPendingTier2Confirm(TENANT));
++    }
++
++    @Test
++    @DisplayName("判档 false - 无滞后跟随实例（全部实例已升级到该版本 / 或全部锁定）")
++    void pendingTier2NoLaggingInstance() {
++        when(configVersionMapper.selectOne(any())).thenReturn(null);
++        when(versionMapper.selectList(any())).thenReturn(List.of(
++                historyRow(2, "{}", "T2:1", LocalDateTime.now())));
++        when(instanceMapper.selectCount(any())).thenReturn(0L);
++
++        assertFalse(service.hasPendingTier2Confirm(TENANT));
++    }
++
++    @Test
++    @DisplayName("判档 false - 仅一档/三档变更（tier_summary 无 T2 段）——一档放行、三档不经本门")
++    void pendingTier2OnlyForTier2() {
++        when(configVersionMapper.selectOne(any())).thenReturn(null);
++        when(versionMapper.selectList(any())).thenReturn(List.of(
++                historyRow(2, "{}", "T1:1,T3:1", LocalDateTime.now())));
++
++        assertFalse(service.hasPendingTier2Confirm(TENANT));
++        verify(instanceMapper, never()).selectCount(any());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngineTest.java
+new file mode 100644
+index 0000000..78816f8
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateContentDiffEngineTest.java
+@@ -0,0 +1,159 @@
++package net.otlab.admin.module.iot.template.tier;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 模板内容 diff 引擎单元测试（TASK-0015 测试口径「diff 生成正确性：增/删/改三形态+
++ * 展示属性归 T1」+「混合保存逐条目判档」）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class TemplateContentDiffEngineTest {
++
++    private static final ObjectMapper MAPPER = new ObjectMapper();
++
++    private static JsonNode tree(String json) {
++        try {
++            return MAPPER.readTree(json);
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    @Test
++    @DisplayName("增 - 新增数据项一条 ADDED（一档）；新增状态规则一条 ADDED（一档）")
++    void addedObjects() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},\"dataItems\":[],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P_NEW\",\"dataName\":\"新项\"}],"
++                + "\"statusRules\":[{\"priority\":1,\"conditionExpr\":\"{P_NEW}>10\"}]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(2, entries.size());
++        TemplateChangeEntry itemEntry = entries.get(0);
++        assertEquals(TemplateChangeEntry.OBJECT_DATA_ITEM, itemEntry.getObjectType());
++        assertEquals("P_NEW", itemEntry.getObjectKey());
++        assertEquals(TemplateChangeEntry.CHANGE_ADDED, itemEntry.getChangeType());
++        assertNull(itemEntry.getField());
++        assertEquals(TemplateChangeTier.TIER_1, itemEntry.getTier());
++        TemplateChangeEntry ruleEntry = entries.get(1);
++        assertEquals(TemplateChangeEntry.OBJECT_STATUS_RULE, ruleEntry.getObjectType());
++        assertEquals("1", ruleEntry.getObjectKey());
++        assertEquals(TemplateChangeEntry.CHANGE_ADDED, ruleEntry.getChangeType());
++        assertEquals(TemplateChangeTier.TIER_1, ruleEntry.getTier());
++    }
++
++    @Test
++    @DisplayName("删 - 删除数据项一条 REMOVED（三档，ADR-0008：删除模板数据项）")
++    void removedObject() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P_OLD\",\"dataName\":\"旧项\"}],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},\"dataItems\":[],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(1, entries.size());
++        assertEquals(TemplateChangeEntry.CHANGE_REMOVED, entries.get(0).getChangeType());
++        assertEquals("P_OLD", entries.get(0).getObjectKey());
++        assertEquals(TemplateChangeTier.TIER_3, entries.get(0).getTier());
++    }
++
++    @Test
++    @DisplayName("改 - 公式字段一条 CHANGED（二档），旧值/新值逐字产出")
++    void changedField() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"defaultFormula\":\"{A}+{B}\"}],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"defaultFormula\":\"{A}*2\"}],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(1, entries.size());
++        assertEquals(TemplateChangeEntry.CHANGE_CHANGED, entries.get(0).getChangeType());
++        assertEquals("defaultFormula", entries.get(0).getField());
++        assertEquals("{A}+{B}", entries.get(0).getOldValue());
++        assertEquals("{A}*2", entries.get(0).getNewValue());
++        assertEquals(TemplateChangeTier.TIER_2, entries.get(0).getTier());
++    }
++
++    @Test
++    @DisplayName("改 - 展示属性（名称）归一档；值性质归三档（同一对象多字段改动逐字段独立出条目）")
++    void mixedFieldsOnOneObject() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"dataName\":\"电耗\",\"valueKind\":2}],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"dataName\":\"有功电耗\",\"valueKind\":1}],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(2, entries.size());
++        TemplateChangeEntry nameEntry = entries.stream()
++                .filter(e -> "dataName".equals(e.getField())).findFirst().orElseThrow();
++        assertEquals(TemplateChangeTier.TIER_1, nameEntry.getTier());
++        TemplateChangeEntry kindEntry = entries.stream()
++                .filter(e -> "valueKind".equals(e.getField())).findFirst().orElseThrow();
++        assertEquals(TemplateChangeTier.TIER_3, kindEntry.getTier());
++    }
++
++    @Test
++    @DisplayName("混合保存逐条目判档 - 增+改+删并存不取最高档合并，每条独立档位")
++    void mixedSavePerEntryTiers() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":["
++                + "{\"dataCode\":\"P1\",\"defaultFormula\":\"old\"},"
++                + "{\"dataCode\":\"P2\",\"dataName\":\"keep\"}"
++                + "],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":["
++                + "{\"dataCode\":\"P1\",\"defaultFormula\":\"new\"},"
++                + "{\"dataCode\":\"P2\",\"dataName\":\"keep\"},"
++                + "{\"dataCode\":\"P3\",\"dataName\":\"新增项\"}"
++                + "],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(2, entries.size());
++        assertEquals(TemplateChangeTier.TIER_2, entries.get(0).getTier()); // P1 公式
++        assertEquals(TemplateChangeTier.TIER_1, entries.get(1).getTier()); // P3 新增
++        assertEquals("P1", entries.get(0).getObjectKey());
++        assertEquals("P3", entries.get(1).getObjectKey());
++    }
++
++    @Test
++    @DisplayName("判空口径 - 缺键 ≡ null（defaultAlarmHigh 从 5 改为不填照常计二档变更）")
++    void absentEqualsNull() {
++        JsonNode prev = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"defaultAlarmHigh\":5}],\"statusRules\":[]}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\",\"defaultAlarmHigh\":null}],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(prev, cur);
++        assertEquals(1, entries.size());
++        assertEquals("defaultAlarmHigh", entries.get(0).getField());
++        assertEquals("5", entries.get(0).getOldValue());
++        assertNull(entries.get(0).getNewValue());
++        assertEquals(TemplateChangeTier.TIER_2, entries.get(0).getTier());
++    }
++
++    @Test
++    @DisplayName("无基线 - prev 缺顶层键按空对象处理（全量计 ADDED）")
++    void nullBaselineAllAdded() {
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\",\"templateName\":\"名\"},"
++                + "\"dataItems\":[{\"dataCode\":\"P1\"}],\"statusRules\":[]}");
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(null, cur);
++        assertTrue(entries.stream().anyMatch(e -> e.getObjectType().equals(TemplateChangeEntry.OBJECT_DATA_ITEM)
++                && e.getChangeType().equals(TemplateChangeEntry.CHANGE_ADDED)));
++        assertTrue(entries.stream().anyMatch(e -> e.getObjectType().equals(TemplateChangeEntry.OBJECT_TEMPLATE)
++                && e.getChangeType().equals(TemplateChangeEntry.CHANGE_ADDED)));
++    }
++
++    @Test
++    @DisplayName("无变更 - 两版内容一致零条目（含键序无关）")
++    void identicalContentZeroEntries() {
++        JsonNode prev = tree("{\"dataItems\":[{\"dataCode\":\"P1\",\"dataName\":\"a\"}],"
++                + "\"statusRules\":[],\"template\":{\"templateCode\":\"T\"}}");
++        JsonNode cur = tree("{\"template\":{\"templateCode\":\"T\"},"
++                + "\"dataItems\":[{\"dataName\":\"a\",\"dataCode\":\"P1\"}],\"statusRules\":[]}");
++        assertEquals(0, TemplateContentDiffEngine.diff(prev, cur).size());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTableTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTableTest.java
+new file mode 100644
+index 0000000..cf02c0a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTableTest.java
+@@ -0,0 +1,142 @@
++package net.otlab.admin.module.iot.template.tier;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++
++/**
++ * 分档规则表单元测试（TASK-0015 测试口径「分档规则表逐档用例」——ADR-0008 三档逐字段
++ * 映射 + tier_summary 摘要格式/解析）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class TemplateTierRuleTableTest {
++
++    // ---------- 字段级判档（ADR-0008 逐档） ----------
++
++    @Test
++    @DisplayName("一档 - 名称/说明/类别/状态颜色等展示属性（纯装饰，不改变值的含义）")
++    void tier1DisplayFields() {
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "dataName"));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "category"));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_TEMPLATE, "templateName"));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_TEMPLATE, "remark"));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_STATUS_RULE, "color"));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_STATUS_RULE, "statusName"));
++    }
++
++    @Test
++    @DisplayName("二档 - 默认公式/聚合/周期/有效范围/告警阈值/单位/状态规则门限与优先级（语义变更类）")
++    void tier2SemanticFields() {
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultFormula"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "aggMethod"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultCalcPeriod"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultValidMin"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultValidMax"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultAlarmLow"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultAlarmHigh"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "unit"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_STATUS_RULE, "conditionExpr"));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_STATUS_RULE, "priority"));
++    }
++
++    @Test
++    @DisplayName("三档 - 数据类型（瞬时↔累计）与取值方式（直绑↔公式↔汇总）（结构破坏类）")
++    void tier3StructuralFields() {
++        assertEquals(TemplateChangeTier.TIER_3,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "valueKind"));
++        assertEquals(TemplateChangeTier.TIER_3,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "defaultSourceType"));
++    }
++
++    @Test
++    @DisplayName("禁止 - data_code 修改直接禁止（换编码=新增一项+停用旧项，REQ-0004）")
++    void forbiddenDataCode() {
++        assertEquals(TemplateChangeTier.FORBIDDEN,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "dataCode"));
++        assertEquals(TemplateChangeTier.FORBIDDEN,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_TEMPLATE, "templateCode"));
++    }
++
++    @Test
++    @DisplayName("未登记字段保守默认二档（fail-closed——需确认优于静默放行）")
++    void unknownFieldDefaultsToTier2() {
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfChangedField(TemplateChangeEntry.OBJECT_DATA_ITEM, "futureField"));
++    }
++
++    // ---------- 对象级判档 ----------
++
++    @Test
++    @DisplayName("对象级 - 新增数据项=一档 / 删除数据项=三档 / 新增状态规则=一档 / 删除状态规则=二档")
++    void objectLevelTiers() {
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfAdded(TemplateChangeEntry.OBJECT_DATA_ITEM));
++        assertEquals(TemplateChangeTier.TIER_3,
++                TemplateTierRuleTable.tierOfRemoved(TemplateChangeEntry.OBJECT_DATA_ITEM));
++        assertEquals(TemplateChangeTier.TIER_1,
++                TemplateTierRuleTable.tierOfAdded(TemplateChangeEntry.OBJECT_STATUS_RULE));
++        assertEquals(TemplateChangeTier.TIER_2,
++                TemplateTierRuleTable.tierOfRemoved(TemplateChangeEntry.OBJECT_STATUS_RULE));
++    }
++
++    // ---------- 摘要格式与解析 ----------
++
++    @Test
++    @DisplayName("tier_summary 格式化 - 仅非零档位段、T1/T2/T3 固定顺序（brief：如 T2:2,T3:1）")
++    void formatSummary() {
++        List<TemplateChangeEntry> entries = List.of(
++                new TemplateChangeEntry(TemplateChangeEntry.OBJECT_DATA_ITEM, "P1",
++                        TemplateChangeEntry.CHANGE_CHANGED, "defaultFormula", "a", "b",
++                        TemplateChangeTier.TIER_2),
++                new TemplateChangeEntry(TemplateChangeEntry.OBJECT_DATA_ITEM, "P2",
++                        TemplateChangeEntry.CHANGE_REMOVED, null, null, null,
++                        TemplateChangeTier.TIER_3),
++                new TemplateChangeEntry(TemplateChangeEntry.OBJECT_DATA_ITEM, "P3",
++                        TemplateChangeEntry.CHANGE_CHANGED, "dataName", "旧名", "新名",
++                        TemplateChangeTier.TIER_1),
++                new TemplateChangeEntry(TemplateChangeEntry.OBJECT_DATA_ITEM, "P4",
++                        TemplateChangeEntry.CHANGE_CHANGED, "defaultAlarmHigh", "1", "2",
++                        TemplateChangeTier.TIER_2));
++        assertEquals("T1:1,T2:2,T3:1", TemplateTierRuleTable.formatSummary(entries));
++    }
++
++    @Test
++    @DisplayName("tier_summary 格式化 - 空清单返回 null（基线快照无变更）")
++    void formatSummaryEmpty() {
++        assertNull(TemplateTierRuleTable.formatSummary(List.of()));
++        assertNull(TemplateTierRuleTable.formatSummary(null));
++    }
++
++    @Test
++    @DisplayName("tier_summary 解析 - T2 计数容错（null/空白/畸形段按 0）")
++    void countTierParses() {
++        assertEquals(2, TemplateTierRuleTable.countTier("T1:1,T2:2,T3:1", TemplateChangeTier.TIER_2));
++        assertEquals(0, TemplateTierRuleTable.countTier("T1:1,T3:2", TemplateChangeTier.TIER_2));
++        assertEquals(0, TemplateTierRuleTable.countTier(null, TemplateChangeTier.TIER_2));
++        assertEquals(0, TemplateTierRuleTable.countTier("", TemplateChangeTier.TIER_2));
++        assertEquals(0, TemplateTierRuleTable.countTier("T2:bad", TemplateChangeTier.TIER_2));
++        assertEquals(3, TemplateTierRuleTable.countTier("T2:1, T2:2", TemplateChangeTier.TIER_2));
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+index 60973dd..6640bd6 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+@@ -29,7 +29,13 @@ public enum ResultCode {
+     // 版本冲突（详细设计 §3.4 错误码分段：5001=配置与发布版本冲突段；语义全局——乐观
+     // 并发闸的受检冲突：前置读条件 UPDATE 影响行数 0 即版本被并发改写，抛出方携带
+     // 「刷新后重试」类提示。TASK-0019 修订轮 I-1 凭据并发轮换先行使用）
+-    VERSION_CONFLICT(5001, "版本冲突");
++    VERSION_CONFLICT(5001, "版本冲突"),
++
++    // 下发未确认（FEAT-0008 业务规则「未确认 5002」；TASK-0015 登记——发布确认门
++    // PublishConfirmGate 真实现拒绝路径专用码：第二档模板变更（ADR-0008 语义变更类）
++    // 发布强制影响预览+二次确认，previewToken 缺失/过期/内容漂移即本码，重取预览
++    // 重新确认后可发布）
++    PUBLISH_NOT_CONFIRMED(5002, "下发未确认");
+ 
+     private final Integer code;
+     private final String message;
+diff --git a/resources/sql/upgrade/20261123_iot_template_version.sql b/resources/sql/upgrade/20261123_iot_template_version.sql
+new file mode 100644
+index 0000000..99fa751
+--- /dev/null
++++ b/resources/sql/upgrade/20261123_iot_template_version.sql
+@@ -0,0 +1,61 @@
++-- ============================================================
++-- 存量库升级脚本：iot_model_template_version 模板版本历史表（TASK-0015 / FEAT-0005 /
++--   REQ-0006 / ADR-0008 落地件）
++--
++-- 用途：
++--   1) 建 iot_model_template_version 模板版本历史表（模板保存升版时的全量内容快照 +
++--      相对上一版本的档位摘要）。DDL 逐字来自 TASK-0015 实施 brief（brief 已提取定稿）。
++--      content 形态 = 模板域既有结构（模板头 + 数据项清单 + 状态规则清单）的 JSON 序列化，
++--      键序确定性（服务层 canonical 序列化：TreeMap 键序 + 清单按业务键排序 + NON_NULL）。
++--
++-- 与上游差异（一处，登记待回写上游）：
++--   **附录 A 无此表**——ADR-0008 裁决「模板支持版本号可回滚」的落地基座（详细设计 V1.1
++--   §1.5 有 version 字段但无历史表，「可回滚」无表支撑，ADR-0008 背景/决定 C 明文）。
++--   本表为 ADR-0008 落地件新增，登记差异，随上游修订清单攒下一版小修订回写。
++--
++-- 菜单种子：无新增——影响预览接口 GET /iot/template/impact-preview 复用既有模板查询权限
++--   iot:template:query（sys_menu 4025，20261122_iot_template_domain.sql 已建），不新增
++--   iot:template:* 权限码（brief 明文）。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS——重复执行不报错、不重建、不改已有行。可安全重复执行。
++--
++-- 业务纪律（ADR-0008 / REQ-0006 / FEAT-0005 / TASK-0015 brief）：
++--   uk_template_version (tenant_id, template_id, version) 物理唯一——模板内版本号单调递增
++--   的物理兜底；version history 行为不可变快照（只插不改不删——「历史保留可查」，服务层
++--   不提供任何 UPDATE/DELETE 通道）；tier_summary 为相对上一版本的档位摘要（如 T2:2,T3:1，
++--   分档规则引擎表驱动判定，ADR-0008 三档政策）；二档变更经发布确认门（PublishConfirmGate
++--   真实现 + previewToken 二次确认，ot-core ResultCode 5002 PUBLISH_NOT_CONFIRMED）。
++--   多租户：iot_ 前缀表由 TASK-0002 TenantLineInnerInterceptor（OtTenantLineHandler 前缀
++--   规则）自动按会话租户注入条件；tenant_id 服务层从会话覆盖、禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）与 20261122_iot_template_domain.sql
++--   （iot_model_template / iot_data_item_template 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_model_template_version` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '版本快照 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `template_id` bigint NOT NULL COMMENT '模板 ID',
++  `version` int NOT NULL COMMENT '模板版本号（模板内单调递增）',
++  `content` json NOT NULL COMMENT '该版本模板全量内容快照（数据项/状态规则等）',
++  `tier_summary` varchar(200) DEFAULT NULL COMMENT '相对上一版本的档位摘要（如 T2:2,T3:1）',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_template_version` (`tenant_id`,`template_id`,`version`),
++  KEY `idx_template` (`tenant_id`,`template_id`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模板版本历史表（ADR-0008 落地件）';
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构含 uk_template_version；本脚本无菜单种子——见头注）：
++--   SHOW CREATE TABLE iot_model_template_version;
++-- ============================================================

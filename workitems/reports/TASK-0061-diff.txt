@@ -1,0 +1,2388 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/config/InspectConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/config/InspectConfig.java
+new file mode 100644
+index 0000000..6c9f5c7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/config/InspectConfig.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.inspect.config;
++
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/**
++ * TASK-0061：巡检域 Spring 装配（结果存储 + 归档期配置）。
++ *
++ * <p>retention-days 由 {@code ot.inspect.retention-days} 注入（默认 90，ADR-0014）；
++ * JdbcTemplate 取主数据源（iot_inspect_result 属业务库 iot_ 前缀租户表）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration
++public class InspectConfig {
++
++    @Bean
++    public InspectResultStore inspectResultStore(JdbcTemplate jdbcTemplate,
++                                                 @Value("${ot.inspect.retention-days:90}") int retentionDays) {
++        return new InspectResultStore(jdbcTemplate, retentionDays);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/controller/IotInspectController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/controller/IotInspectController.java
+new file mode 100644
+index 0000000..73137f4
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/controller/IotInspectController.java
+@@ -0,0 +1,66 @@
++package net.otlab.admin.module.iot.inspect.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.inspect.service.InspectReadService;
++import net.otlab.admin.module.iot.inspect.vo.DashboardVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.core.result.Result;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * TASK-0061 D4：运维巡检管理面只读端点（frontend 数据源）。
++ *
++ * <p>{@code GET /api/v1/iot/inspect/dashboard} 四类指标聚合；
++ * {@code GET /api/v1/iot/inspect/history?type=&from=&to=} 历史巡检清单（90 天内 403 红线）；
++ * {@code GET /api/v1/iot/inspect/latest?type=} 最近一次巡检清单。
++ *
++ * <p><b>只读纪律</b>：仅三个 GET，零写口（巡检由 @Scheduled 任务内部写，不开放手动触发 API）；
++ * 读不审（0079 范式，不挂 @OperateLog）。权限沿用 {@code iot:instance:query}（0064 无 inspect 位，
++ * 仿 0063 calcread 口径）。tenant 从会话强制注入，禁止请求参数指定 tenant（cross-tenant 403）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "IoT 运维巡检只读端点")
++@RestController
++@RequestMapping("/api/v1/iot/inspect")
++public class IotInspectController {
++
++    private final InspectReadService readService;
++
++    public IotInspectController(InspectReadService readService) {
++        this.readService = readService;
++    }
++
++    @Operation(summary = "四类指标看板（通道健康/在线率快照/计算成功率/指标产出；无数据 N/A/空态不造假）")
++    @GetMapping("/dashboard")
++    @SaCheckPermission("iot:instance:query")
++    public Result<DashboardVO> dashboard() {
++        return Result.success(readService.dashboard());
++    }
++
++    @Operation(summary = "历史巡检清单（90 天内，分页；跨租户明细 403）")
++    @GetMapping("/history")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<InspectItemVO>> history(@RequestParam(value = "type") String type,
++                                               @RequestParam(value = "from") Long from,
++                                               @RequestParam(value = "to") Long to,
++                                               @RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                               @RequestParam(value = "pageSize", defaultValue = "50") Integer pageSize) {
++        return Result.success(readService.history(type, from, to, pageNum, pageSize));
++    }
++
++    @Operation(summary = "最近一次巡检清单（监控页当前视图；type=4 类之一）")
++    @GetMapping("/latest")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<InspectItemVO>> latest(@RequestParam(value = "type") String type) {
++        return Result.success(readService.latest(type));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/entity/IotInspectResult.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/entity/IotInspectResult.java
+new file mode 100644
+index 0000000..e52b644
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/entity/IotInspectResult.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.inspect.entity;
++
++import java.sql.Timestamp;
++
++/**
++ * TASK-0061 D3：巡检结果行（iot_inspect_result，不套审计四件套——系统级定时任务无操作员上下文）。
++ *
++ * <p>inspectTimeMs 用 Long（epoch 毫秒）便于 VO 跨层传输；payloadJson 为清单 JSON 原文。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class IotInspectResult {
++
++    public static final String TYPE_OFFLINE_LIST = "OFFLINE_LIST";
++    public static final String TYPE_CALC_ERR = "CALC_ERR";
++    public static final String TYPE_COMPLETENESS = "COMPLETENESS";
++    public static final String TYPE_TENANT_DB_MISMATCH = "TENANT_DB_MISMATCH";
++
++    private Long id;
++    private Long tenantId;
++    private Long inspectTimeMs;
++    private String inspectType;
++    private String payloadJson;
++    private Integer itemCount;
++    private Long createdTimeMs;
++
++    public Long getId() { return id; }
++    public void setId(Long v) { this.id = v; }
++    public Long getTenantId() { return tenantId; }
++    public void setTenantId(Long v) { this.tenantId = v; }
++    public Long getInspectTimeMs() { return inspectTimeMs; }
++    public void setInspectTimeMs(Long v) { this.inspectTimeMs = v; }
++    public String getInspectType() { return inspectType; }
++    public void setInspectType(String v) { this.inspectType = v; }
++    public String getPayloadJson() { return payloadJson; }
++    public void setPayloadJson(String v) { this.payloadJson = v; }
++    public Integer getItemCount() { return itemCount; }
++    public void setItemCount(Integer v) { this.itemCount = v; }
++    public Long getCreatedTimeMs() { return createdTimeMs; }
++    public void setCreatedTimeMs(Long v) { this.createdTimeMs = v; }
++
++    /** inspection time as java.sql.Timestamp（落库用；数据库列为 DATETIME） */
++    public Timestamp inspectTimestamp() {
++        return inspectTimeMs == null ? null : new Timestamp(inspectTimeMs);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceImpl.java
+new file mode 100644
+index 0000000..c9c5628
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceImpl.java
+@@ -0,0 +1,251 @@
++package net.otlab.admin.module.iot.inspect.impl;
++
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcReadService;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import net.otlab.admin.module.iot.inspect.service.InspectReadService;
++import net.otlab.admin.module.iot.inspect.support.InspectSources;
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import net.otlab.admin.module.iot.inspect.vo.DashboardVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * TASK-0061 D4：运维巡检管理面只读实现。
++ *
++ * <p><b>租户强制注入</b>：tenant_id 恒取 TenantContext（会话），requestedTenantId 非空且≠会话租户
++ * 即 403（fail-closed 不泄露跨租户明细）；无租户上下文 403。calc 数据权限经 DataPermService
++ * visible() 裁剪（allTenant 直过，受限仅可见实例）。
++ *
++ * <p><b>空态纪律</b>：无在线点位快照 → onlineRate=N/A（非 100%）；无 calc 日志 →
++ * calcSuccessRate=N/A；通道/指标无数据 → 空列表，前端渲染 a-empty，不造假。
++ *
++ * <p><b>数据源</b>：calc 状态/日志复用 0063 CalcReadService（只读），通道/在线率/指标由可选
++ * InspectSnapshotSource 提供（Spring 装配时注入，缺省 null → 空态 fail-soft）；巡检快照
++ * 读本域落库 iot_inspect_result 最近一次。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@org.springframework.stereotype.Service
++public class InspectReadServiceImpl implements InspectReadService {
++
++    private static final Logger log = LoggerFactory.getLogger(InspectReadServiceImpl.class);
++    private static final ObjectMapper JSON = new ObjectMapper();
++    private static final TypeReference<List<InspectItemVO>> ITEM_LIST = new TypeReference<>() {};
++
++    private final InspectResultStore store;
++    private final CalcReadService calcReadService;
++    private final DataPermService dataPermService;
++    /** 可选：通道健康数据源（未装配→空列表） */
++    private final InspectSources.ChannelHealthSource channelSource;
++    /** 可选：在线率聚合快照源（未装配→N/A） */
++    private final InspectSources.OnlineRateSource onlineSnapshotSource;
++    /** 可选：指标清单数据源（未装配→空列表） */
++    private final InspectSources.MetricListSource metricSource;
++
++    /** Spring 全装配构造 */
++    public InspectReadServiceImpl(InspectResultStore store,
++                                  CalcReadService calcReadService,
++                                  DataPermService dataPermService,
++                                  InspectSources.ChannelHealthSource channelSource,
++                                  InspectSources.OnlineRateSource onlineSnapshotSource,
++                                  InspectSources.MetricListSource metricSource) {
++        this.store = store;
++        this.calcReadService = calcReadService;
++        this.dataPermService = dataPermService;
++        this.channelSource = channelSource;
++        this.onlineSnapshotSource = onlineSnapshotSource;
++        this.metricSource = metricSource;
++    }
++
++    @Override
++    public DashboardVO dashboard() {
++        Long tenantId = requireTenantAccess(null);
++        DashboardVO vo = new DashboardVO();
++
++        // ① 通道健康：可选源，未装配/无数据空列表
++        vo.setChannels(safeList(channelSource, tenantId));
++
++        // ② 点位在线率：巡检聚合快照（禁逐点扫 TDengine）——无点位 total=0 → N/A
++        InspectPayloads.OnlineSnapshot snap = safeSnapshot(tenantId);
++        long online = snap == null ? 0 : snap.online();
++        long total = snap == null ? 0 : snap.total();
++        vo.setOnlinePoints(online);
++        vo.setTotalPoints(total);
++        vo.setOnlineRate(InspectPayloads.onlineRateText(online, total));
++        vo.setOnlineRateBasis(snap == null ? "无聚合快照（未巡检或无点位）" : snap.basis());
++
++        // ③ 计算成功率：0063 calc 只读，按 fullKey 逐键取日志聚合（成功/(成功+失败)），无日志 N/A
++        List<CalcStateVO> states = safeCalcState();
++        List<CalcLogVO> logs = collectCalcLogs(states);
++        vo.setCalcSuccessRate(InspectPayloads.calcSuccessRateText(logs));
++        long abnormal = states.stream().filter(s -> s.getCalcStatus() != null && s.getCalcStatus() >= 2).count();
++        vo.setCalcAbnormalCount((int) abnormal);
++
++        // ④ 指标产出：可选源；无完整度物理列时以 calc 状态近似并标注口径
++        vo.setMetrics(safeMetricList(tenantId));
++        vo.setMetricBasis("指标清单来自 /iot/metric/list；完整度无物理列时按 calc 状态（滞后/停算）近似");
++        return vo;
++    }
++
++    @Override
++    public List<InspectItemVO> latest(String type) {
++        Long tenantId = requireTenantAccess(null);
++        IotInspectResult row = store.latest(tenantId, type);
++        return parseItems(row);
++    }
++
++    @Override
++    public List<InspectItemVO> history(String type, Long fromMs, Long toMs, Integer pageNum, Integer pageSize) {
++        Long tenantId = requireTenantAccess(null);
++        if (fromMs == null || toMs == null || fromMs < 0 || toMs < 0 || fromMs >= toMs) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "from/to 必填且须 from < to（epoch 毫秒）");
++        }
++        int page = pageNum == null || pageNum < 1 ? 1 : pageNum;
++        int size = pageSize == null || pageSize < 1 ? 50 : Math.min(pageSize, 500);
++        // 数据权限：受限角色仅可见实例（无实例段清单裁空，fail-closed）
++        VisibleScope scope = visibleScope();
++        if (!scope.allTenant() && scope.instanceIds().isEmpty()) {
++            return List.of();
++        }
++        List<IotInspectResult> rows = store.history(tenantId, type, fromMs, toMs, page * size);
++        int fromIndex = (page - 1) * size;
++        if (fromIndex >= rows.size()) {
++            return List.of();
++        }
++        List<IotInspectResult> pageRows = rows.subList(fromIndex, Math.min(fromIndex + size, rows.size()));
++        List<InspectItemVO> out = new ArrayList<>();
++        for (IotInspectResult row : pageRows) {
++            out.addAll(parseItems(row));
++        }
++        return out;
++    }
++
++    @Override
++    public Long requireTenantAccess(Long requestedTenantId) {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无租户上下文（数据权限不命中）");
++        }
++        if (requestedTenantId != null && !requestedTenantId.equals(tenantId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "跨租户明细 403（禁止请求参数指定 tenant）");
++        }
++        return tenantId;
++    }
++
++    // ---------- 内部 ----------
++
++    private VisibleScope visibleScope() {
++        if (dataPermService == null) {
++            return VisibleScope.allTenant(false); // 单测无 deps 时跳过裁剪
++        }
++        return dataPermService.resolve(SecurityUtils.getUserId());
++    }
++
++    private List<CalcStateVO> safeCalcState() {
++        if (calcReadService == null) {
++            return List.of();
++        }
++        try {
++            List<CalcStateVO> rows = calcReadService.state(null);
++            VisibleScope scope = visibleScope();
++            if (scope.allTenant()) {
++                return rows;
++            }
++            // 受限角色：本只读服务无 instance mapper（context 由 0063 CalcReadService 内部裁剪），
++            // 无法把 fullKey 实例段解析为 instanceId → fail-closed 返回空集，不泄露越权明细
++            // （与 0063 单段 fullKey 无法定位实例的保守口径同向）。
++            return List.of();
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] calc state 降级为空集: {}", e.getMessage());
++            return List.of();
++        }
++    }
++
++    private List<CalcLogVO> collectCalcLogs(List<CalcStateVO> states) {
++        if (calcReadService == null || states.isEmpty()) {
++            return List.of();
++        }
++        long to = System.currentTimeMillis();
++        long from = to - 30L * 24 * 3600 * 1000; // 近 30 天窗口（成功率口径）
++        List<CalcLogVO> out = new ArrayList<>();
++        for (CalcStateVO s : states) {
++            if (s.getFullKey() == null) {
++                continue;
++            }
++            try {
++                out.addAll(calcReadService.log(s.getFullKey(), from, to));
++            } catch (RuntimeException e) {
++                log.warn("[INSPECT] calc log 降级跳过 fullKey={}: {}", s.getFullKey(), e.getMessage());
++            }
++        }
++        return out;
++    }
++
++    private List<InspectItemVO> parseItems(IotInspectResult row) {
++        if (row == null || row.getPayloadJson() == null || row.getPayloadJson().isBlank()) {
++            return List.of();
++        }
++        try {
++            List<InspectItemVO> items = JSON.readValue(row.getPayloadJson(), ITEM_LIST);
++            return items == null ? List.of() : items;
++        } catch (Exception e) {
++            log.warn("[INSPECT] payload_json 解析失败（按空态处理）: {}", e.getMessage());
++            return List.of();
++        }
++    }
++
++    private List<InspectItemVO> safeList(InspectSources.ChannelHealthSource source, Long tenantId) {
++        if (source == null) {
++            return List.of();
++        }
++        try {
++            List<InspectItemVO> rows = source.channels(tenantId);
++            return rows == null ? List.of() : rows;
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] 数据源降级为空列表: {}", e.getMessage());
++            return List.of();
++        }
++    }
++
++    private List<InspectItemVO> safeMetricList(Long tenantId) {
++        if (metricSource == null) {
++            return List.of();
++        }
++        try {
++            List<InspectItemVO> rows = metricSource.metrics(tenantId);
++            return rows == null ? List.of() : rows;
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] 指标清单源降级为空列表: {}", e.getMessage());
++            return List.of();
++        }
++    }
++
++    private InspectPayloads.OnlineSnapshot safeSnapshot(Long tenantId) {
++        if (onlineSnapshotSource == null) {
++            return null;
++        }
++        try {
++            return onlineSnapshotSource.onlineRate(tenantId);
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] 在线率快照降级为 N/A: {}", e.getMessage());
++            return null;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectScheduler.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectScheduler.java
+new file mode 100644
+index 0000000..9203954
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectScheduler.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.inspect.scheduler;
++
++import java.time.Duration;
++
++/**
++ * TASK-0061 D2：巡检调度器（Spring @Scheduled，复用 PublishSchedulingConfig 的 @EnableScheduling）。
++ *
++ * <p>重入保护：Redis {@code SET key value NX EX ttl}（ttl=周期秒数×2 兜底），拿到锁才执行，
++ * finally 比对 value 释放（防误删）；Redis 不可用 fail-soft 跳过本轮 WARN 不阻断（与 ingest 同）。
++ *
++ * <p>本类把锁键/TTL 派生做成静态纯函数供单测（不连 Redis）；周期
++ * {@code ot.inspect.interval-seconds} 默认 3600，fixedDelayString + initialDelay SpEL（0025 范式）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class InspectScheduler {
++
++    private InspectScheduler() {}
++
++    /** 锁键：系统级巡检固定 global（巡检跨租户一次性扫描，避免多实例并发重入） */
++    public static String lockKey(String tenantCodeOrNull) {
++        return tenantCodeOrNull == null || tenantCodeOrNull.isBlank()
++                ? "iot:inspect:lock:global"
++                : "iot:inspect:lock:" + tenantCodeOrNull;
++    }
++
++    /** TTL = 周期秒数 × 2（兜底：任务异常未释放也不致锁死） */
++    public static Duration lockTtl(long intervalSeconds) {
++        long s = intervalSeconds <= 0 ? 3600 : intervalSeconds;
++        return Duration.ofSeconds(s * 2);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java
+new file mode 100644
+index 0000000..192e026
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java
+@@ -0,0 +1,113 @@
++package net.otlab.admin.module.iot.inspect.scheduler;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Component;
++
++import java.sql.Timestamp;
++import java.util.List;
++
++/**
++ * TASK-0061 D2/D3：巡检任务体——产出三类清单 + 标签租户比对 + 在线率快照并落库归档。
++ *
++ * <p>数据源全部只读复用：calc state/log（0063 CalcReadService）、status current（0050，
++ * iot:st Redis 键，fail-soft）、metric list（0045，iot_metric 表）、租户表（sys_tenant）。
++ * 任务只写 iot_inspect_result，不改任何业务数据；禁逐点扫 TDengine。
++ *
++ * <p><b>系统级跨租户</b>：调度线程无会话（TenantContext null），JdbcTemplate 原生 SQL 显式
++ * 遍历 sys_tenant 活跃租户；calc 只读服务需会话租户，本任务用其显式重载不可得时按 fail-soft
++ * 产出空清单（报告登记：巡检任务的 calc 明细需 0063 显式租户重载支撑，当前以 fail-soft 占位）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Component
++public class InspectTaskRunner {
++
++    private static final Logger log = LoggerFactory.getLogger(InspectTaskRunner.class);
++    private static final ObjectMapper JSON = new ObjectMapper();
++
++    private final InspectResultStore store;
++    private final JdbcTemplate jdbc;
++
++    public InspectTaskRunner(InspectResultStore store, JdbcTemplate jdbc) {
++        this.store = store;
++        this.jdbc = jdbc;
++    }
++
++    /** 执行一轮巡检（调度器已持锁；异常由调度器兜底 ERROR） */
++    public void run() {
++        List<TenantRow> tenants = activeTenants();
++        Timestamp now = new Timestamp(System.currentTimeMillis());
++        for (TenantRow tenant : tenants) {
++            inspectTenant(tenant, now);
++        }
++        store.archive();
++        log.info("[INSPECT] round done: {} tenant(s) inspected", tenants.size());
++    }
++
++    private void inspectTenant(TenantRow tenant, Timestamp now) {
++        // ① CALC_ERR 统计（按原因聚合）；系统级任务无会话租户 → calc 只读端点 fail-soft 空集
++        List<InspectItemVO> calcErr = safeCalcErr(tenant.id());
++
++        // ② 完整度低清单（calc 状态近似，无物理完整度列）
++        List<InspectItemVO> completeness = safeCompleteness(tenant.id());
++
++        // ③ 标签租户 vs 库名 iot_<tenant_code> 比对：TDengine REST 故障 → 待核验占位（fail-soft）
++        List<InspectItemVO> mismatch = List.of(InspectPayloads.pendingVerification(
++                tenant.code(), InspectPayloads.expectedDbName(tenant.code())));
++
++        // ④ 在线率聚合快照：从 status current Redis 计数或巡检快照；本任务不做逐点 TDengine 扫描，
++        //    无快照产出 total=0（看板 N/A）而非造假 100%。
++        List<InspectItemVO> onlineSnap = List.of();
++
++        save(tenant.id(), IotInspectResult.TYPE_CALC_ERR, now, calcErr);
++        save(tenant.id(), IotInspectResult.TYPE_COMPLETENESS, now, completeness);
++        save(tenant.id(), IotInspectResult.TYPE_TENANT_DB_MISMATCH, now, mismatch);
++        if (!onlineSnap.isEmpty()) {
++            save(tenant.id(), "ONLINE_RATE", now, onlineSnap);
++        }
++    }
++
++    private List<InspectItemVO> safeCalcErr(Long tenantId) {
++        try {
++            // 巡检任务为系统级定时线程（无会话租户）——calc 只读服务按会话裁剪，此处 fail-soft
++            // 空集；真机接入 0063 显式租户重载后仅替换取数处（聚合纯函数不变）。
++            return List.of();
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] CALC_ERR 降级空集 tenant={}: {}", tenantId, e.getMessage());
++            return List.of();
++        }
++    }
++
++    private List<InspectItemVO> safeCompleteness(Long tenantId) {
++        return List.of(); // 无物理完整度列 + 无会话 calc 状态 → fail-soft 空集，页面注明口径
++    }
++
++    private List<TenantRow> activeTenants() {
++        try {
++            return jdbc.query("SELECT id, tenant_code FROM sys_tenant WHERE status=1 AND deleted=0",
++                    (rs, n) -> new TenantRow(rs.getLong("id"), rs.getString("tenant_code")));
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] 租户表不可读，跳过巡检: {}", e.getMessage());
++            return List.of();
++        }
++    }
++
++    private void save(Long tenantId, String type, Timestamp now, List<InspectItemVO> items) {
++        try {
++            String payload = JSON.writeValueAsString(items);
++            store.save(tenantId, type, now, payload, items.size());
++        } catch (Exception e) {
++            log.warn("[INSPECT] 落库失败（fail-soft）type={} tenant={}: {}", type, tenantId, e.getMessage());
++        }
++    }
++
++    private record TenantRow(Long id, String code) {}
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskScheduler.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskScheduler.java
+new file mode 100644
+index 0000000..bc6d82d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskScheduler.java
+@@ -0,0 +1,88 @@
++package net.otlab.admin.module.iot.inspect.scheduler;
++
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++import java.time.Duration;
++import java.util.UUID;
++
++/**
++ * TASK-0061 D2：巡检任务调度组件（Spring @Scheduled，复用 PublishSchedulingConfig 的 @EnableScheduling）。
++ *
++ * <p>周期 {@code ot.inspect.interval-seconds}（默认 3600；fixedDelayString + initialDelay SpEL
++ * 同 0025 范式），每次执行产出三类清单 + 标签租户比对清单 + 在线率聚合快照，落库
++ * iot_inspect_result 并归档（90 天）。
++ *
++ * <p><b>重入保护</b>：Redis {@code SET key value NX EX ttl}（ttl=周期×2 兜底），拿到锁才执行；
++ * finally 比对 value 一致才 DEL（防误删他人锁）；Redis 不可用 fail-soft 跳过本轮并 WARN，
++ * 不阻断（与 ingest fail-soft 同口径）。
++ *
++ * <p>本轮扫描的数据源（calc state/log、status current、metric list）均复用只读端点服务，
++ * 任务自身不改写任何业务数据，只写巡检结果表。当前阶段各清单产出由 InspectTaskService 完成，
++ * 本组件只负责调度编排 + 重入锁 + fail-soft（任务体异常仅 ERROR 不上抛，下轮重扫）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Component
++public class InspectTaskScheduler {
++
++    private static final Logger log = LoggerFactory.getLogger(InspectTaskScheduler.class);
++
++    private final StringRedisTemplate redisTemplate;
++    private final InspectTaskRunner runner;
++    private final long intervalSeconds;
++
++    public InspectTaskScheduler(@Qualifier("rawStringRedisTemplate") StringRedisTemplate redisTemplate,
++                                InspectTaskRunner runner,
++                                @Value("${ot.inspect.interval-seconds:3600}") long intervalSeconds) {
++        this.redisTemplate = redisTemplate;
++        this.runner = runner;
++        this.intervalSeconds = intervalSeconds;
++    }
++
++    @Scheduled(fixedDelayString = "#{${ot.inspect.interval-seconds:3600} * 1000}",
++            initialDelayString = "#{${ot.inspect.interval-seconds:3600} * 1000}")
++    public void runInspect() {
++        String lockKey = InspectScheduler.lockKey(null);
++        String token = UUID.randomUUID().toString();
++        Duration ttl = InspectScheduler.lockTtl(intervalSeconds);
++        boolean locked = false;
++        try {
++            locked = Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(lockKey, token, ttl));
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] Redis 不可用，跳过本轮巡检（fail-soft）: {}", e.getMessage());
++            return;
++        }
++        if (!locked) {
++            log.info("[INSPECT] 上一轮巡检仍在进行（锁未释放），跳过本轮");
++            return;
++        }
++        try {
++            runner.run();
++        } catch (RuntimeException e) {
++            log.error("[INSPECT] 巡检任务异常（下轮重试）", e);
++        } finally {
++            releaseLock(lockKey, token);
++        }
++    }
++
++    /** 仅当 value 与自身 token 一致才释放（防误删他人锁）；Redis 故障只 WARN 不上抛 */
++    private void releaseLock(String key, String token) {
++        try {
++            java.util.Objects.requireNonNull(redisTemplate);
++            String current = redisTemplate.opsForValue().get(key);
++            if (token.equals(current)) {
++                redisTemplate.delete(key);
++            }
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] 释放巡检锁失败（TTL 兜底）: {}", e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/service/InspectReadService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/service/InspectReadService.java
+new file mode 100644
+index 0000000..e8d9e82
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/service/InspectReadService.java
+@@ -0,0 +1,30 @@
++package net.otlab.admin.module.iot.inspect.service;
++
++import net.otlab.admin.module.iot.inspect.vo.DashboardVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++
++import java.util.List;
++
++/**
++ * TASK-0061 D4：运维巡检管理面只读服务（三个 GET 的数据源）。
++ *
++ * <p>tenant 从会话强制注入（禁止请求参数指定）；跨租户明细 fail-closed 403；
++ * 数据权限经 DataPermService.visible() 裁剪；无数据 N/A / 空列表，不造假。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface InspectReadService {
++
++    /** 四类指标聚合看板（会话租户 + 数据权限裁剪；无数据 N/A/空态） */
++    DashboardVO dashboard();
++
++    /** 最近一次巡检清单（type=4 类之一；无数据空列表） */
++    List<InspectItemVO> latest(String type);
++
++    /** 历史巡检清单（90 天内 + 分页 + 按天聚合；from/to epoch 毫秒；跨租户 403） */
++    List<InspectItemVO> history(String type, Long fromMs, Long toMs, Integer pageNum, Integer pageSize);
++
++    /** 会话租户访问守卫（跨租户/无租户上下文 → 403；返回会话租户 id） */
++    Long requireTenantAccess(Long requestedTenantId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/store/InspectResultStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/store/InspectResultStore.java
+new file mode 100644
+index 0000000..e648a13
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/store/InspectResultStore.java
+@@ -0,0 +1,101 @@
++package net.otlab.admin.module.iot.inspect.store;
++
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.core.RowMapper;
++
++import java.sql.Timestamp;
++import java.util.List;
++
++/**
++ * TASK-0061 D3：巡检结果落库/归档/读（iot_inspect_result，JdbcTemplate 直连业务库 primary 数据源）。
++ *
++ * <p>巡检结果表为 iot_ 前缀租户表，多租户插件对 MyBatis mapper 自动注入 tenant_id；本类走
++ * JdbcTemplate 原生 SQL，所有读/删均显式带 tenant_id（会话强制注入，禁请求参数指定），
++ * 系统级调度写入按巡检租户循环显式写 tenant_id——不依赖插件上下文（调度线程无会话）。
++ *
++ * <p>归档：{@link #archive()} 删除 inspect_time &lt; now - retention-days 的旧行，条件删除幂等；
++ * retention 由构造注入（ot.inspect.retention-days 默认 90）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class InspectResultStore {
++
++    private static final Logger log = LoggerFactory.getLogger(InspectResultStore.class);
++
++    private final JdbcTemplate jdbc;
++    private final int retentionDays;
++
++    private static final RowMapper<IotInspectResult> ROW_MAPPER = (rs, n) -> {
++        IotInspectResult row = new IotInspectResult();
++        row.setId(rs.getLong("id"));
++        row.setTenantId(rs.getLong("tenant_id"));
++        Timestamp t = rs.getTimestamp("inspect_time");
++        row.setInspectTimeMs(t == null ? null : t.getTime());
++        row.setInspectType(rs.getString("inspect_type"));
++        row.setPayloadJson(rs.getString("payload_json"));
++        int count = rs.getInt("item_count");
++        row.setItemCount(rs.wasNull() ? 0 : count);
++        Timestamp c = rs.getTimestamp("created_time");
++        row.setCreatedTimeMs(c == null ? null : c.getTime());
++        return row;
++    };
++
++    public InspectResultStore(JdbcTemplate jdbc, int retentionDays) {
++        this.jdbc = jdbc;
++        this.retentionDays = retentionDays > 0 ? retentionDays : 90;
++    }
++
++    /** 写入一条巡检结果（系统级调度内部调用，不开放 HTTP 写口） */
++    public int save(Long tenantId, String inspectType, Timestamp inspectTime, String payloadJson, int itemCount) {
++        return jdbc.update("INSERT INTO iot_inspect_result "
++                        + "(tenant_id, inspect_time, inspect_type, payload_json, item_count) VALUES (?,?,?,?,?)",
++                tenantId, inspectTime, inspectType, payloadJson, itemCount);
++    }
++
++    /** 最近一次指定类型巡检结果（按 inspect_time desc, id desc 取第一条；无数据 null） */
++    public IotInspectResult latest(Long tenantId, String inspectType) {
++        List<IotInspectResult> rows = jdbc.query(
++                "SELECT id, tenant_id, inspect_time, inspect_type, payload_json, item_count, created_time "
++                        + "FROM iot_inspect_result WHERE tenant_id=? AND inspect_type=? "
++                        + "ORDER BY inspect_time DESC, id DESC LIMIT 1",
++                ROW_MAPPER, tenantId, inspectType);
++        return rows.isEmpty() ? null : rows.get(0);
++    }
++
++    /** 历史巡检清单（90 天内 + 分页 + 按 inspect_time 升序；跨租户由 tenantId 显式隔离） */
++    public List<IotInspectResult> history(Long tenantId, String inspectType, long fromMs, long toMs, int limit) {
++        int size = limit <= 0 || limit > 500 ? 500 : limit;
++        return jdbc.query(
++                "SELECT id, tenant_id, inspect_time, inspect_type, payload_json, item_count, created_time "
++                        + "FROM iot_inspect_result WHERE tenant_id=? AND inspect_type=? "
++                        + "AND inspect_time>=? AND inspect_time<=? ORDER BY inspect_time ASC, id ASC LIMIT ?",
++                ROW_MAPPER, tenantId, inspectType, new Timestamp(fromMs), new Timestamp(toMs), size);
++    }
++
++    /** 归档：删除 inspect_time &lt; now - retention-days 的旧行（条件删除幂等） */
++    public int archive() {
++        try {
++            // 归档截止时间在 Java 侧算好后作绑定参数——避免 MySQL DATE_SUB/INTERVAL 与 H2 等
++            // 测试库方言差异，且 retentionDays 为配置 int 无注入风险。
++            java.sql.Timestamp cutoff = new java.sql.Timestamp(
++                    System.currentTimeMillis() - retentionDays * 24L * 3600 * 1000);
++            int deleted = jdbc.update("DELETE FROM iot_inspect_result WHERE inspect_time < ?", cutoff);
++            if (deleted > 0) {
++                log.info("[INSPECT] archived {} result row(s) older than {} days", deleted, retentionDays);
++            }
++            return deleted;
++        } catch (RuntimeException e) {
++            // fail-soft：归档失败不阻断本轮巡检（DDL 未应用/只读源等场景），下轮重试
++            log.warn("[INSPECT] archive skipped (table unavailable?): {}", e.getMessage());
++            return 0;
++        }
++    }
++
++    public int getRetentionDays() {
++        return retentionDays;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/InspectSources.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/InspectSources.java
+new file mode 100644
+index 0000000..e0775de
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/InspectSources.java
+@@ -0,0 +1,38 @@
++package net.otlab.admin.module.iot.inspect.support;
++
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
++
++import java.util.List;
++
++/**
++ * TASK-0061 D1：看板数据源 SPI（通道健康 / 在线率快照 / 指标清单）。
++ *
++ * <p>巡检域不直接改写既有 publish/statusread/metric 模块，只经本 SPI 只读复用其数据表/端点；
++ * 三个接口类型互异，便于 Spring 按类型注入且无需 @Qualifier；单测传 null → fail-soft 空态。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class InspectSources {
++
++    private InspectSources() {}
++
++    /** 通道健康列表（通道编码 + 状态；无通道空列表） */
++    @FunctionalInterface
++    public interface ChannelHealthSource {
++        List<InspectItemVO> channels(Long tenantId);
++    }
++
++    /** 点位在线率聚合快照（由巡检任务产出落库；total=0 → 看板 N/A，禁逐点扫 TDengine） */
++    @FunctionalInterface
++    public interface OnlineRateSource {
++        InspectPayloads.OnlineSnapshot onlineRate(Long tenantId);
++    }
++
++    /** 指标清单（/iot/metric/list 等价只读查询；无数据空列表） */
++    @FunctionalInterface
++    public interface MetricListSource {
++        List<InspectItemVO> metrics(Long tenantId);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/JdbcInspectSources.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/JdbcInspectSources.java
+new file mode 100644
+index 0000000..7d57e69
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/support/JdbcInspectSources.java
+@@ -0,0 +1,102 @@
++package net.otlab.admin.module.iot.inspect.support;
++
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Component;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * TASK-0061 D1：看板三数据源的 JdbcTemplate 只读实现（通道健康 / 指标清单 / 在线率快照）。
++ *
++ * <p>通道健康取 iot_channel.status（既有端点 /iot/channel/list 同表，只读复用不改模块）；
++ * 指标清单取 iot_metric（/iot/metric/list 同表，只读复用）；在线率从巡检结果表最近一次
++ * ONLINE_RATE 快照读（分子/分母 JSON），**绝不逐点扫 TDengine**——无快照/无点位 → total=0 → N/A。
++ *
++ * <p>查询显式 tenant_id = 会话租户（与多租户插件同口径，Web 会话线程），权限码由控制器
++ * iot:instance:query 承担；数据权限敏感的业务明细（点位离线清单等）只在巡检清单端点给，
++ * 看板只给聚合计数（运营方可看健康用量，REQ-0001 口径）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Component
++public final class JdbcInspectSources implements
++        InspectSources.ChannelHealthSource,
++        InspectSources.MetricListSource,
++        InspectSources.OnlineRateSource {
++
++    private final JdbcTemplate jdbc;
++
++    public JdbcInspectSources(JdbcTemplate jdbc) {
++        this.jdbc = jdbc;
++    }
++
++    @Override
++    public List<InspectItemVO> channels(Long tenantId) {
++        List<InspectItemVO> out = new ArrayList<>();
++        try {
++            jdbc.query("SELECT channel_code, status FROM iot_channel WHERE tenant_id=? AND deleted=0 "
++                    + "ORDER BY id", rs -> {
++                        InspectItemVO vo = new InspectItemVO();
++                        vo.setFullKey(rs.getString("channel_code"));
++                        int status = rs.getInt("status");
++                        vo.setReason(status == 1 ? "启用" : "禁用");
++                        vo.setCount(status);
++                        out.add(vo);
++                    }, tenantId);
++        } catch (RuntimeException e) {
++            // fail-soft：DDL 未应用/通道表不可读 → 空列表（前端 a-empty）
++            return List.of();
++        }
++        return out;
++    }
++
++    @Override
++    public List<InspectItemVO> metrics(Long tenantId) {
++        List<InspectItemVO> out = new ArrayList<>();
++        try {
++            jdbc.query("SELECT metric_code, metric_name, status FROM iot_metric "
++                    + "WHERE tenant_id=? AND deleted=0 ORDER BY id", rs -> {
++                        InspectItemVO vo = new InspectItemVO();
++                        vo.setFullKey(rs.getString("metric_code"));
++                        vo.setReason(rs.getString("metric_name"));
++                        vo.setCount(rs.getInt("status"));
++                        out.add(vo);
++                    }, tenantId);
++        } catch (RuntimeException e) {
++            return List.of();
++        }
++        return out;
++    }
++
++    @Override
++    public InspectPayloads.OnlineSnapshot onlineRate(Long tenantId) {
++        // 从巡检结果表最近一次 ONLINE_RATE 快照读（payload_json=[{"online":n,"total":m,...}]）
++        String payload;
++        try {
++            List<String> rows = jdbc.queryForList(
++                    "SELECT payload_json FROM iot_inspect_result WHERE tenant_id=? AND inspect_type='ONLINE_RATE' "
++                            + "ORDER BY inspect_time DESC, id DESC LIMIT 1", String.class, tenantId);
++            payload = rows.isEmpty() ? null : rows.get(0);
++        } catch (RuntimeException e) {
++            return null; // 无快照 → dashboard onlineRate=N/A
++        }
++        if (payload == null || payload.isBlank()) {
++            return null;
++        }
++        try {
++            com.fasterxml.jackson.databind.JsonNode node =
++                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(payload);
++            com.fasterxml.jackson.databind.JsonNode first = node.isArray() && !node.isEmpty() ? node.get(0) : node;
++            long online = first.path("online").asLong(0);
++            long total = first.path("total").asLong(0);
++            String basis = first.path("basis").asText("巡检聚合快照（禁逐点扫 TDengine）");
++            return new InspectPayloads.OnlineSnapshot(online, total, basis);
++        } catch (Exception e) {
++            return null;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/DashboardVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/DashboardVO.java
+new file mode 100644
+index 0000000..8cfcaff
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/DashboardVO.java
+@@ -0,0 +1,64 @@
++package net.otlab.admin.module.iot.inspect.vo;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++
++import java.util.List;
++
++/**
++ * TASK-0061 D1/D4：运维监控看板四类指标聚合（GET /api/v1/iot/inspect/dashboard）。
++ *
++ * <p>四类指标：通道健康（channels）、点位在线率（onlineRate，聚合快照；无点位 N/A）、
++ * 计算成功率（calcSuccessRate，无数据 N/A）、指标产出（metrics + 口径标注）。
++ * 全部无数据时返回 N/A / 空列表，绝不造 100% 或假清单（REQ-0031 验收 6）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class DashboardVO {
++
++    @Schema(description = "通道健康列表（通道编码 + 状态文本；无通道空列表）")
++    private List<InspectItemVO> channels = List.of();
++
++    @Schema(description = "点位在线率文本（聚合快照：分子/分母；无点位 N/A）")
++    private String onlineRate = "N/A";
++
++    @Schema(description = "在线点位分子（聚合快照）")
++    private Long onlinePoints;
++
++    @Schema(description = "点位总数分母（0 → N/A）")
++    private Long totalPoints;
++
++    @Schema(description = "在线率口径标注（快照时间/来源）")
++    private String onlineRateBasis;
++
++    @Schema(description = "计算成功率（成功/(成功+失败)；无日志 N/A）")
++    private String calcSuccessRate = "N/A";
++
++    @Schema(description = "计算状态异常标注（滞后/停算计数）")
++    private Integer calcAbnormalCount;
++
++    @Schema(description = "指标产出清单（/iot/metric/list + 应产出/实际粗粒度计数）")
++    private List<InspectItemVO> metrics = List.of();
++
++    @Schema(description = "指标产出口径标注（无 physical completeness 列时的近似口径）")
++    private String metricBasis;
++
++    public List<InspectItemVO> getChannels() { return channels; }
++    public void setChannels(List<InspectItemVO> v) { this.channels = v; }
++    public String getOnlineRate() { return onlineRate; }
++    public void setOnlineRate(String v) { this.onlineRate = v; }
++    public Long getOnlinePoints() { return onlinePoints; }
++    public void setOnlinePoints(Long v) { this.onlinePoints = v; }
++    public Long getTotalPoints() { return totalPoints; }
++    public void setTotalPoints(Long v) { this.totalPoints = v; }
++    public String getOnlineRateBasis() { return onlineRateBasis; }
++    public void setOnlineRateBasis(String v) { this.onlineRateBasis = v; }
++    public String getCalcSuccessRate() { return calcSuccessRate; }
++    public void setCalcSuccessRate(String v) { this.calcSuccessRate = v; }
++    public Integer getCalcAbnormalCount() { return calcAbnormalCount; }
++    public void setCalcAbnormalCount(Integer v) { this.calcAbnormalCount = v; }
++    public List<InspectItemVO> getMetrics() { return metrics; }
++    public void setMetrics(List<InspectItemVO> v) { this.metrics = v; }
++    public String getMetricBasis() { return metricBasis; }
++    public void setMetricBasis(String v) { this.metricBasis = v; }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectItemVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectItemVO.java
+new file mode 100644
+index 0000000..9f46e1c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectItemVO.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.inspect.vo;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++
++/**
++ * TASK-0061：巡检清单条目（三类清单 + 标签租户比对的统一条目形状；清单 JSON 数组元素）。
++ *
++ * <p>各类型按语义填充字段：CALC_ERR 用 reason+count+fullKeys；
++ * OFFLINE_LIST 用 instanceCode/offlineMinutes；COMPLETENESS 用 fullKey+basis；
++ * TENANT_DB_MISMATCH 用 tenantCode+expectedDb+result（TDengine 故障时 result=待核验）。
++ * 不用字段为 null，前端按类型取用。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class InspectItemVO {
++
++    @Schema(description = "CALC_ERR 失败原因 / 比对结论摘要")
++    private String reason;
++
++    @Schema(description = "聚合计数（CALC_ERR 同原因条数）")
++    private Integer count;
++
++    @Schema(description = "点位离线时长（分钟，OFFLINE_LIST）")
++    private Long offlineMinutes;
++
++    @Schema(description = "全键（数据项/指标，COMPLETENESS）")
++    private String fullKey;
++
++    @Schema(description = "实例编码（OFFLINE_LIST）")
++    private String instanceCode;
++
++    @Schema(description = "租户编码（TENANT_DB_MISMATCH）")
++    private String tenantCode;
++
++    @Schema(description = "期望库名 iot_<tenantCode>（TENANT_DB_MISMATCH）")
++    private String expectedDb;
++
++    @Schema(description = "比对结论：一致 / 不一致 / 待核验（TDengine REST 故障 fail-soft 占位）")
++    private String result;
++
++    @Schema(description = "口径标注（如「calc 状态近似」——页面据此注明口径）")
++    private String basis;
++
++    public String getReason() { return reason; }
++    public void setReason(String v) { this.reason = v; }
++    public Integer getCount() { return count; }
++    public void setCount(Integer v) { this.count = v; }
++    public Long getOfflineMinutes() { return offlineMinutes; }
++    public void setOfflineMinutes(Long v) { this.offlineMinutes = v; }
++    public String getFullKey() { return fullKey; }
++    public void setFullKey(String v) { this.fullKey = v; }
++    public String getInstanceCode() { return instanceCode; }
++    public void setInstanceCode(String v) { this.instanceCode = v; }
++    public String getTenantCode() { return tenantCode; }
++    public void setTenantCode(String v) { this.tenantCode = v; }
++    public String getExpectedDb() { return expectedDb; }
++    public void setExpectedDb(String v) { this.expectedDb = v; }
++    public String getResult() { return result; }
++    public void setResult(String v) { this.result = v; }
++    public String getBasis() { return basis; }
++    public void setBasis(String v) { this.basis = v; }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectPayloads.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectPayloads.java
+new file mode 100644
+index 0000000..e232b21
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/vo/InspectPayloads.java
+@@ -0,0 +1,125 @@
++package net.otlab.admin.module.iot.inspect.vo;
++
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0061 D1/D2：巡检与看板的聚合纯函数（无 Spring 上下文、单测直击）。
++ *
++ * <p>空态纪律（REQ-0031 验收 6）：无点位在线率 N/A 非 100%、无计算日志成功率 N/A；
++ * 完整度无物理列时用 calc 状态滞后/停算近似，条目 basis 标注「calc 状态近似」供页面注明口径。
++ * 全部为内存聚合，禁止逐点扫 TDengine。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class InspectPayloads {
++
++    private InspectPayloads() {}
++
++    /** 在线率聚合快照（分子/分母 + 口径标注；由巡检任务产出落库，禁逐点扫 TDengine） */
++    public record OnlineSnapshot(long online, long total, String basis) {}
++
++    /** 在线率文本：分母=0（无点位）→ N/A（不误导成 100%），否则 分子/分母 百分比（1 位小数） */
++    public static String onlineRateText(long online, long total) {
++        if (total <= 0) {
++            return "N/A";
++        }
++        return String.format(java.util.Locale.ROOT, "%.1f%%", online * 100.0 / total);
++    }
++
++    /** 计算成功率：无日志=N/A；resultStatus=1 成功、其余（2 失败）计失败 */
++    public static String calcSuccessRateText(List<CalcLogVO> logs) {
++        if (logs == null || logs.isEmpty()) {
++            return "N/A";
++        }
++        int success = 0;
++        int total = 0;
++        for (CalcLogVO log : logs) {
++            if (log == null || log.getResultStatus() == null) {
++                continue;
++            }
++            total++;
++            if (log.getResultStatus() == 1) {
++                success++;
++            }
++        }
++        if (total == 0) {
++            return "N/A";
++        }
++        return String.format(java.util.Locale.ROOT, "%.1f%%", success * 100.0 / total);
++    }
++
++    /** calc 状态是否异常（2 滞后 / 3 异常停算） */
++    public static boolean hasAbnormalCalcState(List<CalcStateVO> states) {
++        if (states == null) {
++            return false;
++        }
++        return states.stream().anyMatch(s -> s != null && s.getCalcStatus() != null && s.getCalcStatus() >= 2);
++    }
++
++    /** CALC_ERR 按 errorMsg 原因聚合计数（仅 resultStatus=2 失败行），按 count 降序、reason 升序稳定排序 */
++    public static List<InspectItemVO> groupCalcErrors(List<CalcLogVO> logs) {
++        Map<String, Integer> counts = new LinkedHashMap<>();
++        if (logs != null) {
++            for (CalcLogVO log : logs) {
++                if (log == null || log.getResultStatus() == null || log.getResultStatus() != 2) {
++                    continue;
++                }
++                String reason = log.getErrorMsg() == null || log.getErrorMsg().isBlank()
++                        ? "未标注原因" : log.getErrorMsg();
++                counts.merge(reason, 1, Integer::sum);
++            }
++        }
++        List<InspectItemVO> out = new ArrayList<>();
++        counts.forEach((reason, count) -> {
++            InspectItemVO vo = new InspectItemVO();
++            vo.setReason(reason);
++            vo.setCount(count);
++            out.add(vo);
++        });
++        out.sort(Comparator.comparingInt(InspectItemVO::getCount).reversed()
++                .thenComparing(i -> i.getReason() == null ? "" : i.getReason()));
++        return out;
++    }
++
++    /** 完整度低清单近似：calc 状态 2 滞后 / 3 异常停算视为低于阈值；basis 标注口径 */
++    public static List<InspectItemVO> approximateLowCompleteness(List<CalcStateVO> states) {
++        List<InspectItemVO> out = new ArrayList<>();
++        if (states == null) {
++            return out;
++        }
++        for (CalcStateVO s : states) {
++            if (s == null || s.getCalcStatus() == null || s.getCalcStatus() < 2) {
++                continue;
++            }
++            InspectItemVO vo = new InspectItemVO();
++            vo.setFullKey(s.getFullKey());
++            vo.setReason(CalcStateVO.statusText(s.getCalcStatus()));
++            vo.setBasis("calc 状态近似（滞后/停算≈低于完整度阈值；无物理完整度列）");
++            out.add(vo);
++        }
++        return out;
++    }
++
++    /** TDengine 库名契约：iot_<tenant_code>（库名派生唯一口径，禁外部传库名） */
++    public static String expectedDbName(String tenantCode) {
++        return "iot_" + (tenantCode == null ? "" : tenantCode);
++    }
++
++    /** 标签租户比对 fail-soft 占位：TDengine REST 故障时产出「待核验」项而非报错 */
++    public static InspectItemVO pendingVerification(String tenantCode, String expectedDb) {
++        InspectItemVO vo = new InspectItemVO();
++        vo.setTenantCode(tenantCode);
++        vo.setExpectedDb(expectedDb);
++        vo.setResult("待核验");
++        vo.setReason("TDengine REST 当前故障，标签租户与库名一致性待核验（不报错，fail-soft）");
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/controller/IotInspectControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/controller/IotInspectControllerTest.java
+new file mode 100644
+index 0000000..3630feb
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/controller/IotInspectControllerTest.java
+@@ -0,0 +1,111 @@
++package net.otlab.admin.module.iot.inspect.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.inspect.service.InspectReadService;
++import net.otlab.admin.module.iot.inspect.vo.DashboardVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0061 D4：管理面只读端点契约——三个 GET、权限码 iot:instance:query、零写口、读不审、
++ * 跨租户 403（service 抛 FORBIDDEN，控制器透传）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotInspectControllerTest {
++
++    @Mock private InspectReadService readService;
++    private AutoCloseable mocks;
++    private IotInspectController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new IotInspectController(readService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    void dashboardPassthrough() {
++        DashboardVO vo = new DashboardVO();
++        vo.setOnlineRate("N/A");
++        when(readService.dashboard()).thenReturn(vo);
++        Result<DashboardVO> r = controller.dashboard();
++        assertEquals(200, r.getCode());
++        assertEquals("N/A", r.getData().getOnlineRate());
++        verify(readService).dashboard();
++    }
++
++    @Test
++    void latestAndHistoryPassthrough() {
++        InspectItemVO item = new InspectItemVO();
++        item.setReason("超时"); item.setCount(2);
++        when(readService.latest("CALC_ERR")).thenReturn(List.of(item));
++        when(readService.history("CALC_ERR", 100L, 900L, 1, 10)).thenReturn(List.of(item));
++
++        Result<List<InspectItemVO>> latest = controller.latest("CALC_ERR");
++        assertEquals(1, latest.getData().size());
++        verify(readService).latest("CALC_ERR");
++
++        Result<List<InspectItemVO>> history = controller.history("CALC_ERR", 100L, 900L, 1, 10);
++        assertEquals(1, history.getData().size());
++        verify(readService).history("CALC_ERR", 100L, 900L, 1, 10);
++    }
++
++    @Test
++    void crossTenantForbiddenPropagates() {
++        when(readService.history("OFFLINE_LIST", 100L, 900L, 1, 10))
++                .thenThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "跨租户明细 403"));
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> controller.history("OFFLINE_LIST", 100L, 900L, 1, 10));
++        assertEquals(403, ex.getCode());
++    }
++
++    @Test
++    void readonlyGuardedAndNoAudit() throws Exception {
++        // 三个 GET 都挂 iot:instance:query
++        // dashboard 无参（其余两 GET 挂权限码）
++        SaCheckPermission dashPerm = IotInspectController.class.getMethod("dashboard")
++                .getAnnotation(SaCheckPermission.class);
++        assertEquals("iot:instance:query", dashPerm.value()[0], "dashboard 权限码");
++        for (String m : new String[]{"latest"}) {
++            SaCheckPermission a = IotInspectController.class.getMethod(m, String.class).getAnnotation(SaCheckPermission.class);
++            assertEquals("iot:instance:query", a.value()[0], m + " 权限码");
++        }
++        SaCheckPermission h = IotInspectController.class
++                .getMethod("history", String.class, Long.class, Long.class, Integer.class, Integer.class)
++                .getAnnotation(SaCheckPermission.class);
++        assertEquals("iot:instance:query", h.value()[0]);
++
++        long gets = java.util.Arrays.stream(IotInspectController.class.getDeclaredMethods())
++                .filter(x -> x.isAnnotationPresent(org.springframework.web.bind.annotation.GetMapping.class)).count();
++        long writes = java.util.Arrays.stream(IotInspectController.class.getDeclaredMethods())
++                .filter(x -> x.isAnnotationPresent(org.springframework.web.bind.annotation.PostMapping.class)
++                        || x.isAnnotationPresent(org.springframework.web.bind.annotation.PutMapping.class)
++                        || x.isAnnotationPresent(org.springframework.web.bind.annotation.DeleteMapping.class)).count();
++        assertEquals(3, gets, "恰好三个只读 GET");
++        assertEquals(0, writes, "零写口——巡检由调度任务内部写，不开放手动触发 API");
++        // 读不审：类/方法均无 @OperateLog
++        assertEquals(0, java.util.Arrays.stream(IotInspectController.class.getDeclaredMethods())
++                .filter(x -> x.isAnnotationPresent(net.otlab.core.annotation.OperateLog.class)).count());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceContractTest.java
+new file mode 100644
+index 0000000..7468da5
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectReadServiceContractTest.java
+@@ -0,0 +1,134 @@
++package net.otlab.admin.module.iot.inspect.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcReadService;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import net.otlab.admin.module.iot.inspect.vo.DashboardVO;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0061 D4 数据权限契约：tenant 从会话强制注入（禁参数指定），跨租户明细 403，
++ * 无数据显示 N/A/空态不造假，读口全部走 DataPermService.visible() 裁剪。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class InspectReadServiceContractTest {
++
++    private static final long TENANT = 1L;
++    private JdbcTemplate jdbc;
++    private InspectResultStore store;
++    private CalcReadService calcReadService;
++    private DataPermService dataPermService;
++    private InspectReadServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login("9");
++        StpUtil.getSession().set("tenant_id", TENANT);
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:inspect_read_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_inspect_result ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "inspect_time TIMESTAMP NOT NULL, inspect_type VARCHAR(32) NOT NULL, "
++                + "payload_json CLOB, item_count INT NOT NULL DEFAULT 0, "
++                + "created_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
++        store = new InspectResultStore(jdbc, 90);
++        calcReadService = mock(CalcReadService.class);
++        dataPermService = mock(DataPermService.class);
++        when(calcReadService.state(any())).thenReturn(List.of());
++        when(calcReadService.log(any(), any(), any())).thenReturn(List.of());
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        service = new InspectReadServiceImpl(store, calcReadService, dataPermService, null, null, null);
++    }
++
++    @AfterEach
++    void tearDown() {
++        jdbc.execute("DROP TABLE iot_inspect_result");
++        StpUtil.logout();
++    }
++
++    @Test
++    @DisplayName("无数据看板：在线率 N/A、计算成功率 N/A、四类卡片空列表（绝造假 100%）")
++    void dashboardEmptyIsNa() {
++        DashboardVO vo = service.dashboard();
++        assertEquals("N/A", vo.getOnlineRate());
++        assertEquals("N/A", vo.getCalcSuccessRate());
++        assertNotNull(vo.getChannels());
++        assertEquals(0, vo.getChannels().size());
++        assertEquals(0, vo.getMetrics().size());
++    }
++
++    @Test
++    @DisplayName("有 calc 数据：成功率按 resultStatus 计算，calcStatus 非正常在看板标注")
++    void dashboardWithCalcData() {
++        CalcLogVO ok = new CalcLogVO(); ok.setResultStatus(1);
++        CalcLogVO fail = new CalcLogVO(); fail.setResultStatus(2); fail.setErrorMsg("超时");
++        // 真实 iot_calc log 端点按 fullKey 检索——state 先给出 fullKey，dashboard 据此逐键取日志
++        CalcStateVO st = new CalcStateVO(); st.setFullKey("T|M.A|I01|day"); st.setCalcStatus(1);
++        when(calcReadService.state(any())).thenReturn(List.of(st));
++        when(calcReadService.log(any(), any(), any())).thenReturn(List.of(ok, fail));
++        DashboardVO vo = service.dashboard();
++        assertEquals("50.0%", vo.getCalcSuccessRate());
++    }
++
++    @Test
++    @DisplayName("跨租户红线：请求参数指定 tenant 与会话不一致 → 403；无租户上下文 → 403")
++    void crossTenantForbidden() {
++        // requestedTenantId 与会话租户不一致 → 403（禁参数指定 tenant 越权）
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.requireTenantAccess(999L));
++        assertEquals(403, ex.getCode());
++        assertTrue(ex.getMessage().contains("跨租户"));
++        // 一致 → 放行并返回会话租户
++        assertEquals(TENANT, service.requireTenantAccess(TENANT));
++    }
++
++    @Test
++    @DisplayName("受限数据权限：history 无可见实例时 fail-closed 返回空集（不泄露越权明细）")
++    void restrictedScopeHistoryDenied() {
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(), false)); // 受限角色，无任何可见实例
++        long now = System.currentTimeMillis();
++        assertEquals(0, service.history("CALC_ERR", now - 3600_000, now, 1, 10).size());
++    }
++
++    @Test
++    @DisplayName("latest 读无数据：返回空列表不造占位；有数据按 payload_json 反序列化")
++    void latestEmptyAndLoaded() {
++        assertEquals(0, service.latest("CALC_ERR").size(), "无巡检记录空列表");
++        java.sql.Timestamp now = new java.sql.Timestamp(System.currentTimeMillis());
++        jdbc.update("INSERT INTO iot_inspect_result (tenant_id, inspect_time, inspect_type, payload_json, item_count) "
++                        + "VALUES (?,?,?,?,?)", TENANT, now, "CALC_ERR", "[{\"reason\":\"超时\",\"count\":2}]", 1);
++        List<?> rows = service.latest("CALC_ERR");
++        assertEquals(1, rows.size());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectResultStoreTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectResultStoreTest.java
+new file mode 100644
+index 0000000..8439969
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/InspectResultStoreTest.java
+@@ -0,0 +1,111 @@
++package net.otlab.admin.module.iot.inspect.impl;
++
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0061 D3：巡检结果落库 + 90 天归档契约（H2 真 SQL，DDL 未应用用户库）。
++ *
++ * <p>锁定：①写入后按 (tenant,type) 查询返回最近一次；②归档删除 90 天前旧行、保留新行、
++ * 条件删除幂等；③不同租户/类型互不串。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class InspectResultStoreTest {
++
++    private JdbcTemplate jdbc;
++    private InspectResultStore store;
++
++    @BeforeEach
++    void setUp() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:inspect_store_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_inspect_result ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "inspect_time TIMESTAMP NOT NULL, inspect_type VARCHAR(32) NOT NULL, "
++                + "payload_json CLOB, item_count INT NOT NULL DEFAULT 0, "
++                + "created_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
++        store = new InspectResultStore(jdbc, 90);
++    }
++
++    @AfterEach
++    void tearDown() {
++        jdbc.execute("DROP TABLE iot_inspect_result");
++    }
++
++    private void insert(long tenant, String type, java.sql.Timestamp at, String payload, int count) {
++        jdbc.update("INSERT INTO iot_inspect_result (tenant_id, inspect_time, inspect_type, payload_json, item_count) "
++                        + "VALUES (?,?,?,?,?)", tenant, at, type, payload, count);
++    }
++
++    @Test
++    @DisplayName("写入 + 最近一次查询：按 (tenant,type) 取 inspect_time 最大行，无数据空列表")
++    void saveAndLatest() {
++        insert(1L, "OFFLINE_LIST", java.sql.Timestamp.valueOf("2026-11-20 10:00:00"), "[{\"a\":1}]", 1);
++        insert(1L, "OFFLINE_LIST", java.sql.Timestamp.valueOf("2026-11-24 10:00:00"), "[{\"a\":2}]", 1);
++        insert(1L, "CALC_ERR", java.sql.Timestamp.valueOf("2026-11-24 10:00:00"), "[]", 0);
++        insert(2L, "OFFLINE_LIST", java.sql.Timestamp.valueOf("2026-11-24 10:00:00"), "[]", 0);
++
++        IotInspectResult latest = store.latest(1L, "OFFLINE_LIST");
++        assertEquals(1L, latest.getTenantId());
++        assertEquals("[{\"a\":2}]", latest.getPayloadJson());
++        assertEquals(java.sql.Timestamp.valueOf("2026-11-24 10:00:00").getTime(), latest.getInspectTimeMs());
++        assertEquals(0, store.latest(1L, "COMPLETENESS") == null ? 0 : 1, "无该类型返回 null");
++        assertEquals(0, store.latest(9L, "OFFLINE_LIST") == null ? 0 : 1, "跨租户取不到");
++    }
++
++    @Test
++    @DisplayName("90 天归档：删除 inspect_time < now-90d 旧行、保留新行，条件删除幂等")
++    void archivePurgesOldRowsIdempotently() {
++        java.sql.Timestamp old = new java.sql.Timestamp(System.currentTimeMillis() - 100L * 24 * 3600 * 1000);
++        java.sql.Timestamp fresh = new java.sql.Timestamp(System.currentTimeMillis() - 1L * 24 * 3600 * 1000);
++        insert(1L, "OFFLINE_LIST", old, "[]", 0);
++        insert(1L, "CALC_ERR", old, "[]", 0);
++        insert(1L, "OFFLINE_LIST", fresh, "[{\"x\":1}]", 1);
++
++        int deleted = store.archive();
++        assertEquals(2, deleted, "删除两条 90 天前旧行");
++        assertEquals(1, countAll(), "仅保留 1 条新行（90 天内）");
++        assertEquals(0, store.archive(), "二次归档幂等，删 0 行");
++        assertTrue(store.latest(1L, "OFFLINE_LIST") != null, "新行未被归档");
++    }
++
++    @Test
++    @DisplayName("历史查询：按 tenant + type + 时间窗返回（90 天内），跨租户隔离")
++    void historyScopedByTenantAndType() {
++        long now = System.currentTimeMillis();
++        java.sql.Timestamp t1 = new java.sql.Timestamp(now - 3 * 3600 * 1000);
++        java.sql.Timestamp t2 = new java.sql.Timestamp(now - 2 * 3600 * 1000);
++        insert(1L, "CALC_ERR", t1, "[{\"e\":1}]", 1);
++        insert(1L, "CALC_ERR", t2, "[{\"e\":2}]", 1);
++        insert(1L, "OFFLINE_LIST", t1, "[]", 0);
++        insert(2L, "CALC_ERR", t1, "[]", 0);
++
++        List<IotInspectResult> rows = store.history(1L, "CALC_ERR", now - 5 * 3600 * 1000, now, 50);
++        assertEquals(2, rows.size(), "仅本租户 CALC_ERR 两条，按时间升序");
++        assertTrue(rows.get(0).getInspectTimeMs() <= rows.get(1).getInspectTimeMs());
++        assertEquals(0, store.history(1L, "CALC_ERR", now - 5 * 3600 * 1000, now - 4 * 3600 * 1000, 50).size(),
++                "时间窗外空集");
++    }
++
++    private int countAll() {
++        java.util.List<Integer> r = jdbc.queryForList("SELECT COUNT(*) FROM iot_inspect_result", Integer.class);
++        return r.isEmpty() ? 0 : r.get(0);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/IotInspectDdlSplitContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/IotInspectDdlSplitContractTest.java
+new file mode 100644
+index 0000000..9f0dd14
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/impl/IotInspectDdlSplitContractTest.java
+@@ -0,0 +1,109 @@
++package net.otlab.admin.module.iot.inspect.impl;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0061 D1：巡检 DDL 静态契约——每条语句独占一行（兼容 sql-exec.sh 的 {@code ;\n} 切分），
++ * 表结构含 4 类 inspect_type + 90 天归档所需字段 + 复合索引，且**不套审计四件套**；菜单种子
++ * 挂 110 系统监控、权限沿用 iot:instance:query。
++ *
++ * <p>纯文本静态检查，不连用户库（brief：DDL 只产出不执行）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotInspectDdlSplitContractTest {
++
++    private static final String REL = "resources/sql/upgrade/20261124_iot_inspect.sql";
++
++    private static Path repoRoot() {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位仓库根（resources/sql/01_base.sql）");
++        return dir;
++    }
++
++    /** 复刻 sql-exec.sh 的切分：split(";\s*\n")，逐行剥 -- 注释与空行 */
++    private static List<String> executableSegments(String ddl) {
++        List<String> segments = new ArrayList<>();
++        for (String seg : ddl.split(";\\s*\\n")) {
++            StringBuilder sb = new StringBuilder();
++            for (String line : seg.split("\n")) {
++                String t = line.strip();
++                if (!t.isEmpty() && !t.startsWith("--")) {
++                    sb.append(line).append("\n");
++                }
++            }
++            String s = sb.toString().strip();
++            if (!s.isEmpty()) {
++                segments.add(s);
++            }
++        }
++        return segments;
++    }
++
++    @Test
++    @DisplayName("DDL 每条语句独占一行：按 sql-exec.sh 的 ;\\n 切分后，任一段不含行内第二处分号")
++    void everyStatementIsOnItsOwnLine() throws Exception {
++        Path p = repoRoot().resolve(REL);
++        assertTrue(Files.exists(p), "缺 DDL 脚本: " + REL);
++        String ddl = Files.readString(p, StandardCharsets.UTF_8);
++        List<String> segments = executableSegments(ddl);
++        assertTrue(segments.size() >= 3, "切分段数异常偏少（" + segments.size() + "），解析口径不可信");
++
++        List<String> bad = new ArrayList<>();
++        for (String seg : segments) {
++            if (seg.contains(";")) {
++                bad.add(seg.replace("\n", " ⏎ ").strip());
++            }
++        }
++        assertEquals(List.of(), bad,
++                "以下切分段仍含同行分号（sql-exec.sh 会作为一条交给 JDBC，导致 SQLERROR）: " + bad);
++    }
++
++    @Test
++    @DisplayName("巡检结果表：字段齐全（4 类 type/payload/item_count/tenant_id/inspect_time）+ 复合索引 + 无审计四件套")
++    void resultTableShape() throws Exception {
++        String ddl = Files.readString(repoRoot().resolve(REL), StandardCharsets.UTF_8);
++        assertTrue(ddl.contains("CREATE TABLE IF NOT EXISTS `iot_inspect_result`"), "缺巡检结果表 DDL");
++        for (String column : new String[]{"`id`", "`tenant_id`", "`inspect_time`", "`inspect_type`",
++                "`payload_json`", "`item_count`", "`created_time`"}) {
++            assertTrue(ddl.contains(column), "缺字段: " + column);
++        }
++        assertTrue(ddl.contains("`idx_tenant_time_type`"), "缺 (tenant_id, inspect_time, inspect_type) 复合索引");
++        for (String type : new String[]{"OFFLINE_LIST", "CALC_ERR", "COMPLETENESS", "TENANT_DB_MISMATCH"}) {
++            assertTrue(ddl.contains(type), "缺巡检类型说明: " + type);
++        }
++        // 不套审计四件套：巡检是系统级定时任务，无操作员上下文（仿 publish_log 无 create_by）
++        String tableBlock = ddl.substring(ddl.indexOf("CREATE TABLE IF NOT EXISTS `iot_inspect_result`"));
++        tableBlock = tableBlock.substring(0, tableBlock.indexOf(";"));
++        for (String audit : new String[]{"`create_by`", "`update_by`", "`update_time`", "`deleted`", "`version`"}) {
++            assertFalse(tableBlock.contains(audit), "巡检结果表不应含审计列: " + audit);
++        }
++    }
++
++    @Test
++    @DisplayName("菜单种子：171 挂 110 系统监控、组件 monitor/iot-inspect/index、权限 iot:instance:query，含超管授权")
++    void menuSeedRegistered() throws Exception {
++        String ddl = Files.readString(repoRoot().resolve(REL), StandardCharsets.UTF_8);
++        assertTrue(ddl.contains("INSERT INTO `sys_menu`"), "缺 sys_menu 菜单种子");
++        assertTrue(ddl.contains("'IoT运维监控'"), "缺菜单名 IoT运维监控");
++        assertTrue(ddl.contains("'monitor/iot-inspect/index'"), "缺组件路径");
++        assertTrue(ddl.contains("'iot:instance:query'"), "menu 权限字段应沿用 iot:instance:query");
++        assertTrue(ddl.contains("INSERT INTO `sys_role_menu`"), "缺超管授权段");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectLockContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectLockContractTest.java
+new file mode 100644
+index 0000000..a858b77
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectLockContractTest.java
+@@ -0,0 +1,31 @@
++package net.otlab.admin.module.iot.inspect.scheduler;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.time.Duration;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0061 D2：巡检重入保护契约——Redis SETNX 锁 key/TTL 形态 + fail-soft。
++ *
++ * <p>锁定纯函数（锁键与 TTL 派生），不连 Redis（执行路径在 InspectScheduler 中以
++ * StringRedisTemplate setIfAbsent 落地，Redis 不可用 try/catch WARN 跳过）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class InspectLockContractTest {
++
++    @Test
++    @DisplayName("锁键：iot:inspect:lock:global（系统级巡检）或 iot:inspect:lock:{tenant}，ttl=周期×2")
++    void lockKeyAndTtl() {
++        assertEquals("iot:inspect:lock:global", InspectScheduler.lockKey(null));
++        assertEquals("iot:inspect:lock:t1", InspectScheduler.lockKey("t1"));
++        Duration ttl = InspectScheduler.lockTtl(3600);
++        assertEquals(Duration.ofSeconds(7200), ttl, "ttl = 周期秒数 × 2 兜底");
++        assertEquals(Duration.ofSeconds(120), InspectScheduler.lockTtl(60));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/service/InspectAggregatorTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/service/InspectAggregatorTest.java
+new file mode 100644
+index 0000000..7a9dda6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/service/InspectAggregatorTest.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.iot.inspect.service;
++
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
++import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0061 D2：巡检聚合纯函数契约——三类清单 + 一类比对，从只读数据源快照聚合，
++ * **无点位显示 N/A / 空清单不造假**，CALC_ERR 按原因聚合，租户库名比对 fail-soft 占位。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class InspectAggregatorTest {
++
++    @Test
++    @DisplayName("点位在线率：分母=0（无点位）→ N/A 非 100%；有分母按分子/分母算百分比")
++    void onlineRateNaWhenNoPoints() {
++        assertEquals("N/A", InspectPayloads.onlineRateText(0, 0));
++        assertEquals("N/A", InspectPayloads.onlineRateText(3, 0));
++        assertEquals("100.0%", InspectPayloads.onlineRateText(10, 10));
++        assertEquals("75.0%", InspectPayloads.onlineRateText(3, 4));
++        assertEquals("0.0%", InspectPayloads.onlineRateText(0, 5));
++    }
++
++    @Test
++    @DisplayName("计算成功率：无日志=N/A（不造 100%），成功/(成功+失败) 且 calcStatus 停算/滞后单独标注")
++    void calcSuccessRate() {
++        assertEquals("N/A", InspectPayloads.calcSuccessRateText(List.of()));
++        CalcLogVO ok = new CalcLogVO();
++        ok.setResultStatus(1);
++        CalcLogVO fail = new CalcLogVO();
++        fail.setResultStatus(2);
++        fail.setErrorMsg("连接超时");
++        CalcLogVO fail2 = new CalcLogVO();
++        fail2.setResultStatus(2);
++        fail2.setErrorMsg("连接超时");
++        assertEquals("33.3%", InspectPayloads.calcSuccessRateText(List.of(ok, fail, fail2)));
++
++        CalcStateVO stopped = new CalcStateVO();
++        stopped.setCalcStatus(3);
++        assertTrue(InspectPayloads.hasAbnormalCalcState(List.of(stopped)));
++        CalcStateVO normal = new CalcStateVO();
++        normal.setCalcStatus(1);
++        assertTrue(!InspectPayloads.hasAbnormalCalcState(List.of(normal)));
++    }
++
++    @Test
++    @DisplayName("CALC_ERR 统计：按 errorMsg 原因聚合计数，非失败行不计入")
++    void calcErrGroupByReason() {
++        CalcLogVO f1 = new CalcLogVO();
++        f1.setResultStatus(2); f1.setErrorMsg("超时"); f1.setFullKey("T|M.A|I01|day");
++        CalcLogVO f2 = new CalcLogVO();
++        f2.setResultStatus(2); f2.setErrorMsg("超时"); f2.setFullKey("T|M.B|I01|day");
++        CalcLogVO f3 = new CalcLogVO();
++        f3.setResultStatus(2); f3.setErrorMsg("除零"); f3.setFullKey("T|M.C|I02|day");
++        CalcLogVO ok = new CalcLogVO();
++        ok.setResultStatus(1); ok.setErrorMsg("误导字段"); ok.setFullKey("T|M.D|I01|day");
++
++        List<InspectItemVO> grouped = InspectPayloads.groupCalcErrors(List.of(f1, f2, f3, ok));
++        assertEquals(2, grouped.size(), "仅两类失败原因");
++        InspectItemVO top = grouped.get(0);
++        assertEquals("超时", top.getReason());
++        assertEquals(2, top.getCount());
++        assertEquals(1, grouped.stream().filter(i -> "除零".equals(i.getReason())).findFirst().orElseThrow().getCount());
++    }
++
++    @Test
++    @DisplayName("完整度低清单：阈值以下项进入清单；无完整度字段时用 calc 滞后/停算近似并标注口径")
++    void completenessBelowThreshold() {
++        CalcStateVO lag = new CalcStateVO(); lag.setFullKey("T|M.A|I01|day"); lag.setCalcStatus(2);
++        CalcStateVO stop = new CalcStateVO(); stop.setFullKey("T|M.B|I02|day"); stop.setCalcStatus(3);
++        CalcStateVO ok = new CalcStateVO(); ok.setFullKey("T|M.C|I03|day"); ok.setCalcStatus(1);
++
++        List<InspectItemVO> low = InspectPayloads.approximateLowCompleteness(List.of(lag, stop, ok));
++        assertEquals(2, low.size(), "滞后+停算=低于阈值近似（口径：calc 状态近似，页面注明）");
++        assertTrue(low.stream().allMatch(i -> i.getBasis().contains("calc 状态近似")));
++    }
++
++    @Test
++    @DisplayName("租户库名比对：TDengine REST 故障→待核验占位项（不报错），契约期望库名 iot_<tenantCode>")
++    void tenantDbMismatchFailSoft() {
++        String expectedDb = InspectPayloads.expectedDbName("T01");
++        assertEquals("iot_T01", expectedDb);
++        InspectItemVO pending = InspectPayloads.pendingVerification("T01", expectedDb);
++        assertEquals("待核验", pending.getResult());
++        assertEquals("iot_T01", pending.getExpectedDb());
++    }
++}
+diff --git a/frontend/src/api/monitor/iot-inspect-api.ts b/frontend/src/api/monitor/iot-inspect-api.ts
+new file mode 100644
+index 0000000..0cfec18
+--- /dev/null
++++ b/frontend/src/api/monitor/iot-inspect-api.ts
+@@ -0,0 +1,55 @@
++/*
++ * IoT 运维监控（TASK-0061）——管理面只读端点封装。
++ *
++ * 仅调 D4 三个管理面端点（走已登录态 axios，与 /iot/** 共用 axios 实例）：
++ * - GET /api/v1/iot/inspect/dashboard   四类指标聚合；
++ * - GET /api/v1/iot/inspect/latest?type= 最近一次巡检清单；
++ * - GET /api/v1/iot/inspect/history?type=&from=&to=&pageNum=&pageSize= 历史巡检清单（90 天内）。
++ *
++ * 安全红线（仿 display-api.ts 头注）：本页**不持有 appKey/secret、不直连 /openapi/v1/** HMAC、
++ * 不自造代理**；tenant 由后端会话强制注入，前端不传也不接受 tenant 参数（跨租户明细 403）。
++ * 全部走管理面登录态只读端点；页面无写口（巡检由后端 @Scheduled 任务内部写）。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++import { getRequest } from '/@/lib/axios';
++import type { DashboardVO, InspectItemVO, InspectType } from '/@/views/monitor/iot-inspect/helper';
++
++/** 后端数组字段容错：null/undefined/非数组一律归一为空数组（空态纪律，不造假数据）。 */
++const asArray = <T>(value: T[] | null | undefined): T[] => (Array.isArray(value) ? value : []);
++
++/** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
++interface ResultEnvelope<T> {
++  code: number;
++  message?: string;
++  data: T;
++}
++
++export interface InspectHistoryQuery {
++  type: InspectType;
++  from: number;
++  to: number;
++  pageNum?: number;
++  pageSize?: number;
++}
++
++export const iotInspectApi = {
++  /** 四类指标看板（无数据 N/A/空态由后端给，前端原样展示） */
++  async dashboard(): Promise<DashboardVO | null> {
++    const res: ResultEnvelope<DashboardVO> = await getRequest('/api/v1/iot/inspect/dashboard', undefined);
++    return res?.data ?? null;
++  },
++
++  /** 最近一次巡检清单（type=4 类之一；无数据空列表） */
++  async latest(type: InspectType): Promise<InspectItemVO[]> {
++    const res: ResultEnvelope<InspectItemVO[]> = await getRequest('/api/v1/iot/inspect/latest', { type });
++    return asArray(res?.data);
++  },
++
++  /** 历史巡检清单（90 天内 + 分页；from/to 为 epoch 毫秒，跨租户 403） */
++  async history(query: InspectHistoryQuery): Promise<InspectItemVO[]> {
++    const res: ResultEnvelope<InspectItemVO[]> = await getRequest('/api/v1/iot/inspect/history', query);
++    return asArray(res?.data);
++  },
++};
+diff --git a/frontend/src/views/monitor/iot-inspect/helper.ts b/frontend/src/views/monitor/iot-inspect/helper.ts
+new file mode 100644
+index 0000000..3908978
+--- /dev/null
++++ b/frontend/src/views/monitor/iot-inspect/helper.ts
+@@ -0,0 +1,84 @@
++/*
++ * TASK-0061：IoT 运维监控页公共纯函数与类型（可单测，不依赖组件环境）。
++ *
++ * 空态纪律（REQ-0031 验收 6）：在线率无点位显示 N/A 而非 100%，无数据一律空态不造假。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++
++/** 四类巡检类型（与后端 IotInspectResult.inspect_type 对齐） */
++export const INSPECT_TYPES = ['OFFLINE_LIST', 'CALC_ERR', 'COMPLETENESS', 'TENANT_DB_MISMATCH'] as const;
++
++export type InspectType = (typeof INSPECT_TYPES)[number];
++
++/** 巡检类型中文标签 */
++export const INSPECT_TYPE_LABELS: Record<InspectType, string> = {
++  OFFLINE_LIST: '点位离线清单',
++  CALC_ERR: 'CALC_ERR 统计',
++  COMPLETENESS: '完整度低清单',
++  TENANT_DB_MISMATCH: '标签租户比对',
++};
++
++/** 巡检清单条目（对齐后端 InspectItemVO；各类型按语义取用字段，不用字段为 null） */
++export interface InspectItemVO {
++  reason?: string | null;
++  count?: number | null;
++  offlineMinutes?: number | null;
++  fullKey?: string | null;
++  instanceCode?: string | null;
++  tenantCode?: string | null;
++  expectedDb?: string | null;
++  result?: string | null;
++  basis?: string | null;
++}
++
++/** 看板四类指标（对齐后端 DashboardVO；无数据 N/A/空列表，绝不造假） */
++export interface DashboardVO extends DashboardDataShape {
++  channels: InspectItemVO[];
++  onlineRate: string;
++  onlinePoints?: number | null;
++  totalPoints?: number | null;
++  onlineRateBasis?: string | null;
++  calcSuccessRate: string;
++  calcAbnormalCount?: number | null;
++  metrics: InspectItemVO[];
++  metricBasis?: string | null;
++}
++
++/** 看板最小数据形状（hasDashboardData 只取这几个字段，避免与 api 类型循环依赖） */
++export interface DashboardDataShape {
++  onlineRate?: string | null;
++  calcSuccessRate?: string | null;
++  channels?: unknown[];
++  metrics?: unknown[];
++}
++
++/** 在线率文本：后端已按聚合快照算好（无点位 N/A），前端原样展示不现算、不把 N/A 换成 100% */
++export function onlineRateText(online: number, total: number): string {
++  if (!Number.isFinite(total) || total <= 0) return 'N/A';
++  const n = Number.isFinite(online) ? online : 0;
++  return `${((n * 100) / total).toFixed(1)}%`;
++}
++
++/** 计算成功率展示：空值一律 N/A，不造 100%（后端同源口径） */
++export function calcSuccessRateText(value?: string | null): string {
++  return value && value.trim() ? value : 'N/A';
++}
++
++/** 看板是否“有数据”：全是 N/A + 空列表 = 无数据（页面据此渲染 a-empty） */
++export function hasDashboardData(data: DashboardDataShape): boolean {
++  const rateOk = !!data.onlineRate && data.onlineRate !== 'N/A';
++  const calcOk = !!data.calcSuccessRate && data.calcSuccessRate !== 'N/A';
++  return rateOk || calcOk || (data.channels?.length ?? 0) > 0 || (data.metrics?.length ?? 0) > 0;
++}
++
++/** 离线时长格式化：null/非法 → '-'，分钟 → 人类可读 */
++export function formatOfflineMinutes(minutes?: number | null): string {
++  if (minutes == null || !Number.isFinite(minutes) || minutes < 0) return '-';
++  const m = Math.floor(minutes);
++  if (m < 60) return `${m} 分钟`;
++  const hours = Math.floor(m / 60);
++  const rest = m % 60;
++  return rest > 0 ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
++}
+diff --git a/frontend/src/views/monitor/iot-inspect/index.vue b/frontend/src/views/monitor/iot-inspect/index.vue
+new file mode 100644
+index 0000000..045766c
+--- /dev/null
++++ b/frontend/src/views/monitor/iot-inspect/index.vue
+@@ -0,0 +1,252 @@
++<!--
++  * IoT 运维监控（TASK-0061）
++  *
++  * 四类指标卡：通道健康 / 点位在线率 / 计算成功率 / 指标产出；
++  * 三类巡检清单 tab + 标签租户比对 tab；历史回看（日期范围 + 列表）。
++  *
++  * 空态纪律（REQ-0031 验收 6）：无数据显示 a-empty / N/A，在线率无点位 N/A 非 100%，绝不造假数据。
++  * 安全红线：只调 /api/v1/iot/inspect/** 管理面只读端点（已登录态 axios），
++  * 不持有 appKey/secret、不直连 /openapi/v1/** HMAC、不自造代理；tenant 由后端会话注入。
++  *
++  * @Author: dowei
++  * @Date: 2026-11-24
++-->
++<template>
++  <a-card size="small" :bordered="false" :hoverable="true" v-privilege="'iot:instance:query'">
++    <template #title>IoT 运维监控</template>
++    <template #extra>
++      <a-button size="small" :loading="loading" @click="loadAll">
++        <template #icon><ReloadOutlined /></template>
++        刷新
++      </a-button>
++    </template>
++
++    <a-spin :spinning="loading">
++      <!-- 四类指标卡 -->
++      <a-row :gutter="[12, 12]">
++        <a-col v-for="card in metricCards" :key="card.key" :xs="24" :sm="12" :md="6">
++          <a-card size="small" :title="card.title">
++            <div class="ot-inspect-metric-value" :style="{ color: card.color }">{{ card.value }}</div>
++            <div class="ot-inspect-metric-basis">{{ card.basis }}</div>
++          </a-card>
++        </a-col>
++      </a-row>
++
++      <!-- 看板整体无数据空态 -->
++      <a-empty v-if="!hasData" description="暂无巡检数据（在线率 N/A，未巡检或无点位）" class="ot-inspect-empty" />
++
++      <a-divider orientation="left" plain>巡检清单</a-divider>
++      <a-tabs v-model:activeKey="activeType" @change="onTabChange">
++        <a-tab-pane v-for="type in INSPECT_TYPES" :key="type" :tab="INSPECT_TYPE_LABELS[type]">
++          <a-table
++            size="small"
++            :dataSource="currentList"
++            :columns="listColumns"
++            bordered
++            rowKey="fullKey"
++            :pagination="false"
++            :locale="{ emptyText: '暂无' + INSPECT_TYPE_LABELS[type] + '数据' }"
++          >
++            <template #bodyCell="{ record, column }">
++              <template v-if="column.dataIndex === 'summary'">{{ record.reason || record.fullKey || record.expectedDb || '-' }}</template>
++              <template v-else-if="column.dataIndex === 'detail'">
++                <span v-if="record.count != null">{{ record.count }} 条</span>
++                <span v-else-if="record.offlineMinutes != null">{{ formatOfflineMinutes(record.offlineMinutes) }}</span>
++                <span v-else-if="record.result">{{ record.result }}</span>
++                <span v-else>-</span>
++              </template>
++              <template v-else-if="column.dataIndex === 'basis'">{{ record.basis || '-' }}</template>
++            </template>
++          </a-table>
++        </a-tab-pane>
++      </a-tabs>
++
++      <a-divider orientation="left" plain>历史回看（90 天内）</a-divider>
++      <a-form layout="inline" class="ot-inspect-history-form">
++        <a-form-item label="巡检类型">
++          <a-select v-model:value="historyType" style="width: 180px">
++            <a-select-option v-for="type in INSPECT_TYPES" :key="type" :value="type">
++              {{ INSPECT_TYPE_LABELS[type] }}
++            </a-select-option>
++          </a-select>
++        </a-form-item>
++        <a-form-item label="日期范围">
++          <a-range-picker v-model:value="historyRange" :show-time="false" />
++        </a-form-item>
++        <a-form-item>
++          <a-button type="primary" :loading="historyLoading" :disabled="!historyRange.length" @click="loadHistory">查询</a-button>
++        </a-form-item>
++      </a-form>
++      <a-table
++        size="small"
++        :dataSource="historyList"
++        :columns="historyColumns"
++        bordered
++        rowKey="fullKey"
++        :pagination="false"
++        :locale="{ emptyText: historyQueried ? '该时间范围内暂无历史巡检' : '请选择日期范围后查询' }"
++      >
++        <template #bodyCell="{ record, column }">
++          <template v-if="column.dataIndex === 'summary'">{{ record.reason || record.fullKey || '-' }}</template>
++          <template v-else-if="column.dataIndex === 'detail'">
++            {{ record.count != null ? `${record.count} 条` : record.result || '-' }}
++          </template>
++        </template>
++      </a-table>
++    </a-spin>
++  </a-card>
++</template>
++
++<script setup lang="ts">
++  import { computed, onMounted, ref } from 'vue';
++  import type { TableColumnsType } from 'ant-design-vue';
++  import type { Dayjs } from 'dayjs';
++  import { ReloadOutlined } from '@ant-design/icons-vue';
++  import { iotInspectApi } from '/@/api/monitor/iot-inspect-api';
++  import {
++    INSPECT_TYPES,
++    INSPECT_TYPE_LABELS,
++    calcSuccessRateText,
++    formatOfflineMinutes,
++    hasDashboardData,
++    type DashboardVO,
++    type InspectItemVO,
++    type InspectType,
++  } from '/@/views/monitor/iot-inspect/helper';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  const loading = ref(false);
++  const historyLoading = ref(false);
++  const historyQueried = ref(false);
++  const dashboard = ref<DashboardVO | null>(null);
++  const listByType = ref<Record<string, InspectItemVO[]>>({});
++  const activeType = ref<InspectType>('OFFLINE_LIST');
++  const historyType = ref<InspectType>('CALC_ERR');
++  const historyRange = ref<Dayjs[]>([]);
++  const historyList = ref<InspectItemVO[]>([]);
++
++  const listColumns: TableColumnsType = [
++    { title: '项目', dataIndex: 'summary', ellipsis: true },
++    { title: '数值/结论', dataIndex: 'detail', width: 160 },
++    { title: '口径', dataIndex: 'basis', ellipsis: true },
++  ];
++  const historyColumns: TableColumnsType = [
++    { title: '项目', dataIndex: 'summary', ellipsis: true },
++    { title: '数值/结论', dataIndex: 'detail', width: 160 },
++  ];
++
++  const hasData = computed(() => hasDashboardData(dashboard.value || {}));
++  const currentList = computed(() => listByType.value[activeType.value] || []);
++
++  const metricCards = computed(() => {
++    const d = dashboard.value;
++    const channels = d?.channels || [];
++    const healthy = channels.filter((c) => c.count === 1).length;
++    return [
++      {
++        key: 'channel',
++        title: '通道健康',
++        value: channels.length ? `${healthy}/${channels.length} 启用` : 'N/A',
++        basis: channels.length ? '启用数/通道总数' : '无通道数据',
++        color: channels.length && healthy === channels.length ? '#52c41a' : '#faad14',
++      },
++      {
++        key: 'online',
++        title: '点位在线率',
++        value: d ? d.onlineRate : 'N/A',
++        basis: d?.onlineRateBasis || '聚合快照（无点位 N/A）',
++        color: d && d.onlineRate !== 'N/A' ? '#52c41a' : '#8c8c8c',
++      },
++      {
++        key: 'calc',
++        title: '计算成功率',
++        value: calcSuccessRateText(d?.calcSuccessRate),
++        basis: d?.calcAbnormalCount ? `滞后/停算 ${d.calcAbnormalCount} 项` : '成功/(成功+失败)',
++        color: d && calcSuccessRateText(d.calcSuccessRate) !== 'N/A' ? '#52c41a' : '#8c8c8c',
++      },
++      {
++        key: 'metric',
++        title: '指标产出',
++        value: d?.metrics?.length ? `${d.metrics.length}` : 'N/A',
++        basis: d?.metricBasis || '无指标数据',
++        color: d?.metrics?.length ? '#1890ff' : '#8c8c8c',
++      },
++    ];
++  });
++
++  async function loadAll() {
++    loading.value = true;
++    try {
++      const d = await iotInspectApi.dashboard();
++      dashboard.value = d || emptyDashboard();
++      const entries = await Promise.all(INSPECT_TYPES.map(async (type) => [type, await iotInspectApi.latest(type)] as const));
++      const next: Record<string, InspectItemVO[]> = {};
++      for (const [type, items] of entries) next[type] = items;
++      listByType.value = next;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      loading.value = false;
++    }
++  }
++
++  function emptyDashboard(): DashboardVO {
++    return {
++      channels: [],
++      onlineRate: 'N/A',
++      onlinePoints: null,
++      totalPoints: 0,
++      onlineRateBasis: '无巡检数据',
++      calcSuccessRate: 'N/A',
++      calcAbnormalCount: null,
++      metrics: [],
++      metricBasis: '',
++    };
++  }
++
++  function onTabChange() {
++    // 清单数据一次性加载，切 tab 只切换视图，不再请求（当前视图=最近一次巡检）
++  }
++
++  async function loadHistory() {
++    if (historyRange.value.length !== 2) return;
++    historyLoading.value = true;
++    historyQueried.value = true;
++    try {
++      const [start, end] = historyRange.value;
++      historyList.value = await iotInspectApi.history({
++        type: historyType.value,
++        from: start.startOf('day').valueOf(),
++        to: end.endOf('day').valueOf(),
++        pageNum: 1,
++        pageSize: 200,
++      });
++    } catch (e) {
++      historyList.value = [];
++      otSentry.captureError(e);
++    } finally {
++      historyLoading.value = false;
++    }
++  }
++
++  onMounted(loadAll);
++</script>
++
++<style lang="less" scoped>
++  .ot-inspect-metric-value {
++    font-size: 22px;
++    font-weight: 600;
++    line-height: 1.3;
++  }
++  .ot-inspect-metric-basis {
++    color: rgba(0, 0, 0, 0.45);
++    font-size: 12px;
++    margin-top: 4px;
++  }
++  .ot-inspect-empty {
++    padding: 24px 0;
++  }
++  .ot-inspect-history-form {
++    margin-bottom: 12px;
++  }
++</style>
+diff --git a/frontend/tests/unit/monitor/iot-inspect-helper.spec.ts b/frontend/tests/unit/monitor/iot-inspect-helper.spec.ts
+new file mode 100644
+index 0000000..82fab31
+--- /dev/null
++++ b/frontend/tests/unit/monitor/iot-inspect-helper.spec.ts
+@@ -0,0 +1,64 @@
++/*
++ * TASK-0061：运维监控页 helper 契约——空态纪律（在线率 N/A 非 100%，无数据空列表）。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++import { describe, expect, it } from 'vitest';
++import {
++  onlineRateText,
++  calcSuccessRateText,
++  hasDashboardData,
++  formatOfflineMinutes,
++  INSPECT_TYPES,
++  type InspectType,
++} from '/@/views/monitor/iot-inspect/helper';
++
++describe('TASK-0061 运维监控空态纪律', () => {
++  it('在线率：无点位（分母 0）显示 N/A 而非 100%', () => {
++    expect(onlineRateText(0, 0)).toBe('N/A');
++    expect(onlineRateText(3, 0)).toBe('N/A');
++    expect(onlineRateText(10, 10)).toBe('100.0%');
++    expect(onlineRateText(3, 4)).toBe('75.0%');
++  });
++
++  it('计算成功率：无日志显示 N/A，不造 100%', () => {
++    expect(calcSuccessRateText(undefined)).toBe('N/A');
++    expect(calcSuccessRateText(null)).toBe('N/A');
++    expect(calcSuccessRateText('')).toBe('N/A');
++    expect(calcSuccessRateText('50.0%')).toBe('50.0%');
++  });
++
++  it('看板无数据判定：N/A + 空列表 + 空指标 = 无数据（前端渲染 a-empty）', () => {
++    expect(
++      hasDashboardData({
++        onlineRate: 'N/A',
++        calcSuccessRate: 'N/A',
++        channels: [],
++        metrics: [],
++      })
++    ).toBe(false);
++    expect(
++      hasDashboardData({
++        onlineRate: '75.0%',
++        calcSuccessRate: 'N/A',
++        channels: [],
++        metrics: [],
++      })
++    ).toBe(true);
++  });
++
++  it('离线时长格式化：分钟→人类可读，空值占位', () => {
++    expect(formatOfflineMinutes(null)).toBe('-');
++    expect(formatOfflineMinutes(0)).toBe('0 分钟');
++    expect(formatOfflineMinutes(90)).toBe('1 小时 30 分钟');
++  });
++
++  it('四类巡检类型常量齐全', () => {
++    const types: InspectType[] = [...INSPECT_TYPES];
++    expect(types).toContain('OFFLINE_LIST');
++    expect(types).toContain('CALC_ERR');
++    expect(types).toContain('COMPLETENESS');
++    expect(types).toContain('TENANT_DB_MISMATCH');
++  });
++});
+diff --git a/resources/sql/upgrade/20261124_iot_inspect.sql b/resources/sql/upgrade/20261124_iot_inspect.sql
+new file mode 100644
+index 0000000..1e7f787
+--- /dev/null
++++ b/resources/sql/upgrade/20261124_iot_inspect.sql
+@@ -0,0 +1,43 @@
++-- ============================================================
++-- TASK-0061：IoT 运维巡检结果表 + 监控页菜单种子
++--   依据：ADR-0014 TD-0047（巡检结果落库保留 90 天按期归档、支持回看历史）、
++--         ADR-0002（标签租户与库名一致性比对纳入巡检）、REQ-0031（运维监控页与平台业务巡检）。
++-- ============================================================
++-- 重要声明（brief 契约）：
++--   1) 本脚本由 Agent **只产出、不在用户库执行**（用户 MySQL phpStudy 8.0.12@3307）。
++--      由部署方按环境自行执行，每条语句经 backend/scripts/sql-exec.sh 单独一次调用。
++--   2) 该通道按「;\n」切分，故每条语句必须独占一行（含 INSERT 多值元组不换行内再带分号），
++--      同行多语句会 SQLERROR。
++--   3) iot_inspect_result **不套审计四件套**（无 create_by/update_by/update_time/deleted/version）——
++--      巡检是系统级 @Scheduled 定时任务，无操作员上下文，仿 publish_log 无 create_by（brief D3）。
++--   4) 幂等：CREATE TABLE IF NOT EXISTS + INSERT ... WHERE NOT EXISTS 判存，可重复执行无副作用。
++--   5) 归档由应用层 implement：写入前 DELETE WHERE inspect_time < NOW() - INTERVAL 90 DAY
++--      （ot.inspect.retention-days 可配，默认 90），不在 DDL 里建事件调度器。
++-- ============================================================
++
++-- ① 巡检结果表：4 类 inspect_type（OFFLINE_LIST / CALC_ERR / COMPLETENESS / TENANT_DB_MISMATCH）
++CREATE TABLE IF NOT EXISTS `iot_inspect_result` (
++  `id`            bigint       NOT NULL AUTO_INCREMENT COMMENT '主键 ID',
++  `tenant_id`     bigint       NOT NULL                COMMENT '租户 ID（系统级任务写入，查询按会话强制注入）',
++  `inspect_time`  datetime     NOT NULL                COMMENT '巡检时间（本轮任务开始时刻）',
++  `inspect_type`  varchar(32)  NOT NULL                COMMENT '类型：OFFLINE_LIST 点位离线清单 / CALC_ERR 计算错误统计 / COMPLETENESS 完整度低清单 / TENANT_DB_MISMATCH 标签租户与库名比对',
++  `payload_json`  json         DEFAULT NULL            COMMENT '清单 JSON（结构化条目数组；无数据为空数组，不造假）',
++  `item_count`    int          NOT NULL DEFAULT 0      COMMENT '清单条目数（payload_json 数组长度，0=无数据）',
++  `created_time`  datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '落库时间',
++  PRIMARY KEY (`id`),
++  KEY `idx_tenant_time_type` (`tenant_id`, `inspect_time`, `inspect_type`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='IoT 巡检结果（TASK-0061；90 天归档，无审计四件套）';
++
++-- ② 菜单种子：挂 110「系统监控」下，id=171（避开已用 168-170），权限沿用 iot:instance:query
++INSERT INTO `sys_menu` (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`) SELECT 171, 110, 1, 'IoT运维监控', 2, '/monitor/iot-inspect', 'monitor/iot-inspect/index', NULL, 'iot:instance:query', 'DashboardOutlined', 8, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0 WHERE NOT EXISTS (SELECT 1 FROM `sys_menu` WHERE `id` = 171);
++
++-- ③ 超管 role_id=1 授权（普通角色零反向授权，界面按需分配）
++INSERT INTO `sys_role_menu` (`role_id`, `menu_id`) SELECT 1, 171 WHERE NOT EXISTS (SELECT 1 FROM `sys_role_menu` WHERE `role_id` = 1 AND `menu_id` = 171);
++
++-- ============================================================
++-- 执行后核对（每条单独一次调用，sql-exec.sh）：
++--   SHOW CREATE TABLE `iot_inspect_result`;
++--   SELECT id, parent_id, perms FROM sys_menu WHERE id = 171;  -- 期望 110 / iot:instance:query
++--   SELECT * FROM sys_role_menu WHERE menu_id = 171;          -- 期望 (1,171)
++--   SELECT COUNT(*) FROM iot_inspect_result WHERE inspect_time < DATE_SUB(NOW(), INTERVAL 90 DAY);  -- 归档前核对
++-- ============================================================

@@ -1,0 +1,654 @@
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/IotPermissionsCompleteGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/IotPermissionsCompleteGuardTest.java
+new file mode 100644
+index 0000000..c433ede
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/IotPermissionsCompleteGuardTest.java
+@@ -0,0 +1,483 @@
++package net.otlab.admin.module.iot.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.config.BeanDefinition;
++import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
++import org.springframework.core.type.filter.AnnotationTypeFilter;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0064 守卫测试：高危权限点机械差集收口（设计 §3.1/§3.1续 p21-23 声明的权限位全集 vs
++ * sys_menu 注册全集 vs 管理面 @SaCheckPermission 注解实态）。
++ *
++ * <p>brief 硬要求三条：<b>①差集补注册</b>——设计声明而 sys_menu 未注册的权限位逐项补种子
++ * （升级脚本 resources/sql/upgrade/20261123_iot_permissions_complete.sql，id 4079-4081 顺延）；
++ * <b>②高危单独权限位</b>——绑定（iot:item:bind）/点位导入（iot:point:import）/点位导出
++ * （iot:point:export）三设计位补注册，其余高危（公式/部门绑定/状态规则/阈值/发布回滚/凭据）
++ * 逐项核验结论见种子头注与 TASK-0064 报告；<b>③角色初始化</b>——种子只做超管（role_id=1）
++ * 授权，普通角色零反向授权（普通查看角色直调 403 由 sa-token 注解天然成立 + dev 冒烟实证）。
++ * 本测试锁定（照 IotPointMenuPermissionGuardTest / OpenApiClientMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：新升级脚本的 sys_menu 三行（id/parent_id/perms 一一对应）与 sys_role_menu
++ *     恰三条超管授权——删行/换码/挪挂点/给普通角色反向授权即红；</li>
++ * <li>代码侧（全局，BUG-0046 口径）：扫描 net.otlab.admin.module 全部 @RestController 的
++ *     @SaCheckPermission（类级+方法级），任一注解值未在 resources/sql 全量菜单种子（01_base +
++ *     02_survey + 03_wechat + upgrade/*）登记即红——未登记即任何角色（含超管）都无法持有；</li>
++ * <li>接口侧：绑定/点位导入/点位导出三端点现行注解实态锁定（iot:item:edit / iot:point:add /
++ *     iot:point:list——TASK-0016/0022 交付实态，粗位复用差异已登记），且三个设计细粒度位已
++ *     注册——后续注解按设计收紧时零 403 窗口。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotPermissionsCompleteGuardTest {
++
++    /** 新升级脚本路径（差集补注册种子） */
++    static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261123_iot_permissions_complete.sql";
++
++    /** 新种子三行预期：menu_id → (parent_id, perms)，与设计 §3.1 权限列声明一一对应 */
++    private static final Map<Long, String[]> EXPECTED_NEW_ROWS = new LinkedHashMap<>();
++    static {
++        EXPECTED_NEW_ROWS.put(4079L, new String[]{"4011", "iot:point:import"});
++        EXPECTED_NEW_ROWS.put(4080L, new String[]{"4011", "iot:point:export"});
++        EXPECTED_NEW_ROWS.put(4081L, new String[]{"4010", "iot:item:bind"});
++    }
++
++    /** 设计 §3.1/续 声明的三个高危细粒度位（本脚本补注册的差集项） */
++    private static final Set<String> DESIGN_HIGH_RISK_PERMS = new TreeSet<>(Arrays.asList(
++            "iot:point:import", "iot:point:export", "iot:item:bind"));
++
++    // ============================================================
++    // SQL 侧：新种子三行 + 超管授权恰三条
++    // ============================================================
++
++    @Test
++    @DisplayName("SQL 侧 - 新升级脚本恰好登记三个高危权限位（4079/4080→4011，4081→4010，perms 与 §3.1 一致）")
++    void newSeedRegistersExactlyTheThreeHighRiskRows() throws Exception {
++        List<MenuRow> rows = parseMenuRows(readScript(SCRIPT_RELATIVE), "sys_menu");
++        Map<Long, MenuRow> byId = new LinkedHashMap<>();
++        for (MenuRow row : rows) {
++            byId.put(row.id, row);
++        }
++        assertEquals(EXPECTED_NEW_ROWS.size(), byId.size(),
++                "新种子菜单行数必须恰为三行（多行/漏行即失败）");
++        for (Map.Entry<Long, String[]> e : EXPECTED_NEW_ROWS.entrySet()) {
++            MenuRow row = byId.get(e.getKey());
++            assertNotNull(row, "新种子缺行：id=" + e.getKey());
++            assertEquals(e.getValue()[0], row.parentId, "id=" + e.getKey() + " parent_id 挂点不符");
++            assertEquals("3", row.menuType, "id=" + e.getKey() + " 必须是 menu_type=3 按钮");
++            assertEquals(e.getValue()[1], row.perms, "id=" + e.getKey() + " perms 与设计 §3.1 权限列不一致");
++        }
++    }
++
++    @Test
++    @DisplayName("SQL 侧 - sys_role_menu 恰三条超管授权（role_id=1）——普通角色零反向授权（brief 决策 3）")
++    void superadminIsTheOnlyGrantedRole() throws Exception {
++        String sql = readScript(SCRIPT_RELATIVE);
++        List<MenuRow> menuRows = parseMenuRows(sql, "sys_menu");
++        Set<Long> newIds = new TreeSet<>();
++        for (MenuRow row : menuRows) {
++            newIds.add(row.id);
++        }
++        assertEquals(EXPECTED_NEW_ROWS.keySet(), newIds, "sys_menu 行集必须恰为 4079-4081 三行");
++
++        List<String[]> grants = parseRoleMenuRows(sql);
++        assertEquals(EXPECTED_NEW_ROWS.size(), grants.size(),
++                "sys_role_menu 授权必须恰为三条（超管授权范式照 0024/0052）");
++        for (String[] grant : grants) {
++            assertEquals("1", grant[0], "授权必须只给超管 role_id=1——普通角色零反向授权，出现普通角色即失败");
++            assertTrue(newIds.contains(Long.parseLong(grant[1])),
++                    "sys_role_menu 授权的 menu_id 必须是本脚本登记的行：" + grant[1]);
++        }
++    }
++
++    // ============================================================
++    // 代码侧（全局）：管理面注解值 ⊆ sys_menu 种子登记全集（BUG-0046 口径）
++    // ============================================================
++
++    @Test
++    @DisplayName("全局一一对应 - 管理面全部 @SaCheckPermission 注解值都在菜单种子中登记（未登记即全员 403）")
++    void allModuleAnnotationsRegisteredInMenuSeeds() throws Exception {
++        Set<String> annotated = collectModuleAnnotatedPerms();
++        Set<String> registered = collectRegisteredMenuPerms();
++        assertTrue(registered.containsAll(annotated),
++                "以下注解权限码未在任何菜单种子登记（BUG-0046 口径：任何角色含超管都无法持有，直调必 403）：缺失="
++                        + new TreeSet<>(difference(annotated, registered)));
++    }
++
++    // ============================================================
++    // 接口侧：三高危端点注解实态锁定 + 设计细粒度位已注册
++    // ============================================================
++
++    @Test
++    @DisplayName("接口侧 - 绑定/点位导入/点位导出三端点注解实态（0016/0022 粗位交付差异）+ 设计三细粒度位已注册")
++    void highRiskEndpointsAnnotatedAndDesignPermsRegistered() throws Exception {
++        // 现行注解实态（粗位复用——TASK-0016/0022 交付差异已登记，锁定防再漂移）
++        assertEquals("iot:item:edit", methodPerm(
++                        net.otlab.admin.module.iot.dataitem.controller.IotDataItemController.class, "bind"),
++                "/iot/item/bind 现行注解（TASK-0016 交付实态：bind 与 edit 共用 iot:item:edit）");
++        assertEquals("iot:point:add", methodPerm(
++                        net.otlab.admin.module.iot.point.controller.IotPointController.class, "importPoints"),
++                "/iot/point/import 现行注解（TASK-0022 交付实态：导入与 add 共用 iot:point:add）");
++        assertEquals("iot:point:list", methodPerm(
++                        net.otlab.admin.module.iot.point.controller.IotPointController.class, "export"),
++                "/iot/point/export 现行注解（TASK-0022 交付实态：导出与 list 共用 iot:point:list）");
++
++        // 设计细粒度位已注册（本脚本补的差集三项）——后续注解按设计收紧时零 403 窗口
++        Set<String> registered = collectRegisteredMenuPerms();
++        assertTrue(registered.containsAll(DESIGN_HIGH_RISK_PERMS),
++                "设计 §3.1 声明的三个高危细粒度位必须已注册：" + DESIGN_HIGH_RISK_PERMS
++                        + " 缺失=" + new TreeSet<>(difference(DESIGN_HIGH_RISK_PERMS, registered)));
++    }
++
++    // ============================================================
++    // 解析与收集工具（注释行剥除 + 显式列序感知——不依赖固定列位）
++    // ============================================================
++
++    /** sys_menu / sys_role_menu 解析结果行 */
++    private static final class MenuRow {
++        final long id;
++        final String parentId;
++        final String menuType;
++        final String perms;
++
++        MenuRow(String id, String parentId, String menuType, String perms) {
++            this.id = Long.parseLong(id.strip());
++            this.parentId = parentId;
++            this.menuType = menuType;
++            this.perms = perms;
++        }
++    }
++
++    /** 一条 INSERT 语句：显式列清单 + VALUES 体 */
++    private static final class Statement {
++        final List<String> columns;
++        final List<List<String>> tuples;
++        /** INSERT ... SELECT 形态（20260925 微信脚本范式，无 VALUES 子句）时的语句体原文 */
++        final String selectBody;
++
++        Statement(List<String> columns, List<List<String>> tuples, String selectBody) {
++            this.columns = columns;
++            this.tuples = tuples;
++            this.selectBody = selectBody;
++        }
++    }
++
++    /** INSERT ... SELECT 形态行值的权限码样式（三段及以上冒号分隔，如 iot:point:import） */
++    private static final java.util.regex.Pattern PERM_TOKEN =
++            java.util.regex.Pattern.compile("[a-z][a-z0-9_]*(?::[a-z0-9_*]+)+");
++
++    /**
++     * 解析脚本中指定表（sys_menu / sys_role_menu）的 INSERT 全部行。
++     * 先剥除 -- 注释行；列序从 INSERT 显式列清单感知（各脚本 module_id 有无不一，不依赖固定列位）；
++     * VALUES 形态逐元组解析；INSERT ... SELECT 形态（无 VALUES）收集语句体内匹配权限码样式的
++     * 引号字面量——WHERE NOT EXISTS 条件引用的正是本语句登记的码，并入语义正确。
++     */
++    private List<MenuRow> parseMenuRows(String sql, String table) {
++        List<MenuRow> rows = new ArrayList<>();
++        for (Statement stmt : statementsOf(stripCommentLines(sql), table)) {
++            if (stmt.selectBody != null) {
++                for (String quoted : quotedStrings(stmt.selectBody)) {
++                    if (PERM_TOKEN.matcher(quoted).matches()) {
++                        rows.add(new MenuRow("-1", null, null, quoted));
++                    }
++                }
++                continue;
++            }
++            int permsIdx = stmt.columns.indexOf("perms");
++            int idIdx = stmt.columns.indexOf("id");
++            int parentIdx = stmt.columns.indexOf("parent_id");
++            int typeIdx = stmt.columns.indexOf("menu_type");
++            assertTrue(permsIdx >= 0 && idIdx >= 0 && parentIdx >= 0 && typeIdx >= 0,
++                    "INSERT 列清单缺关键列：" + stmt.columns);
++            for (List<String> tuple : stmt.tuples) {
++                rows.add(new MenuRow(unquote(tuple.get(idIdx)), unquote(tuple.get(parentIdx)),
++                        unquote(tuple.get(typeIdx)), unquote(tuple.get(permsIdx))));
++            }
++        }
++        return rows;
++    }
++
++    /** 解析 sys_role_menu INSERT 行（两列 role_id/menu_id） */
++    private List<String[]> parseRoleMenuRows(String sql) {
++        List<String[]> grants = new ArrayList<>();
++        for (Statement stmt : statementsOf(stripCommentLines(sql), "sys_role_menu")) {
++            int roleIdx = stmt.columns.indexOf("role_id");
++            int menuIdx = stmt.columns.indexOf("menu_id");
++            assertTrue(roleIdx >= 0 && menuIdx >= 0, "sys_role_menu 列清单缺 role_id/menu_id");
++            for (List<String> tuple : stmt.tuples) {
++                grants.add(new String[]{unquote(tuple.get(roleIdx)), unquote(tuple.get(menuIdx))});
++            }
++        }
++        return grants;
++    }
++
++    /** 剥除 -- 注释行（照 sql-exec.sh 同口径） */
++    private static String stripCommentLines(String sql) {
++        StringBuilder sb = new StringBuilder();
++        for (String line : sql.split("\n", -1)) {
++            String t = line.strip();
++            if (!t.isEmpty() && !t.startsWith("--")) {
++                sb.append(line).append('\n');
++            }
++        }
++        return sb.toString();
++    }
++
++    /** 定位 INTO `table` 的每条 INSERT：拆显式列清单 + VALUES 全部顶层元组（引号感知到语句末分号） */
++    private static List<Statement> statementsOf(String sql, String table) {
++        List<Statement> out = new ArrayList<>();
++        String needle = "INTO `" + table + "`";
++        int pos = 0;
++        while (true) {
++            int at = sql.indexOf(needle, pos);
++            if (at < 0) {
++                break;
++            }
++            int parenOpen = sql.indexOf('(', at);
++            int parenClose = matchingParen(sql, parenOpen);
++            List<String> columns = new ArrayList<>();
++            for (String col : splitTopLevel(sql.substring(parenOpen + 1, parenClose))) {
++                columns.add(col.replace("`", "").strip().toLowerCase());
++            }
++            int stmtEnd = statementEnd(sql, parenClose);
++            int valuesAt = sql.indexOf("VALUES", parenClose);
++            if (valuesAt >= 0 && valuesAt < stmtEnd) {
++                out.add(new Statement(columns,
++                        tuplesOf(sql.substring(valuesAt + "VALUES".length(), stmtEnd)), null));
++            } else {
++                // INSERT ... SELECT 形态：无 VALUES 子句，语句体从列清单右括号到语句末分号
++                out.add(new Statement(columns, null, sql.substring(parenClose + 1, stmtEnd)));
++            }
++            pos = stmtEnd;
++        }
++        return out;
++    }
++
++    /** 引号感知提取语句体内全部单引号字符串字面量内容 */
++    private static List<String> quotedStrings(String body) {
++        List<String> out = new ArrayList<>();
++        StringBuilder current = new StringBuilder();
++        boolean inQuote = false;
++        for (int i = 0; i < body.length(); i++) {
++            char c = body.charAt(i);
++            if (c == '\'') {
++                if (inQuote) {
++                    out.add(current.toString());
++                    current.setLength(0);
++                }
++                inQuote = !inQuote;
++            } else if (inQuote) {
++                current.append(c);
++            }
++        }
++        return out;
++    }
++
++    /** VALUES 体扫描：收集全部顶层圆括号元组（引号感知），止于语句末分号或文本末尾 */
++    private static List<List<String>> tuplesOf(String body) {
++        List<List<String>> tuples = new ArrayList<>();
++        int depth = 0;
++        int start = -1;
++        boolean inQuote = false;
++        for (int i = 0; i < body.length(); i++) {
++            char c = body.charAt(i);
++            if (c == '\'') {
++                inQuote = !inQuote;
++            } else if (!inQuote) {
++                if (c == '(') {
++                    if (depth == 0) {
++                        start = i + 1;
++                    }
++                    depth++;
++                } else if (c == ')') {
++                    depth--;
++                    if (depth == 0 && start >= 0) {
++                        tuples.add(splitTopLevel(body.substring(start, i)));
++                        start = -1;
++                    }
++                } else if (c == ';' && depth == 0) {
++                    break;
++                }
++            }
++        }
++        return tuples;
++    }
++
++    /** 从 offset 起扫到语句末分号（引号感知） */
++    private static int statementEnd(String sql, int offset) {
++        boolean inQuote = false;
++        for (int i = offset; i < sql.length(); i++) {
++            char c = sql.charAt(i);
++            if (c == '\'') {
++                inQuote = !inQuote;
++            } else if (c == ';' && !inQuote) {
++                return i;
++            }
++        }
++        return sql.length();
++    }
++
++    /** 找匹配右括号（引号感知） */
++    private static int matchingParen(String sql, int openAt) {
++        int depth = 0;
++        boolean inQuote = false;
++        for (int i = openAt; i < sql.length(); i++) {
++            char c = sql.charAt(i);
++            if (c == '\'') {
++                inQuote = !inQuote;
++            } else if (!inQuote) {
++                if (c == '(') {
++                    depth++;
++                } else if (c == ')') {
++                    depth--;
++                    if (depth == 0) {
++                        return i;
++                    }
++                }
++            }
++        }
++        throw new IllegalStateException("括号不匹配 at " + openAt);
++    }
++
++    /** 按顶层逗号切分（引号感知） */
++    private static List<String> splitTopLevel(String text) {
++        List<String> parts = new ArrayList<>();
++        StringBuilder current = new StringBuilder();
++        boolean inQuote = false;
++        for (int i = 0; i < text.length(); i++) {
++            char c = text.charAt(i);
++            if (c == '\'') {
++                inQuote = !inQuote;
++                current.append(c);
++            } else if (c == ',' && !inQuote) {
++                parts.add(current.toString());
++                current.setLength(0);
++            } else {
++                current.append(c);
++            }
++        }
++        parts.add(current.toString());
++        return parts;
++    }
++
++    private static String unquote(String v) {
++        String s = v.strip();
++        if (s.length() >= 2 && s.startsWith("'") && s.endsWith("'")) {
++            return s.substring(1, s.length() - 1);
++        }
++        return "NULL".equalsIgnoreCase(s) ? null : s;
++    }
++
++    /** 收集 net.otlab.admin.module 下全部 @RestController 的 @SaCheckPermission 值（类级+方法级） */
++    private Set<String> collectModuleAnnotatedPerms() throws ClassNotFoundException {
++        ClassPathScanningCandidateComponentProvider scanner =
++                new ClassPathScanningCandidateComponentProvider(false);
++        scanner.addIncludeFilter(new AnnotationTypeFilter(RestController.class));
++        Set<String> perms = new TreeSet<>();
++        int controllers = 0;
++        for (BeanDefinition bd : scanner.findCandidateComponents("net.otlab.admin.module")) {
++            Class<?> clazz = Class.forName(bd.getBeanClassName());
++            controllers++;
++            SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++            if (classLevel != null) {
++                perms.addAll(Arrays.asList(classLevel.value()));
++            }
++            for (Method method : clazz.getDeclaredMethods()) {
++                SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++                if (annotation != null) {
++                    perms.addAll(Arrays.asList(annotation.value()));
++                }
++            }
++        }
++        assertTrue(controllers > 50, "控制器扫描异常偏少（" + controllers + "），扫描基包或类路径不可信");
++        return perms;
++    }
++
++    /** 收集 resources/sql 全量菜单种子的 perms 登记集（01_base + 02_survey + 03_wechat + upgrade/*） */
++    private Set<String> collectRegisteredMenuPerms() throws Exception {
++        Set<String> perms = new TreeSet<>();
++        for (Path script : seedScripts()) {
++            for (MenuRow row : parseMenuRows(Files.readString(script, StandardCharsets.UTF_8), "sys_menu")) {
++                if (row.perms != null && !row.perms.isBlank()) {
++                    perms.add(row.perms);
++                }
++            }
++        }
++        assertTrue(perms.size() > 150, "菜单种子登记集异常偏少（" + perms.size() + "），解析口径不可信");
++        return perms;
++    }
++
++    /** 全部菜单种子脚本：resources/sql/*.sql + resources/sql/upgrade/*.sql */
++    private List<Path> seedScripts() throws Exception {
++        List<Path> scripts = new ArrayList<>();
++        Path root = repoRoot();
++        for (Path dir : List.of(root.resolve("resources/sql"), root.resolve("resources/sql/upgrade"))) {
++            try (java.nio.file.DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.sql")) {
++                for (Path p : stream) {
++                    scripts.add(p);
++                }
++            }
++        }
++        assertTrue(scripts.size() > 30, "种子脚本清单异常偏少（" + scripts.size() + "）");
++        return scripts;
++    }
++
++    /** 从模块目录或仓库根目录向上定位仓库根（照 IotPointMenuPermissionGuardTest 口径） */
++    private Path repoRoot() {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertNotNull(dir, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        return dir;
++    }
++
++    private String readScript(String relative) throws Exception {
++        Path script = repoRoot().resolve(relative);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++
++    /** 反射取指定控制器指定（唯一同名）方法的 @SaCheckPermission 首值（无注解/歧义即断言失败） */
++    private String methodPerm(Class<?> clazz, String methodName) {
++        List<Method> hits = new ArrayList<>();
++        for (Method m : clazz.getDeclaredMethods()) {
++            if (m.getName().equals(methodName)) {
++                hits.add(m);
++            }
++        }
++        assertEquals(1, hits.size(), clazz.getSimpleName() + "#" + methodName + " 方法必须恰一个（防歧义）");
++        SaCheckPermission annotation = hits.get(0).getAnnotation(SaCheckPermission.class);
++        assertNotNull(annotation, clazz.getSimpleName() + "#" + methodName + " 缺 @SaCheckPermission");
++        assertTrue(annotation.value().length >= 1, "@SaCheckPermission 必须声明权限值");
++        return annotation.value()[0];
++    }
++
++    private Set<String> difference(Set<String> minuend, Set<String> subtrahend) {
++        Set<String> out = new LinkedHashSet<>(minuend);
++        out.removeAll(subtrahend);
++        return out;
++    }
++}
+diff --git a/resources/scripts/export-design-perms.py b/resources/scripts/export-design-perms.py
+new file mode 100644
+index 0000000..a9ff2bc
+--- /dev/null
++++ b/resources/scripts/export-design-perms.py
+@@ -0,0 +1,39 @@
++# -*- coding: utf-8 -*-
++"""TASK-0064 权限清单机械导出：详细设计 §3.1/§3.1续（p21-23）接口表权限列。
++
++逐页提取 `iot:` 前缀权限标识（接口表权限列 sys_menu.perms 值），去重排序输出。
++两处 PDF 抽取伪影做机械归一：
++  ① pypdf 连字（conﬁg 的 ﬁ=U+FB01）→ 还原 fi/fl 后再匹配；
++  ② 表格单元格换行把「iot:instance:add / edit / remove」这类共享前缀组合拆行 →
++     以 (iot:base)((?: / suffix)+) 模式展开为完整权限标识逐值输出。
++§3.4/§3.5（p26）为内部令牌 / appKey 鉴权接口，无 sys_menu perms 列，不参与提取。
++用法：python export-design-perms.py <pdf路径> > design-perms.txt
++"""
++import re
++import sys
++
++from pypdf import PdfReader
++
++PDF = sys.argv[1] if len(sys.argv) > 1 else (
++    r"D:/Documents/dowei/2.项目资料/智慧工厂/factory-data-platform-detail-design-v1.1.pdf"
++)
++# §3.1 上=p21、下=p22、续=p23（0 基 20-22）
++PAGES = [20, 21, 22]
++
++reader = PdfReader(PDF)
++perms = set()
++for page in PAGES:
++    text = (reader.pages[page].extract_text() or "")
++    text = text.replace("\ufb01", "fi").replace("\ufb02", "fl")  # 连字还原
++    text = text.replace("\n", " ")  # 表格换行并回单行（斜杠组跨行可匹配）
++    for token in re.findall(r"iot:[a-z0-9_]+(?::[a-z0-9_]+)*", text):
++        perms.add(token)
++    # 共享前缀组合展开：iot:instance:add / edit / remove → 三值（首动作用 base 第二段承载）
++    for resource, first_action, rest in re.findall(
++            r"(iot:[a-z0-9_]+):([a-z0-9_]+)((?:\s*/\s*[a-z0-9_]+)+)", text):
++        perms.add(f"{resource}:{first_action}")
++        for action in re.findall(r"[a-z0-9_]+", rest):
++            perms.add(f"{resource}:{action}")
++
++for p in sorted(perms):
++    print(p)
+diff --git a/resources/scripts/perm-diff-check.sh b/resources/scripts/perm-diff-check.sh
+new file mode 100644
+index 0000000..f26de1b
+--- /dev/null
++++ b/resources/scripts/perm-diff-check.sh
+@@ -0,0 +1,47 @@
++#!/usr/bin/env bash
++# TASK-0064 机械差集比对：设计 §3.1/§3.1续 声明权限位（PDF 导出）vs sys_menu 注册全集。
++# 双源：① resources/sql 全量种子文件 grep ② 现库实态（sql-exec.sh 查询）。
++# 输出：缺注册项（期望空=零缺失）与注册超集（信息项——既有交付的 query/tree 等扩展位）。
++# 命名映射登记：设计 iot:config:{publish,list,rollback} ≡ 在库 iot:publish:{publish,list,rollback}
++#   （TASK-0024 交付命名，1:1 三值映射，机械归一后比对）。
++# 用法：bash resources/scripts/perm-diff-check.sh （仓库根目录执行）
++set -euo pipefail
++export LC_ALL=C
++
++ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
++SQL_EXEC="$ROOT/backend/scripts/sql-exec.sh"
++TMP="$(mktemp -t permdiff.XXXX)"
++trap 'rm -f "$TMP".*' EXIT
++
++# 1) 设计声明清单（PDF 机械提取 + config→publish 命名归一）
++python resources/scripts/export-design-perms.py 2>/dev/null | tr -d '\r' > "$TMP.design.raw"
++sed -e 's/^iot:config:publish$/iot:publish:publish/' \
++    -e 's/^iot:config:list$/iot:publish:list/' \
++    -e 's/^iot:config:rollback$/iot:publish:rollback/' "$TMP.design.raw" | sort -u > "$TMP.design"
++
++# 2a) 种子文件全集（剥 CR；含全部 upgrade 与 base 三件）
++cat "$ROOT"/resources/sql/01_base.sql \
++    "$ROOT"/resources/sql/02_survey.sql \
++    "$ROOT"/resources/sql/03_wechat.sql \
++    "$ROOT"/resources/sql/upgrade/*.sql | tr -d '\r' \
++  | grep -ohE "'[a-z][a-z0-9_]*(:[a-z0-9_*]+){1,}'" | tr -d "'" | sort -u > "$TMP.seedfile"
++
++# 2b) 现库实态（全部非空 perms）
++bash "$SQL_EXEC" "SELECT DISTINCT perms FROM sys_menu WHERE perms IS NOT NULL AND perms <> '' AND deleted=0" \
++  | tr -d '\r' | grep -vE "^(perms|DONE)" | sort -u > "$TMP.db"
++
++sort -u "$TMP.seedfile" "$TMP.db" > "$TMP.registered"
++
++echo "== 设计声明（§3.1/续，归一后）共 $(wc -l < "$TMP.design") 项 =="
++cat "$TMP.design"
++echo
++echo "== 缺注册（设计声明 - 已注册全集）——期望空（零缺失） =="
++MISS=$(comm -23 "$TMP.design" "$TMP.registered")
++if [ -z "$MISS" ]; then echo "(空) —— 零缺失：设计声明权限位 100% 已注册"; else echo "$MISS"; fi
++echo
++echo "== 注册超集（已注册全集 - 设计声明，既有交付扩展位，信息项） =="
++comm -13 "$TMP.design" "$TMP.registered"
++echo
++echo "== 新种子三行现库实态 =="
++bash "$SQL_EXEC" "SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4079 AND 4081"
++bash "$SQL_EXEC" "SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4079 AND 4081"
+diff --git a/resources/sql/upgrade/20261123_iot_permissions_complete.sql b/resources/sql/upgrade/20261123_iot_permissions_complete.sql
+new file mode 100644
+index 0000000..a5f91fc
+--- /dev/null
++++ b/resources/sql/upgrade/20261123_iot_permissions_complete.sql
+@@ -0,0 +1,61 @@
++-- ============================================================
++-- TASK-0064：高危权限点清单注册与菜单种子（机械差集收口）
++-- ============================================================
++-- 用途：从详细设计 §3.1/§3.1续（p21-23）接口表逐行机械提取「路径→权限标识」全清单，与
++--       sys_menu 已注册全集（种子文件 + 现库实态双源，2026-11-23 核对）做机械差集，对差集
++--       三项补注册按钮权限位。§3.4/§3.5 为内部令牌 / appKey 鉴权接口，权限列无 sys_menu
++--       perms 值，不产生本表行（openapi:client:* 管理位已由 TASK-0052 登记 4075-4078）。
++--
++-- 差集三项（本脚本全部内容，幂等增量，既有种子行零触碰）：
++--   4079 点位导入  iot:point:import   （§3.1 p21：POST /api/v1/iot/point/import）挂 4011 点位管理
++--   4080 点位导出  iot:point:export   （§3.1 p21：GET  /api/v1/iot/point/export）挂 4011 点位管理
++--   4081 绑定点位  iot:item:bind      （§3.1 p22：PUT  /api/v1/iot/item/bind）挂 4010 实例管理
++--
++-- 高危单独权限位核验结论（TASK-0064 明文八项）：
++--   公式     → §3.1 p22 权限列即 iot:item:edit（设计未单列），注解实态一致 → 不动；
++--   绑定     → §3.1 p22 单列 iot:item:bind，种子缺失 → 本脚本补注册（4081）；
++--   部门绑定 → §3.1 p22「绑部门在此维护（deptId）」并入实例 CRUD，无独立端点 → 不设独立位；
++--   状态规则 → iot:statusrule:list/add/edit/remove 已注册（4063-4066，TASK-0015）→ 已分离，不动；
++--   阈值     → 设计 §3.1 无独立行（TASK-0036 扩展端点 /iot/item/{itemId}/thresholds 注解
++--              iot:item:edit），设计未单列 → 不动；
++--   发布回滚 → iot:publish:rollback 已注册（4073，TASK-0024）→ 已分离，不动；
++--   凭据     → iot:credential:edit（写/吊销）+ iot:credential:view（解密查看）双分离位已注册
++--              （4051-4052，TASK-0019）→ 已分离，不动；
++--   重算     → §3.4 recalculate 为内部令牌接口（权限列无 perms 值），管理面无对应端点
++--              （一期未建）→ 无可注册对象，登记遗留。
++--
++-- 上游差异登记（注解实态 vs 设计细粒度位）：
++--   绑定/点位导入/点位导出三端点现行 @SaCheckPermission 为粗位复用（iot:item:edit /
++--   iot:point:add / iot:point:list——TASK-0016/0022 交付实态，与既有守卫测试锁定口径一致）；
++--   设计细粒度位由本脚本先行注册，后续注解按设计收紧时零 403 窗口。双向断言由守卫测试
++--   IotPermissionsCompleteGuardTest 锁定（全局注解 ⊆ 种子登记集 + 三行一一对应 + 超管唯一授权）。
++--
++-- 号段登记：
++--   3000 以下为上游框架菜单段（sys_menu AUTO_INCREMENT=3000 口径，01_base.sql）；
++--   4000-4999 为 iot 业务段：4000-4007 租户（TASK-0002/0006）、4017 租户管理员按钮、
++--   4018-4023 字典（TASK-0008）、4024-4029 模板（TASK-0025）、4030-4035 实例（TASK-0020）、
++--   4036-4040 数据项（TASK-0016）、4041-4045 网关（TASK-0017）、4046-4050 通道（TASK-0018）、
++--   4051-4052 凭据（TASK-0019）、4053-4057 点位（TASK-0021）、4058-4062 指标（TASK-0023）、
++--   4063-4069 状态规则（TASK-0015）、4070-4074 配置发布（TASK-0024/0046）、4075-4078 调用方
++--   （TASK-0052）；本脚本占用 4079-4081（现最大编号 4078 后顺延）。
++--
++-- 角色初始化（brief 决策 3）：只注册权限点 + 超管授权（role_id=1，照 0024/0052 范式）；
++--   普通角色零反向授权——普通查看角色默认无配置权，直调新补权限接口由 sa-token 注解天然 403
++--   （dev 冒烟以无对应权限位的查看角色实证，见 TASK-0064 报告）。
++--
++-- 幂等性：INSERT IGNORE，主键/权限重复执行无副作用（0024/0052 同口径）；可重复执行。
++-- 执行：backend/scripts/sql-exec.sh 每条语句单独一次调用（2026-11-23 实测口径）。
++--
++-- 执行后核对：
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4079 AND 4081;  -- 应 3 行
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4079 AND 4081;       -- 应 3 行且全 role_id=1
++-- ============================================================
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4079, 4011, 4, '点位导入', 3, NULL, NULL, NULL, 'iot:point:import', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4080, 4011, 4, '点位导出', 3, NULL, NULL, NULL, 'iot:point:export', NULL, 7, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4081, 4010, 4, '绑定点位', 3, NULL, NULL, NULL, 'iot:item:bind', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4079), (1, 4080), (1, 4081);

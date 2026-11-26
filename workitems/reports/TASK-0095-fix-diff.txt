@@ -1,0 +1,99 @@
+diff --git a/frontend/src/views/iot/metric/components/metric-form-modal.vue b/frontend/src/views/iot/metric/components/metric-form-modal.vue
+index c5a74bd9..2615e844 100644
+--- a/frontend/src/views/iot/metric/components/metric-form-modal.vue
++++ b/frontend/src/views/iot/metric/components/metric-form-modal.vue
+@@ -38,6 +38,7 @@
+           :options="instanceOptions"
+           :disabled="isEdit"
+           placeholder="请选择实例（指标绑定设备，创建后不可改）"
++          @change="onInstanceChange"
+         />
+       </a-form-item>
+       <a-form-item label="来源数据项" name="sourceItemId">
+@@ -203,6 +204,18 @@
+     }
+   }
+ 
++  /**
++   * 实例变更（新增态用户选择 / 编辑态初始化）：按新实例加载数据项下拉选项。
++   * 换实例时旧的数据项引用已失效——清空来源/比值分子分母，避免提交跨实例引用（后端 4001）。
++   * 数据项清单来自 itemApi.queryItemList(instanceId)（真实后端数据）；无实例/无数据项时诚实空态。
++   */
++  async function onInstanceChange(instanceId?) {
++    form.sourceItemId = undefined;
++    form.ratioNumItemId = undefined;
++    form.ratioDenItemId = undefined;
++    await loadItemOptions(instanceId ?? form.instanceId);
++  }
++
+   /**
+    * 父组件 ref 入口：新增传 undefined；编辑传入列表行（含 id）。
+    * 编辑态 metricCode/instanceId 锁定（后端创建后不可改）。
+@@ -299,6 +312,7 @@
+ 
+   defineExpose({
+     showModal,
++    onInstanceChange,
+     validateRatio,
+   });
+ </script>
+diff --git a/frontend/tests/unit/views/iot/metric.spec.ts b/frontend/tests/unit/views/iot/metric.spec.ts
+index 806c977f..00c7e091 100644
+--- a/frontend/tests/unit/views/iot/metric.spec.ts
++++ b/frontend/tests/unit/views/iot/metric.spec.ts
+@@ -179,6 +179,55 @@ describe('指标管理页与表单校验（TASK-0095）', () => {
+     parent.unmount();
+   });
+ 
++  it('新增态选实例后加载数据项下拉，比值型可选分子/分母并成功提交（评审 Important 回归）', async () => {
++    const parent = mount(FormParent, { global: globalOpts });
++    const modalRef = (parent.vm as unknown as { modalRef: ModalRef }).modalRef;
++    const formVm = parent.findComponent(MetricFormModal).vm as unknown as {
++      form: Record<string, unknown>;
++      itemOptions: { label: string; value: number }[];
++    };
++
++    // 新增态：无 rowData；此时数据项下拉应为空（无实例，诚实空态）
++    await modalRef.showModal();
++    await flushPromises();
++    expect(queryItemList).not.toHaveBeenCalled();
++    expect(formVm.itemOptions).toEqual([]);
++
++    // 选中实例 → 应触发按 instanceId 加载数据项（生产路径：a-select @change）
++    formVm.form.instanceId = 1001;
++    const instanceSelect = parent.findComponent(MetricFormModal).findAllComponents({ name: 'ASelect' })[0];
++    instanceSelect.vm.$emit('change', 1001);
++    await flushPromises();
++    expect(queryItemList).toHaveBeenCalledWith(1001);
++    expect(formVm.itemOptions).toEqual([{ label: 'I-001（用电量）', value: 11 }]);
++
++    // 新生态直接配置比值型：分子/分母从已加载选项中取值，提交成功
++    Object.assign(formVm.form, {
++      metricCode: 'INS1_DAY_RATIO',
++      metricName: '日比值',
++      instanceId: 1001,
++      aggType: 5,
++      period: 'DAY',
++      ratioNumItemId: 11,
++      ratioDenItemId: 11,
++    });
++    await nextTick();
++    const submitVm = parent.findComponent(MetricFormModal).vm as unknown as { onSubmit: () => Promise<void> };
++    await submitVm.onSubmit();
++    await flushPromises();
++    expect(addMetric).toHaveBeenCalledTimes(1);
++    expect(addMetric.mock.calls[0][0]).toMatchObject({
++      metricCode: 'INS1_DAY_RATIO',
++      instanceId: 1001,
++      aggType: 5,
++      period: 'DAY',
++      calendarType: 1,
++      ratioNumItemId: 11,
++      ratioDenItemId: 11,
++    });
++    parent.unmount();
++  });
++
+   it('新增提交：calendarType 锁 1，非比值型 ratio_* 置空，metricCode 原样透传', async () => {
+     const parent = mount(FormParent, { global: globalOpts });
+     const modalRef = (parent.vm as unknown as { modalRef: ModalRef }).modalRef;

@@ -1,0 +1,2725 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceController.java
+new file mode 100644
+index 0000000..77d7c3c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceController.java
+@@ -0,0 +1,104 @@
++package net.otlab.admin.module.iot.instance.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceUpdateForm;
++import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.stream.Collectors;
++
++/**
++ * 模型实例控制器（TASK-0012）
++ *
++ * <p>路径命名空间 /iot/instance（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
++ * iot:instance:*（sys_menu 4030-4035，实例管理页 4010 之下，树接口单设权限点
++ * iot:instance:tree）。数据权限裁剪在服务层接线（FEAT-0002 组件首个真实消费方）：
++ * 树无权节点不返回、列表 id ∈ 可见集、详情越权 403（SCOPE_FORBIDDEN 首个消费点）。
++ *
++ * <p>编辑不承载挪树/改编码（instance_code/parent_id/ancestors/node_type/template_id 五字段
++ * 不可改，TD-0010）；删除为真实逻辑删（@TableLogic deleted=1），有子实例时拒绝并提示。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "模型实例")
++@RestController
++@RequestMapping("/iot/instance")
++public class IotModelInstanceController {
++
++    @Autowired
++    private IotModelInstanceService instanceService;
++
++    @Operation(summary = "实例树查询（按数据权限裁剪：无权节点不返回，路径节点仅骨架）")
++    @GetMapping("/tree")
++    @SaCheckPermission("iot:instance:tree")
++    public Result<List<IotInstanceTreeVO>> tree() {
++        return Result.success(instanceService.selectInstanceTree());
++    }
++
++    @Operation(summary = "分页查询实例（数据权限裁剪生效：id ∈ 可见集；createByOnly 空集）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:instance:list")
++    public Result<Page<IotModelInstance>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                               @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                               IotModelInstance query) {
++        Page<IotModelInstance> page = new Page<>(pageNum, pageSize);
++        return Result.success(instanceService.selectInstanceList(page, query));
++    }
++
++    @Operation(summary = "实例详情（数据权限不命中 403——SCOPE_FORBIDDEN 首个消费点）")
++    @GetMapping("/{id}")
++    @SaCheckPermission("iot:instance:query")
++    public Result<IotModelInstance> getById(@PathVariable("id") Long id) {
++        return Result.success(instanceService.getInstanceDetail(id));
++    }
++
++    @OperateLog(title = "模型实例", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增实例（选模板 TD-0008/路径式编码/绑部门；编码重复报 4002）")
++    @PostMapping
++    @SaCheckPermission("iot:instance:add")
++    public Result<Void> add(@Valid @RequestBody IotInstanceCreateForm form) {
++        instanceService.createInstance(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "模型实例", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改实例（编码/父/祖级/类型/模板五字段不可改；锁定后仅 status）")
++    @PutMapping
++    @SaCheckPermission("iot:instance:edit")
++    public Result<Void> edit(@Valid @RequestBody IotInstanceUpdateForm form) {
++        instanceService.updateInstance(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "模型实例", businessType = BusinessType.DELETE)
++    @Operation(summary = "批量删除实例（逻辑删；有子实例拒绝并提示子实例编码）")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:instance:remove")
++    public Result<Void> remove(@PathVariable("ids") String ids) {
++        instanceService.deleteInstances(parseIds(ids));
++        return Result.success();
++    }
++
++    /** 逗号分隔 id 路径参数解析（照框架批量删除口径，空白段剔除） */
++    private List<Long> parseIds(String ids) {
++        return Arrays.stream(ids.split(","))
++                .map(String::trim)
++                .filter(s -> !s.isEmpty())
++                .map(Long::valueOf)
++                .collect(Collectors.toList());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceCreateForm.java
+new file mode 100644
+index 0000000..272345f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceCreateForm.java
+@@ -0,0 +1,65 @@
++package net.otlab.admin.module.iot.instance.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 实例创建请求表单（TASK-0012，路径式编码语义）
++ *
++ * <p><b>请求只传本级短码</b>（shortCode）：服务层拼 {@code 父.instance_code + "." + shortCode}
++ * 为全码（顶级实例直接以 shortCode 为全码）——路径式编码（详细设计 §1.5，REQ-0005 核心规则）。
++ * 短码字符集 [A-Za-z0-9_]（防 "." 路径分隔符注入编码体系）；全码长度上限 96（DB varchar(96)）。
++ *
++ * <p>选模板语义（TD-0008，ADR-0011）：node_type=4 设备 / 5 组件时 template_id 必填，且模板
++ * 存在、status=1、模板 node_type 与实例 node_type 一致（REQ-0004 验收 5）；node_type=1 工厂 /
++ * 2 车间时 template_id 可空（纯组织节点，§1.5 口径）；3 产线可选。
++ *
++ * <p>绑部门（ADR-0016 开放点 10 归本任务服务层）：node_type=1/2 时 dept_id 必填（数据权限
++ * 锚点）；设备/组件级可空（可从模板实例生成链继承，归 TASK-0013）。
++ *
++ * <p>表单无 remark 字段——iot_model_instance 附录 A p31 逐字 DDL 无 remark 列（0011 建库），
++ * brief「remark 类」按库内实际可变集落地（离计划处登记见任务报告）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "实例创建表单（请求只传本级短码，服务层拼路径式全码）")
++public class IotInstanceCreateForm {
++
++    @NotBlank(message = "本级短码不能为空")
++    @Pattern(regexp = "[A-Za-z0-9_]+", message = "本级短码仅允许字母/数字/下划线")
++    @Schema(description = "本级短码（[A-Za-z0-9_]；服务层拼父全码+\".\"+短码为全码）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String shortCode;
++
++    @NotBlank(message = "实例名称不能为空")
++    @Size(max = 100, message = "实例名称长度不能超过 100")
++    @Schema(description = "实例名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String instanceName;
++
++    @Schema(description = "父实例ID（null/0 = 顶级实例）")
++    private Long parentId;
++
++    @NotNull(message = "节点类型不能为空")
++    @Min(value = 1, message = "节点类型仅允许 1-5")
++    @Max(value = 5, message = "节点类型仅允许 1-5")
++    @Schema(description = "节点类型：1 工厂 2 车间 3 产线 4 设备 5 组件",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer nodeType;
++
++    @Schema(description = "来源模板ID（设备/组件级必填，TD-0008；工厂/车间级可空；产线可选）")
++    private Long templateId;
++
++    @Schema(description = "绑定部门ID（工厂/车间级必填，数据权限锚点）")
++    private Long deptId;
++
++    @Schema(description = "同级排序（未携带落库默认 0）")
++    private Integer sort;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceTreeVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceTreeVO.java
+new file mode 100644
+index 0000000..9c82ec1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceTreeVO.java
+@@ -0,0 +1,84 @@
++package net.otlab.admin.module.iot.instance.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * 实例树节点 VO（TASK-0012，GET /iot/instance/tree 返回结构）
++ *
++ * <p>树按数据权限裁剪（FEAT-0002 组件 resolve() → VisibleScope）：allTenant 全树；受限用户
++ * 只见可见集节点及其到根的路径骨架（无权兄弟节点不返回——REQ-0002 验收「实例树接口无权节点
++ * 不返回」）；createByOnly 按空树返回（实例树属数据查询语义，ADR-0016 裁决 3/4）。
++ *
++ * <p>禁用节点照常返回（status 字段携带，禁用语义由展示层与数据项停算承接——REQ-0005
++ * 「禁用节点其下数据项停止计算、历史数据保留」）；同级排序 sort 升序。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@Schema(description = "实例树节点（按数据权限裁剪后的子树）")
++public class IotInstanceTreeVO {
++
++    @Schema(description = "实例ID")
++    private Long id;
++
++    @Schema(description = "父实例ID，顶级为 0")
++    private Long parentId;
++
++    @Schema(description = "祖级路径（逗号分隔 ID，仿 sys_dept.ancestors）")
++    private String ancestors;
++
++    @Schema(description = "实例编码（租户内唯一，路径式 F01、F01.WS01、F01.WS01.EQ001）")
++    private String instanceCode;
++
++    @Schema(description = "实例名称")
++    private String instanceName;
++
++    @Schema(description = "节点类型：1 工厂 2 车间 3 产线 4 设备 5 组件")
++    private Integer nodeType;
++
++    @Schema(description = "来源模板ID（组织节点为 null）")
++    private Long templateId;
++
++    @Schema(description = "已应用的模板版本（未选模板为 null）")
++    private Integer appliedTemplateVersion;
++
++    @Schema(description = "绑定部门ID（数据权限锚点，工厂/车间级必填）")
++    private Long deptId;
++
++    @Schema(description = "同级排序")
++    private Integer sort;
++
++    @Schema(description = "状态 0 禁用 1 启用（禁用节点照常返回）")
++    private Integer status;
++
++    @Schema(description = "实例锁定 0 未锁 1 已锁")
++    private Integer locked;
++
++    @Schema(description = "子节点（同级按 sort 升序）")
++    private List<IotInstanceTreeVO> children = new ArrayList<>();
++
++    public static IotInstanceTreeVO from(IotModelInstance entity) {
++        IotInstanceTreeVO vo = new IotInstanceTreeVO();
++        vo.setId(entity.getId());
++        vo.setParentId(entity.getParentId());
++        vo.setAncestors(entity.getAncestors());
++        vo.setInstanceCode(entity.getInstanceCode());
++        vo.setInstanceName(entity.getInstanceName());
++        vo.setNodeType(entity.getNodeType());
++        vo.setTemplateId(entity.getTemplateId());
++        vo.setAppliedTemplateVersion(entity.getAppliedTemplateVersion());
++        vo.setDeptId(entity.getDeptId());
++        vo.setSort(entity.getSort());
++        vo.setStatus(entity.getStatus());
++        vo.setLocked(entity.getLocked());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceUpdateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceUpdateForm.java
+new file mode 100644
+index 0000000..c2f1bd5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/dto/IotInstanceUpdateForm.java
+@@ -0,0 +1,61 @@
++package net.otlab.admin.module.iot.instance.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 实例编辑请求表单（TASK-0012）
++ *
++ * <p><b>不可变五字段</b>（TD-0010 挪树一期禁止 + 一期不开放改编码，ADR-0011）：instance_code /
++ * parent_id / ancestors / node_type / template_id 创建后不可改——改父即改全键前缀、改编码=改全键。
++ * 本表单允许<b>携带</b>这五字段（前端回显场景），服务层校验「与库中一致」：携带不一致一律拒绝；
++ * 未携带（null）不参与校验。ancestors 由服务层维护，请求携带值仅用于一致性核对。
++ *
++ * <p>可变字段白名单：instanceName / deptId / sort / status（iot_model_instance 附录 A p31 逐字
++ * DDL 无 remark 列，brief「instanceName/deptId/sort/status/remark 类」按库内实际可变集落地）；
++ * <b>锁定语义</b>（REQ-0005）：locked=1 时仅允许 status（其余字段携带且与库中不一致即拒绝）。
++ *
++ * <p>更新走字段白名单构建（不直接 updateById 请求实体，杜绝 mass assignment）：审计字段由
++ * MetaObjectHandler 回填、tenant_id 不进更新集、id 为路由主键。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "实例编辑表单（编码/父/祖级/类型/模板五字段不可改；锁定后仅 status/remark 可变）")
++public class IotInstanceUpdateForm {
++
++    @NotNull(message = "实例ID不能为空")
++    @Schema(description = "实例ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long id;
++
++    @Schema(description = "实例编码（仅作一致性核对：携带不一致即拒，创建后不可改）")
++    private String instanceCode;
++
++    @Schema(description = "父实例ID（仅作一致性核对：携带不一致即拒，挪树一期禁止）")
++    private Long parentId;
++
++    @Schema(description = "祖级路径（仅作一致性核对：携带不一致即拒，服务层维护）")
++    private String ancestors;
++
++    @Schema(description = "节点类型（仅作一致性核对：携带不一致即拒）")
++    private Integer nodeType;
++
++    @Schema(description = "来源模板ID（仅作一致性核对：携带不一致即拒）")
++    private Long templateId;
++
++    @Size(max = 100, message = "实例名称长度不能超过 100")
++    @Schema(description = "实例名称（锁定后不可变）")
++    private String instanceName;
++
++    @Schema(description = "绑定部门ID（锁定后不可变；携带时校验部门存在且启用）")
++    private Long deptId;
++
++    @Schema(description = "同级排序（锁定后不可变）")
++    private Integer sort;
++
++    @Schema(description = "状态 0 禁用 1 启用")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeMapper.java
+new file mode 100644
+index 0000000..8431991
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeMapper.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.instance.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 实例编码占用旁路 Mapper（TASK-0012，uk_tenant_instance_code 双道闸第一道预检专用）。
++ *
++ * <p><b>含已删行</b>：uk_tenant_instance_code 为 (tenant_id, instance_code) 物理唯一索引、
++ * 不含 deleted 列，逻辑删行仍占用编码且无任何 API 途径复活/清除（编码不复用纪律，与字典/
++ * 租户/模板数据项域同款）——预检若只看活跃行（@TableLogic 过滤），重存同码必撞物理索引
++ * 且被误报为瞬态并发冲突。故本方法绕过 @TableLogic（原生 @Select 不过逻辑删注入）返回
++ * 占用行的 deleted 标记，由调用方区分文案（0011 修订轮 I-1 同款口径）。
++ *
++ * <p>旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}，照 TASK-0002 三处旁路
++ * 与 0011 IotDataItemTemplateMapper.selectByTemplateAndCodes 的显式条件范式）：显式条件为
++ * tenant_id + instance_code——tenant_id 显式取会话租户（调用方传入），预检语义与物理唯一
++ * 索引的作用域 (tenant_id, instance_code) 精确一致。
++ *
++ * <p>调用方保证 codes 非空（空集走调用方短路，不发 IN ()）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotInstanceCodeMapper {
++
++    /**
++     * 按 (tenant_id, instance_code) 显式查占用行（含已删行，携带 deleted 标记）
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param codes    待预检全码集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, instance_code, deleted FROM iot_model_instance "
++            + "WHERE tenant_id = #{tenantId} AND instance_code IN "
++            + "<foreach collection='codes' item='code' open='(' separator=',' close=')'>#{code}</foreach>"
++            + "</script>")
++    List<IotInstanceCodeRow> selectOccupiedByCodes(@Param("tenantId") Long tenantId,
++                                                   @Param("codes") Collection<String> codes);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeRow.java
+new file mode 100644
+index 0000000..2f6a0f0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/mapper/IotInstanceCodeRow.java
+@@ -0,0 +1,23 @@
++package net.otlab.admin.module.iot.instance.mapper;
++
++import lombok.Data;
++
++/**
++ * 实例编码占用行（uk_tenant_instance_code 双道闸预检的旁路查询结果行，TASK-0012）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、编码、deleted 标记——deleted=1 为逻辑删行
++ * （uk_tenant_instance_code 物理唯一索引不含 deleted 列，逻辑删行永久占用编码），
++ * 调用方据此区分「已存在」/「已被删除记录占用，不可复用」文案（0011 修订轮 I-1 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotInstanceCodeRow {
++
++    private Long id;
++
++    private String instanceCode;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/IotModelInstanceService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/IotModelInstanceService.java
+new file mode 100644
+index 0000000..bd2bfd7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/IotModelInstanceService.java
+@@ -0,0 +1,90 @@
++package net.otlab.admin.module.iot.instance.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceUpdateForm;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++
++import java.util.List;
++
++/**
++ * 模型实例服务接口（TASK-0012，详细设计 §1.5 / §3.1 p22 / REQ-0005）
++ *
++ * <p>一棵租户内模型树（工厂 &gt; 车间 &gt; 产线可选 &gt; 设备 &gt; 组件）是一切配置的载体
++ * 与数据权限锚点——每个实例绑一个部门，可见范围最终翻译为可见实例集合（FEAT-0002 组件）。
++ * 创建走选模板（TD-0008）+ 路径式编码（请求只传本级短码，服务层拼父全码）+ ancestors
++ * 维护 + 绑部门；编码/父/祖级/类型/模板五字段创建后不可改（TD-0010 挪树一期禁止）；
++ * 树查询按数据权限裁剪（无权节点不返回）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotModelInstanceService {
++
++    /**
++     * 创建实例（路径式编码 / 选模板 / 绑部门）。
++     *
++     * <p>短码字符集 [A-Za-z0-9_]（防路径分隔符注入编码体系）；全码 = 父.instance_code +
++     * "." + 短码（顶级直接以短码为全码），长度上限 96；uk_tenant_instance_code 双道闸 4002
++     * （含已删行预检 + DuplicateKeyException 兜底，0011 修订轮口径同款）。
++     *
++     * @param form 创建表单（请求只传本级短码）
++     * @return 是否成功
++     */
++    boolean createInstance(IotInstanceCreateForm form);
++
++    /**
++     * 编辑实例（白名单 instanceName/deptId/sort/status——iot_model_instance 附录 A p31 逐字
++     * DDL 无 remark 列，brief「instanceName/deptId/sort/status/remark 类」按库内实际可变集落地）。
++     *
++     * <p>instance_code/parent_id/ancestors/node_type/template_id 五字段不可改（请求携带
++     * 不一致一律拒绝）；locked=1 时仅允许 status（REQ-0005 锁定口径按库内可变集收窄）。
++     *
++     * @param form 编辑表单
++     * @return 是否成功
++     */
++    boolean updateInstance(IotInstanceUpdateForm form);
++
++    /**
++     * 批量删除实例（逻辑删）。
++     *
++     * <p>有子实例（parent_id 引用）拒绝并提示子实例编码；实例数据项引用保护归 TASK-0013
++     * 交付后自然生效（一期该计数恒 0）；批内缺失 fail-closed 整批拒绝。
++     *
++     * @param ids 实例 id 列表
++     * @return 是否成功
++     */
++    boolean deleteInstances(List<Long> ids);
++
++    /**
++     * 实例树查询（按数据权限裁剪——本任务核心接线）。
++     *
++     * <p>调 DataPermService.resolve(当前用户) → VisibleScope：allTenant 返回全树；否则只保留
++     * instanceIds 集合内的节点及其到根的路径节点（路径节点仅作骨架展示，无权兄弟节点不返回）；
++     * createByOnly 按空树返回（实例树属数据查询语义，ADR-0016 裁决 3/4）。实现在服务层做
++     * 内存裁剪（全树一次查出后按可见集过滤），同级 sort 升序；禁用节点照常返回。
++     *
++     * @return 裁剪后的树（可能为空树）
++     */
++    List<IotInstanceTreeVO> selectInstanceTree();
++
++    /**
++     * 分页查询实例（数据权限裁剪同样生效——§3.1 未标注接口走 §4 过滤：id ∈ 可见集）。
++     *
++     * <p>brief 口径：createByOnly → 空集（与树查询同一数据查询语义，不做 OR create_by 分支）。
++     *
++     * @param page  分页参数
++     * @param query 过滤条件（instanceCode/instanceName 模糊，nodeType/status/deptId 精确）
++     * @return 分页结果
++     */
++    Page<IotModelInstance> selectInstanceList(Page<IotModelInstance> page, IotModelInstance query);
++
++    /**
++     * 实例详情（详情类 403 语义——ADR-0016 裁决 2，SCOPE_FORBIDDEN 常量首个真实消费点）。
++     *
++     * @param id 实例 id
++     * @return 实例实体；数据权限不命中抛 403
++     */
++    IotModelInstance getInstanceDetail(Long id);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+new file mode 100644
+index 0000000..d38a063
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+@@ -0,0 +1,566 @@
++package net.otlab.admin.module.iot.instance.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataperm.DataPermAccessStrategy;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceUpdateForm;
++import net.otlab.admin.module.iot.instance.mapper.IotInstanceCodeMapper;
++import net.otlab.admin.module.iot.instance.mapper.IotInstanceCodeRow;
++import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++
++/**
++ * 模型实例服务实现类（TASK-0012，数据权限组件首个真实消费方）
++ *
++ * <p><b>路径式编码</b>（详细设计 §1.5，REQ-0005 核心规则）：请求只传本级短码（字符集
++ * [A-Za-z0-9_]，防 "." 路径分隔符注入编码体系），服务层拼 {@code 父.instance_code + "." +
++ * 短码} 为全码（顶级实例直接以短码为全码）；全码长度上限 96（uk_tenant_instance_code 落在
++ * varchar(96)）。编码唯一性双道闸 4002：先经含已删行旁路（{@link IotInstanceCodeMapper}，
++ * 0011 修订轮 I-1 口径同款——uk 不含 deleted 列，逻辑删行永久占用编码）预检，再捕获
++ * {@link DuplicateKeyException} 兜底真实并发窗口。
++ *
++ * <p><b>ancestors 维护</b>仿 sys_dept（SysDeptServiceImpl.resolveAncestors 范式）：
++ * 顶级="0"，其余=父.ancestors + "," + parentId；子树展开靠前缀匹配不递归查库。
++ * <b>防环结构性成立</b>：创建时父实例必须是已存在的活跃节点（自身 id 未产生、其子孙不存在，
++ * 不可能挂到自身或自身子孙下）；编辑一律禁止改父（TD-0010 挪树一期禁止——改父即改全键前缀，
++ * 设备搬迁走「旧节点停用、新节点重建、历史留旧键可查」承接），防环校验随挪树禁止而闭环
++ * （REQ-0005 验收 6）。
++ *
++ * <p><b>选模板语义</b>（TD-0008，ADR-0011）：设备/组件级 template_id 必填且模板存在、
++ * status=1、模板 node_type 与实例 node_type 一致（REQ-0004 验收 5）；工厂/车间级可空
++ * （纯组织节点）；产线可选。applied_template_version 创建时=模板当前 version（选了模板时），
++ * 模板升版实例不自动跟随（REQ-0005 版本锁定口径）；locked 创建时=0。
++ *
++ * <p><b>绑部门</b>（ADR-0016 开放点 10 归本任务服务层）：工厂/车间级 dept_id 必填（数据
++ * 权限锚点）；携带时校验部门存在、启用、同租户（sys_dept 在多租户插件覆盖表清单内，
++ * selectById 注入会话租户条件即同租户保证）；设备/组件级可空（可从模板实例生成链继承，
++ * 归 TASK-0013）。
++ *
++ * <p><b>树裁剪接线</b>（本任务核心，FEAT-0002 组件首个真实消费方）：resolve(当前用户) →
++ * VisibleScope——allTenant 全树；受限用户只保留可见集节点及其到根的路径骨架（无权兄弟节点
++ * 不返回）；createByOnly 按空树返回（实例树属数据查询语义，ADR-0016 裁决 3/4）。列表同样
++ * 裁剪（id ∈ 可见集，brief 口径 createByOnly → 空集）；详情按裁决 2 走详情类 403
++ * （{@link DataPermAccessStrategy.DenyStrategy#SCOPE_FORBIDDEN} 首个真实消费点）。
++ *
++ * <p>字段白名单：新增/更新均不直接落请求实体——status 创建时强制 1、locked 创建时强制 0、
++ * tenant_id 会话覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经 API 注入；更新仅
++ * instanceName/deptId/sort/status 可变（表无 remark 列，brief「remark 类」按库内实际可变集
++ * 落地），杜绝 mass assignment。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMapper, IotModelInstance> implements IotModelInstanceService {
++
++    /** varchar 限长口径（与 iot_model_instance DDL 一致；表无 remark 列） */
++    private static final int MAX_LEN_INSTANCE_CODE = 96;
++    private static final int MAX_LEN_INSTANCE_NAME = 100;
++
++    /** node_type 值域（与表单 @Min/@Max 一致：1 工厂 2 车间 3 产线 4 设备 5 组件） */
++    private static final int NODE_TYPE_MIN = 1;
++    private static final int NODE_TYPE_MAX = 5;
++    private static final int NODE_TYPE_FACTORY = 1;
++    private static final int NODE_TYPE_WORKSHOP = 2;
++    private static final int NODE_TYPE_DEVICE = 4;
++    private static final int NODE_TYPE_COMPONENT = 5;
++
++    /** 本级短码字符集（防 "." 路径分隔符注入编码体系；与创建表单 @Pattern 一致） */
++    private static final String SHORT_CODE_PATTERN = "[A-Za-z0-9_]+";
++
++    /** 引用来源提示最多列出的编码数（超出以「等 N 个」汇总，防消息过长） */
++    private static final int MAX_REF_SOURCES_DISPLAYED = 5;
++
++    @Autowired
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Autowired
++    private IotInstanceCodeMapper instanceCodeMapper;
++
++    @Autowired
++    private SysDeptMapper deptMapper;
++
++    @Autowired
++    private DataPermService dataPermService;
++
++    // ---------- 创建 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createInstance(IotInstanceCreateForm form) {
++        validateNodeType(form.getNodeType());
++        if (isOverLength(form.getInstanceName(), MAX_LEN_INSTANCE_NAME)) {
++            throw paramError("实例名称超长（上限 100）");
++        }
++        if (!form.getShortCode().matches(SHORT_CODE_PATTERN)) {
++            throw paramError("本级短码仅允许字母/数字/下划线: " + form.getShortCode());
++        }
++
++        // 父实例解析与校验（顶级 parentId=null/0）：存在性/同租户（插件注入）/status=1；
++        // 同步维护 ancestors（仿 sys_dept）与全码长度预检
++        IotModelInstance parent = resolveParent(form.getParentId());
++        String fullCode = buildFullCode(parent, form.getShortCode());
++
++        // 选模板语义（TD-0008）：设备/组件必填，模板存在、启用、node_type 一致
++        IotModelTemplate template = resolveTemplate(form.getTemplateId(), form.getNodeType());
++
++        // 绑部门（ADR-0016 开放点 10）：工厂/车间必填；携带时校验部门存在且启用
++        validateDeptForCreate(form.getDeptId(), form.getNodeType());
++
++        // 字段白名单构建新增实体（照 IotModelTemplateServiceImpl.insertTemplate 范式）：
++        // 1) status 强制 1：新建实例一律启用（启停走编辑接口）；
++        // 2) locked 强制 0 / applied_template_version=模板当前 version（选了模板时）；
++        // 3) id / 审计字段不复制（框架自增 + MetaObjectHandler 回填）；
++        // 4) tenant_id 服务层从会话覆盖（插件对 iot_ 前缀表 INSERT 自动补列与会话租户同值，
++        //    双保险口径同模板域）。
++        IotModelInstance entity = new IotModelInstance();
++        entity.setInstanceCode(fullCode);
++        entity.setInstanceName(form.getInstanceName());
++        entity.setTemplateId(template != null ? template.getId() : null);
++        entity.setParentId(parent != null ? parent.getId() : 0L);
++        entity.setAncestors(resolveAncestors(parent));
++        entity.setNodeType(form.getNodeType());
++        entity.setDeptId(form.getDeptId());
++        entity.setSort(form.getSort() != null ? form.getSort() : 0);
++        entity.setStatus(1);
++        entity.setAppliedTemplateVersion(template != null ? template.getVersion() : null);
++        entity.setLocked(0);
++        entity.setTenantId(TenantContext.getTenantId());
++
++        // 双道闸第一道：含已删行占用预检（uk_tenant_instance_code 不含 deleted 列，
++        // 逻辑删行永久占用编码——文案区分活跃行「已存在」/已删行「已被删除记录占用」）
++        Long tenantId = TenantContext.getTenantId();
++        List<IotInstanceCodeRow> occupied = instanceCodeMapper.selectOccupiedByCodes(tenantId, List.of(fullCode));
++        if (!occupied.isEmpty()) {
++            throw duplicateInstanceCode(occupied.get(0));
++        }
++        try {
++            return this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的真实并发插入窗口（物理唯一索引；重存同码撞已删行
++            // 场景已在预检拦截，不会走到此处）
++            throw duplicateCode4002("实例编码已存在: " + fullCode);
++        }
++    }
++
++    /**
++     * 父实例解析：parentId null/0 → 顶级（返回 null）；否则按 id 查活跃行（多租户插件注入
++     * 会话租户条件即同租户保证），不存在或禁用即拒绝（防御脏 parentId 直调接口）
++     */
++    private IotModelInstance resolveParent(Long parentId) {
++        if (parentId == null || parentId == 0L) {
++            return null;
++        }
++        IotModelInstance parent = this.getById(parentId);
++        if (parent == null) {
++            throw paramError("父实例不存在或已删除: " + parentId);
++        }
++        if (parent.getStatus() == null || parent.getStatus() != 1) {
++            throw paramError("父实例已禁用，禁止挂载子实例: " + parent.getInstanceCode());
++        }
++        return parent;
++    }
++
++    /** 拼路径式全码：父.instance_code + "." + 短码；顶级直接用短码；超长即拒（varchar(96)） */
++    private String buildFullCode(IotModelInstance parent, String shortCode) {
++        String fullCode = parent == null ? shortCode : parent.getInstanceCode() + "." + shortCode;
++        if (fullCode.length() > MAX_LEN_INSTANCE_CODE) {
++            throw paramError("实例编码全码超长（上限 " + MAX_LEN_INSTANCE_CODE + " 字符）: " + fullCode);
++        }
++        return fullCode;
++    }
++
++    /**
++     * 选模板语义（TD-0008）：设备/组件级 template_id 必填；携带时模板存在（多租户插件注入
++     * 会话租户条件）、status=1、模板 node_type 与实例 node_type 一致（REQ-0004 验收 5：
++     * 空压机模板只能建设备级实例）
++     */
++    private IotModelTemplate resolveTemplate(Long templateId, Integer nodeType) {
++        if (templateId == null) {
++            if (nodeType == NODE_TYPE_DEVICE || nodeType == NODE_TYPE_COMPONENT) {
++                throw paramError("设备/组件级实例必须选择模板（TD-0008 强制选模板）");
++            }
++            return null;
++        }
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("模板不存在或已删除: " + templateId);
++        }
++        if (template.getStatus() == null || template.getStatus() != 1) {
++            throw paramError("模板已禁用，不可用于创建实例: " + template.getTemplateCode());
++        }
++        if (!template.getNodeType().equals(nodeType)) {
++            throw paramError("模板节点类型与实例不一致（模板 " + template.getTemplateCode()
++                    + " node_type=" + template.getNodeType() + "，实例 node_type=" + nodeType
++                    + "）——设备级模板只能建设备级实例");
++        }
++        return template;
++    }
++
++    /**
++     * 绑部门校验（创建）：工厂/车间级 dept_id 必填（数据权限锚点必填，ADR-0016 开放点 10
++     * 归本任务服务层）；携带时校验部门存在且启用（sys_dept 在多租户插件覆盖表清单内，
++     * selectById 注入会话租户条件即同租户保证）。设备/组件级可空（继承链归 TASK-0013）
++     */
++    private void validateDeptForCreate(Long deptId, Integer nodeType) {
++        if (deptId == null) {
++            if (nodeType == NODE_TYPE_FACTORY || nodeType == NODE_TYPE_WORKSHOP) {
++                throw paramError("工厂/车间级实例必须绑定部门（数据权限锚点必填）");
++            }
++            return;
++        }
++        SysDept dept = deptMapper.selectById(deptId);
++        if (dept == null) {
++            throw paramError("部门不存在或已删除: " + deptId);
++        }
++        if (dept.getStatus() == null || dept.getStatus() != 1) {
++            throw paramError("部门已禁用: " + dept.getDeptName());
++        }
++    }
++
++    /** 解析祖级列表：顶级（无父）为 "0"，其余为 "父 ancestors,父 id"（仿 SysDeptServiceImpl） */
++    private String resolveAncestors(IotModelInstance parent) {
++        if (parent == null) {
++            return "0";
++        }
++        return (parent.getAncestors() == null ? "0" : parent.getAncestors()) + "," + parent.getId();
++    }
++
++    // ---------- 编辑 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateInstance(IotInstanceUpdateForm form) {
++        IotModelInstance existing = this.getById(form.getId());
++        if (existing == null) {
++            throw paramError("实例不存在或已删除");
++        }
++        validateImmutability(form, existing);
++
++        if (form.getStatus() != null && form.getStatus() != 0 && form.getStatus() != 1) {
++            throw paramError("实例状态仅允许 0 禁用 / 1 启用");
++        }
++        if (isOverLength(form.getInstanceName(), MAX_LEN_INSTANCE_NAME)) {
++            throw paramError("实例名称超长（上限 100）");
++        }
++
++        // 锁定语义（REQ-0005，按库内可变集收窄：表无 remark 列）：locked=1 时编辑仅允许
++        // status——其余可变字段携带且与库中不一致即拒绝（携带同值为 no-op 不拦）
++        boolean locked = existing.getLocked() != null && existing.getLocked() == 1;
++        if (locked) {
++            if (form.getInstanceName() != null && !form.getInstanceName().equals(existing.getInstanceName())) {
++                throw paramError("实例已锁定，仅允许修改状态");
++            }
++            if (form.getDeptId() != null && !form.getDeptId().equals(existing.getDeptId())) {
++                throw paramError("实例已锁定，仅允许修改状态");
++            }
++            if (form.getSort() != null && !form.getSort().equals(existing.getSort())) {
++                throw paramError("实例已锁定，仅允许修改状态");
++            }
++        } else if (form.getDeptId() != null) {
++            // 部门变更校验（存在且启用；sys_dept 在插件覆盖表清单内即同租户保证）
++            SysDept dept = deptMapper.selectById(form.getDeptId());
++            if (dept == null) {
++                throw paramError("部门不存在或已删除: " + form.getDeptId());
++            }
++            if (dept.getStatus() == null || dept.getStatus() != 1) {
++                throw paramError("部门已禁用: " + dept.getDeptName());
++            }
++        }
++
++        // 字段白名单构建更新（不可变字段不回写、连 no-op 都不进 SET；null 不进更新集，
++        // MP 自动跳过保持库内原值）：仅 instanceName/deptId/sort/status 可变
++        IotModelInstance upd = new IotModelInstance();
++        upd.setId(existing.getId());
++        upd.setInstanceName(form.getInstanceName());
++        upd.setDeptId(form.getDeptId());
++        upd.setSort(form.getSort());
++        upd.setStatus(form.getStatus());
++        return this.updateById(upd);
++    }
++
++    /**
++     * 不可变五字段校验（TD-0010 挪树一期禁止 + 一期不开放改编码）：instance_code/parent_id/
++     * ancestors/node_type/template_id 请求携带不一致一律拒绝——改父即改全键前缀、改编码=改全键
++     * （须专门流程并同步 TDengine 标签，一期不开放）；ancestors 服务层维护，请求携带仅核对。
++     * 防环（REQ-0005 验收 6「节点不能挂到自身子孙下」）随「任何改父均拒」闭环。
++     */
++    private void validateImmutability(IotInstanceUpdateForm form, IotModelInstance existing) {
++        if (form.getInstanceCode() != null && !form.getInstanceCode().equals(existing.getInstanceCode())) {
++            throw paramError("实例编码不允许修改: " + existing.getInstanceCode());
++        }
++        if (form.getParentId() != null && !form.getParentId().equals(existing.getParentId())) {
++            throw paramError("父实例不允许修改（挪树一期禁止，TD-0010）");
++        }
++        if (form.getAncestors() != null && !form.getAncestors().equals(existing.getAncestors())) {
++            throw paramError("祖级路径不允许修改（服务层维护）");
++        }
++        if (form.getNodeType() != null && !form.getNodeType().equals(existing.getNodeType())) {
++            throw paramError("节点类型不允许修改");
++        }
++        if (form.getTemplateId() != null && !form.getTemplateId().equals(existing.getTemplateId())) {
++            throw paramError("来源模板不允许修改");
++        }
++    }
++
++    // ---------- 删除 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteInstances(List<Long> ids) {
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要删除的实例");
++        }
++        // fail-closed：批内全部 id 必须存在且活跃（@TableLogic 过滤已删行），缺失即整批拒绝（不半删）
++        List<IotModelInstance> existingList = this.listByIds(ids);
++        if (existingList.size() < ids.size()) {
++            Map<Long, IotModelInstance> found = existingList.stream()
++                    .collect(Collectors.toMap(IotModelInstance::getId, Function.identity()));
++            List<Long> missing = ids.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("实例不存在或已删除: " + missing);
++        }
++
++        // 子实例保护：有子实例（parent_id 引用）→ 拒并提示子实例编码（fail-closed，防孤儿节点）
++        List<IotModelInstance> children = this.list(new LambdaQueryWrapper<IotModelInstance>()
++                .select(IotModelInstance::getId, IotModelInstance::getInstanceCode)
++                .in(IotModelInstance::getParentId, ids));
++        if (!children.isEmpty()) {
++            List<String> childCodes = children.stream()
++                    .map(IotModelInstance::getInstanceCode)
++                    .collect(Collectors.toList());
++            throw paramError("存在子实例，禁止删除（子实例: " + joinLimit(childCodes) + "）");
++        }
++
++        // 实例数据项引用保护：iot_data_item 表与其生成链归 TASK-0013 交付——届时此处接线
++        // 引用计数查询即自然生效；一期该表不存在、计数恒 0，不构成拒绝路径（brief 口径）。
++        // 无引用：逻辑删（@TableLogic，deleted=1）
++        return this.removeByIds(ids);
++    }
++
++    // ---------- 树查询（数据权限裁剪——本任务核心） ----------
++
++    @Override
++    public List<IotInstanceTreeVO> selectInstanceTree() {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++
++        // createByOnly：实例树属数据查询语义 → 空树（ADR-0016 裁决 3/4：仅本人对数据类=空集；
++        // 可见集为空（无锚点命中/超限截断后空集）同口径短路，不查库）
++        if (!scope.allTenant() && (scope.createByOnly() || scope.instanceIds().isEmpty())) {
++            return List.of();
++        }
++
++        // 全树一次查出后按可见集内存过滤（brief 口径；多租户条件由插件注入，deleted 由
++        // @TableLogic 运行时过滤）；同级 sort 升序、id 升序保稳定序
++        List<IotModelInstance> all = this.list(new LambdaQueryWrapper<IotModelInstance>()
++                .orderByAsc(IotModelInstance::getSort)
++                .orderByAsc(IotModelInstance::getId));
++        if (all.isEmpty()) {
++            return List.of();
++        }
++
++        List<IotModelInstance> kept;
++        if (scope.allTenant()) {
++            kept = all;
++        } else {
++            // 只保留可见集节点及其到根的路径节点：路径节点仅作骨架展示、无权兄弟节点不返回
++            // （REQ-0002 验收「实例树接口无权节点不返回」）。ancestors 逗号路径整 token 解析
++            // （数据权限组件 expandSubtree 同范式，防字符串前缀误判）
++            Map<Long, IotModelInstance> byId = new LinkedHashMap<>();
++            for (IotModelInstance node : all) {
++                byId.put(node.getId(), node);
++            }
++            Set<Long> keep = new LinkedHashSet<>();
++            for (IotModelInstance node : all) {
++                if (scope.instanceIds().contains(node.getId())) {
++                    keep.add(node.getId());
++                    collectAncestorIds(node.getAncestors(), byId.keySet(), keep);
++                }
++            }
++            if (keep.isEmpty()) {
++                return List.of();
++            }
++            kept = all.stream().filter(node -> keep.contains(node.getId())).collect(Collectors.toList());
++        }
++        return buildTree(kept);
++    }
++
++    /** ancestors 逗号路径 → 存在于当前行的祖先 id 集合（防御性：已删祖先 id 不补骨架） */
++    private void collectAncestorIds(String ancestors, Set<Long> presentIds, Set<Long> keep) {
++        if (ancestors == null || ancestors.isBlank()) {
++            return;
++        }
++        for (String token : ancestors.split(",")) {
++            String trimmed = token.trim();
++            if (trimmed.isEmpty()) {
++                continue;
++            }
++            try {
++                Long ancestorId = Long.valueOf(trimmed);
++                if (presentIds.contains(ancestorId)) {
++                    keep.add(ancestorId);
++                }
++            } catch (NumberFormatException ignored) {
++                // 脏 token（非数字）跳过：骨架缺失不阻断树返回
++            }
++        }
++    }
++
++    /** 组装树：输入已按 sort,id 升序，groupingBy 保序 → 子节点天然有序；父不在场（骨架防御）的节点视作根 */
++    private List<IotInstanceTreeVO> buildTree(List<IotModelInstance> nodes) {
++        Map<Long, List<IotModelInstance>> byParent = new HashMap<>();
++        Set<Long> presentIds = new LinkedHashSet<>();
++        for (IotModelInstance node : nodes) {
++            Long parentId = node.getParentId() == null ? 0L : node.getParentId();
++            byParent.computeIfAbsent(parentId, k -> new ArrayList<>()).add(node);
++            presentIds.add(node.getId());
++        }
++        List<IotInstanceTreeVO> roots = new ArrayList<>();
++        for (IotModelInstance node : nodes) {
++            Long parentId = node.getParentId() == null ? 0L : node.getParentId();
++            if (parentId == 0L || !presentIds.contains(parentId)) {
++                roots.add(assemble(node, byParent));
++            }
++        }
++        return roots;
++    }
++
++    private IotInstanceTreeVO assemble(IotModelInstance node, Map<Long, List<IotModelInstance>> byParent) {
++        IotInstanceTreeVO vo = IotInstanceTreeVO.from(node);
++        List<IotInstanceTreeVO> children = new ArrayList<>();
++        for (IotModelInstance child : byParent.getOrDefault(node.getId(), List.of())) {
++            children.add(assemble(child, byParent));
++        }
++        vo.setChildren(children);
++        return vo;
++    }
++
++    // ---------- 列表（数据权限裁剪同样生效） ----------
++
++    @Override
++    public Page<IotModelInstance> selectInstanceList(Page<IotModelInstance> page, IotModelInstance query) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        LambdaQueryWrapper<IotModelInstance> wrapper = new LambdaQueryWrapper<>();
++        if (!scope.allTenant()) {
++            // brief 口径：createByOnly → 空集（与树查询同一数据查询语义，不做 OR create_by 分支）；
++            // 可见集为空同口径短路（避免 IN () 空集 SQL）
++            if (scope.createByOnly() || scope.instanceIds().isEmpty()) {
++                page.setRecords(List.of());
++                page.setTotal(0);
++                return page;
++            }
++            // 照 ADR-0016 裁决 6 点位类形态的实例版：id ∈ 可见集（配置类条件 instance_id IN）
++            wrapper.in(IotModelInstance::getId, scope.instanceIds());
++        }
++        if (query.getInstanceCode() != null) {
++            wrapper.like(IotModelInstance::getInstanceCode, SqlLikeUtils.escape(query.getInstanceCode()));
++        }
++        if (query.getInstanceName() != null) {
++            wrapper.like(IotModelInstance::getInstanceName, SqlLikeUtils.escape(query.getInstanceName()));
++        }
++        if (query.getNodeType() != null) {
++            wrapper.eq(IotModelInstance::getNodeType, query.getNodeType());
++        }
++        if (query.getStatus() != null) {
++            wrapper.eq(IotModelInstance::getStatus, query.getStatus());
++        }
++        if (query.getDeptId() != null) {
++            wrapper.eq(IotModelInstance::getDeptId, query.getDeptId());
++        }
++        wrapper.orderByAsc(IotModelInstance::getSort).orderByAsc(IotModelInstance::getId);
++        return this.page(page, wrapper);
++    }
++
++    // ---------- 详情（详情类 403 语义） ----------
++
++    @Override
++    public IotModelInstance getInstanceDetail(Long id) {
++        IotModelInstance instance = this.getById(id);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除");
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(id)) {
++            // ADR-0016 裁决 2：空结果 vs 403 按接口形态判定——GET /iot/instance/{id} 尾段为
++            // 数字 id，组件 isDetailAccess 判定为详情类 → 选 SCOPE_FORBIDDEN（数据权限不命中
++            // 归 4xx 口径，§3 p20）——组件拒绝策略常量的首个真实消费点
++            DataPermAccessStrategy.DenyStrategy strategy = DataPermAccessStrategy
++                    .isDetailAccess("/iot/instance/" + id)
++                    ? DataPermAccessStrategy.DenyStrategy.SCOPE_FORBIDDEN
++                    : DataPermAccessStrategy.DenyStrategy.SCOPE_EMPTY;
++            if (strategy == DataPermAccessStrategy.DenyStrategy.SCOPE_FORBIDDEN) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）");
++            }
++            // 集合类形态（本端点不可达）：数据不存在口径返回 null——fail-closed 不泄露对象
++            return null;
++        }
++        return instance;
++    }
++
++    // ---------- 内部辅助 ----------
++
++    private void validateNodeType(Integer nodeType) {
++        if (nodeType == null || nodeType < NODE_TYPE_MIN || nodeType > NODE_TYPE_MAX) {
++            throw paramError("节点类型仅允许 1-5（1 工厂 2 车间 3 产线 4 设备 5 组件）");
++        }
++    }
++
++    private boolean isOverLength(String value, int max) {
++        return value != null && value.length() > max;
++    }
++
++    /** 引用来源展示限长：最多展示前 5 个，超出以「等 N 个」汇总 */
++    private String joinLimit(List<String> sources) {
++        if (sources.size() <= MAX_REF_SOURCES_DISPLAYED) {
++            return String.join(", ", sources);
++        }
++        return String.join(", ", sources.subList(0, MAX_REF_SOURCES_DISPLAYED))
++                + " 等 " + sources.size() + " 个";
++    }
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011 修订轮口径） */
++    private BusinessException duplicateInstanceCode(IotInstanceCodeRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return duplicateCode4002("实例编码已被删除记录占用，不可复用: " + row.getInstanceCode());
++        }
++        return duplicateCode4002("实例编码已存在: " + row.getInstanceCode());
++    }
++
++    private BusinessException duplicateCode4002(String message) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java
+index 57baf57..e02d137 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java
+@@ -11,17 +11,22 @@ import lombok.NoArgsConstructor;
+ import net.otlab.core.base.BaseEntity;
+ 
+ /**
+- * 模型实例实体类（TASK-0011 建库先行，详细设计 §1.5 / 附录 A p31）
++ * 模型实例实体类（TASK-0011 建库先行，详细设计 §1.5 / 附录 A p31；业务逻辑 TASK-0012 交付）
+  *
+- * <p><b>本实体仅为模板删除保护的引用计数查询提供最小映射</b>：iot_model_instance 表随
+- * TASK-0011 升级脚本建库先行（TASK-0005 数据权限组件 selectAllForPerm 亦以本表存在为前提），
+- * 实例业务逻辑——实例接口、路径式编码规则、绑部门流程、树管理——全部归 TASK-0012，
+- * 本任务零实例业务代码；TASK-0012 届时按需扩展本实体。
++ * <p>iot_model_instance 表随 TASK-0011 升级脚本建库先行（TASK-0005 数据权限组件
++ * selectAllForPerm 亦以本表存在为前提）；实例业务逻辑——实例接口、路径式编码规则、
++ * 绑部门流程、树管理按数据权限裁剪——由 TASK-0012 交付（本实体按 0011 javadoc 声明的
++ * 授权扩展：补 applied_template_version / locked 两新列）。
+  *
+  * <p>字段映射照附录 A p31 逐字 DDL：instance_code 租户内路径式唯一
+  * （uk_tenant_instance_code），template_id 为来源模板（删除保护引用计数的关键列），
+  * dept_id 为数据权限锚点，ancestors 仿 sys_dept 前缀匹配。
+  *
++ * <p>两新列为「与上游差异」（20261122_iot_instance_columns.sql 头注登记，上游附录 A
++ * p31 无此两列）：applied_template_version 创建时=模板当前 version（选了模板时），
++ * 模板升版实例不自动跟随（REQ-0005 版本锁定口径）；locked=1 时编辑仅允许 status/remark
++ * （REQ-0005 锁定口径）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -65,4 +70,10 @@ public class IotModelInstance extends BaseEntity {
+ 
+     @Schema(description = "状态 0 禁用 1 启用")
+     private Integer status;
++
++    @Schema(description = "已应用的模板版本（创建时=模板当前 version，选了模板时；模板升版实例不自动跟随）")
++    private Integer appliedTemplateVersion;
++
++    @Schema(description = "实例锁定 0 未锁 1 已锁（锁定后编辑仅允许 status/remark，REQ-0005）")
++    private Integer locked;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+index 80da259..e07ef37 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+@@ -165,6 +165,18 @@ public class IotModelTemplateServiceImpl extends ServiceImpl<IotModelTemplateMap
+             throw paramError("模板编码不允许修改");
+         }
+         validateNodeType(template.getNodeType());
++        // M-6 守卫（0011 评审裁决，TASK-0012 随本任务落地）：有实例引用时 node_type 不可改——
++        // 实例的 node_type 创建时与模板一致（TD-0008 选模板语义），模板改档会让存量实例的
++        // 「模板 node_type=实例 node_type」约束失真（已建实例无法跟随，层级语义漂移）。
++        // 引用计数按 template_id 过滤（租户条件由插件追加、deleted 由 @TableLogic 运行时过滤）；
++        // node_type 未变时不查询（编辑常规字段零额外开销），文案含引用计数。
++        if (!template.getNodeType().equals(existing.getNodeType())) {
++            Long instanceRefs = modelInstanceMapper.selectCount(new LambdaQueryWrapper<IotModelInstance>()
++                    .eq(IotModelInstance::getTemplateId, existing.getId()));
++            if (instanceRefs != null && instanceRefs > 0) {
++                throw paramError("模板已被实例引用，节点类型不允许修改（引用实例 " + instanceRefs + " 个）");
++            }
++        }
+         if (template.getStatus() != null && template.getStatus() != 0 && template.getStatus() != 1) {
+             throw paramError("模板状态仅允许 0 禁用 / 1 启用");
+         }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/config/IotInstanceMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/config/IotInstanceMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..a2c0d3f
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/config/IotInstanceMenuPermissionGuardTest.java
+@@ -0,0 +1,137 @@
++package net.otlab.admin.module.iot.instance.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.instance.controller.IotModelInstanceController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0012 守卫测试：实例域菜单权限（sys_menu 4030-4035 六行）与控制器接口清单一一对应。
++ *
++ * <p>brief 硬要求「权限与接口一一对应（守卫测试强制）」。本测试双向锁定（照
++ * IotTemplateMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_instance_columns.sql 的 sys_menu 六行种子
++ *     （id 4030-4035，parent_id=4010）权限码必须恰好等于预期的六值映射——删行/换码/
++ *     挪 parent 即红；</li>
++ * <li>代码侧：实例域 @RestController 全部 @SaCheckPermission 权限码并集必须恰好等于
++ *     六值集合——多注解/漏注解/写错码即红；</li>
++ * <li>双向相等（一一对应）。</li>
++ * </ul>
++ *
++ * <p>与既有 {@code SaPermissionRegistryConsistencyTest}（注解 ⊆ 全库 sys_menu SQL 并集）
++ * 互补：本测试是实例域的精确守卫，防止未来任务挪用/复用本号段权限码造成口径漂移。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotInstanceMenuPermissionGuardTest {
++
++    /** 六行菜单种子的预期映射（id → perms），与升级脚本 4030-4035 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4030L, "iot:instance:list",
++            4031L, "iot:instance:query",
++            4032L, "iot:instance:add",
++            4033L, "iot:instance:edit",
++            4034L, "iot:instance:remove",
++            4035L, "iot:instance:tree");
++
++    /** 升级脚本路径（从模块目录或仓库根目录向上定位 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_instance_columns.sql";
++
++    /** 菜单种子行形如 (4030, 4010, 4, '实例查询', 3, NULL, NULL, NULL, 'iot:instance:list', ...） */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[3-9]\\d),\\s*4010,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的实例菜单行恰好等于预期六值映射（4030-4035）")
++    void scriptRegistersExactlyTheSixMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4030-4035 六行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 实例域控制器权限码并集恰好等于六值集合")
++    void controllerPermissionsAreExactlyTheSixPerms() {
++        Set<String> annotated = collectControllerPerms();
++
++        Set<String> expected = new TreeSet<>(EXPECTED_MENU_ROWS.values());
++        assertEquals(expected, annotated,
++                "实例域 @SaCheckPermission 权限码并集必须恰好等于菜单六值集合（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向一致 - SQL 登记集与注解集一一对应（brief：权限与接口一一对应）")
++    void sqlRegistryAndAnnotationsAreInOneToOneCorrespondence() throws Exception {
++        Set<String> fromSql = new TreeSet<>(parseMenuRows(readScript()).values());
++        Set<String> fromCode = collectControllerPerms();
++        assertEquals(fromCode, fromSql, "SQL 登记与控制器注解两集合必须完全一致");
++        assertTrue(fromSql.containsAll(EXPECTED_MENU_ROWS.values()), "六值映射必须全部被登记");
++    }
++
++    /** 收集实例域控制器的全部 @SaCheckPermission 权限码（方法级 + 类级） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = IotModelInstanceController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（实例管理页 4010 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript() throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(SCRIPT_RELATIVE);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceControllerTest.java
+new file mode 100644
+index 0000000..43b05d1
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/controller/IotModelInstanceControllerTest.java
+@@ -0,0 +1,353 @@
++package net.otlab.admin.module.iot.instance.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceUpdateForm;
++import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 模型实例控制器测试（TASK-0012 接口层）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），权限注解以反射断言，路由与参数
++ * 校验走真实 MockMvc 请求（照 IotModelTemplateControllerTest 范式）。六接口权限契约：
++ * iot:instance:list/query/add/edit/remove/tree（sys_menu 4030-4035）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotModelInstanceControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotModelInstanceService instanceService;
++
++    private IotModelInstanceController instanceController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        instanceController = new IotModelInstanceController();
++        ReflectionTestUtils.setField(instanceController, "instanceService", instanceService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(instanceController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private IotInstanceCreateForm createForm() {
++        IotInstanceCreateForm form = new IotInstanceCreateForm();
++        form.setShortCode("EQ001");
++        form.setInstanceName("一号空压机");
++        form.setParentId(2L);
++        form.setNodeType(4);
++        form.setTemplateId(5L);
++        form.setDeptId(null);
++        form.setSort(1);
++        return form;
++    }
++
++    private IotModelInstance testInstance() {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(1L);
++        inst.setTenantId(1L);
++        inst.setInstanceCode("F01");
++        inst.setInstanceName("一号工厂");
++        inst.setParentId(0L);
++        inst.setAncestors("0");
++        inst.setNodeType(1);
++        inst.setDeptId(10L);
++        inst.setSort(1);
++        inst.setStatus(1);
++        inst.setLocked(0);
++        return inst;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 六个接口的 @SaCheckPermission 取值符合 iot:instance:* 契约（树接口单设权限点）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:instance:tree", IotModelInstanceController.class
++                .getMethod("tree")
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:list", IotModelInstanceController.class
++                .getMethod("list", Integer.class, Integer.class, IotModelInstance.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:query", IotModelInstanceController.class
++                .getMethod("getById", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:add", IotModelInstanceController.class
++                .getMethod("add", IotInstanceCreateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:edit", IotModelInstanceController.class
++                .getMethod("edit", IotInstanceUpdateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:remove", IotModelInstanceController.class
++                .getMethod("remove", String.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 三个写操作（新增/编辑/删除）均有 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method add = IotModelInstanceController.class.getMethod("add", IotInstanceCreateForm.class);
++        Method edit = IotModelInstanceController.class.getMethod("edit", IotInstanceUpdateForm.class);
++        Method remove = IotModelInstanceController.class.getMethod("remove", String.class);
++        for (Method method : List.of(add, edit, remove)) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, add.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, edit.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.DELETE, remove.getAnnotation(OperateLog.class).businessType());
++    }
++
++    // ---------- 路由（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("实例树 - GET /iot/instance/tree 返回裁剪后树结构")
++    void testTree_Success() throws Exception {
++        IotInstanceTreeVO root = new IotInstanceTreeVO();
++        root.setId(1L);
++        root.setInstanceCode("F01");
++        root.setChildren(new java.util.ArrayList<>());
++        when(instanceService.selectInstanceTree()).thenReturn(List.of(root));
++
++        mockMvc.perform(get("/iot/instance/tree"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").isArray())
++                .andExpect(jsonPath("$.data[0].instanceCode").value("F01"));
++
++        verify(instanceService).selectInstanceTree();
++    }
++
++    @Test
++    @DisplayName("分页查询 - GET /iot/instance/list 返回分页数据")
++    void testList_Success() throws Exception {
++        Page<IotModelInstance> page = new Page<>(1, 10);
++        page.setRecords(List.of(testInstance()));
++        page.setTotal(1);
++        when(instanceService.selectInstanceList(any(), any(IotModelInstance.class))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/instance/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10")
++                        .param("instanceCode", "F01")
++                        .param("nodeType", "1")
++                        .param("status", "1")
++                        .param("deptId", "10"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.records").isArray())
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].instanceCode").value("F01"));
++
++        verify(instanceService).selectInstanceList(any(), any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("详情 - GET /iot/instance/{id} 正常返回")
++    void testGetById_Success() throws Exception {
++        when(instanceService.getInstanceDetail(1L)).thenReturn(testInstance());
++
++        mockMvc.perform(get("/iot/instance/{id}", 1L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.instanceCode").value("F01"))
++                .andExpect(jsonPath("$.data.nodeType").value(1));
++    }
++
++    @Test
++    @DisplayName("详情 - 数据权限不命中透传服务层 403")
++    void testGetById_ScopeMiss403() throws Exception {
++        when(instanceService.getInstanceDetail(5L))
++                .thenThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）"));
++
++        mockMvc.perform(get("/iot/instance/{id}", 5L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
++
++    // ---------- 创建：路由 + 参数校验 ----------
++
++    @Test
++    @DisplayName("新增 - POST /iot/instance 正常返回 200")
++    void testAdd_Success() throws Exception {
++        when(instanceService.createInstance(any(IotInstanceCreateForm.class))).thenReturn(true);
++
++        mockMvc.perform(post("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(instanceService).createInstance(any(IotInstanceCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：shortCode 缺失返回业务码 400")
++    void testAdd_ShortCodeMissing() throws Exception {
++        IotInstanceCreateForm form = createForm();
++        form.setShortCode(null);
++
++        mockMvc.perform(post("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceService, org.mockito.Mockito.never()).createInstance(any(IotInstanceCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：shortCode 携带路径分隔符（点号）被 @Pattern 拒绝")
++    void testAdd_ShortCodePatternViolated() throws Exception {
++        IotInstanceCreateForm form = createForm();
++        form.setShortCode("EQ.001");
++
++        mockMvc.perform(post("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceService, org.mockito.Mockito.never()).createInstance(any(IotInstanceCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：nodeType 缺失/越界均拒（仅允许 1-5）")
++    void testAdd_NodeTypeBounds() throws Exception {
++        for (Integer bad : new Integer[]{null, 0, 6}) {
++            IotInstanceCreateForm form = createForm();
++            form.setNodeType(bad);
++            mockMvc.perform(post("/iot/instance")
++                            .contentType(MediaType.APPLICATION_JSON)
++                            .content(objectMapper.writeValueAsString(form)))
++                    .andExpect(status().isOk())
++                    .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        }
++        verify(instanceService, org.mockito.Mockito.never()).createInstance(any(IotInstanceCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 重复编码透传服务层 4002")
++    void testAdd_DuplicateCode() throws Exception {
++        when(instanceService.createInstance(any(IotInstanceCreateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "实例编码已存在: F01"));
++
++        mockMvc.perform(post("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4002));
++    }
++
++    // ---------- 编辑 / 删除 ----------
++
++    @Test
++    @DisplayName("编辑 - PUT /iot/instance 正常返回 200")
++    void testEdit_Success() throws Exception {
++        when(instanceService.updateInstance(any(IotInstanceUpdateForm.class))).thenReturn(true);
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(1L);
++        form.setInstanceName("改名");
++
++        mockMvc.perform(put("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(instanceService).updateInstance(any(IotInstanceUpdateForm.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 改父（挪树）被服务层拒绝（PARAM_ERROR 400 透传）")
++    void testEdit_RejectParentChange() throws Exception {
++        when(instanceService.updateInstance(any(IotInstanceUpdateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "父实例不允许修改（挪树一期禁止，TD-0010）"));
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(1L);
++        form.setParentId(2L);
++
++        mockMvc.perform(put("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("编辑 - id 缺失被 bean 校验拒绝")
++    void testEdit_IdMissing() throws Exception {
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setInstanceName("无 id 编辑");
++
++        mockMvc.perform(put("/iot/instance")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceService, org.mockito.Mockito.never()).updateInstance(any(IotInstanceUpdateForm.class));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /iot/instance/{ids} 透传服务层（逗号分隔批量）")
++    void testRemove_Success() throws Exception {
++        when(instanceService.deleteInstances(any())).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/instance/{ids}", "1,2"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(instanceService).deleteInstances(List.of(1L, 2L));
++    }
++
++    @Test
++    @DisplayName("删除 - 有子实例透传服务层参数错误")
++    void testRemove_ChildProtected() throws Exception {
++        when(instanceService.deleteInstances(any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "存在子实例，禁止删除（子实例: F01.WS01）"));
++
++        mockMvc.perform(delete("/iot/instance/{ids}", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+new file mode 100644
+index 0000000..79a6fb3
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+@@ -0,0 +1,874 @@
++package net.otlab.admin.module.iot.instance.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceUpdateForm;
++import net.otlab.admin.module.iot.instance.mapper.IotInstanceCodeMapper;
++import net.otlab.admin.module.iot.instance.mapper.IotInstanceCodeRow;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 模型实例服务单元测试（TASK-0012，数据权限组件首个真实消费方）
++ *
++ * <p>核心业务纪律（详细设计 §1.5 / REQ-0005 / ADR-0011 TD-0008/TD-0010 / ADR-0016 / brief）：
++ * 路径式编码——请求只传本级短码，服务层拼父全码+"."+短码（F01→F01.WS01→F01.WS01.EQ001）；
++ * 选模板（TD-0008 设备/组件强制，模板存在/启用/node_type 一致）；绑部门（工厂/车间必填，
++ * ADR-0016 开放点 10）；uk_tenant_instance_code 双道闸 4002（含已删行预检 + DuplicateKey 兜底，
++ * 0011 修订轮 I-1 口径同款）；编辑不可改五字段（TD-0010 挪树禁止——防环随之闭环，REQ-0005
++ * 验收 6）与锁定语义（locked=1 仅允许 status——表无 remark 列按库内可变集收窄）；树裁剪
++ * （allTenant 全树 / 可见集+根路径骨架 / 无权兄弟不返回 / createByOnly 空树——实例树属数据
++ * 查询语义，ADR-0016 裁决 3/4）；列表 id ∈ 可见集（createByOnly → 空集）；详情越权 403
++ * （SCOPE_FORBIDDEN 首个消费点）；删除子实例保护 + 批内缺失 fail-closed。
++ *
++ * <p>standalone Mockito 范式（照 IotModelTemplateServiceImplTest）：Mapper 全 mock 不触真实库；
++ * TenantContext/SecurityUtils 静态 mock 供会话租户与当前用户取值；VisibleScope 构造场景覆盖。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotModelInstanceServiceImplTest {
++
++    @Mock
++    private IotModelInstanceMapper baseMapper;
++
++    @Mock
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Mock
++    private IotInstanceCodeMapper instanceCodeMapper;
++
++    @Mock
++    private SysDeptMapper deptMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    private IotModelInstanceServiceImpl instanceService;
++
++    /** 创建/详情/列表消费会话租户上下文与当前登录用户（静态 mock，逐用例注入） */
++    private MockedStatic<TenantContext> tenantContext;
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, SysDept.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        securityUtils = mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(1L);
++        instanceService = new IotModelInstanceServiceImpl();
++        ReflectionTestUtils.setField(instanceService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(instanceService, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(instanceService, "instanceCodeMapper", instanceCodeMapper);
++        ReflectionTestUtils.setField(instanceService, "deptMapper", deptMapper);
++        ReflectionTestUtils.setField(instanceService, "dataPermService", dataPermService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotInstanceCreateForm createForm(String shortCode, Integer nodeType, Long parentId, Long templateId, Long deptId) {
++        IotInstanceCreateForm form = new IotInstanceCreateForm();
++        form.setShortCode(shortCode);
++        form.setInstanceName("实例-" + shortCode);
++        form.setParentId(parentId);
++        form.setNodeType(nodeType);
++        form.setTemplateId(templateId);
++        form.setDeptId(deptId);
++        form.setSort(1);
++        return form;
++    }
++
++    private IotModelInstance instance(Long id, String code, Long parentId, String ancestors, Integer nodeType, Long deptId, Integer status, Integer sort) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setTenantId(1L);
++        inst.setInstanceCode(code);
++        inst.setInstanceName("实例-" + code);
++        inst.setParentId(parentId);
++        inst.setAncestors(ancestors);
++        inst.setNodeType(nodeType);
++        inst.setDeptId(deptId);
++        inst.setSort(sort);
++        inst.setStatus(status);
++        inst.setLocked(0);
++        return inst;
++    }
++
++    private IotModelTemplate template(Long id, String code, Integer nodeType, Integer status, Integer version) {
++        IotModelTemplate tpl = new IotModelTemplate();
++        tpl.setId(id);
++        tpl.setTemplateCode(code);
++        tpl.setTemplateName("模板-" + code);
++        tpl.setNodeType(nodeType);
++        tpl.setStatus(status);
++        tpl.setVersion(version);
++        return tpl;
++    }
++
++    private SysDept dept(Long id, String name, Integer status) {
++        SysDept d = new SysDept();
++        d.setId(id);
++        d.setDeptName(name);
++        d.setStatus(status);
++        return d;
++    }
++
++    private IotInstanceCodeRow occupiedRow(String code, Integer deleted) {
++        IotInstanceCodeRow row = new IotInstanceCodeRow();
++        row.setId(99L);
++        row.setInstanceCode(code);
++        row.setDeleted(deleted);
++        return row;
++    }
++
++    // ---------- 创建：路径式编码全链 ----------
++
++    @Test
++    @DisplayName("创建 - 顶级工厂：短码即全码、ancestors=0、parentId=0、白名单落库（status=1/locked=0/tenant 会话覆盖）")
++    void testCreate_Success_TopFactory() {
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(Collections.emptyList());
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(baseMapper.insert(any(IotModelInstance.class))).thenReturn(1);
++
++        assertTrue(instanceService.createInstance(createForm("F01", 1, null, null, 10L)));
++
++        ArgumentCaptor<IotModelInstance> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        IotModelInstance entity = captor.getValue();
++        assertEquals("F01", entity.getInstanceCode(), "顶级实例直接以短码为全码");
++        assertEquals("0", entity.getAncestors(), "顶级 ancestors=0");
++        assertEquals(0L, entity.getParentId());
++        assertEquals(Integer.valueOf(1), entity.getStatus(), "新增强制 status=1");
++        assertEquals(Integer.valueOf(0), entity.getLocked(), "创建时 locked=0");
++        assertNull(entity.getAppliedTemplateVersion(), "未选模板 applied_template_version 为 null");
++        assertNull(entity.getTemplateId());
++        assertEquals(10L, entity.getDeptId());
++        assertEquals(Integer.valueOf(1), entity.getSort());
++        assertEquals(1L, entity.getTenantId(), "tenant_id 服务层从会话覆盖（请求无此字段）");
++        assertNull(entity.getId(), "id 框架自增，白名单不复制");
++        assertNull(entity.getCreateBy(), "审计字段由 MetaObjectHandler 回填");
++        // 占用预检按 (tenant_id, instance_code) 双键显式查（含已删行旁路）
++        verify(instanceCodeMapper).selectOccupiedByCodes(eq(1L), eq(List.of("F01")));
++    }
++
++    @Test
++    @DisplayName("创建 - 三级链 F01→F01.WS01→F01.WS01.EQ001：全码拼接与 ancestors 逐级正确")
++    void testCreate_Success_ThreeLevelChain() {
++        IotModelInstance f01 = instance(1L, "F01", 0L, "0", 1, 10L, 1, 1);
++        IotModelInstance ws01 = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(Collections.emptyList());
++        when(deptMapper.selectById(11L)).thenReturn(dept(11L, "一车间", 1));
++        when(modelTemplateMapper.selectById(5L)).thenReturn(template(5L, "AIR_COMPRESSOR", 4, 1, 3));
++        when(baseMapper.selectById(1L)).thenReturn(f01);
++        when(baseMapper.selectById(2L)).thenReturn(ws01);
++        when(baseMapper.insert(any(IotModelInstance.class))).thenReturn(1);
++
++        // 二级：工厂下建车间（绑部门）
++        assertTrue(instanceService.createInstance(createForm("WS01", 2, 1L, null, 11L)));
++        ArgumentCaptor<IotModelInstance> second = ArgumentCaptor.captor();
++        verify(baseMapper, org.mockito.Mockito.times(1)).insert(second.capture());
++        IotModelInstance ws = second.getValue();
++        assertEquals("F01.WS01", ws.getInstanceCode(), "子编码=父编码+.+本级短码");
++        assertEquals("0,1", ws.getAncestors(), "ancestors=父ancestors,父id");
++        assertEquals(1L, ws.getParentId());
++
++        // 三级：车间下建设备（选模板，TD-0008）
++        assertTrue(instanceService.createInstance(createForm("EQ001", 4, 2L, 5L, null)));
++        ArgumentCaptor<IotModelInstance> third = ArgumentCaptor.captor();
++        verify(baseMapper, org.mockito.Mockito.times(2)).insert(third.capture());
++        IotModelInstance eq = third.getValue();
++        assertEquals("F01.WS01.EQ001", eq.getInstanceCode());
++        assertEquals("0,1,2", eq.getAncestors());
++        assertEquals(2L, eq.getParentId());
++        assertEquals(5L, eq.getTemplateId());
++        assertEquals(Integer.valueOf(3), eq.getAppliedTemplateVersion(), "创建时=模板当前 version");
++        assertNull(eq.getDeptId(), "设备级 dept_id 可空（继承链归 TASK-0013）");
++    }
++
++    @Test
++    @DisplayName("创建 - 短码字符集越界（点/空格/连字符）拒绝：防路径分隔符注入编码体系")
++    void testCreate_ShortCodeCharsetRejected() {
++        for (String bad : Arrays.asList("WS.01", "WS 01", "WS-01", "车间1")) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> instanceService.createInstance(createForm(bad, 1, null, null, null)),
++                    "短码 " + bad + " 应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        }
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++        verify(instanceCodeMapper, never()).selectOccupiedByCodes(anyLong(), anyCollection());
++    }
++
++    @Test
++    @DisplayName("创建 - 全码超长（父码 90 + 短码 10 > 96）拒绝")
++    void testCreate_FullCodeOverLength() {
++        String longParentCode = "F." + "A".repeat(88);
++        when(baseMapper.selectById(1L)).thenReturn(instance(1L, longParentCode, 0L, "0", 1, 10L, 1, 1));
++        when(deptMapper.selectById(11L)).thenReturn(dept(11L, "车间", 1));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("WSWSWSWS01", 2, 1L, null, 11L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("超长"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 父实例不存在/已禁用拒绝（存在性/status=1 校验）")
++    void testCreate_ParentInvalid() {
++        when(baseMapper.selectById(404L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("WS01", 2, 404L, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        when(baseMapper.selectById(5L)).thenReturn(instance(5L, "F01", 0L, "0", 1, 10L, 0, 1));
++        BusinessException disabled = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("WS01", 2, 5L, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), disabled.getCode());
++        assertTrue(disabled.getMessage().contains("禁用"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    // ---------- 创建：选模板语义（TD-0008） ----------
++
++    @Test
++    @DisplayName("创建 - 设备/组件级未选模板拒绝（TD-0008 强制选模板）")
++    void testCreate_DeviceWithoutTemplateRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(instance(1L, "F01", 0L, "0", 1, 10L, 1, 1));
++        for (Integer deviceType : Arrays.asList(4, 5)) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> instanceService.createInstance(createForm("EQ1", deviceType, 1L, null, null)),
++                    "node_type=" + deviceType + " 未选模板应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++            assertTrue(e.getMessage().contains("必须选择模板"));
++        }
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 模板不存在/已禁用拒绝")
++    void testCreate_TemplateInvalid() {
++        when(baseMapper.selectById(1L)).thenReturn(instance(1L, "F01", 0L, "0", 1, 10L, 1, 1));
++        when(modelTemplateMapper.selectById(404L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("EQ001", 4, 1L, 404L, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        when(modelTemplateMapper.selectById(9L)).thenReturn(template(9L, "AIR", 4, 0, 1));
++        BusinessException disabled = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("EQ001", 4, 1L, 9L, null)));
++        assertTrue(disabled.getMessage().contains("禁用"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 模板 node_type 与实例不一致拒绝（REQ-0004 验收 5：空压机模板只能建设备级实例）")
++    void testCreate_TemplateNodeTypeMismatch() {
++        when(baseMapper.selectById(1L)).thenReturn(instance(1L, "F01", 0L, "0", 1, 10L, 1, 1));
++        when(modelTemplateMapper.selectById(5L)).thenReturn(template(5L, "AIR_COMPRESSOR", 4, 1, 1));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("WS99", 2, 1L, 5L, 11L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("不一致"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    // ---------- 创建：绑部门（ADR-0016 开放点 10） ----------
++
++    @Test
++    @DisplayName("创建 - 工厂/车间级未绑部门拒绝（数据权限锚点必填，服务层防线）")
++    void testCreate_FactoryWorkshopDeptRequired() {
++        for (Integer orgType : Arrays.asList(1, 2)) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> instanceService.createInstance(createForm("TOP" + orgType, orgType, null, null, null)),
++                    "node_type=" + orgType + " 未绑部门应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++            assertTrue(e.getMessage().contains("必须绑定部门"));
++        }
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 部门不存在/已禁用拒绝")
++    void testCreate_DeptInvalid() {
++        when(deptMapper.selectById(404L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F01", 1, null, null, 404L)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        when(deptMapper.selectById(7L)).thenReturn(dept(7L, "停用部门", 0));
++        BusinessException disabled = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F01", 1, null, null, 7L)));
++        assertTrue(disabled.getMessage().contains("禁用"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    // ---------- 创建：uk_tenant_instance_code 双道闸 ----------
++
++    @Test
++    @DisplayName("创建 - 编码被活跃行占用：预检 4002 不落库")
++    void testCreate_DuplicateActiveCode() {
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection()))
++                .thenReturn(List.of(occupiedRow("F01", 0)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F01", 1, null, null, 10L)));
++
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("F01"));
++        assertTrue(e.getMessage().contains("已存在"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 编码被已删除行占用（uk 不含 deleted 列永久占用）报 4002 且文案区分")
++    void testCreate_DeletedRowOccupiesCode() {
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection()))
++                .thenReturn(List.of(occupiedRow("F01", 1)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F01", 1, null, null, 10L)));
++
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("已被删除记录占用"), "文案区分已删行占用（0011 修订轮口径）");
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 并发撞物理唯一索引：DuplicateKeyException 兜底映射 4002")
++    void testCreate_DuplicateKeyFallback() {
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(Collections.emptyList());
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(baseMapper.insert(any(IotModelInstance.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '1-F01' for key 'uk_tenant_instance_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F01", 1, null, null, 10L)));
++
++        assertEquals(4002, e.getCode());
++    }
++
++    // ---------- 编辑：不可改五字段（TD-0010） ----------
++
++    @Test
++    @DisplayName("编辑 - 正常情况：白名单构建更新，不可变字段不进更新集")
++    void testUpdate_Success() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++        when(deptMapper.selectById(12L)).thenReturn(dept(12L, "二车间", 1));
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setInstanceName("一车间改名");
++        form.setDeptId(12L);
++        form.setSort(5);
++        form.setStatus(0);
++
++        assertTrue(instanceService.updateInstance(form));
++
++        ArgumentCaptor<IotModelInstance> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        IotModelInstance upd = captor.getValue();
++        assertEquals(2L, upd.getId());
++        assertEquals("一车间改名", upd.getInstanceName());
++        assertEquals(12L, upd.getDeptId());
++        assertEquals(Integer.valueOf(5), upd.getSort());
++        assertEquals(Integer.valueOf(0), upd.getStatus(), "编辑可启停实例");
++        assertNull(upd.getInstanceCode(), "不可变五字段不进更新集");
++        assertNull(upd.getParentId());
++        assertNull(upd.getAncestors());
++        assertNull(upd.getNodeType());
++        assertNull(upd.getTemplateId());
++        assertNull(upd.getTenantId(), "tenant_id 不进更新集（插件 WHERE 已隔离）");
++    }
++
++    @Test
++    @DisplayName("编辑 - 不可改五字段携带不一致一律拒（编码/父/祖级/类型/模板）")
++    void testUpdate_ImmutableFiveRejected() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++
++        String[] fieldNames = {"instanceCode", "parentId", "ancestors", "nodeType", "templateId"};
++        Object[] changedValues = {"F01.WS02", 9L, "0,9", 4, 77L};
++        for (int i = 0; i < fieldNames.length; i++) {
++            IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++            form.setId(2L);
++            if (fieldNames[i].equals("instanceCode")) {
++                form.setInstanceCode("F01.WS02");
++            } else if (fieldNames[i].equals("parentId")) {
++                form.setParentId((Long) changedValues[i]);
++            } else if (fieldNames[i].equals("ancestors")) {
++                form.setAncestors((String) changedValues[i]);
++            } else if (fieldNames[i].equals("nodeType")) {
++                form.setNodeType((Integer) changedValues[i]);
++            } else {
++                form.setTemplateId((Long) changedValues[i]);
++            }
++            BusinessException e = assertThrows(BusinessException.class, () -> instanceService.updateInstance(form),
++                    "改 " + fieldNames[i] + " 应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode(), fieldNames[i] + " 应报参数错误");
++        }
++        // 改父即改全键前缀——挪树一期禁止的文案必须点明 TD-0010
++        IotInstanceUpdateForm moveForm = new IotInstanceUpdateForm();
++        moveForm.setId(2L);
++        moveForm.setParentId(9L);
++        BusinessException move = assertThrows(BusinessException.class, () -> instanceService.updateInstance(moveForm));
++        assertTrue(move.getMessage().contains("挪树"), "改父拒绝文案应指向挪树禁止（TD-0010）");
++        verify(baseMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 不可变字段携带与库中一致（no-op 回显）放行")
++    void testUpdate_ImmutableCarriedConsistentAllowed() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setInstanceCode("F01.WS01");
++        form.setParentId(1L);
++        form.setAncestors("0,1");
++        form.setNodeType(2);
++        form.setTemplateId(null);
++        form.setInstanceName("改名");
++
++        assertTrue(instanceService.updateInstance(form));
++        verify(baseMapper).updateById(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - status 越界（2）拒绝")
++    void testUpdate_StatusInvalid() {
++        when(baseMapper.selectById(2L)).thenReturn(instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1));
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setStatus(2);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.updateInstance(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 实例不存在报参数错误")
++    void testUpdate_NotFound() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(99L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.updateInstance(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    // ---------- 编辑：锁定语义（REQ-0005） ----------
++
++    @Test
++    @DisplayName("锁定 - locked=1 时改名称/部门/排序拒绝，仅允许 status（表无 remark 列按库内可变集收窄）")
++    void testUpdate_LockedRestrictsMutableFields() {
++        IotModelInstance locked = instance(4L, "F01.WS01.EQ001", 2L, "0,1,2", 4, null, 1, 1);
++        locked.setLocked(1);
++        when(baseMapper.selectById(4L)).thenReturn(locked);
++
++        IotInstanceUpdateForm rename = new IotInstanceUpdateForm();
++        rename.setId(4L);
++        rename.setInstanceName("新名字");
++        BusinessException renameBlocked = assertThrows(BusinessException.class, () -> instanceService.updateInstance(rename));
++        assertTrue(renameBlocked.getMessage().contains("已锁定"));
++
++        IotInstanceUpdateForm rebind = new IotInstanceUpdateForm();
++        rebind.setId(4L);
++        rebind.setDeptId(10L);
++        BusinessException rebindBlocked = assertThrows(BusinessException.class, () -> instanceService.updateInstance(rebind));
++        assertTrue(rebindBlocked.getMessage().contains("已锁定"));
++
++        IotInstanceUpdateForm resort = new IotInstanceUpdateForm();
++        resort.setId(4L);
++        resort.setSort(9);
++        BusinessException resortBlocked = assertThrows(BusinessException.class, () -> instanceService.updateInstance(resort));
++        assertTrue(resortBlocked.getMessage().contains("已锁定"));
++
++        // locked=1 时改 status 允许（锁定实例仍可启停——禁用节点停算语义的必要通道）
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++        IotInstanceUpdateForm disable = new IotInstanceUpdateForm();
++        disable.setId(4L);
++        disable.setStatus(0);
++        assertTrue(instanceService.updateInstance(disable));
++        ArgumentCaptor<IotModelInstance> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(Integer.valueOf(0), captor.getValue().getStatus());
++        assertNull(captor.getValue().getInstanceName(), "锁定编辑更新集仅含白名单字段");
++        verify(deptMapper, never()).selectById(anyLong());
++    }
++
++    // ---------- 删除 ----------
++
++    @Test
++    @DisplayName("删除 - 有子实例拒绝并提示子实例编码（fail-closed 防孤儿节点）")
++    void testDelete_ChildExistsRejected() {
++        IotModelInstance f01 = instance(1L, "F01", 0L, "0", 1, 10L, 1, 1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(f01));
++        when(baseMapper.selectList(any())).thenReturn(List.of(instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1)));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(List.of(1L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("子实例"));
++        assertTrue(e.getMessage().contains("F01.WS01"));
++        // 子实例检查按 parent_id IN 过滤
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectList(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("parent_id"));
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 批内缺失 fail-closed 整批拒绝（不半删）")
++    void testDelete_MissingIdFailClosed() {
++        IotModelInstance f01 = instance(1L, "F01", 0L, "0", 1, 10L, 1, 1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(f01));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(Arrays.asList(1L, 99L)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("99"));
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 无子实例叶子节点逻辑删成功")
++    void testDelete_Success() {
++        IotModelInstance eq = instance(4L, "F01.WS01.EQ001", 2L, "0,1,2", 4, null, 1, 1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(eq));
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(baseMapper.deleteByIds(any())).thenReturn(1);
++
++        assertTrue(instanceService.deleteInstances(List.of(4L)));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<java.util.Collection<java.io.Serializable>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).deleteByIds(captor.capture());
++        assertEquals(List.of(4L), new java.util.ArrayList<>(captor.getValue()));
++    }
++
++    @Test
++    @DisplayName("删除 - 空列表拒绝")
++    void testDelete_EmptyIds() {
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(Collections.emptyList()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).selectByIds(any());
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    // ---------- 树查询：数据权限裁剪（本任务核心） ----------
++
++    /** 全量夹具：F01(1) → WS01(2, dept=11 可见锚点子树) + WS02(3, 无权兄弟)；F02(5, 无权厂)；EQ001(4, 挂 WS01) */
++    private List<IotModelInstance> fullFixture() {
++        return List.of(
++                instance(1L, "F01", 0L, "0", 1, 10L, 1, 1),
++                instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1),
++                instance(3L, "F01.WS02", 1L, "0,1", 2, 12L, 1, 2),
++                instance(4L, "F01.WS01.EQ001", 2L, "0,1,2", 4, null, 1, 1),
++                instance(5L, "F02", 0L, "0", 1, 20L, 0, 2));
++    }
++
++    private IotInstanceTreeVO flattenFind(List<IotInstanceTreeVO> roots, Long id) {
++        for (IotInstanceTreeVO vo : roots) {
++            if (vo.getId().equals(id)) {
++                return vo;
++            }
++            IotInstanceTreeVO found = flattenFind(vo.getChildren(), id);
++            if (found != null) {
++                return found;
++            }
++        }
++        return null;
++    }
++
++    @Test
++    @DisplayName("树 - allTenant 全树返回（含禁用节点，status 携带；同级 sort 升序）")
++    void testTree_AllTenantFullTree() {
++        when(dataPermService.resolve(1L)).thenReturn(VisibleScope.allTenant(false));
++        List<IotModelInstance> all = fullFixture();
++        when(baseMapper.selectList(any())).thenReturn(all);
++
++        List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++
++        assertEquals(2, tree.size(), "两个厂级根节点");
++        IotInstanceTreeVO f01 = flattenFind(tree, 1L);
++        assertNotNull(f01);
++        assertEquals(2, f01.getChildren().size(), "F01 下 WS01/WS02 两车间");
++        assertEquals(2L, f01.getChildren().get(0).getId(), "同级按 sort 升序（WS01 sort=1 < WS02 sort=2）");
++        IotInstanceTreeVO eq = flattenFind(tree, 4L);
++        assertNotNull(eq);
++        assertEquals("F01.WS01.EQ001", eq.getInstanceCode());
++        // 禁用节点照常返回（status 字段携带）
++        IotInstanceTreeVO f02 = flattenFind(tree, 5L);
++        assertNotNull(f02, "禁用节点照常返回（禁用语义由停算承接，非隐藏）");
++        assertEquals(0, f02.getStatus());
++    }
++
++    @Test
++    @DisplayName("树 - 受限用户（车间级 dept 锚点）：可见集+到根路径骨架，无权兄弟与无权厂不返回")
++    void testTree_RestrictedVisiblePlusSkeleton() {
++        // 可见集 = WS01(2) 子树展开 = {2, 4}（数据权限组件步骤 4 的产物）
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectList(any())).thenReturn(fullFixture());
++
++        List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++
++        assertEquals(1, tree.size(), "仅一个根：F01 为骨架根，F02 无权不返回");
++        IotInstanceTreeVO f01 = flattenFind(tree, 1L);
++        assertNotNull(f01, "F01 为可见节点的到根路径骨架（仅骨架展示）");
++        assertEquals(1, f01.getChildren().size(), "无权兄弟 WS02 不返回（REQ-0002：无权节点不返回）");
++        IotInstanceTreeVO ws01 = flattenFind(tree, 2L);
++        assertNotNull(ws01);
++        assertEquals(11L, ws01.getDeptId());
++        IotInstanceTreeVO eq = flattenFind(tree, 4L);
++        assertNotNull(eq, "可见子节点完整返回");
++        assertNull(flattenFind(tree, 3L), "WS02 无权不返回");
++        assertNull(flattenFind(tree, 5L), "F02 无权不返回");
++    }
++
++    @Test
++    @DisplayName("树 - createByOnly 空树（实例树属数据查询语义，ADR-0016 裁决 3/4）且不查库")
++    void testTree_CreateByOnlyEmpty() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(), Set.of(), true));
++
++        List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++
++        assertTrue(tree.isEmpty(), "仅本人对数据类=空集");
++        verify(baseMapper, never()).selectList(any());
++    }
++
++    @Test
++    @DisplayName("树 - 可见集为空（无锚点命中/截断空集）空树且不查库")
++    void testTree_EmptyVisibleEmpty() {
++        when(dataPermService.resolve(1L)).thenReturn(VisibleScope.denied());
++
++        assertTrue(instanceService.selectInstanceTree().isEmpty());
++        verify(baseMapper, never()).selectList(any());
++    }
++
++    @Test
++    @DisplayName("树 - 可见集内禁用节点照常返回（status=0 携带）")
++    void testTree_DisabledVisibleNodeReturned() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(10L), Set.of(1L, 2L), false));
++        List<IotModelInstance> all = List.of(
++                instance(1L, "F01", 0L, "0", 1, 10L, 1, 1),
++                instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 0, 1));
++        when(baseMapper.selectList(any())).thenReturn(all);
++
++        List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++
++        IotInstanceTreeVO ws01 = flattenFind(tree, 2L);
++        assertNotNull(ws01);
++        assertEquals(0, ws01.getStatus(), "禁用节点照常返回，status 字段携带");
++    }
++
++    // ---------- 列表：数据权限裁剪 ----------
++
++    @Test
++    @DisplayName("列表 - allTenant 不追加权限条件，过滤条件拼装正确且不旁路 tenant_id")
++    void testList_AllTenantNoPermCondition() {
++        when(dataPermService.resolve(1L)).thenReturn(VisibleScope.allTenant(false));
++        Page<IotModelInstance> expected = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(), any())).thenReturn(expected);
++
++        IotModelInstance query = new IotModelInstance();
++        query.setInstanceCode("F01");
++        query.setInstanceName("厂");
++        query.setNodeType(1);
++        query.setStatus(1);
++        query.setDeptId(10L);
++
++        Page<IotModelInstance> page = instanceService.selectInstanceList(new Page<>(1, 10), query);
++        assertEquals(expected, page);
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("instance_code"), "instanceCode 应进模糊过滤");
++        assertTrue(sql.contains("instance_name"), "instanceName 应进模糊过滤");
++        assertTrue(sql.contains("node_type"), "nodeType 应进精确过滤");
++        assertTrue(sql.contains("status"), "status 应进精确过滤");
++        assertTrue(sql.contains("dept_id"), "deptId 应进精确过滤");
++        assertTrue(!sql.contains("id IN"), "allTenant 不追加权限条件");
++        assertTrue(!sql.contains("tenant_id"), "租户条件由多租户插件注入，服务层不旁路拼接");
++    }
++
++    @Test
++    @DisplayName("列表 - 受限用户拼 id ∈ 可见集（ADR-0016 裁决 6 点位类形态的实例版）")
++    void testList_RestrictedIdInVisible() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
++
++        instanceService.selectInstanceList(new Page<>(1, 10), new IotModelInstance());
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("id IN"), "可见集 IN 条件必须拼装");
++    }
++
++    @Test
++    @DisplayName("列表 - createByOnly 空集（brief 口径：与树同一数据查询语义）不查库")
++    void testList_CreateByOnlyEmpty() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(), Set.of(), true));
++        Page<IotModelInstance> page = new Page<>(1, 10);
++
++        Page<IotModelInstance> result = instanceService.selectInstanceList(page, new IotModelInstance());
++
++        assertEquals(0, result.getTotal());
++        assertTrue(result.getRecords().isEmpty());
++        verify(baseMapper, never()).selectPage(any(), any());
++    }
++
++    @Test
++    @DisplayName("列表 - 可见集为空（如部门角色无锚点命中）空集不查库（避免 IN () 空集 SQL）")
++    void testList_EmptyVisibleShortCircuit() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(), false));
++        Page<IotModelInstance> page = new Page<>(1, 10);
++
++        Page<IotModelInstance> result = instanceService.selectInstanceList(page, new IotModelInstance());
++
++        assertEquals(0, result.getTotal());
++        assertTrue(result.getRecords().isEmpty());
++        verify(baseMapper, never()).selectPage(any(), any());
++    }
++
++    // ---------- 详情：详情类 403 语义 ----------
++
++    @Test
++    @DisplayName("详情 - allTenant 直接返回")
++    void testDetail_AllTenantReturns() {
++        when(dataPermService.resolve(1L)).thenReturn(VisibleScope.allTenant(false));
++        IotModelInstance f01 = instance(1L, "F01", 0L, "0", 1, 10L, 1, 1);
++        when(baseMapper.selectById(1L)).thenReturn(f01);
++
++        assertEquals(f01, instanceService.getInstanceDetail(1L));
++    }
++
++    @Test
++    @DisplayName("详情 - 受限用户可见集命中返回")
++    void testDetail_ScopeHitReturns() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        IotModelInstance ws01 = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(ws01);
++
++        assertEquals(ws01, instanceService.getInstanceDetail(2L));
++    }
++
++    @Test
++    @DisplayName("详情 - 数据权限不命中 403（SCOPE_FORBIDDEN 首个真实消费点，ADR-0016 裁决 2）")
++    void testDetail_ScopeMiss403() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectById(5L)).thenReturn(instance(5L, "F02", 0L, "0", 1, 20L, 1, 2));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.getInstanceDetail(5L));
++
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertEquals(403, e.getCode());
++        assertTrue(e.getMessage().contains("无权"));
++    }
++
++    @Test
++    @DisplayName("详情 - 实例不存在报参数错误")
++    void testDetail_NotFound() {
++        when(dataPermService.resolve(1L)).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.selectById(404L)).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.getInstanceDetail(404L));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++    }
++
++    // ---------- 防环（REQ-0005 验收 6）：挪树禁止闭环的结构性说明用例 ----------
++
++    @Test
++    @DisplayName("防环 - 节点不能挂到自身子孙下：改父一律拒绝（TD-0010 挪树禁止使防环结构性成立）")
++    void testAntiCycle_ParentChangeAlwaysRejected() {
++        // F01(1) → WS01(2) → EQ001(4)：尝试把 F01 挂到其子孙 WS01 下（典型成环请求）
++        when(baseMapper.selectById(1L)).thenReturn(instance(1L, "F01", 0L, "0", 1, 10L, 1, 1));
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(1L);
++        form.setParentId(2L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.updateInstance(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("挪树"), "挂自身子孙=改父，随挪树禁止一并拒绝（防环验收）");
++        verify(baseMapper, never()).updateById(any(IotModelInstance.class));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+index f3b0800..9c7e8f3 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+@@ -291,6 +291,72 @@ class IotModelTemplateServiceImplTest {
+         verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
+     }
+ 
++    // ---------- M-6 守卫（0011 评审裁决，TASK-0012 随本任务落地） ----------
++
++    @Test
++    @DisplayName("M-6 守卫 - 有实例引用时改 node_type 拒绝并提示引用计数（红转绿）")
++    void testUpdateTemplate_NodeTypeChangeWithInstanceRefRejected() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        existing.setNodeType(4);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setNodeType(2);
++        when(modelInstanceMapper.selectCount(any())).thenReturn(3L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("节点类型"), "文案应指向 node_type 不可改");
++        assertTrue(e.getMessage().contains("3"), "文案应含引用计数");
++        // 引用计数按 template_id 过滤（租户条件由插件追加、deleted 由 @TableLogic 运行时过滤）
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(modelInstanceMapper).selectCount(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("template_id"));
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("M-6 守卫 - 无实例引用时改 node_type 允许（守卫不误伤模板改档）")
++    void testUpdateTemplate_NodeTypeChangeWithoutInstanceRefAllowed() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        existing.setNodeType(4);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setNodeType(3);
++        form.setTemplateName("改档后的模板");
++        when(modelInstanceMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.updateById(any(IotModelTemplate.class))).thenReturn(1);
++
++        assertTrue(templateService.updateTemplate(form));
++
++        ArgumentCaptor<IotModelTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(Integer.valueOf(3), captor.getValue().getNodeType());
++    }
++
++    @Test
++    @DisplayName("M-6 守卫 - node_type 未变时不触发引用计数查询（编辑常规字段零额外查询）")
++    void testUpdateTemplate_NodeTypeUnchangedSkipsRefCount() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        existing.setNodeType(4);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setNodeType(4);
++        form.setTemplateName("改名");
++        when(baseMapper.updateById(any(IotModelTemplate.class))).thenReturn(1);
++
++        assertTrue(templateService.updateTemplate(form));
++
++        verify(modelInstanceMapper, never()).selectCount(any());
++        verify(baseMapper).updateById(any(IotModelTemplate.class));
++    }
++
+     // ---------- 删除保护 ----------
+ 
+     @Test
+diff --git a/resources/sql/upgrade/20261122_iot_instance_columns.sql b/resources/sql/upgrade/20261122_iot_instance_columns.sql
+new file mode 100644
+index 0000000..7f59318
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_instance_columns.sql
+@@ -0,0 +1,106 @@
++-- ============================================================
++-- 存量库升级脚本：模型实例域两列增量 + 实例管理按钮权限种子（TASK-0012 / FEAT-0004 / REQ-0005）
++--
++-- 用途：
++--   1) iot_model_instance 补两列（TASK 正文指定，PDF 附录 A p31 逐字 DDL 无此两列——
++--      「与上游差异」头注登记，随上游修订清单回写详细设计攒下一版小修订）：
++--        `applied_template_version` int DEFAULT NULL COMMENT '已应用的模板版本（实例版本锁定，REQ-0005）'
++--        `locked`                   tinyint DEFAULT 0 COMMENT '实例锁定 0 未锁 1 已锁（锁定后配置变更受限，REQ-0005）'
++--      （FEAT-0004 实现方式栏：实体增「已应用模板版本」「锁定版本」字段，ADR-0008 落地件。
++--      applied_template_version 创建时=模板当前 version，模板升版实例不自动跟随；
++--      locked=1 时编辑仅允许 status/remark——锁定语义 REQ-0005 口径。）
++--      判存幂等：information_schema.COLUMNS 判列存在性，存在即跳过（PREPARE 动态执行），
++--      重复执行不报错、不重复加列。
++--   2) sys_menu 登记实例管理页（sys_menu 4010「实例管理」，TASK-0055 已建）之下的
++--      六个按钮权限行（menu_type=3）：iot:instance:list/query/add/edit/remove +
++--      iot:instance:tree（实例树接口单设权限点——树查询是数据权限裁剪的独立消费方，
++--      与分页列表分权：只需看树的用户可不授列表权限）。
++--   3) sys_role_menu 将上述六行授予超级管理员（role_id=1；照 20261121_iot_data_dict.sql 范式）。
++--
++-- 与上游差异（一处，随上游修订清单回写详细设计攒下一版小修订）：
++--   1) iot_model_instance 较附录 A p31 逐字 DDL 增补两列：
++--        applied_template_version / locked（来源：FEAT-0004 实现方式栏 + REQ-0005 锁定口径，
++--        TASK-0012 正文指定；上游附录 A p31 无此两列）。
++--      其余列与索引逐字一致，不改语义。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 p21 + 本任务 brief）：
++--   iot:instance:list    GET    /iot/instance/list（实例分页列表，数据权限裁剪生效）
++--   iot:instance:query   GET    /iot/instance/{id}（详情，越权 403——SCOPE_FORBIDDEN 首个消费点）
++--   iot:instance:add     POST   /iot/instance（创建：选模板/路径式编码/ancestors/绑部门）
++--   iot:instance:edit    PUT    /iot/instance（编辑：编码/父/祖级/类型/模板五字段不可改；锁定受限）
++--   iot:instance:remove  DELETE /iot/instance/{ids}（逻辑删；有子实例拒绝）
++--   iot:instance:tree    GET    /iot/instance/tree（实例树，数据权限裁剪：无权节点不返回）
++--   （守卫：backend IotInstanceMenuPermissionGuardTest 强制六行权限码与控制器注解一一对应；
++--   SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4024-4029：TASK-0011 占用（模板按钮六行）；
++--   本脚本占用 sys_menu id 4030-4035（实例按钮六行，parent_id=4010），连续取号。
++--
++-- 幂等口径：
++--   加列走 information_schema 判存（存在即跳过）+ INSERT IGNORE 显式 id——重复执行不报错、
++--   不重复加列、不重复插入、不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.5 / REQ-0005 / ADR-0011 TD-0008/TD-0010 / ADR-0016）：
++--   uk_tenant_instance_code 为 (tenant_id, instance_code) 物理唯一索引；子节点编码=父编码+
++--   "."+本级短码（服务层拼装，请求只传本级短码，短码字符集 [A-Za-z0-9_]）；编码/父/祖级/
++--   类型/模板五字段创建后不可改（TD-0010 挪树一期禁止，防环结构性成立）；工厂/车间级节点
++--   dept_id 必填（服务层防线，ADR-0016 开放点 10 归属本任务）；设备/组件级实例强制选模板
++--   （TD-0008）；树查询按数据权限裁剪（FEAT-0002 组件，resolve() → VisibleScope，
++--   allTenant 全树、受限用户可见集+根路径骨架、createByOnly 空树——实例树属数据查询语义）。
++--   多租户：iot_ 前缀表由 TASK-0002 TenantLineInnerInterceptor（OtTenantLineHandler 前缀规则）
++--   自动按会话租户注入条件，tenant_id 服务层从会话覆盖、禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）与 20261121_iot_console_menus.sql、
++--   20261122_iot_template_domain.sql（4010 与 iot_model_instance 在位）的存量库及全新库
++--   均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。加列采用单行 SET @ddl = IF(...) + PREPARE/EXECUTE 动态执行，
++--   字符串内引号以双写单引号转义，语句行内不得出现行尾分号以外的分号。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++SET @col_applied_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_model_instance' AND COLUMN_NAME = 'applied_template_version');
++
++SET @ddl_applied = IF(@col_applied_exists = 0, 'ALTER TABLE `iot_model_instance` ADD COLUMN `applied_template_version` int DEFAULT NULL COMMENT ''已应用的模板版本（实例版本锁定，REQ-0005）'' AFTER `status`', 'SELECT ''skip: applied_template_version already exists'' AS note');
++
++PREPARE stmt_applied FROM @ddl_applied;
++
++EXECUTE stmt_applied;
++
++DEALLOCATE PREPARE stmt_applied;
++
++SET @col_locked_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_model_instance' AND COLUMN_NAME = 'locked');
++
++SET @ddl_locked = IF(@col_locked_exists = 0, 'ALTER TABLE `iot_model_instance` ADD COLUMN `locked` tinyint DEFAULT 0 COMMENT ''实例锁定 0 未锁 1 已锁（锁定后配置变更受限，REQ-0005）'' AFTER `applied_template_version`', 'SELECT ''skip: locked already exists'' AS note');
++
++PREPARE stmt_locked FROM @ddl_locked;
++
++EXECUTE stmt_locked;
++
++DEALLOCATE PREPARE stmt_locked;
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4030, 4010, 4, '实例查询', 3, NULL, NULL, NULL, 'iot:instance:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4031, 4010, 4, '实例详情', 3, NULL, NULL, NULL, 'iot:instance:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4032, 4010, 4, '实例新增', 3, NULL, NULL, NULL, 'iot:instance:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4033, 4010, 4, '实例修改', 3, NULL, NULL, NULL, 'iot:instance:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4034, 4010, 4, '实例删除', 3, NULL, NULL, NULL, 'iot:instance:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4035, 4010, 4, '实例树查询', 3, NULL, NULL, NULL, 'iot:instance:tree', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4030), (1, 4031), (1, 4032), (1, 4033), (1, 4034), (1, 4035);
++
++-- ============================================================
++-- 执行后核对（第一条应见两新列、第二条应 6 行、第三条应 6 行）：
++--   SHOW COLUMNS FROM iot_model_instance LIKE 'applied_template_version';
++--   SHOW COLUMNS FROM iot_model_instance LIKE 'locked';
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4030 AND 4035;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4030 AND 4035;
++-- ============================================================

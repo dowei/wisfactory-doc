@@ -1,0 +1,516 @@
+commit 509a82b3a8b5f28f4c1499aaeee0798e9c22edad
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 01:14:19 2026 +0800
+
+    fix(iot): 数据权限组件修订轮——中台 deptIds 恒空集（I-1）与入口租户上下文守卫（I-2），ADR-0016 增补第 8/9 条（TASK-0005 修订轮）
+    
+    - I-1（增补第 8 条）：resolveClientScope 不再从实例行推导 deptIds 并集——该并集会让点位类条件部门分支放行「同部门但 scope 外」的其他实例点位（授权放大）；中台路径 deptIds 恒空集，点位条件仅实例分支（fail-closed）；DataPermClientScopeTest 两条固化放大行为的断言随裁决修正（合法红转绿）
+    - I-2（增补第 9 条）：resolve/resolveClientScope 入口检查 TenantContext——无租户上下文返回空 VisibleScope 并 WARN [DATAPERM] no-tenant-context user=<id 或 unknown>，禁止静默产出跨租户全量；新增 DataPermTenantContextGuardTest（含 WARN 逐字符断言与 subject=unknown 档）
+    - 测试设施：resolve 系三个测试类以 mockStatic(TenantContext) 注入会话租户（守卫用例显式 thenReturn(null)——mockStatic 默认答案对包装 Long 返 0 会骗过守卫）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java
+index 244f07c..d04427b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java
+@@ -20,6 +20,10 @@ public interface DataPermService {
+     /**
+      * 步骤 1-6：登录用户 → 可见范围。
+      *
++     * <p>入口守卫（ADR-0016 增补第 9 条）：无租户上下文（异步线程/接线方漏设）时返回
++     * 空 VisibleScope 并 WARN {@code [DATAPERM] no-tenant-context user=<id 或 unknown>}——
++     * 禁止静默产出跨租户全量；调用方必须在有租户上下文的会话内调用。
++     *
+      * <p>调用路径先缓存后计算（步骤 6 接缝，{@link VisibleScopeCache}）：
+      * 本期 NoOp 直查，Redis 缓存与主动失效归 TASK-0006（key=(user_id, 角色版本)，TTL 10 分钟）。
+      *
+@@ -36,9 +40,14 @@ public interface DataPermService {
+      * 子树展开（含上限截断），false 精确匹配；scope 为 null 或空数组 = 无任何数据权限
+      * （默认拒绝，不是全部）。展开成可见实例集合后与登录用户走完全相同的拼装与下推。
+      *
+-     * @param clientId  中台调用方 id（iot_api_client.id），仅用于截断 WARN 日志的主体标识
++     * <p>中台可见范围只有实例集合：deptIds 恒为空集（ADR-0016 增补第 8 条）——
++     * 点位类条件的部门分支会放行「同部门但 scope 外」的其他实例点位（授权放大），
++     * 中台点位条件仅实例分支（fail-closed）。
++     *
++     * @param clientId  中台调用方 id（iot_api_client.id），仅用于截断/守卫 WARN 日志的主体标识
+      * @param scopeJson iot_api_client.scope 的 JSON 串，允许 null/空白（默认拒绝）
+-     * @return 可见范围；allTenant 恒 false（中台 scope 永远不是全租户）、createByOnly 恒 false（无本人语义）
++     * @return 可见范围；allTenant 恒 false（中台 scope 永远不是全租户）、createByOnly 恒 false（无本人语义）、
++     *         deptIds 恒空集（增补第 8 条）
+      */
+     VisibleScope resolveClientScope(Long clientId, String scopeJson);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java
+index 27cd798..d520c2b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java
+@@ -10,6 +10,7 @@ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
+ import net.otlab.core.constant.DataScopeEnum;
++import net.otlab.core.tenant.TenantContext;
+ import org.springframework.stereotype.Service;
+ 
+ import java.util.ArrayList;
+@@ -37,6 +38,11 @@ import java.util.stream.Collectors;
+  *     Redis 与主动失效归 TASK-0006。</li>
+  * </ol>
+  *
++ * <p>入口守卫（ADR-0016 增补第 9 条）：resolve/resolveClientScope 先检查租户上下文，
++ * 无上下文（异步线程/接线方漏设）返回空 VisibleScope 并 WARN
++ * {@code [DATAPERM] no-tenant-context user=<id 或 unknown>}——禁止静默产出跨租户全量；
++ * 租户过滤本身仍完全由多租户插件按会话上下文注入，守卫不重复实现隔离。
++ *
+  * <p>自包含设计：只依赖本包只读 Mapper 与配置，不调用框架 DataScopeService、不依赖
+  * iot 域业务服务；多租户隔离消费会话租户上下文（插件自动注入），不重复实现。
+  *
+@@ -82,6 +88,13 @@ public class DataPermServiceImpl implements DataPermService {
+ 
+     @Override
+     public VisibleScope resolve(Long userId) {
++        // ADR-0016 增补第 9 条：入口租户上下文守卫——无上下文时多租户插件对所有表跳过注入，
++        // 继续计算会静默产出跨租户全量（本组件要防的最严重失效模式）：fail-closed 返回空集并 WARN。
++        // 守卫是防失效模式而非重复实现隔离，租户过滤仍完全由插件按会话上下文注入。
++        if (TenantContext.getTenantId() == null) {
++            log.warn("[DATAPERM] no-tenant-context user={}", subjectLabel(userId));
++            return VisibleScope.denied();
++        }
+         // 步骤 6：先缓存后计算（Redis 实现与主动失效归 TASK-0006，本接缝已按缓存语义写好）
+         VisibleScope cached = cache.get(userId);
+         if (cached != null) {
+@@ -150,6 +163,11 @@ public class DataPermServiceImpl implements DataPermService {
+ 
+     @Override
+     public VisibleScope resolveClientScope(Long clientId, String scopeJson) {
++        // ADR-0016 增补第 9 条：入口租户上下文守卫（同 resolve）
++        if (TenantContext.getTenantId() == null) {
++            log.warn("[DATAPERM] no-tenant-context user={}", subjectLabel(clientId));
++            return VisibleScope.denied();
++        }
+         ClientScopeSpec spec = parseClientScope(scopeJson);
+         if (spec == null || spec.instanceIds() == null || spec.instanceIds().isEmpty()) {
+             // 裁决 5：scope 为 null 或空数组 = 无任何数据权限（默认拒绝，与「为空表示无权限」一致）
+@@ -159,7 +177,8 @@ public class DataPermServiceImpl implements DataPermService {
+         if (!spec.subtree()) {
+             // subtree=false：精确匹配，不展开子树；行集经多租户插件收敛在会话租户内
+             List<DataPermInstanceRow> rows = instanceMapper.selectByIds(scopeIds);
+-            return exactScope(rows);
++            return clientScope(rows.stream().map(DataPermInstanceRow::getId)
++                    .collect(Collectors.toCollection(LinkedHashSet::new)));
+         }
+         // subtree=true：与登录用户完全相同的步骤 3-5——scope 实例为锚点，ancestors 展开全部后代（含上限截断）
+         List<DataPermInstanceRow> rows = instanceMapper.selectAllForPerm();
+@@ -170,22 +189,18 @@ public class DataPermServiceImpl implements DataPermService {
+         if (anchorIds.isEmpty()) {
+             return VisibleScope.denied();
+         }
+-        Set<Long> visibleIds = expandSubtree(rows, anchorIds, clientId);
+-        return exactScope(rows.stream().filter(r -> visibleIds.contains(r.getId())).toList());
++        return clientScope(expandSubtree(rows, anchorIds, clientId));
+     }
+ 
+     /**
+-     * 由实例行集构造中台可见范围：实例集合=行 id，部门集合=行绑定部门（点位类条件与
+-     * 登录用户同构拼装的输入，dept_id 未绑行不产出部门）
++     * 由可见实例集合构造中台可见范围（ADR-0016 增补第 8 条）：deptIds 恒为空集——
++     * 中台授权本体是实例集合（裁决 5）；若从实例行推导部门并集，点位类条件
++     * {@code dept_id IN (部门集) OR bound_instance_id IN (实例集)} 的部门分支会放行
++     * 「与被授权实例同部门、但 scope 外」的其他实例点位行/TDengine 子表（授权放大超出
++     * scope 声明）。定版：中台路径 deptIds 恒空集，点位条件仅实例分支（fail-closed）。
+      */
+-    private VisibleScope exactScope(List<DataPermInstanceRow> rows) {
+-        Set<Long> ids = rows.stream().map(DataPermInstanceRow::getId)
+-                .collect(Collectors.toCollection(LinkedHashSet::new));
+-        Set<Long> deptIds = rows.stream()
+-                .map(DataPermInstanceRow::getDeptId)
+-                .filter(d -> d != null)
+-                .collect(Collectors.toCollection(LinkedHashSet::new));
+-        return new VisibleScope(false, deptIds, ids, false);
++    private VisibleScope clientScope(Set<Long> visibleIds) {
++        return new VisibleScope(false, Set.of(), visibleIds, false);
+     }
+ 
+     private ClientScopeSpec parseClientScope(String scopeJson) {
+@@ -290,6 +305,14 @@ public class DataPermServiceImpl implements DataPermService {
+         return ancestors.split(",").length;
+     }
+ 
++    /**
++     * 守卫 WARN 的主体标识（ADR-0016 增补第 9 条 user=&lt;id 或 unknown&gt;）：
++     * 用户路径=userId，中台路径=clientId，null 兜底 unknown
++     */
++    private static String subjectLabel(Long subjectId) {
++        return subjectId == null ? "unknown" : String.valueOf(subjectId);
++    }
++
+     private static boolean isScope(DataPermRoleRow role, DataScopeEnum expected) {
+         return role.getDataScope() != null && role.getDataScope().equals(expected.getValue());
+     }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java
+index cbc5957..2fa2166 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java
+@@ -5,6 +5,7 @@ import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import net.otlab.core.tenant.TenantContext;
+ import ch.qos.logback.classic.Level;
+ import ch.qos.logback.classic.Logger;
+ import ch.qos.logback.classic.spi.ILoggingEvent;
+@@ -15,6 +16,7 @@ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
++import org.mockito.MockedStatic;
+ import org.mockito.MockitoAnnotations;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -25,6 +27,7 @@ import java.util.Set;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.Mockito.mockStatic;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoInteractions;
+@@ -60,11 +63,16 @@ class DataPermClientScopeTest {
+ 
+     private ListAppender<ILoggingEvent> logAppender;
+ 
++    /** 组件入口消费会话租户上下文（守卫按 ADR-0016 增补第 9 条检查 TenantContext）——本类用例默认注入租户 1 */
++    private MockedStatic<TenantContext> tenantContext;
++
+     private AutoCloseable mocks;
+ 
+     @BeforeEach
+     void setUp() {
+         mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
+         properties = new DataPermProperties();
+         service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
+                 deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
+@@ -75,6 +83,7 @@ class DataPermClientScopeTest {
+ 
+     @AfterEach
+     void tearDown() throws Exception {
++        tenantContext.close();
+         ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).detachAppender(logAppender);
+         mocks.close();
+     }
+@@ -135,7 +144,7 @@ class DataPermClientScopeTest {
+     // ---------- 三态之二：subtree=false 精确匹配 ----------
+ 
+     @Test
+-    @DisplayName("subtree=false - 按 instanceIds 精确匹配，不展开子树；deptIds 取命中实例绑定的部门")
++    @DisplayName("subtree=false - 按 instanceIds 精确匹配，不展开子树；deptIds 恒空集（ADR-0016 增补第 8 条）")
+     void testClientScope_ExactMatch_NoSubtreeExpansion() {
+         when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
+                 inst(1L, "F01", 10L, "0"),
+@@ -144,7 +153,8 @@ class DataPermClientScopeTest {
+         VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1,2],\"subtree\":false}");
+ 
+         assertEquals(Set.of(1L, 2L), scope.instanceIds());
+-        assertEquals(Set.of(10L, 11L), scope.deptIds(), "中台可见部门=可见实例绑定的部门（点位类条件与登录用户同构拼装）");
++        assertEquals(Set.of(), scope.deptIds(), "中台 deptIds 恒空集（增补第 8 条）：中台授权本体是实例集合，"
++                + "从实例行推导部门并集会让点位条件部门分支放行「同部门但 scope 外」的其他实例点位——fail-closed 仅实例分支");
+         assertFalse(scope.allTenant());
+         assertFalse(scope.createByOnly());
+         ArgumentCaptor<Collection<Long>> idsCaptor = ArgumentCaptor.captor();
+@@ -175,7 +185,7 @@ class DataPermClientScopeTest {
+     // ---------- 三态之三：subtree=true 与登录用户相同展开 ----------
+ 
+     @Test
+-    @DisplayName("subtree=true - 复用步骤 4：锚点=scope 实例，ancestors 展开全部后代")
++    @DisplayName("subtree=true - 复用步骤 4：锚点=scope 实例，ancestors 展开全部后代；deptIds 恒空集（增补第 8 条）")
+     void testClientScope_SubtreeTrue_ExpandsDescendants() {
+         when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
+                 inst(1L, "F01", 10L, "0"),
+@@ -186,7 +196,8 @@ class DataPermClientScopeTest {
+         VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1],\"subtree\":true}");
+ 
+         assertEquals(Set.of(1L, 2L, 3L), scope.instanceIds(), "与登录用户完全相同的子树展开（ADR-0016 裁决 5）");
+-        assertEquals(Set.of(10L, 20L, 30L), scope.deptIds(), "展开后可见实例的部门一并进入部门集合");
++        assertEquals(Set.of(), scope.deptIds(), "展开后实例虽绑定部门 10/20/30，也不产出部门可见性（增补第 8 条："
++                + "部门分支会放行同部门 scope 外实例的点位行/TDengine 子表）");
+         assertFalse(scope.createByOnly());
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+index acccb61..483056e 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+@@ -5,10 +5,13 @@ import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import net.otlab.core.tenant.TenantContext;
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.Mock;
++import org.mockito.MockedStatic;
+ import org.mockito.MockitoAnnotations;
+ 
+ import java.util.HashSet;
+@@ -20,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertSame;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+-import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mockStatic;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+@@ -56,16 +59,27 @@ class DataPermResolveScopeTest {
+     private DataPermProperties properties;
+     private DataPermServiceImpl service;
+ 
++    /** 组件入口消费会话租户上下文（守卫按 ADR-0016 增补第 9 条检查 TenantContext）——本类用例默认注入租户 1 */
++    private MockedStatic<TenantContext> tenantContext;
++
+     private AutoCloseable mocks;
+ 
+     @BeforeEach
+     void setUp() {
+         mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
+         properties = new DataPermProperties();
+         service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
+                 deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
+     }
+ 
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
+     private DataPermRoleRow role(Long id, Integer dataScope) {
+         DataPermRoleRow row = new DataPermRoleRow();
+         row.setId(id);
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java
+index 804e079..efd0378 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java
+@@ -5,6 +5,7 @@ import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
+ import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import net.otlab.core.tenant.TenantContext;
+ import ch.qos.logback.classic.Level;
+ import ch.qos.logback.classic.Logger;
+ import ch.qos.logback.classic.spi.ILoggingEvent;
+@@ -14,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.Mock;
++import org.mockito.MockedStatic;
+ import org.mockito.MockitoAnnotations;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -22,6 +24,7 @@ import java.util.Set;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mockStatic;
+ import static org.mockito.Mockito.when;
+ 
+ /**
+@@ -53,11 +56,16 @@ class DataPermResolveSubtreeTest {
+ 
+     private ListAppender<ILoggingEvent> logAppender;
+ 
++    /** 组件入口消费会话租户上下文（守卫按 ADR-0016 增补第 9 条检查 TenantContext）——本类用例默认注入租户 1 */
++    private MockedStatic<TenantContext> tenantContext;
++
+     private AutoCloseable mocks;
+ 
+     @BeforeEach
+     void setUp() {
+         mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
+         properties = new DataPermProperties();
+         service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
+                 deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
+@@ -68,6 +76,7 @@ class DataPermResolveSubtreeTest {
+ 
+     @AfterEach
+     void tearDown() throws Exception {
++        tenantContext.close();
+         ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).detachAppender(logAppender);
+         mocks.close();
+     }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTenantContextGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTenantContextGuardTest.java
+new file mode 100644
+index 0000000..3c248bb
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTenantContextGuardTest.java
+@@ -0,0 +1,163 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import net.otlab.core.tenant.TenantContext;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.MockitoAnnotations;
++import org.slf4j.LoggerFactory;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++/**
++ * 数据权限翻译组件——入口租户上下文守卫单元测试（TASK-0005 修订轮，ADR-0016 增补第 9 条）。
++ *
++ * <p>无租户上下文时（异步线程 / 接线方漏设上下文）多租户插件对所有表跳过注入，
++ * 继续计算会静默产出跨租户全量——组件要防的最严重失效模式。定版：入口
++ * resolve/resolveClientScope 检查 TenantContext，无上下文返回空 VisibleScope
++ * （allTenant=false、集合全空）并 WARN {@code [DATAPERM] no-tenant-context user=<id 或 unknown>}。
++ *
++ * <p>standalone 测试以 mockStatic(TenantContext) 显式控制上下文有无：
++ * 未打桩时 getTenantId() 返回 null = 无上下文形态。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermTenantContextGuardTest {
++
++    @Mock
++    private DataPermUserMapper userMapper;
++    @Mock
++    private DataPermRoleMapper roleMapper;
++    @Mock
++    private DataPermRoleDeptMapper roleDeptMapper;
++    @Mock
++    private DataPermDeptMapper deptMapper;
++    @Mock
++    private DataPermInstanceMapper instanceMapper;
++    @Mock
++    private VisibleScopeCache cache;
++
++    private DataPermProperties properties;
++    private DataPermServiceImpl service;
++
++    private ListAppender<ILoggingEvent> logAppender;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        // 默认不打桩：getTenantId() 返回 null = 无租户上下文（守卫用例主体）
++        tenantContext = mockStatic(TenantContext.class);
++        properties = new DataPermProperties();
++        service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, cache, properties);
++        logAppender = new ListAppender<>();
++        logAppender.start();
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).addAppender(logAppender);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).detachAppender(logAppender);
++        mocks.close();
++    }
++
++    private DataPermRoleRow role(Long id, Integer dataScope) {
++        DataPermRoleRow row = new DataPermRoleRow();
++        row.setId(id);
++        row.setDataScope(dataScope);
++        return row;
++    }
++
++    /**
++     * 显式模拟无租户上下文。注意：mockStatic 未打桩时 Mockito 默认答案对包装类型 Long
++     * 返回 0 而非 null，与真实「无上下文返回 null」不符（会骗过守卫），必须显式置 null。
++     */
++    private void noTenantContext() {
++        tenantContext.when(TenantContext::getTenantId).thenReturn(null);
++    }
++
++    private List<String> warnMessages() {
++        return logAppender.list.stream()
++                .filter(e -> e.getLevel() == Level.WARN)
++                .map(ILoggingEvent::getFormattedMessage)
++                .toList();
++    }
++
++    @Test
++    @DisplayName("resolve 无租户上下文 - 返回空集 fail-closed + WARN 固定格式，不触达缓存与任何 Mapper")
++    void testResolve_NoTenantContext_DeniedWithWarn() {
++        noTenantContext();
++        VisibleScope scope = service.resolve(7L);
++
++        assertFalse(scope.allTenant());
++        assertFalse(scope.createByOnly());
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        assertEquals(List.of("[DATAPERM] no-tenant-context user=7"), warnMessages(),
++                "守卫 WARN 格式为 ADR-0016 增补第 9 条硬约束（可 grep）");
++        verifyNoInteractions(cache, roleMapper, userMapper, roleDeptMapper, deptMapper, instanceMapper);
++    }
++
++    @Test
++    @DisplayName("resolveClientScope 无租户上下文 - 同样空集拒绝 + WARN（subject=clientId）")
++    void testResolveClientScope_NoTenantContext_DeniedWithWarn() {
++        noTenantContext();
++        VisibleScope scope = service.resolveClientScope(5L, "{\"instanceIds\":[1],\"subtree\":true}");
++
++        assertFalse(scope.allTenant());
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        assertEquals(List.of("[DATAPERM] no-tenant-context user=5"), warnMessages());
++        verifyNoInteractions(instanceMapper, cache);
++    }
++
++    @Test
++    @DisplayName("subject 为 null - WARN 以 user=unknown 兜底（格式约定的 unknown 档）")
++    void testResolve_NullSubject_WarnUnknown() {
++        noTenantContext();
++        VisibleScope scope = service.resolve(null);
++
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        assertEquals(List.of("[DATAPERM] no-tenant-context user=unknown"), warnMessages());
++    }
++
++    @Test
++    @DisplayName("有租户上下文 - 守卫放行，正常进入六步计算（不误伤合法调用）")
++    void testWithTenantContext_ComputationProceeds() {
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertTrue(scope.allTenant(), "有上下文的合法调用不受守卫影响");
++        verify(roleMapper).selectEnabledRolesByUserId(7L);
++    }
++}

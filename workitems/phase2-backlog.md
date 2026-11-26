@@ -33,3 +33,4 @@
 - **PB-D3** 架构 V1.2 附录 A 标注上游/仓库 ADR 编号映射（上游 ADR-001/002/003 = 仓库 ADR-0001/0002/0006）。
 - **PB-D4** 详细设计 iot_data_item_template 补 default_calc_period 字段（ADR-0011）。
 - **PB-D5** 产品 §9.1 数据项实时值超级表段按 ADR-0001 同逻辑修订（st_item_value 一张、category 为标签维度）。
+- ~~PB-D6~~ **已完成（2026-11-21）**：详细设计 V1.3 已落地 iot_point OPC UA 发现字段（§1.4 + 附录 DDL），TASK-0021 建表按 V1.3 两列执行；注：V1.3 文件尚未归档至 docs 联接目录，归档后以 V1.3 为详细设计现行版（原 PB 待上游修订⑥闭环）。

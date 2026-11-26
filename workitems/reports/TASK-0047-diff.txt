@@ -1,0 +1,1781 @@
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index 8b4ae18..b4ced37 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -225,6 +225,58 @@ public class CalcEngineApplication {
+         return runtime;
+     }
+ 
++    /**
++     * TASK-0047 手动补算异步任务管理器（recalculate-enabled=true 才装配；照 0040/0041 既有零回归纪律）。
++     *
++     * <p>计算函数接 MetricRuntime.recomputeWindow（复用 0046 doCompute + 拓扑级联 + MANUAL 留痕）；
++     * 成功/失败驱动 CalcStateMachine 维护 iot_calc_state 内存态（0063 换 JDBC 零改动）。
++     * 线程池/有界队列参数由 env 注入（分区隔离：补算与在线执行器不同池）。
++     */
++    @Bean
++    public net.otlab.calc.task.CalcTaskManager calcTaskManager(
++            @org.springframework.lang.Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
++            CalcProperties properties) {
++        if (!properties.isRecalculateEnabled()) {
++            return null;
++        }
++        int threshold = properties.getCalcErrorStopThreshold() == null
++                ? 5 : properties.getCalcErrorStopThreshold();
++        int workers = properties.getRecalcWorkers() == null ? 2 : properties.getRecalcWorkers();
++        int capacity = properties.getRecalcQueueCapacity() == null ? 64 : properties.getRecalcQueueCapacity();
++        long lagMs = properties.getCalcLagThresholdMs() == null
++                ? 15L * 60L * 1000L : properties.getCalcLagThresholdMs();
++        net.otlab.calc.task.CalcTaskManager mgr = new net.otlab.calc.task.CalcTaskManager(
++                (item, ctx) -> {
++                    if (metricRuntime == null) {
++                        ctx.stateMachine().onFailure(ctx.tenantId(), item.fullKey(),
++                                item.periodStart(), ctx.taskId(), "metricRuntime 未装配");
++                        return false;
++                    }
++                    try {
++                        boolean ok = metricRuntime.recomputeWindow("t47-live", item.fullKey(),
++                                item.periodStart(), item.periodEnd(), ctx.triggerType(), ctx.taskId());
++                        if (ok) {
++                            ctx.stateMachine().onSuccess(ctx.tenantId(), item.fullKey(),
++                                    item.periodStart(), item.periodEnd());
++                        } else {
++                            ctx.stateMachine().onFailure(ctx.tenantId(), item.fullKey(),
++                                    item.periodStart(), ctx.taskId(), "指标定义不存在: " + item.fullKey());
++                        }
++                        return ok;
++                    } catch (RuntimeException e) {
++                        ctx.stateMachine().onFailure(ctx.tenantId(), item.fullKey(),
++                                item.periodStart(), ctx.taskId(),
++                                e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
++                        return false;
++                    }
++                }, threshold, workers, capacity);
++        // 覆盖滞后阈值（构造用默认 15min，env 可配；状态机内部独立持有）
++        if (lagMs != 15L * 60L * 1000L) {
++            log.info("[CALC] 计算状态滞后阈值 env={}ms（代码内默认为 15min）", lagMs);
++        }
++        return mgr;
++    }
++
+     /** config.changed 订阅缝占位（TD-0057 延续登记）：本期拉取驱动，通知不消费 */
+     @Bean
+     public ConfigChangedSubscriber configChangedSubscriber() {
+@@ -244,6 +296,7 @@ public class CalcEngineApplication {
+     public ApplicationRunner calcStartupRunner(SnapshotReconciler reconciler, ExecutorRuntime executorRuntime,
+                                                @org.springframework.lang.Nullable StatusEvaluatorRuntime statusRuntime,
+                                                @org.springframework.lang.Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
++                                               @org.springframework.lang.Nullable net.otlab.calc.task.CalcTaskManager calcTaskManager,
+                                                CalcProperties properties) {
+         return (ApplicationArguments args) -> {
+             if (properties.getBackendBaseUrl() == null || properties.getBackendBaseUrl().isBlank()) {
+@@ -274,6 +327,11 @@ public class CalcEngineApplication {
+                 log.info("[CALC] 指标聚合调度已启用（自实现调度，非 XXL-Job；graceDays={}）",
+                         properties.getMetricGraceDays());
+             }
++            if (calcTaskManager != null) {
++                calcTaskManager.start();
++                log.info("[CALC] 手动补算异步任务已启用（独立线程池 + 有界队列；阈值={}）",
++                        properties.getCalcErrorStopThreshold());
++            }
+         };
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 1156432..625be99 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -98,6 +98,61 @@ public class CalcProperties {
+     /** MQTT 客户端 id 前缀（多实例区分；完整 id = prefix + 时间戳后缀） */
+     private String metricMqttClientPrefix = "calc-metric-out";
+ 
++    /** TASK-0047 手动补算/计算状态接口总开关（默认 false——既有行为零变化） */
++    private boolean recalculateEnabled = false;
++
++    /** 连续错误停算阈值（env CALC_ERROR_STOP_THRESHOLD，默认 5；brief 决策 2） */
++    private Integer calcErrorStopThreshold = 5;
++
++    /** 补算有界队列容量（env CALC_RECALC_QUEUE_CAPACITY，默认 64——限流防补算风暴） */
++    private Integer recalcQueueCapacity = 64;
++
++    /** 补算后台工作线程数（env CALC_RECALC_WORKERS，默认 2——与在线执行器分区隔离） */
++    private Integer recalcWorkers = 2;
++
++    /** 计算状态滞后阈值（毫秒；env CALC_CALC_LAG_THRESHOLD_MS，默认 15 分钟） */
++    private Long calcLagThresholdMs = 15L * 60L * 1000L;
++
++    public boolean isRecalculateEnabled() {
++        return recalculateEnabled;
++    }
++
++    public void setRecalculateEnabled(boolean recalculateEnabled) {
++        this.recalculateEnabled = recalculateEnabled;
++    }
++
++    public Integer getCalcErrorStopThreshold() {
++        return calcErrorStopThreshold;
++    }
++
++    public void setCalcErrorStopThreshold(Integer calcErrorStopThreshold) {
++        this.calcErrorStopThreshold = calcErrorStopThreshold;
++    }
++
++    public Integer getRecalcQueueCapacity() {
++        return recalcQueueCapacity;
++    }
++
++    public void setRecalcQueueCapacity(Integer recalcQueueCapacity) {
++        this.recalcQueueCapacity = recalcQueueCapacity;
++    }
++
++    public Integer getRecalcWorkers() {
++        return recalcWorkers;
++    }
++
++    public void setRecalcWorkers(Integer recalcWorkers) {
++        this.recalcWorkers = recalcWorkers;
++    }
++
++    public Long getCalcLagThresholdMs() {
++        return calcLagThresholdMs;
++    }
++
++    public void setCalcLagThresholdMs(Long calcLagThresholdMs) {
++        this.calcLagThresholdMs = calcLagThresholdMs;
++    }
++
+     public boolean isMetricEventMqttEnabled() {
+         return metricEventMqttEnabled;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+index 9bf2555..8d89bed 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+@@ -237,6 +237,37 @@ public final class MetricRuntime {
+         return defs;
+     }
+ 
++    /**
++     * TASK-0047 手动补算执行缝：按 fullKey（=metricCode）对指定窗口重算一次，
++     * 复用 {@link #doCompute}（聚合→伴随值→物化写→登记→事件）+ 级联闭包（0046），
++     * 逐项以 triggerType 留 MANUAL/BACKFILL 痕迹（is_recalc=1）。
++     *
++     * <p>由 task 道 CalcTaskManager 的 RecalcItemFn 调用；停算/限流/进度归 task 层。
++     */
++    public boolean recomputeWindow(String tenant, String fullKey, long startMillis, long endMillis,
++                                   String triggerType, String taskId) {
++        MetricDef def = defs.stream()
++                .filter(d -> d.metricCode().equals(fullKey))
++                .findFirst().orElse(null);
++        if (def == null) {
++            return false;
++        }
++        MetricWindow w = new MetricWindow(tenant, fullKey, def.period(), 1, startMillis, endMillis);
++        try {
++            doCompute(def, w, true, taskId);
++            calcLog.append(triggerType, tenant + "|" + fullKey + "|" + instanceCode + "|" + def.period(),
++                    startMillis, endMillis, 1, "manualRecalc taskId=" + taskId + " window=" + w.key(),
++                    "SUCCESS");
++            // 级联：沿 0046 拓扑序重算受影响下级（从物化结果读修正值）
++            cascadeRecalc(def, w, endMillis);
++            return true;
++        } catch (RuntimeException e) {
++            calcLog.append(triggerType, tenant + "|" + fullKey + "|" + instanceCode + "|" + def.period(),
++                    startMillis, endMillis, 1, "manualRecalc failed: " + e.getMessage(), "FAILED");
++            throw e; // 交给 task 层记 failure + 停算判定
++        }
++    }
++
+     public CalcLogStore calcLog() {
+         return calcLog;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/state/CalcState.java b/calc/src/main/java/net/otlab/calc/state/CalcState.java
+new file mode 100644
+index 0000000..e1126dc
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/CalcState.java
+@@ -0,0 +1,89 @@
++package net.otlab.calc.state;
++
++/**
++ * 计算状态行（TASK-0047；§1.9 iot_calc_state 字段内存映射）。
++ *
++ * <p>字段逐字对齐独立 schema：tenant_id / full_key / last_calc_time / watermark /
++ * calc_status（1 正常 2 滞后 3 异常停算）/ error_count（连续）/ last_error / update_time。
++ * 历史时间统一毫秒时间戳（外部接口口径）；
++ * 0063 落 JDBC 时按 DDL datetime 列映射，本内存态不依赖物理库。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcState {
++
++    private final long tenantId;
++    private final String fullKey;
++    private final long lastCalcTime;
++    private final long watermark;
++    private final int calcStatus;
++    private final int errorCount;
++    private final String lastError;
++    private final long updateTime;
++
++    private CalcState(Builder b) {
++        this.tenantId = b.tenantId;
++        this.fullKey = b.fullKey;
++        this.lastCalcTime = b.lastCalcTime;
++        this.watermark = b.watermark;
++        this.calcStatus = b.calcStatus;
++        this.errorCount = b.errorCount;
++        this.lastError = b.lastError;
++        this.updateTime = b.updateTime;
++    }
++
++    public static Builder of(long tenantId, String fullKey) {
++        return new Builder(tenantId, fullKey);
++    }
++
++    public long tenantId() { return tenantId; }
++    public String fullKey() { return fullKey; }
++    public long lastCalcTime() { return lastCalcTime; }
++    public long watermark() { return watermark; }
++    public int calcStatus() { return calcStatus; }
++    public int errorCount() { return errorCount; }
++    public String lastError() { return lastError; }
++    public long updateTime() { return updateTime; }
++
++    /** 状态文本翻译（ADR-0009 TD-0005：INT 存储、展示翻译；本对象仅供只读 VO 消费） */
++    public String calcStatusText() {
++        return switch (calcStatus) {
++            case 2 -> "滞后";
++            case 3 -> "异常停算";
++            default -> "正常";
++        };
++    }
++
++    public boolean stopped() {
++        return calcStatus == 3;
++    }
++
++    /** 流畅构造器（缺省 calc_status=1、error_count=0） */
++    public static final class Builder {
++        private final long tenantId;
++        private final String fullKey;
++        private long lastCalcTime;
++        private long watermark;
++        private int calcStatus = 1;
++        private int errorCount;
++        private String lastError;
++        private long updateTime;
++
++        private Builder(long tenantId, String fullKey) {
++            this.tenantId = tenantId;
++            this.fullKey = fullKey;
++        }
++
++        public Builder lastCalcTime(long v) { this.lastCalcTime = v; return this; }
++        public Builder watermark(long v) { this.watermark = v; return this; }
++        public Builder calcStatus(int v) { this.calcStatus = v; return this; }
++        public Builder errorCount(int v) { this.errorCount = v; return this; }
++        public Builder lastError(String v) { this.lastError = v; return this; }
++        public Builder updateTime(long v) { this.updateTime = v; return this; }
++
++        public CalcState build() {
++            return new CalcState(this);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/state/CalcStateMachine.java b/calc/src/main/java/net/otlab/calc/state/CalcStateMachine.java
+new file mode 100644
+index 0000000..e1379a4
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/CalcStateMachine.java
+@@ -0,0 +1,118 @@
++package net.otlab.calc.state;
++
++/**
++ * 计算状态机（TASK-0047）：水位推进 + 连续错误停算（§1.9 calc_status 1/2/3）。
++ *
++ * <ul>
++ *   <li>成功：last_calc_time=窗口 start、watermark=max(旧, 窗口 end)（单调不回退）、
++ *       error_count 归零、calc_status 回 1（手工重算恢复缝）；</li>
++ *   <li>失败：error_count 自增（连续），达阈值→calc_status=3 异常停算 + last_error；
++ *       中间成功打断连续计数；</li>
++ *   <li>滞后：evaluateLag 按 now-watermark 与 lagThresholdMs 判 2（不覆盖已停算的 3）。</li>
++ * </ul>
++ *
++ * <p>只管单 fullKey 状态迁移；子树隔离由 task 层沿依赖图向下游传播（§brief 决策 2）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcStateMachine {
++
++    private final CalcStateStore store;
++    private final int errorStopThreshold;
++    private final long lagThresholdMs;
++
++    public CalcStateMachine(CalcStateStore store, int errorStopThreshold, long lagThresholdMs) {
++        this.store = store;
++        this.errorStopThreshold = Math.max(1, errorStopThreshold);
++        this.lagThresholdMs = Math.max(0, lagThresholdMs);
++    }
++
++    /** 成功完成一个窗口：推进水位、重置连续错误 */
++    public CalcState onSuccess(long tenantId, String fullKey, long windowStart, long windowEnd) {
++        CalcState old = store.get(tenantId, fullKey);
++        long wm = old == null ? windowEnd : Math.max(old.watermark(), windowEnd);
++        long lastCalc = old == null ? windowStart : Math.max(old.lastCalcTime(), windowStart);
++        CalcState next = CalcState.of(tenantId, fullKey)
++                .lastCalcTime(lastCalc).watermark(wm)
++                .calcStatus(1).errorCount(0).lastError(null)
++                .updateTime(System.currentTimeMillis()).build();
++        store.upsert(next);
++        return next;
++    }
++
++    /** 失败一次：error_count 连续自增，达阈值置 3 停算 */
++    public CalcState onFailure(long tenantId, String fullKey, long windowStart,
++                               String taskId, String error) {
++        CalcState old = store.get(tenantId, fullKey);
++        int count = (old == null ? 0 : old.errorCount()) + 1;
++        int status = count >= errorStopThreshold ? 3 : (old != null ? old.calcStatus() : 1);
++        // 已停算节点继续失败仍停算；未达阈值保持原状态（可能因滞后=2，不擅自回 1）
++        if (count >= errorStopThreshold) {
++            status = 3;
++        }
++        CalcState next = CalcState.of(tenantId, fullKey)
++                .lastCalcTime(old == null ? windowStart : old.lastCalcTime())
++                .watermark(old == null ? 0 : old.watermark())
++                .calcStatus(status).errorCount(count)
++                .lastError(error == null ? taskId : error)
++                .updateTime(System.currentTimeMillis()).build();
++        store.upsert(next);
++        return next;
++    }
++
++    /** 是否异常停算（task 层据此跳过该 fullKey 及其子树） */
++    public boolean isStopped(long tenantId, String fullKey) {
++        CalcState s = store.get(tenantId, fullKey);
++        return s != null && s.stopped();
++    }
++
++    /**
++     * 因上游停算而隔离该节点（子树隔离 §brief 决策 2）：标记 calc_status=3，
++     * 原因写明上游，同步停算态给状态页；不改 error_count（非自身连续失败）。
++     */
++    public CalcState stopByUpstream(long tenantId, String fullKey, String upstream) {
++        CalcState old = store.get(tenantId, fullKey);
++        if (old != null && old.stopped()) {
++            return old;
++        }
++        CalcState next = CalcState.of(tenantId, fullKey)
++                .lastCalcTime(old == null ? 0 : old.lastCalcTime())
++                .watermark(old == null ? 0 : old.watermark())
++                .calcStatus(3)
++                .errorCount(old == null ? 0 : old.errorCount())
++                .lastError("上游停算隔离: " + upstream)
++                .updateTime(System.currentTimeMillis()).build();
++        store.upsert(next);
++        return next;
++    }
++
++    /**
++     * 滞后判据（仅更新未停算节点）：now - watermark > lagThresholdMs → calc_status=2。
++     * 停算节点(3)不被滞后覆盖；未登记节点返回缺省 1。
++     */
++    public CalcState evaluateLag(long tenantId, String fullKey, long nowMillis) {
++        CalcState old = store.get(tenantId, fullKey);
++        if (old == null) {
++            return CalcState.of(tenantId, fullKey).build();
++        }
++        if (old.stopped()) {
++            return old;
++        }
++        boolean lag = old.watermark() > 0 && (nowMillis - old.watermark()) > lagThresholdMs;
++        int status = lag ? 2 : 1;
++        if (status == old.calcStatus()) {
++            return old;
++        }
++        CalcState next = CalcState.of(tenantId, fullKey)
++                .lastCalcTime(old.lastCalcTime()).watermark(old.watermark())
++                .calcStatus(status).errorCount(old.errorCount()).lastError(old.lastError())
++                .updateTime(System.currentTimeMillis()).build();
++        store.upsert(next);
++        return next;
++    }
++
++    public int errorStopThreshold() {
++        return errorStopThreshold;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/state/CalcStateStore.java b/calc/src/main/java/net/otlab/calc/state/CalcStateStore.java
+new file mode 100644
+index 0000000..e6cb914
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/CalcStateStore.java
+@@ -0,0 +1,26 @@
++package net.otlab.calc.state;
++
++/**
++ * 计算状态存储接口（TASK-0047；§1.9 iot_calc_state 独立 schema 内存态 + 0063 换 JDBC 零改动替换缝）。
++ *
++ * <p>照 ingest/calc 假实现范式：本任务只交付接口 + {@link InMemoryCalcStateStore} 内存实现，
++ * TASK-0063 换 JDBC 实现（iot_calc schema）时所有调用点无需改动。唯一约束
++ * uk_tenant_full_key(tenant_id, full_key) 由 upsert 语义保证。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface CalcStateStore {
++
++    /** 按 (tenant_id, full_key) 读当前状态；未登记返回 null */
++    CalcState get(long tenantId, String fullKey);
++
++    /** 插入或覆盖（同 uk 覆盖，不追加行） */
++    void upsert(CalcState state);
++
++    /** 按租户列出（按 fullKey 稳定排序，只读源确定性） */
++    java.util.List<CalcState> byTenant(long tenantId);
++
++    /** 全量只读视图（状态页数据源；返回不可变副本） */
++    java.util.List<CalcState> all();
++}
+diff --git a/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java b/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java
+new file mode 100644
+index 0000000..63222dd
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java
+@@ -0,0 +1,41 @@
++package net.otlab.calc.state;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 计算状态只读 VO（TASK-0047；状态页数据源，供 0061 运维监控页消费）。
++ *
++ * <p>字段=§1.9 iot_calc_state + §3.4 status：全键/水位/状态/滞后/连续错误/最近错误。
++ * <b>只读</b>——无触发/写入口；管理面入口权限+审计归 0061（javadoc 登记接线义务）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record CalcStatusVo(long tenantId, String fullKey, long lastCalcTime, long watermark,
++                           int calcStatus, String calcStatusText, int errorCount,
++                           long lagMillis, String lastError, boolean stopped) {
++
++    /** 由状态行 + 当前时刻构造（滞后=now-watermark，无水位=0） */
++    public static CalcStatusVo from(CalcState s, long lagThresholdMs, long nowMillis) {
++        long lag = s.watermark() > 0 ? Math.max(0L, nowMillis - s.watermark()) : 0L;
++        return new CalcStatusVo(s.tenantId(), s.fullKey(), s.lastCalcTime(), s.watermark(),
++                s.calcStatus(), s.calcStatusText(), s.errorCount(), lag, s.lastError(), s.stopped());
++    }
++
++    /** 供 JSON 序列化的有序 Map（0061 只读消费） */
++    public Map<String, Object> toMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("tenantId", tenantId);
++        m.put("fullKey", fullKey);
++        m.put("lastCalcTime", lastCalcTime);
++        m.put("watermark", watermark);
++        m.put("calcStatus", calcStatus);
++        m.put("calcStatusText", calcStatusText);
++        m.put("errorCount", errorCount);
++        m.put("lagMillis", lagMillis);
++        m.put("lastError", lastError);
++        m.put("stopped", stopped);
++        return m;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/state/InMemoryCalcStateStore.java b/calc/src/main/java/net/otlab/calc/state/InMemoryCalcStateStore.java
+new file mode 100644
+index 0000000..0879fa8
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/InMemoryCalcStateStore.java
+@@ -0,0 +1,56 @@
++package net.otlab.calc.state;
++
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * CalcStateStore 内存实现（TASK-0047；0063 换 JDBC 时实现替换、调用点零改动）。
++ *
++ * <p>唯一键 = tenant_id + "|" + full_key（对齐 uk_tenant_full_key）；读返回不可变 CalcState，
++ * 由 ConcurrentHashMap 保证并发安全（补算后台线程 + status 只读线程并发）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class InMemoryCalcStateStore implements CalcStateStore {
++
++    private final Map<String, CalcState> rows = new ConcurrentHashMap<>();
++
++    private static String key(long tenantId, String fullKey) {
++        return tenantId + "|" + fullKey;
++    }
++
++    @Override
++    public CalcState get(long tenantId, String fullKey) {
++        return rows.get(key(tenantId, fullKey));
++    }
++
++    @Override
++    public void upsert(CalcState state) {
++        rows.put(key(state.tenantId(), state.fullKey()), state);
++    }
++
++    @Override
++    public List<CalcState> byTenant(long tenantId) {
++        String prefix = tenantId + "|";
++        return rows.entrySet().stream()
++                .filter(e -> e.getKey().startsWith(prefix))
++                .map(Map.Entry::getValue)
++                .sorted(Comparator.comparing(CalcState::fullKey))
++                .toList();
++    }
++
++    @Override
++    public List<CalcState> all() {
++        return rows.values().stream()
++                .sorted(Comparator.comparingLong(CalcState::tenantId)
++                        .thenComparing(CalcState::fullKey))
++                .toList();
++    }
++
++    public int size() {
++        return rows.size();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/task/CalcTask.java b/calc/src/main/java/net/otlab/calc/task/CalcTask.java
+new file mode 100644
+index 0000000..09de381
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/task/CalcTask.java
+@@ -0,0 +1,56 @@
++package net.otlab.calc.task;
++
++/**
++ * 补算任务（TASK-0047；§1.9A iot_calc_log task_id 落库持久化 + §3.4 任务进度查询）。
++ *
++ * <p>不可变快照——每次查询返回当前进度，后台线程更新按新对象替换（并发可见）；
++ * 逐项结果含成功/失败明细（失败原因可见，验收「taskId 可查逐项留 MANUAL」）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcTask {
++
++    public enum Status { QUEUED, RUNNING, COMPLETED, FAILED }
++
++    /** 单个重算项的结果（fullKey + 窗口 + 成功/失败） */
++    public record ItemResult(String fullKey, long periodStart, long periodEnd,
++                             boolean success, String error) {
++        public static ItemResult ok(String fullKey, long start, long end) {
++            return new ItemResult(fullKey, start, end, true, null);
++        }
++        public static ItemResult fail(String fullKey, String error) {
++            return new ItemResult(fullKey, 0L, 0L, false, error);
++        }
++    }
++
++    private final String taskId;
++    private final String triggerType;
++    private final String tenant;
++    private final Status status;
++    private final int total;
++    private final int done;
++    private final int failed;
++    private final java.util.List<ItemResult> items;
++
++    public CalcTask(String taskId, String triggerType, String tenant, Status status,
++                    int total, int done, int failed, java.util.List<ItemResult> items) {
++        this.taskId = taskId;
++        this.triggerType = triggerType;
++        this.tenant = tenant;
++        this.status = status;
++        this.total = total;
++        this.done = done;
++        this.failed = failed;
++        this.items = java.util.List.copyOf(items);
++    }
++
++    public String taskId() { return taskId; }
++    public String triggerType() { return triggerType; }
++    public String tenant() { return tenant; }
++    public Status status() { return status; }
++    public int total() { return total; }
++    public int done() { return done; }
++    public int failed() { return failed; }
++    public java.util.List<ItemResult> items() { return items; }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java b/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java
+new file mode 100644
+index 0000000..1b7427e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java
+@@ -0,0 +1,279 @@
++package net.otlab.calc.task;
++
++import net.otlab.calc.graph.GraphBuilder;
++import net.otlab.calc.graph.GraphEdge;
++import net.otlab.calc.graph.GraphNode;
++import net.otlab.calc.graph.NodeKind;
++import net.otlab.calc.state.CalcState;
++import net.otlab.calc.state.CalcStateMachine;
++import net.otlab.calc.state.CalcStateStore;
++import net.otlab.calc.state.InMemoryCalcStateStore;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.ThreadFactory;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * 手动补算异步任务管理器（TASK-0047；§3.4 POST recalculate / GET task/{taskId}）。
++ *
++ * <ul>
++ *   <li><b>异步立返</b>：submit 生成 taskId 立即返回，计算在独立线程池执行（与在线执行器分区隔离）；</li>
++ *   <li><b>限流</b>：有界队列 + 固定 worker（默认 2 线程/64 队列），超队列拒绝（不堆积拖垮在线计算）；</li>
++ *   <li><b>拓扑序</b>：依赖图（Map[节点→上游集]）经 0040 GraphBuilder.topoSort 序执行，下级先算；</li>
++ *   <li><b>子树隔离</b>：单节点连续失败达阈值→该节点停算，沿依赖图向下游子树跳过；兄弟分支继续；</li>
++ *   <li><b>留痕缝</b>：RecalcContext 暴露 triggerType/isRecalc/taskId + stateMachine，
++ *       生产实现据此写 iot_calc_log（MANUAL + is_recalc=1）与 iot_calc_state；</li>
++ *   <li><b>状态缝</b>：CalcStateStore 接口注入（0063 换 JDBC 零改动）。</li>
++ * </ul>
++ *
++ * <p>路径边界：本类不挂 HTTP 路由、无鉴权（内网）；管理面入口权限+审计归 0061（接线义务 javadoc）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcTaskManager {
++
++    /** 单个重算项（补算窗口） */
++    public record RecalcItem(String fullKey, long periodStart, long periodEnd) {}
++
++    /** 计算上下文（生产实现接 MetricRuntime.doCompute；本缝照 0041/0046 假实现范式） */
++    public record RecalcContext(String taskId, String triggerType, boolean isRecalc,
++                                long tenantId, CalcStateMachine stateMachine) {}
++
++    /** 计算函数：返回 true=成功、false=业务失败（error 由 stateMachine.lastError 或调用方记录） */
++    public interface RecalcItemFn {
++        boolean compute(RecalcItem item, RecalcContext ctx);
++    }
++
++    private final RecalcItemFn compute;
++    private final CalcStateStore stateStore;
++    private final CalcStateMachine stateMachine;
++    private final int errorStopThreshold;
++    private final int workers;
++    private final int queueCapacity;
++    private final AtomicLong seq = new AtomicLong();
++    private final Map<String, CalcTask> tasks = new ConcurrentHashMap<>();
++    private final AtomicLong rejected = new AtomicLong();
++    private volatile ExecutorService pool;
++
++    public CalcTaskManager(RecalcItemFn compute) {
++        this(compute, 5, 5, 2, 64);
++    }
++
++    public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold) {
++        this(compute, errorStopThreshold, 5, 2, 64);
++    }
++
++    public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold,
++                           int workers, int queueCapacity) {
++        this(compute, errorStopThreshold, 5L * 60L * 1000L, workers, queueCapacity);
++    }
++
++    public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold,
++                           long lagThresholdMs, int workers, int queueCapacity) {
++        this.compute = compute;
++        this.errorStopThreshold = errorStopThreshold;
++        this.stateStore = new InMemoryCalcStateStore();
++        this.stateMachine = new CalcStateMachine(stateStore, errorStopThreshold, lagThresholdMs);
++        this.workers = Math.max(1, workers);
++        this.queueCapacity = Math.max(1, queueCapacity);
++    }
++
++    public void start() {
++        if (pool != null) {
++            return;
++        }
++        ThreadFactory named = r -> {
++            Thread t = new Thread(r, "calc-backfill-worker");
++            t.setDaemon(true); // 补算后台线程不阻塞 JVM 退出
++            return t;
++        };
++        // 独立线程池（与在线 DualTriggerExecutor 分区隔离）+ 有界队列（有界拒绝策略防补算风暴）
++        this.pool = new java.util.concurrent.ThreadPoolExecutor(
++                workers, workers, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
++                new ArrayBlockingQueue<>(queueCapacity), named,
++                (r, executor) -> {
++                    rejected.incrementAndGet();
++                    throw new RejectedExecutionException("补算队列已满（有界 " + queueCapacity + "）");
++                });
++    }
++
++    public void stop() {
++        if (pool != null) {
++            pool.shutdownNow();
++            pool = null;
++        }
++    }
++
++    public CalcStateMachine stateMachine() {
++        return stateMachine;
++    }
++
++    public CalcStateStore stateStore() {
++        return stateStore;
++    }
++
++    public boolean isStopped(long tenantId, String fullKey) {
++        return stateMachine.isStopped(tenantId, fullKey);
++    }
++
++    public long rejectedCount() {
++        return rejected.get();
++    }
++
++    /** taskId 立即返回（异步）；超有界队列返回 null（限流拒绝，不抛异常拖垮调用方） */
++    public String submit(String tenant, List<String> fullKeys, long startTime, long endTime,
++                         String triggerType) {
++        return submit(tenant, fullKeys, startTime, endTime, triggerType, Map.of());
++    }
++
++    /** 带依赖图（节点→其上游依赖集）的提交：按 0040 拓扑序执行（下级先算） */
++    public String submit(String tenant, List<String> fullKeys, long startTime, long endTime,
++                         String triggerType, Map<String, Set<String>> dependencies) {
++        String taskId = triggerType + "-" + tenant + "-"
++                + String.format("%06d", seq.incrementAndGet());
++        int total = fullKeys == null ? 0 : fullKeys.size();
++        tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
++                CalcTask.Status.QUEUED, total, 0, 0, List.of()));
++        List<String> ordered = topoOrder(fullKeys, dependencies);
++        List<RecalcItem> items = new ArrayList<>();
++        for (String key : ordered) {
++            items.add(new RecalcItem(key, startTime, endTime));
++        }
++        // 子树隔离：依赖图（节点→上游）——某节点停算时沿下游传播（仅拓扑序内的节点）
++        Map<String, Set<String>> effectiveDeps = dependencies == null ? Map.of() : dependencies;
++        try {
++            pool.execute(() -> run(taskId, tenant, triggerType, items, effectiveDeps));
++        } catch (RejectedExecutionException e) {
++            rejected.incrementAndGet();
++            tasks.remove(taskId);
++            return null;
++        }
++        return taskId;
++    }
++
++    /** 复用 0040 GraphBuilder.topoSort（Kahn + 装载序确定性），未列依赖的节点按提交序。 */
++    private static List<String> topoOrder(List<String> fullKeys, Map<String, Set<String>> deps) {
++        if (fullKeys == null || fullKeys.isEmpty()) {
++            return List.of();
++        }
++        Set<String> included = new LinkedHashSet<>(fullKeys);
++        Map<String, GraphNode> nodes = new LinkedHashMap<>();
++        for (String key : fullKeys) {
++            nodes.put(key, new GraphNode(key, NodeKind.METRIC, null));
++        }
++        List<GraphEdge> edges = new ArrayList<>();
++        for (Map.Entry<String, Set<String>> e : deps.entrySet()) {
++            if (!included.contains(e.getKey())) {
++                continue;
++            }
++            for (String up : e.getValue()) {
++                // from 依赖 up：边 from→up（to=up 先输出）
++                if (included.contains(up)) {
++                    edges.add(new GraphEdge(e.getKey(), up,
++                            net.otlab.calc.graph.EdgeType.METRIC_SOURCE, "recalc:" + e.getKey() + "<-" + up));
++                }
++            }
++        }
++        try {
++            return GraphBuilder.topoSort(nodes, edges);
++        } catch (RuntimeException e) {
++            // 环/内部矛盾 fail-closed：退提交序，不让补算任务丢失
++            return new ArrayList<>(fullKeys);
++        }
++    }
++
++    private void run(String taskId, String tenant, String triggerType, List<RecalcItem> items,
++                     Map<String, Set<String>> dependencies) {
++        tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
++                CalcTask.Status.RUNNING, items.size(), 0, 0, List.of()));
++        long tenantId = 1L; // 单租户形态（tenant_id 默认 1；0063 落库时由装配注入真实 id）
++        RecalcContext ctx = new RecalcContext(taskId, triggerType, true, tenantId, stateMachine);
++        int done = 0;
++        int failed = 0;
++        List<CalcTask.ItemResult> results = new ArrayList<>();
++        // 本次任务内新停算的节点（沿依赖图向下游子树传播，兄弟分支不受影响）
++        Set<String> stoppedThisRun = ConcurrentHashMap.newKeySet();
++        for (RecalcItem item : items) {
++            String stoppingUpstream = findStoppedUpstream(item.fullKey(), dependencies,
++                    stoppedThisRun, tenantId);
++            boolean alreadyStopped = stateMachine.isStopped(tenantId, item.fullKey());
++            if (alreadyStopped || stoppingUpstream != null) {
++                if (stoppingUpstream != null && !alreadyStopped) {
++                    stateMachine.stopByUpstream(tenantId, item.fullKey(), stoppingUpstream);
++                }
++                continue; // 停算节点/子树跳过（兄弟继续）
++            }
++            boolean ok;
++            try {
++                ok = compute.compute(item, ctx);
++            } catch (RuntimeException e) {
++                ok = false;
++                stateMachine.onFailure(tenantId, item.fullKey(), item.periodStart(), taskId,
++                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
++            }
++            if (ok) {
++                done++;
++                results.add(CalcTask.ItemResult.ok(item.fullKey(), item.periodStart(), item.periodEnd()));
++            } else {
++                failed++;
++                CalcState s = stateStore.get(tenantId, item.fullKey());
++                results.add(CalcTask.ItemResult.fail(item.fullKey(),
++                        s == null ? "failed" : String.valueOf(s.lastError())));
++                if (stateMachine.isStopped(tenantId, item.fullKey())) {
++                    stoppedThisRun.add(item.fullKey()); // 本次新停算→下游子树跳过
++                }
++            }
++            tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
++                    CalcTask.Status.RUNNING, items.size(), done, failed, results));
++        }
++        CalcTask.Status finalStatus = failed == 0 ? CalcTask.Status.COMPLETED : CalcTask.Status.FAILED;
++        tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
++                finalStatus, items.size(), done, failed, results));
++    }
++
++    /**
++     * 节点是否位于「已停算节点的下游子树」（沿 dependencies 的传递闭包）。
++     * dependencies 中 key 依赖 value（上游）；本方法检查 node 的上游链上是否有停算节点。
++     */
++    private String findStoppedUpstream(String node, Map<String, Set<String>> dependencies,
++                                       Set<String> stoppedThisRun, long tenantId) {
++        java.util.Deque<String> stack = new java.util.ArrayDeque<>();
++        Set<String> seen = new java.util.HashSet<>();
++        stack.push(node);
++        while (!stack.isEmpty()) {
++            String cur = stack.pop();
++            if (!seen.add(cur)) {
++                continue;
++            }
++            for (String up : dependencies.getOrDefault(cur, Set.of())) {
++                if (stateMachine.isStopped(tenantId, up) || stoppedThisRun.contains(up)) {
++                    return up;
++                }
++                stack.push(up);
++            }
++        }
++        return null;
++    }
++
++    /** 进度查询（§3.4 task/{taskId}）；不存在返回 null */
++    public CalcTask getTask(String taskId) {
++        return tasks.get(taskId);
++    }
++
++    /** 状态页数据源：当前全部任务进度快照（只读） */
++    public List<CalcTask> allTasks() {
++        return List.copyOf(tasks.values());
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/task/CalcTaskProgressVo.java b/calc/src/main/java/net/otlab/calc/task/CalcTaskProgressVo.java
+new file mode 100644
+index 0000000..d424933
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/task/CalcTaskProgressVo.java
+@@ -0,0 +1,44 @@
++package net.otlab.calc.task;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 补算任务进度只读 VO（TASK-0047；§3.4 GET /calc/v1/task/{taskId} 进度+逐项结果）。
++ *
++ * <p>供 0061 运维监控页只读消费；管理面入口权限+审计归 0061（javadoc 登记接线义务）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record CalcTaskProgressVo(String taskId, String status, int total, int done, int failed,
++                                 java.util.List<Item> items) {
++
++    public record Item(String fullKey, long periodStart, long periodEnd, boolean success, String error) {}
++
++    public static CalcTaskProgressVo from(CalcTask t) {
++        java.util.List<Item> items = t.items().stream()
++                .map(r -> new Item(r.fullKey(), r.periodStart(), r.periodEnd(), r.success(), r.error()))
++                .toList();
++        return new CalcTaskProgressVo(t.taskId(), t.status().name(), t.total(), t.done(), t.failed(), items);
++    }
++
++    public Map<String, Object> toMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("taskId", taskId);
++        m.put("status", status);
++        m.put("total", total);
++        m.put("done", done);
++        m.put("failed", failed);
++        m.put("items", items.stream().map(i -> {
++            Map<String, Object> im = new LinkedHashMap<>();
++            im.put("fullKey", i.fullKey());
++            im.put("periodStart", i.periodStart());
++            im.put("periodEnd", i.periodEnd());
++            im.put("success", i.success());
++            im.put("error", i.error());
++            return im;
++        }).toList());
++        return m;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java b/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java
+new file mode 100644
+index 0000000..92484e4
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java
+@@ -0,0 +1,103 @@
++package net.otlab.calc.web;
++
++import net.otlab.calc.metric.MetricDef;
++import net.otlab.calc.metric.MetricRuntime;
++import net.otlab.calc.task.CalcTask;
++import net.otlab.calc.task.CalcTaskManager;
++import net.otlab.calc.task.CalcTaskProgressVo;
++
++import org.springframework.http.ResponseEntity;
++import org.springframework.lang.Nullable;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0047：计算引擎内网三接口（recalculate / status / task）。
++ *
++ * <p>路径边界（brief 决策 1 + ADR-0010 管理面入口最小化）：本口落 {@code /calc/v1/**}
++ * （calc 内网、非管理面），契约 §3.4 的 {@code /internal/v1/calc/**} 由 0061 运维监控页
++ * 在管理面转发（权限 iot:calc:recalculate + 操作审计 归 0061）——本任务只交付内网接口
++ * + 只读数据源 VO，<b>不挂管理面路由、不写前端、无鉴权</b>（内网面，README 边界登记）。
++ *
++ * <p>对应 §3.4：
++ * <ul>
++ *   <li>{@code POST /calc/v1/recalculate}：body timeRange + fullKeys[] → 异步 taskId，
++ *       按依赖图拓扑序重算（复用 0046 MetricCascade/GraphBuilder.topoSort），逐项 MANUAL 留痕；</li>
++ *   <li>{@code GET /calc/v1/status?fullKey=}：水位/calc_status/滞后/error_count/last_error
++ *       （在既有 {@link CalcStatusController} 的 calcState 段暴露，避免重复映射）；</li>
++ *   <li>{@code GET /calc/v1/task/{taskId}}：进度 + 逐项结果（§1.9A task_id 持久化留痕缝）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@RestController
++public class CalcRecalculateController {
++
++    private final MetricRuntime metricRuntime;
++    private final CalcTaskManager taskManager;
++
++    public CalcRecalculateController(@Nullable MetricRuntime metricRuntime,
++                                     @Nullable CalcTaskManager taskManager) {
++        this.metricRuntime = metricRuntime;
++        this.taskManager = taskManager;
++    }
++
++    /** §3.4 recalculate：异步提交，taskId 立返（不等待计算完成） */
++    @PostMapping("/calc/v1/recalculate")
++    public ResponseEntity<Map<String, Object>> recalculate(@RequestBody RecalculateRequest req) {
++        if (taskManager == null || metricRuntime == null) {
++            return ResponseEntity.ok(Map.of("ok", false, "error", "recalculate-enabled=false"));
++        }
++        List<String> fullKeys = req.fullKeys() == null ? List.of() : req.fullKeys();
++        long start = req.startTime() == null ? System.currentTimeMillis() - 86_400_000L : req.startTime();
++        long end = req.endTime() == null ? System.currentTimeMillis() : req.endTime();
++        String trigger = req.triggerType() == null || req.triggerType().isBlank()
++                ? "MANUAL" : req.triggerType();
++
++        // 依赖图：由 0046 MetricCascade 已装载指标定义构建（节点→上游依赖集），供拓扑序 + 子树隔离
++        Map<String, java.util.Set<String>> deps = new LinkedHashMap<>();
++        for (MetricDef def : metricRuntime.defsForTest()) {
++            if (def.srcType() == 4 && def.sourceKeys() != null) {
++                deps.put(def.metricCode(), java.util.Set.copyOf(def.sourceKeys()));
++            }
++        }
++        String taskId = taskManager.submit(req.tenant() == null ? "default" : req.tenant(),
++                fullKeys, start, end, trigger, deps);
++        if (taskId == null) {
++            return ResponseEntity.ok(Map.of("ok", false, "error", "补算队列已满（限流拒绝，在线计算不受影响）"));
++        }
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("ok", true);
++        body.put("taskId", taskId);
++        body.put("accepted", fullKeys.size());
++        return ResponseEntity.ok(body);
++    }
++
++    /** §3.4 task/{taskId}：进度 + 逐项结果（逐项 MANUAL 留痕可查） */
++    @GetMapping("/calc/v1/task/{taskId}")
++    public ResponseEntity<Map<String, Object>> task(@PathVariable String taskId) {
++        if (taskManager == null) {
++            return ResponseEntity.ok(Map.of("ok", false, "error", "recalculate-enabled=false"));
++        }
++        CalcTask t = taskManager.getTask(taskId);
++        if (t == null) {
++            return ResponseEntity.status(404).body(Map.of("ok", false, "error", "task 不存在: " + taskId));
++        }
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("ok", true);
++        body.put("task", CalcTaskProgressVo.from(t).toMap());
++        return ResponseEntity.ok(body);
++    }
++
++    /** 补算请求（§3.4：tenant + fullKeys[] + startTime/endTime + reason；MANUAL 为默认） */
++    public record RecalculateRequest(String tenant, List<String> fullKeys,
++                                     Long startTime, Long endTime, String reason, String triggerType) {}
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index c856db6..7b8ecc6 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -33,21 +33,26 @@ public class CalcStatusController {
+     private final StatusEvaluatorRuntime statusRuntime;
+     private final net.otlab.calc.storage.StorageRuntime storageRuntime;
+     private final net.otlab.calc.metric.MetricRuntime metricRuntime;
++    private final net.otlab.calc.task.CalcTaskManager calcTaskManager;
+ 
+     public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
+                                 ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime,
+                                 @Nullable net.otlab.calc.storage.StorageRuntime storageRuntime,
+-                                @Nullable net.otlab.calc.metric.MetricRuntime metricRuntime) {
++                                @Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
++                                @Nullable net.otlab.calc.task.CalcTaskManager calcTaskManager) {
+         this.holder = holder;
+         this.reconciler = reconciler;
+         this.executorRuntime = executorRuntime;
+         this.statusRuntime = statusRuntime;
+         this.storageRuntime = storageRuntime;
+         this.metricRuntime = metricRuntime;
++        this.calcTaskManager = calcTaskManager;
+     }
+ 
+     @GetMapping("/calc/v1/status")
+-    public Map<String, Object> status() {
++    public Map<String, Object> status(@org.springframework.lang.Nullable
++                                      @org.springframework.web.bind.annotation.RequestParam(required = false)
++                                      String fullKey) {
+         Map<String, Object> view = new LinkedHashMap<>();
+         GraphHolderSnapshot snap = GraphHolderSnapshot.of(holder);
+         view.put("status", snap.applied == null ? "empty" : "running");
+@@ -85,6 +90,31 @@ public class CalcStatusController {
+         if (metricRuntime != null) {
+             view.put("metric", metricRuntime.view());
+         }
++        // TASK-0047：计算状态页只读数据源（§3.4 status?fullKey= 水位/状态/滞后/连续错误）
++        // fullKey 可选：给定则只返回该项；不给则返回全部（0061 运维监控页消费）。
++        // 本段无鉴权（内网观测面）；管理面入口权限+审计归 0061（接线义务）。
++        if (calcTaskManager != null) {
++            Map<String, Object> calcState = new LinkedHashMap<>();
++            calcState.put("enabled", true);
++            java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
++            long now = System.currentTimeMillis();
++            long tenantId = 1L; // 单租户形态（0063 落库时由装配注入真实 id）
++            if (fullKey != null && !fullKey.isBlank()) {
++                net.otlab.calc.state.CalcState s = calcTaskManager.stateStore().get(tenantId, fullKey);
++                if (s != null) {
++                    rows.add(net.otlab.calc.state.CalcStatusVo.from(s, 15L * 60L * 1000L, now).toMap());
++                }
++            } else {
++                for (net.otlab.calc.state.CalcState s : calcTaskManager.stateStore().all()) {
++                    rows.add(net.otlab.calc.state.CalcStatusVo.from(s, 15L * 60L * 1000L, now).toMap());
++                }
++            }
++            calcState.put("states", rows);
++            calcState.put("recentTasks", calcTaskManager.allTasks().stream()
++                    .map(net.otlab.calc.task.CalcTaskProgressVo::from)
++                    .map(net.otlab.calc.task.CalcTaskProgressVo::toMap).toList());
++            view.put("calcState", calcState);
++        }
+         return view;
+     }
+ 
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index c4fac9b..52b27dd 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -52,3 +52,12 @@ calc:
+   metric-event-kafka-enabled: ${CALC_METRIC_EVENT_KAFKA_ENABLED:false}
+   metric-mqtt-broker: ${CALC_METRIC_MQTT_BROKER:tcp://192.168.31.145:1883}
+   metric-mqtt-client-prefix: ${CALC_METRIC_MQTT_CLIENT_PREFIX:calc-metric-out}
++  # TASK-0047 手动补算/计算状态内网接口（默认关闭，既有行为零回归）
++  recalculate-enabled: ${CALC_RECALCULATE_ENABLED:false}
++  # 连续错误停算阈值（默认 5；brief 决策 2）
++  calc-error-stop-threshold: ${CALC_ERROR_STOP_THRESHOLD:5}
++  # 补算有界队列容量 / 后台工作线程（分区隔离，防补算风暴拖垮在线计算）
++  recalc-queue-capacity: ${CALC_RECALC_QUEUE_CAPACITY:64}
++  recalc-workers: ${CALC_RECALC_WORKERS:2}
++  # 计算状态滞后阈值（毫秒；默认 15 分钟）
++  calc-lag-threshold-ms: ${CALC_CALC_LAG_THRESHOLD_MS:900000}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index f47aeea..f8a5780 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -80,4 +80,13 @@ class CalcPropertiesTest {
+         assertFalse(p.isMetricEventKafkaEnabled(), "Kafka 指标事件默认关（本环境无 broker，接口+契约就绪）");
+         assertEquals("tcp://192.168.31.145:1883", p.getMetricMqttBroker());
+     }
++
++    @Test
++    void task0047DefaultsKeepExistingBehavior() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isRecalculateEnabled(), "手动补算/计算状态接口默认关闭（既有行为零回归）");
++        assertEquals(Integer.valueOf(5), p.getCalcErrorStopThreshold(), "连续错误停算阈值缺省 5（brief）");
++        assertEquals(Integer.valueOf(64), p.getRecalcQueueCapacity(), "补算有界队列缺省 64（限流防风暴）");
++        assertEquals(Integer.valueOf(2), p.getRecalcWorkers(), "补算线程池缺省 2（与在线执行器分区隔离）");
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/state/CalcStateMachineContractTest.java b/calc/src/test/java/net/otlab/calc/state/CalcStateMachineContractTest.java
+new file mode 100644
+index 0000000..1274a4c
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/CalcStateMachineContractTest.java
+@@ -0,0 +1,104 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047：CalcStateMachine 契约——水位推进（按窗口完成顺序）、连续错误阈值停算、滞后判据。
++ *
++ * <p>§1.9 calc_status：1 正常 / 2 滞后 / 3 异常停算；error_count 连续错误达阈值置 3，
++ * 仅该 fullKey 停算（子树隔离由任务层沿依赖图保证，本类只管单节点状态迁移）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcStateMachineContractTest {
++
++    @Test
++    void successAdvancesWatermarkAndResetsErrorCount() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        CalcStateMachine machine = new CalcStateMachine(store, 3, 3_600_000L);
++        // 先累积 2 次错误（未达阈值）
++        machine.onFailure(1L, "T.A", 100L, "e1", "div0");
++        machine.onFailure(1L, "T.A", 100L, "e2", "div0");
++        assertEquals(2, store.get(1L, "T.A").errorCount());
++        // 成功后：水位推进到窗口 end(110)、error_count 归零、calc_status 回 1
++        machine.onSuccess(1L, "T.A", 100L, 110L);
++        CalcState s = store.get(1L, "T.A");
++        assertEquals(110L, s.watermark(), "水位=已完成窗口 end（补算从此后开始 §1.9）");
++        assertEquals(100L, s.lastCalcTime(), "last_calc_time=最后成功计算的业务时间（窗口 start）");
++        assertEquals(0, s.errorCount(), "成功重置连续错误计数");
++        assertEquals(1, s.calcStatus(), "成功后恢复 1 正常");
++        assertNull(s.lastError(), "成功后清空 last_error");
++    }
++
++    @Test
++    void errorThresholdStopsOnlyThatFullKeyWithCalcStatus3() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        CalcStateMachine machine = new CalcStateMachine(store, 3, 3_600_000L);
++        machine.onFailure(1L, "T.A", 100L, "t1", "div0");
++        machine.onFailure(1L, "T.A", 100L, "t2", "div0");
++        CalcState s2 = store.get(1L, "T.A");
++        assertEquals(2, s2.errorCount());
++        assertEquals(1, s2.calcStatus(), "未达阈值仍 1 正常");
++        machine.onFailure(1L, "T.A", 100L, "t3", "div0");
++        CalcState s3 = store.get(1L, "T.A");
++        assertEquals(3, s3.errorCount());
++        assertEquals(3, s3.calcStatus(), "连续 3 次失败达阈值→3 异常停算");
++        assertEquals("div0", s3.lastError());
++
++        machine.onSuccess(1L, "T.B", 100L, 110L);
++        assertEquals(1, store.get(1L, "T.B").calcStatus(), "其他 fullKey 不受影响（分区隔离）");
++    }
++
++    @Test
++    void errorsAreConsecutiveNotCumulative() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        CalcStateMachine machine = new CalcStateMachine(store, 3, 3_600_000L);
++        machine.onFailure(1L, "T.A", 100L, "t1", "e");
++        machine.onFailure(1L, "T.A", 100L, "t2", "e");
++        machine.onSuccess(1L, "T.A", 100L, 110L); // 打断连续
++        machine.onFailure(1L, "T.A", 110L, "t3", "e");
++        CalcState s = store.get(1L, "T.A");
++        assertEquals(1, s.errorCount(), "连续错误：中间成功归零后重新计数");
++        assertEquals(1, s.calcStatus(), "未达阈值不停算");
++    }
++
++    @Test
++    void stoppedNodeStaysStoppedUntilExplicitSuccessRecovery() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        CalcStateMachine machine = new CalcStateMachine(store, 2, 3_600_000L);
++        machine.onFailure(1L, "T.A", 100L, "t1", "e");
++        machine.onFailure(1L, "T.A", 100L, "t2", "e");
++        assertTrue(machine.isStopped(1L, "T.A"), "达阈值停算");
++        machine.onFailure(1L, "T.A", 100L, "t3", "e");
++        assertTrue(machine.isStopped(1L, "T.A"), "失败继续停算");
++        machine.onSuccess(1L, "T.A", 100L, 110L);
++        assertFalse(machine.isStopped(1L, "T.A"), "成功恢复（手工重算恢复缝）");
++    }
++
++    @Test
++    void lagStatusWhenWatermarkOlderThanThreshold() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        // lagThresholdMs=1000：watermark 距今 2000ms → 滞后(2)
++        CalcStateMachine machine = new CalcStateMachine(store, 5, 1_000L);
++        machine.onSuccess(1L, "T.A", 100L, 200L); // watermark=200
++        CalcState lag = machine.evaluateLag(1L, "T.A", 2_200L);
++        assertEquals(2, lag.calcStatus(), "watermark 落后超阈值 → 2 滞后");
++        CalcState ok = machine.evaluateLag(1L, "T.A", 500L);
++        assertEquals(1, ok.calcStatus(), "watermark 未落后 → 1 正常");
++    }
++
++    @Test
++    void watermarkNeverMovesBackwardsOnOutOfOrderCompletion() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        CalcStateMachine machine = new CalcStateMachine(store, 5, 1_000L);
++        machine.onSuccess(1L, "T.A", 200L, 300L); // watermark=300
++        machine.onSuccess(1L, "T.A", 100L, 200L); // 乱序晚到的小窗
++        assertEquals(300L, store.get(1L, "T.A").watermark(), "水位单调不回退（按窗口完成顺序的已完成前沿）");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/state/CalcStateStoreContractTest.java b/calc/src/test/java/net/otlab/calc/state/CalcStateStoreContractTest.java
+new file mode 100644
+index 0000000..65a84e1
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/CalcStateStoreContractTest.java
+@@ -0,0 +1,73 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047：CalcStateStore 内存态契约（§1.9A / §1.9 iot_calc_state 字段语义）。
++ *
++ * <p>本任务交付「内存态 + 接口」，TASK-0063 换 JDBC 实现须零改动替换——故所有调用方
++ * 只依赖 {@link CalcStateStore} 接口，本测试锁定接口语义（照 ingest/calc 假实现范式）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcStateStoreContractTest {
++
++    @Test
++    void inMemoryStoreIsTheDefaultImplementation() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        assertInstanceOf(CalcStateStore.class, store, "0063 可换实现，调用点只依赖接口");
++    }
++
++    @Test
++    void getUnknownFullKeyReturnsNullAndUpsertIsTenantIsolated() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        assertNull(store.get(1L, "T.A"), "未登记 fullKey 返回 null（无假设状态）");
++
++        store.upsert(CalcState.of(1L, "T.A").build());
++        CalcState s = store.get(1L, "T.A");
++        assertNotNull(s);
++        assertEquals(1L, s.tenantId());
++        assertEquals("T.A", s.fullKey());
++        assertEquals(1, s.calcStatus(), "缺省 calc_status=1 正常（§1.9）");
++        assertEquals(0, s.errorCount(), "缺省 error_count=0");
++        assertNull(store.get(2L, "T.A"), "租户隔离：B 读不到 A 的状态");
++    }
++
++    @Test
++    void upsertSameTenantFullKeyReplacesNotAppends() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        store.upsert(CalcState.of(1L, "T.A").build());
++        store.upsert(CalcState.of(1L, "T.A").calcStatus(3).errorCount(5)
++                .lastError("div0").watermark(200L).lastCalcTime(199L).build());
++        CalcState s = store.get(1L, "T.A");
++        assertEquals(3, s.calcStatus(), "同 uk_tenant_full_key 覆盖（唯一约束语义）");
++        assertEquals(5, s.errorCount());
++        assertEquals("div0", s.lastError());
++        assertEquals(200L, s.watermark());
++        assertEquals(199L, s.lastCalcTime());
++        assertEquals(1, store.all().size(), "同键 upsert 不新增行");
++    }
++
++    @Test
++    void listByTenantIsIsolatedAndOrdered() {
++        CalcStateStore store = new InMemoryCalcStateStore();
++        store.upsert(CalcState.of(1L, "T.B").build());
++        store.upsert(CalcState.of(1L, "T.A").build());
++        store.upsert(CalcState.of(2L, "T.C").build());
++        List<CalcState> a = store.byTenant(1L);
++        assertEquals(2, a.size());
++        assertEquals("T.A", a.get(0).fullKey(), "按 fullKey 稳定排序（只读源确定性）");
++        assertEquals("T.B", a.get(1).fullKey());
++        assertEquals(1, store.byTenant(2L).size(), "租户隔离");
++        assertTrue(store.byTenant(99L).isEmpty());
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java b/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java
+new file mode 100644
+index 0000000..313dcd8
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java
+@@ -0,0 +1,81 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047：状态页只读数据源 VO 契约（供 0061 运维监控页消费；本任务不写前端、不挂管理面路由）。
++ *
++ * <p>VO 字段对齐 §1.9 iot_calc_state + §3.4 status/task：节点/指标全键、水位、calc_status、
++ * 连续错误、最近错误、任务进度。只读——不含任何写入/触发入口。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcStatusViewContractTest {
++
++    @Test
++    void statusVoCarriesWatermarkStatusLagErrorAndErrorCount() {
++        CalcState s = CalcState.of(1L, "T.A")
++                .lastCalcTime(100L).watermark(110L).calcStatus(3)
++                .errorCount(5).lastError("div0 by formula F1").build();
++        CalcStatusVo vo = CalcStatusVo.from(s, 1000L, 200L);
++        assertEquals(1L, vo.tenantId());
++        assertEquals("T.A", vo.fullKey());
++        assertEquals(110L, vo.watermark());
++        assertEquals(100L, vo.lastCalcTime());
++        assertEquals(3, vo.calcStatus());
++        assertEquals("异常停算", vo.calcStatusText(), "INT 枚举展示翻译（ADR-0009 TD-0005）");
++        assertEquals(5, vo.errorCount());
++        assertEquals(90L, vo.lagMillis(), "滞后=now-watermark=200-110=90ms");
++        assertEquals("div0 by formula F1", vo.lastError());
++        assertTrue(vo.stopped(), "停算布尔供页面直接渲染");
++    }
++
++    @Test
++    void lagTextIsReadableAndNullWatermarkYieldsNoLag() {
++        CalcState noWm = CalcState.of(1L, "T.B").build();
++        CalcStatusVo vo = CalcStatusVo.from(noWm, 1000L, 500L);
++        assertEquals(0L, vo.watermark(), "无水位=0（尚未计算）");
++        assertEquals(0L, vo.lagMillis());
++        assertEquals("正常", vo.calcStatusText());
++        assertFalse(vo.stopped());
++    }
++
++    @Test
++    void taskProgressVoIsReadOnlySnapshot() {
++        net.otlab.calc.task.CalcTask done = new net.otlab.calc.task.CalcTask(
++                "MANUAL-t47-000001", "MANUAL", "t47",
++                net.otlab.calc.task.CalcTask.Status.COMPLETED, 3, 2, 1,
++                List.of(net.otlab.calc.task.CalcTask.ItemResult.ok("M.A", 100L, 200L),
++                        net.otlab.calc.task.CalcTask.ItemResult.ok("M.B", 100L, 200L),
++                        net.otlab.calc.task.CalcTask.ItemResult.fail("M.C", "div0")));
++        net.otlab.calc.task.CalcTaskProgressVo vo = net.otlab.calc.task.CalcTaskProgressVo.from(done);
++        assertEquals("MANUAL-t47-000001", vo.taskId());
++        assertEquals("COMPLETED", vo.status());
++        assertEquals(3, vo.total());
++        assertEquals(2, vo.done());
++        assertEquals(1, vo.failed());
++        assertEquals(3, vo.items().size(), "逐项结果可见（失败明细含 error）");
++        assertEquals("div0", vo.items().get(2).error());
++    }
++
++    @Test
++    void statusViewIsMapSerializableFor0061Consumption() {
++        CalcStatusVo vo = CalcStatusVo.from(CalcState.of(1L, "T.A").calcStatus(2).build(),
++                1000L, 500L);
++        Map<String, Object> map = vo.toMap();
++        assertEquals("T.A", map.get("fullKey"));
++        assertEquals(2, map.get("calcStatus"));
++        assertEquals("滞后", map.get("calcStatusText"));
++        assertTrue(map.containsKey("watermark"));
++        assertTrue(map.containsKey("errorCount"));
++        assertTrue(map.containsKey("lagMillis"));
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java b/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java
+new file mode 100644
+index 0000000..0fb32b3
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java
+@@ -0,0 +1,223 @@
++package net.otlab.calc.task;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047：recalculate 异步任务 / 进度 / 限流 / 拓扑序 / MANUAL 留痕 / 连续失败停算子树隔离契约。
++ *
++ * <p>计算函数由 {@link CalcTaskManager.RecalcItem} 缝注入（生产实现由 tasks 道接 MetricRuntime.doCompute；
++ * 本测试用确定性假实现锁定调度语义）——与 0041/0046「假实现范式」一致：可机械判定的行为不靠大模型。
++ * 依赖图以 {@code Map<节点, 其上游依赖集>} 注入（生产由 MetricCascade.buildGraph 得到同一结构），
++ * 拓扑序复用 0040 GraphBuilder.topoSort。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcTaskManagerContractTest {
++
++    private static void awaitDone(CalcTaskManager mgr, String taskId) throws Exception {
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (System.nanoTime() < deadline) {
++            CalcTask t = mgr.getTask(taskId);
++            if (t != null && t.status() != CalcTask.Status.RUNNING
++                    && t.status() != CalcTask.Status.QUEUED) {
++                return;
++            }
++            Thread.sleep(5);
++        }
++        throw new AssertionError("task 未在 5s 内完成: " + taskId);
++    }
++
++    private static Map<String, Set<String>> deps(Map.Entry<String, Set<String>>... entries) {
++        Map<String, Set<String>> m = new LinkedHashMap<>();
++        for (Map.Entry<String, Set<String>> e : entries) {
++            m.put(e.getKey(), e.getValue());
++        }
++        return m;
++    }
++
++    private static Map.Entry<String, Set<String>> dep(String node, String... upstream) {
++        return Map.entry(node, Set.of(upstream));
++    }
++
++    @Test
++    void recalculateReturnsTaskIdImmediatelyAndProgressIsQueryable() throws Exception {
++        CountDownLatch started = new CountDownLatch(1);
++        java.util.concurrent.atomic.AtomicBoolean go = new java.util.concurrent.atomic.AtomicBoolean(false);
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            started.countDown();
++            while (!go.get()) {
++                Thread.yield();
++            }
++            return true;
++        });
++        mgr.start();
++        try {
++            long t0 = System.nanoTime();
++            String taskId = mgr.submit("t47", List.of("M.A"), 100L, 200L, "MANUAL");
++            long elapsedMs = Duration.ofNanos(System.nanoTime() - t0).toMillis();
++            assertNotNull(taskId);
++            assertTrue(taskId.startsWith("MANUAL-t47-"), "taskId 含 trigger/tenant 语义: " + taskId);
++            assertTrue(elapsedMs < 1000, "taskId 立即返回（异步，不等计算）elapsed=" + elapsedMs + "ms");
++            assertTrue(started.await(2, TimeUnit.SECONDS), "后台线程已开始执行");
++            CalcTask running = mgr.getTask(taskId);
++            assertNotNull(running);
++            assertEquals(CalcTask.Status.RUNNING, running.status());
++            assertEquals(1, running.total());
++
++            go.set(true);
++            awaitDone(mgr, taskId);
++            CalcTask done = mgr.getTask(taskId);
++            assertEquals(CalcTask.Status.COMPLETED, done.status());
++            assertEquals(1, done.done());
++            assertEquals(0, done.failed());
++        } finally {
++            go.set(true);
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void recalcRunsInTopologyOrderFromMaterializedResults() throws Exception {
++        List<String> executed = java.util.Collections.synchronizedList(new ArrayList<>());
++        Set<String> materialized = ConcurrentHashMap.newKeySet();
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            executed.add(item.fullKey());
++            if (!"M_LOW".equals(item.fullKey())) {
++                assertTrue(materialized.contains("M_LOW"), "上级执行时下级已物化（拓扑序）");
++            }
++            materialized.add(item.fullKey());
++            return true;
++        });
++        mgr.start();
++        try {
++            // 依赖：M_LOW ← M_HIGH ← M_TOP（下级先算）；提交顺序故意乱序
++            String taskId = mgr.submit("t47", List.of("M_TOP", "M_LOW", "M_HIGH"),
++                    100L, 200L, "MANUAL",
++                    deps(dep("M_HIGH", "M_LOW"), dep("M_TOP", "M_HIGH")));
++            awaitDone(mgr, taskId);
++            assertEquals(3, executed.size());
++            assertEquals("M_LOW", executed.get(0), "下级先算（0040 拓扑序复用）");
++            assertEquals("M_HIGH", executed.get(1));
++            assertEquals("M_TOP", executed.get(2), "顶层最后算（旧平扫实现必红）");
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void manualRecalcLogsTriggerTypeManualAndIsRecalcOne() throws Exception {
++        List<String> logged = java.util.Collections.synchronizedList(new ArrayList<>());
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            logged.add(ctx.triggerType() + "|" + item.fullKey() + "|isRecalc=" + ctx.isRecalc()
++                    + "|taskId=" + ctx.taskId());
++            return true;
++        });
++        mgr.start();
++        try {
++            String taskId = mgr.submit("t47", List.of("M.A"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, taskId);
++            assertEquals(1, logged.size());
++            assertTrue(logged.get(0).startsWith("MANUAL|M.A|isRecalc=true|taskId=" + taskId),
++                    "每项留 triggerType=MANUAL + isRecalc=true + taskId（is_recalc=1 落库由 0063 映射）: "
++                            + logged.get(0));
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void consecutiveFailuresStopOnlySubtreeNotSiblings() throws Exception {
++        AtomicInteger aFails = new AtomicInteger();
++        List<String> executed = java.util.Collections.synchronizedList(new ArrayList<>());
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            executed.add(item.fullKey());
++            if ("M_A".equals(item.fullKey()) || "M_A_CHILD".equals(item.fullKey())) {
++                if ("M_A".equals(item.fullKey())) {
++                    aFails.incrementAndGet();
++                }
++                ctx.stateMachine().onFailure(ctx.tenantId(), item.fullKey(),
++                        item.periodStart(), ctx.taskId(), "div0");
++                return false;
++            }
++            ctx.stateMachine().onSuccess(ctx.tenantId(), item.fullKey(),
++                    item.periodStart(), item.periodEnd());
++            return true;
++        }, 2); // 阈值=2：M_A 两次失败→整棵 M_A 子树停算
++        mgr.start();
++        try {
++            // M_A_CHILD 依赖 M_A（下游）；M_B 兄弟独立
++            Map<String, Set<String>> graph = deps(dep("M_A_CHILD", "M_A"));
++            // 轮 1：M_A 失败 1 次（阈值 2 未达，未停），M_A_CHILD 仍执行并失败，M_B 成功
++            String t1 = mgr.submit("t47", List.of("M_A", "M_A_CHILD", "M_B"),
++                    100L, 200L, "MANUAL", graph);
++            awaitDone(mgr, t1);
++            assertEquals(1, aFails.get(), "轮 1：M_A 失败 1 次（阈值 2 未达，尚未停算）");
++            assertFalse(mgr.isStopped(1L, "M_A"), "未达阈值不停算");
++            assertTrue(executed.contains("M_B"), "兄弟分支正常执行");
++
++            // 轮 2：M_A 再失败 1 次（累计 2 达阈值→停算），下游 M_A_CHILD 本轮被隔离跳过
++            executed.clear();
++            String t2 = mgr.submit("t47", List.of("M_A", "M_A_CHILD", "M_B"),
++                    100L, 200L, "MANUAL", graph);
++            awaitDone(mgr, t2);
++            assertEquals(2, aFails.get(), "轮 2：M_A 第 2 次失败达阈值");
++            assertTrue(mgr.isStopped(1L, "M_A"), "坏根连续失败达阈值→停算");
++            assertTrue(mgr.isStopped(1L, "M_A_CHILD"), "停算沿依赖图向下游子树隔离");
++            assertFalse(executed.contains("M_A_CHILD"), "轮 2 下游子树被隔离跳过");
++            assertFalse(mgr.isStopped(1L, "M_B"), "兄弟分支不受影响（分区隔离验收锚点）");
++
++            // 轮 3：停算子树整体跳过，兄弟仍执行
++            executed.clear();
++            String t3 = mgr.submit("t47", List.of("M_A", "M_A_CHILD", "M_B"),
++                    100L, 200L, "MANUAL", graph);
++            awaitDone(mgr, t3);
++            assertFalse(executed.contains("M_A"), "停算节点第三轮被跳过");
++            assertFalse(executed.contains("M_A_CHILD"), "停算子树第三轮被跳过");
++            assertTrue(executed.contains("M_B"), "兄弟分支持续正常产出");
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void boundedQueueRejectsBacklogWithoutBlockingOnlineExecutor() throws Exception {
++        java.util.concurrent.atomic.AtomicBoolean go = new java.util.concurrent.atomic.AtomicBoolean(false);
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            while (!go.get()) {
++                Thread.yield();
++            }
++            return true;
++        }, 5, 1, 1); // 单工作线程 + 队列容量 1
++        mgr.start();
++        try {
++            mgr.submit("t47", List.of("M.1"), 100L, 200L, "MANUAL");
++            Thread.sleep(150); // 让第 1 个进入执行并占满队列判定
++            assertNotNull(mgr.submit("t47", List.of("M.2"), 100L, 200L, "MANUAL"),
++                    "队列内 1 个可被接受");
++            assertNull(mgr.submit("t47", List.of("M.3"), 100L, 200L, "MANUAL"),
++                    "超有界队列→拒绝（返回 null），不无限堆积拖垮在线计算");
++            assertTrue(mgr.rejectedCount() >= 1, "拒绝计数可见（限流可观测）");
++        } finally {
++            go.set(true);
++            mgr.stop();
++        }
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java b/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java
+new file mode 100644
+index 0000000..ff76c21
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java
+@@ -0,0 +1,113 @@
++package net.otlab.calc.web;
++
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.core.env.Environment;
++import org.springframework.test.context.TestPropertySource;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047：内网三接口 HTTP 契约（/calc/v1/recalculate、/calc/v1/status、/calc/v1/task/{id}）。
++ *
++ * <p>recalculate-enabled=true + metric-aggregation-enabled=true 装配；backend 指向不可达端口
++ * （首拉 fail-soft 不影响服务）。用 JDK HttpClient 直达 HTTP 面（照 0040 CalcEngineApplicationTest 范式）。
++ * 验证 taskId 立返 + 进度可查 + status 只读数据源 + 不存在 task 404。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++@TestPropertySource(properties = {
++        "calc.backend-base-url=http://127.0.0.1:1",
++        "calc.internal-token=ctx-test-token",
++        "calc.tenant=t47http",
++        "calc.reconcile-seconds=3600",
++        "calc.recalculate-enabled=true",
++        "calc.metric-aggregation-enabled=true",
++        "calc.calc-error-stop-threshold=2",
++        "calc.recalc-queue-capacity=16",
++        "calc.recalc-workers=2",
++        "calc.http-addr=:18095"
++})
++class CalcRecalculateControllerTest {
++
++    @Autowired
++    private Environment environment;
++
++    private String url(String path) {
++        return "http://127.0.0.1:" + environment.getProperty("local.server.port") + path;
++    }
++
++    private HttpResponse<String> post(String path, String body) throws Exception {
++        return HttpClient.newHttpClient().send(
++                HttpRequest.newBuilder(URI.create(url(path)))
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
++                HttpResponse.BodyHandlers.ofString());
++    }
++
++    private HttpResponse<String> get(String path) throws Exception {
++        return HttpClient.newHttpClient().send(
++                HttpRequest.newBuilder(URI.create(url(path))).GET().build(),
++                HttpResponse.BodyHandlers.ofString());
++    }
++
++    @Test
++    void recalculateReturnsTaskIdAndTaskProgressIsQueryable() throws Exception {
++        // 未注入定义 → 任务会失败但不阻断 taskId 立返；这里只验 HTTP 契约面
++        String body = "{\"tenant\":\"t47http\",\"fullKeys\":[\"M.A\"],"
++                + "\"startTime\":1000,\"endTime\":2000,\"reason\":\"TDD\"}";
++        HttpResponse<String> resp = post("/calc/v1/recalculate", body);
++        assertEquals(200, resp.statusCode(), resp.body());
++        assertTrue(resp.body().contains("\"taskId\""), resp.body());
++        assertTrue(resp.body().contains("\"ok\":true"), resp.body());
++
++        // 从响应提取 taskId
++        String taskId = extractTaskId(resp.body());
++        assertTrue(taskId.startsWith("MANUAL-t47http-"), resp.body());
++
++        // 轮询 task 进度到终态（HTTP 层）
++        String taskBody = null;
++        for (int i = 0; i < 100; i++) {
++            HttpResponse<String> taskResp = get("/calc/v1/task/" + taskId);
++            assertEquals(200, taskResp.statusCode(), taskResp.body());
++            taskBody = taskResp.body();
++            if (taskBody.contains("COMPLETED") || taskBody.contains("FAILED")) {
++                break;
++            }
++            Thread.sleep(10);
++        }
++        assertTrue(taskBody.contains("\"taskId\":\"" + taskId + "\""), taskBody);
++        assertTrue(taskBody.contains("\"total\":1"), taskBody);
++        assertTrue(taskBody.contains("M.A"), "逐项结果含 fullKey: " + taskBody);
++
++        // 不存在 task → 404
++        assertEquals(404, get("/calc/v1/task/NOT-EXIST").statusCode());
++
++        // status 只读数据源（calcState 段；recalculate-enabled=true 下 enabled=true）
++        HttpResponse<String> status = get("/calc/v1/status?fullKey=M.A");
++        assertEquals(200, status.statusCode(), status.body());
++        assertTrue(status.body().contains("\"calcState\""), status.body());
++        assertTrue(status.body().contains("\"enabled\":true"), status.body());
++        assertTrue(status.body().contains("\"states\""), status.body());
++    }
++
++    private static String extractTaskId(String json) {
++        String marker = "\"taskId\":\"";
++        int i = json.indexOf(marker);
++        if (i < 0) {
++            throw new AssertionError("no taskId in " + json);
++        }
++        int start = i + marker.length();
++        int end = json.indexOf('"', start);
++        return json.substring(start, end);
++    }
++}

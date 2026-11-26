@@ -1,0 +1,1640 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockController.java
+new file mode 100644
+index 0000000..5f69112
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockController.java
+@@ -0,0 +1,56 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
++import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 实例锁定开关控制器（TASK-0016，brief 接口 1）
++ *
++ * <p>路径 PUT /iot/instance/lock（实例域命名空间；与既有 IotModelInstanceController 的
++ * /iot/instance 基础路径共存——PUT /lock 与既有 PUT "" / GET /{id} 方法+路径组合不冲突）。
++ * 权限复用既有 iot:instance:edit（brief 决策 1：不新增菜单种子）；数据权限裁剪在服务层
++ * 接线（照 0012 写路径防线范式，目标实例 ∈ 可见集）。
++ *
++ * <p>本控制器归 iot/template 包：IotModelInstance 实体与 Mapper 本就随 0011 建库先行
++ * 落位 template 包（实例业务逻辑 0012 落位 instance 包），TASK-0016 的锁定/升级三接口
++ * 属 ADR-0008 模板变更控制落地件、与模板版本域强耦合（清单 diff 消费版本历史），brief
++ * 改动范围声明 template/**——包位与依赖方向一致。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Tag(name = "实例版本锁定")
++@RestController
++@RequestMapping("/iot/instance")
++public class IotInstanceLockController {
++
++    @Autowired
++    private IotInstanceUpgradeService instanceUpgradeService;
++
++    /**
++     * 锁定开关（brief 接口 1）：置位后实例不自动跟随二档变更、进待升级清单；解除后回归
++     * 跟随面。locked=1 时实例编辑仅允许 status（0012 既有口径）——锁定开关本身是锁定列
++     * 的唯一管理通道，不受该限制（否则锁上就解不开）。
++     */
++    @OperateLog(title = "实例版本锁定", businessType = BusinessType.UPDATE)
++    @Operation(summary = "实例锁定开关（TASK-0016：0 解除锁定 / 1 锁定；权限复用 iot:instance:edit；"
++            + "锁定后编辑仅允许 status——0012 既有口径）")
++    @PutMapping("/lock")
++    @SaCheckPermission("iot:instance:edit")
++    public Result<Void> setLock(@Valid @RequestBody IotInstanceLockForm form) {
++        instanceUpgradeService.setLock(form);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java
+new file mode 100644
+index 0000000..a476fa7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java
+@@ -0,0 +1,72 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
++import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 待升级清单控制器（TASK-0016，brief 接口 2/3——0070 待升级清单页的前端 API）
++ *
++ * <p>路径命名空间 /iot/template/upgrade（模板域子资源，与 /iot/template 基础路径共存）。
++ * 权限复用既有种子（brief 决策 4，不新增菜单）：清单查询 iot:template:query（0015 影响
++ * 预览同款）；确认升级 iot:instance:edit——确认动作逐台推进实例 applied_template_version，
++ * 本质是实例写操作（与锁定开关同权限面），持模板查询权限而无实例编辑权限的用户可看清单
++ * 不可确认（视线与动作分离，照「菜单权限与数据权限分离」同构口径）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Tag(name = "待升级清单")
++@RestController
++@RequestMapping("/iot/template/upgrade")
++public class IotTemplateUpgradeController {
++
++    @Autowired
++    private IotInstanceUpgradeService instanceUpgradeService;
++
++    /**
++     * 待升级清单（brief 接口 2）：行=引用该模板且 appliedTemplateVersion &lt; 模板当前
++     * version 的实例，逐行 diff（0015 引擎，applied 版本 content vs 当前版本 content，
++     * 逐条目带档位——T2 段=锁定实例待确认项，T3 段=逐台迁移项）。
++     */
++    @Operation(summary = "待升级清单（TASK-0016：引用该模板且版本滞后的实例，逐行 diff 带档位；"
++            + "分页+数据权限裁剪照实例域范式；权限复用 iot:template:query）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:template:query")
++    public Result<Page<TemplateUpgradeRowVO>> list(@RequestParam("templateId") Long templateId,
++                                                   @RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                                   @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize) {
++        return Result.success(instanceUpgradeService.selectUpgradeList(templateId, pageNum, pageSize));
++    }
++
++    /**
++     * 逐台/批量确认升级（brief 接口 3）：targetVersion 必须等于模板当前版本；逐台乐观锁
++     * UPDATE applied_template_version（冲突 4002）；整批原子（任一无效整批拒绝不半成功）；
++     * locked 实例同样可确认（这正是锁定实例的升级通道）。确认动作逐台写操作日志——本注解
++     * 记请求级留痕（参数含全量 instanceIds），服务层另逐台 INFO 留痕。
++     */
++    @OperateLog(title = "待升级清单确认升级", businessType = BusinessType.UPDATE)
++    @Operation(summary = "逐台/批量确认升级（TASK-0016：targetVersion=模板当前版本；乐观锁冲突 4002；"
++            + "整批原子；locked 实例可确认；权限复用 iot:instance:edit）")
++    @PostMapping("/confirm")
++    @SaCheckPermission("iot:instance:edit")
++    public Result<Void> confirm(@Valid @RequestBody TemplateUpgradeConfirmForm form) {
++        instanceUpgradeService.confirmUpgrade(form);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotInstanceLockForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotInstanceLockForm.java
+new file mode 100644
+index 0000000..6e42cf0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotInstanceLockForm.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 实例锁定开关表单（TASK-0016，PUT /iot/instance/lock 请求体——brief 接口 1）。
++ *
++ * <p>锁定语义（ADR-0008 第二档政策）：locked=1 的关键设备不自动跟随二档变更，进待升级
++ * 清单逐台确认后再升；锁定开关本身复用既有 iot:instance:edit 权限（brief 决策 4，
++ * 不新增菜单种子）。locked=1 后实例编辑仅允许 status（0012 既有口径，接口层校验确认）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "实例锁定开关表单（TASK-0016）")
++public class IotInstanceLockForm {
++
++    @NotNull(message = "实例ID不能为空")
++    @Schema(description = "实例ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long instanceId;
++
++    @NotNull(message = "锁定标记不能为空")
++    @Min(value = 0, message = "锁定标记仅允许 0 未锁 / 1 已锁")
++    @Max(value = 1, message = "锁定标记仅允许 0 未锁 / 1 已锁")
++    @Schema(description = "锁定开关：0 解除锁定 / 1 锁定（锁定后编辑仅允许 status）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer locked;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeConfirmForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeConfirmForm.java
+new file mode 100644
+index 0000000..6ec9636
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeConfirmForm.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 逐台/批量确认升级表单（TASK-0016，POST /iot/template/upgrade/confirm 请求体——brief 接口 3）。
++ *
++ * <p>brief 请求体面：instanceIds[] + targetVersion（无 templateId 字段——模板从实例行
++ * 解析并校验批内同源，见 {@code IotInstanceUpgradeService#confirmUpgrade}）；逐台/批量
++ * 共用一个接口（逐台=单元素列表）。确认是显式升级动作（ADR-0008 第二/三档的实例侧通道），
++ * 逐台写操作日志由控制器 @OperateLog 承载（参数含全量实例 id 逐台留痕）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "逐台/批量确认升级表单（TASK-0016）")
++public class TemplateUpgradeConfirmForm {
++
++    @NotEmpty(message = "请选择要确认升级的实例")
++    @Schema(description = "实例 ID 列表（逐台=单元素；批量=多元素；整批原子——任一无效整批拒绝不半成功）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<Long> instanceIds;
++
++    @NotNull(message = "目标版本不能为空")
++    @Schema(description = "目标版本号（必须等于模板当前版本——不允许任意目标版）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer targetVersion;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeRowVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeRowVO.java
+new file mode 100644
+index 0000000..80d68f0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeRowVO.java
+@@ -0,0 +1,49 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 待升级清单行 VO（TASK-0016，GET /iot/template/upgrade/list 响应 records 元素——brief 接口 2）。
++ *
++ * <p>行语义：引用该模板且 appliedTemplateVersion &lt; 模板当前 version 的实例（无版本差异
++ * 不出现）；diff 用 0015 的 {@code TemplateContentDiffEngine} 对「实例 applied 版本 content
++ * vs 当前版本 content」生成，逐条目带档位（T2 段=锁定实例待确认项，T3 段=逐台迁移项）。
++ *
++ * <p>brief 字段面：{instanceId, instanceName, appliedTemplateVersion, currentVersion,
++ * locked, tierSummary, diff}；instanceCode 为纯增量展示字段（前端清单渲染设备编码所需，
++ * 照 0015 影响预览 VO「附加字段为前端展示所需纯增量信息」同口径）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "待升级清单行（TASK-0016）")
++public class TemplateUpgradeRowVO {
++
++    @Schema(description = "实例 ID")
++    private Long instanceId;
++
++    @Schema(description = "实例编码（纯增量展示字段——前端清单渲染所需）")
++    private String instanceCode;
++
++    @Schema(description = "实例名称")
++    private String instanceName;
++
++    @Schema(description = "已应用的模板版本")
++    private Integer appliedTemplateVersion;
++
++    @Schema(description = "模板当前版本号（升级目标）")
++    private Integer currentVersion;
++
++    @Schema(description = "实例锁定 0 未锁 1 已锁（锁定实例同样经确认升级——这正是锁定实例的升级通道）")
++    private Integer locked;
++
++    @Schema(description = "档位摘要（如 T2:2,T3:1；无差异 null）")
++    private String tierSummary;
++
++    @Schema(description = "待生效变更条目（applied 版本 content vs 当前版本 content，逐条目带档位）")
++    private List<TemplateChangeEntryVO> diff;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java
+new file mode 100644
+index 0000000..c0f8e6f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java
+@@ -0,0 +1,74 @@
++package net.otlab.admin.module.iot.template.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
++
++/**
++ * 实例版本锁定与待升级清单服务（TASK-0016，ADR-0008 落地件最后一环——brief 三接口）。
++ *
++ * <p>职责面（brief 三件事）：
++ * <ol>
++ * <li><b>锁定开关</b>：PUT /iot/instance/lock——复用既有 iot:instance:edit 权限；locked=1
++ *     的实例编辑仅允许 status（0012 既有口径）；locked 实例进入待升级清单（不自动跟随），
++ *     但同样可经确认升级（这正是锁定实例的升级通道）；</li>
++ * <li><b>待升级清单</b>：GET /iot/template/upgrade/list?templateId=——行=引用该模板且
++ *     appliedTemplateVersion &lt; 模板当前 version 的实例；diff 用 0015 引擎对「实例 applied
++ *     版本 content vs 当前版本 content」生成（逐条目带档位）；分页 + 数据权限裁剪照实例域
++ *     范式；</li>
++ * <li><b>逐台/批量确认升级</b>：POST /iot/template/upgrade/confirm——校验 targetVersion ==
++ *     模板当前 version；逐台乐观锁 UPDATE applied_template_version（冲突 4002，0015 修订轮
++ *     范式）；整批原子（任一无效整批拒绝不半成功）；确认动作逐台留痕（控制器 @OperateLog +
++ *     服务逐台 INFO 日志）。</li>
++ * </ol>
++ *
++ * <p>边界（brief 决策 5）：无版本差异的实例不出现在清单；模板回退（current &lt; applied，
++ * 理论上不发生——版本单调）防御性跳过并 WARN。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface IotInstanceUpgradeService {
++
++    /**
++     * 锁定开关（brief 接口 1）：置位/解除实例锁定。数据权限照 0012 写路径防线（目标实例
++     * ∈ 可见集，否则 403）；locked=1 后实例编辑仅允许 status 由既有编辑接口校验（0012
++     * 口径），本接口是锁定列的唯一管理通道（锁定/解除不受「已锁定仅 status」限制——
++     * 否则锁上就解不开）。
++     *
++     * @param form 表单（instanceId + locked 0/1）
++     * @return 是否成功
++     */
++    boolean setLock(IotInstanceLockForm form);
++
++    /**
++     * 待升级清单（brief 接口 2）：引用该模板且 appliedTemplateVersion &lt; 模板当前 version
++     * 的实例（无版本差异不出现；模板回退防御性跳过并 WARN）。diff 按实例 applied 版本
++     * 缓存——同版本实例共享同一 diff（diff 只依赖 applied 版本，与实例无关）。
++     *
++     * <p>数据权限裁剪照实例域读范式：allTenant 全量；受限用户保留 id ∈ 可见集 OR
++     * （createByOnly 且 create_by=本人）的实例（与实例列表 OR 分支同口径，ADR-0016 裁决 4）。
++     *
++     * @param templateId 模板 id
++     * @param pageNum    页码（&lt;1 归 1）
++     * @param pageSize   页大小（&lt;1 归 10）
++     * @return 分页清单（total=裁剪后的滞后实例总数）
++     */
++    Page<TemplateUpgradeRowVO> selectUpgradeList(Long templateId, Integer pageNum, Integer pageSize);
++
++    /**
++     * 逐台/批量确认升级（brief 接口 3）：整批原子（@Transactional——任一失败整批回滚，
++     * 不半成功）。校验链：批内实例存在（fail-closed）→ 数据权限写路径防线（任一不可见 403
++     * 整批拒绝）→ 批内同模板（清单页按模板维度操作）→ targetVersion == 模板当前 version
++     * → 逐台乐观锁 UPDATE（WHERE applied=旧值；affected=0 即并发确认冲突 → 4002）。
++     *
++     * <p>locked 实例同样可确认（锁定只限制编辑面字段——锁定实例的升级通道就是本接口）。
++     * 确认后实例离开待升级清单，确认门滞后判定（hasPendingTier2Confirm）随之兑现——
++     * 快照消费面（0024 组装）不受本接口影响（brief：本任务不改 publish）。
++     *
++     * @param form 表单（instanceIds[] + targetVersion）
++     * @return 确认台数
++     */
++    int confirmUpgrade(TemplateUpgradeConfirmForm form);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+index 5861cef..4215090 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+@@ -75,6 +75,17 @@ public interface IotTemplateVersionService {
+      */
+     String computeConfirmCredentialHash(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion);
+ 
++    /**
++     * 当前模板内容快照（TASK-0016 待升级清单 diff 基线复用）：以 {@code buildContentJson}
++     * canonical 形态构建模板当前时刻的内容 JSON——与版本历史行 content 同一构建器同一形态
++     * （两次构建逐字节一致），是「实例 applied 版本 content vs 当前版本 content」diff
++     * 相等性判断的直接前提（形态漂移会产出伪 diff 条目）。
++     *
++     * @param templateId 模板 id
++     * @return 当前内容快照 JSON（canonical）；模板不存在抛 PARAM_ERROR
++     */
++    String buildCurrentContentJson(Long templateId);
++
+     /**
+      * 确认门判档（PublishConfirmGate 真实现消费）：本租户是否存在「待确认的二档模板
+      * 变更」——判定两条件（同时成立）：
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java
+new file mode 100644
+index 0000000..4e5e4a2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java
+@@ -0,0 +1,351 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
++import net.otlab.admin.module.iot.template.tier.TemplateContentDiffEngine;
++import net.otlab.admin.module.iot.template.tier.TemplateTierRuleTable;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.SecurityUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++/**
++ * 实例版本锁定与待升级清单服务实现（TASK-0016，ADR-0008 落地件最后一环——brief 三接口）。
++ *
++ * <p><b>锁定开关</b>（{@link #setLock}）：锁定列白名单更新（更新集仅 locked——除锁定列外
++ * 不携带任何字段，杜绝 mass assignment）；数据权限照 0012 写路径防线（目标实例 ∈ 可见集，
++ * 403 文案不泄露实例标识）。锁定/解除是锁定列的唯一管理通道——不受「locked=1 编辑仅允许
++ * status」限制（否则锁上就解不开；编辑面限制由既有编辑接口 0012 口径校验）。
++ *
++ * <p><b>待升级清单</b>（{@link #selectUpgradeList}）：行=引用该模板且 appliedTemplateVersion
++ * &lt; 模板当前 version 的实例。筛选在装载后内存判定（照 0012 树裁剪「一次查出后内存过滤」
++ * 范式）——同时承载三类边界语义并可测：applied=current 无差异不出现；applied=null（脏数据
++ * 防御）跳过；applied&gt;current（模板回退，理论上不发生——版本单调）防御性跳过并 WARN。
++ * 数据权限裁剪照实例域读范式（id ∈ 可见集 OR createByOnly 本人，ADR-0016 裁决 4 OR 分支）；
++ * 可见集空且无 createByOnly 短路空页（不查库）。diff 用 0015 引擎对「实例 applied 版本
++ * content vs 当前版本 content」生成（基线=版本历史行 (templateId, applied) 的 content 快照；
++ * 当前侧经 {@link IotTemplateVersionService#buildCurrentContentJson} 同一 canonical 构建器
++ * ——形态逐字节一致是 diff 相等性的直接前提）；diff 按已应用版本缓存（同版本实例共享同一
++ * diff）；无历史基线（存量模板 0015 前建库）diff 留空降级（同 0015 影响预览口径，不误计
++ * 全量 ADDED）。分页：total=裁剪后滞后总数、records=内存分页切片（模板内实例量级为十~百，
++ * 全量装载+内存切片与 0012 树查询同口径）。
++ *
++ * <p><b>逐台/批量确认升级</b>（{@link #confirmUpgrade}）：整批原子（@Transactional——任一
++ * 失败整批回滚，不半成功）。校验链 fail-closed：批内实例存在（缺失提示具体 id）→ 写路径
++ * 数据权限防线（任一不可见 403 整批拒绝）→ 批内同模板（清单页按模板维度操作；模板从实例行
++ * 解析——brief 请求体只有 instanceIds[]+targetVersion）→ targetVersion == 模板当前 version
++ * （不允许任意目标版）→ 逐台状态校验（applied&gt;target 回退拒绝；applied==target 按 4002
++ * 并发冲突口径整批拒绝——同值 UPDATE 的影响行数受驱动 affected 口径歧义，显式前置判定消除
++ * 歧义且幂等重放需刷新清单重选）→ 逐台乐观锁 UPDATE（{@code SET applied=target WHERE id=?
++ * AND applied=旧值}；affected=0 即并发确认推进了版本 → 4002，0015 修订轮 M-2 范式）。
++ * locked 实例同样可确认（锁定只限制编辑面字段——本接口就是锁定实例的升级通道）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Slf4j
++@Service
++public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService {
++
++    /** 内容快照行解析用（与 0015 版本服务 diff 链路同源 com.fasterxml） */
++    private static final ObjectMapper PARSE_MAPPER = new ObjectMapper();
++
++    @Autowired
++    private IotModelInstanceMapper instanceMapper;
++
++    @Autowired
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Autowired
++    private IotModelTemplateVersionMapper versionMapper;
++
++    @Autowired
++    private DataPermService dataPermService;
++
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
++    // ---------- 锁定开关 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean setLock(IotInstanceLockForm form) {
++        if (form.getLocked() == null || (form.getLocked() != 0 && form.getLocked() != 1)) {
++            // bean 校验（@Min/@Max）之外的防御兜底——直调服务不经校验链也 fail-closed
++            throw paramError("锁定标记仅允许 0 未锁 / 1 已锁");
++        }
++        IotModelInstance existing = instanceMapper.selectById(form.getInstanceId());
++        if (existing == null) {
++            throw paramError("实例不存在或已删除: " + form.getInstanceId());
++        }
++        // 写路径数据权限防线（0012 修订轮 I-1 范式）：先于任何状态变更
++        requireDataPerm(existing.getId());
++        // 锁定列白名单更新：更新集仅 locked（MP null 不进 SET），其余字段保持库内原值
++        IotModelInstance upd = new IotModelInstance();
++        upd.setId(existing.getId());
++        upd.setLocked(form.getLocked());
++        boolean updated = instanceMapper.updateById(upd) > 0;
++        log.info("[INSTANCE-LOCK] instanceId={} locked {} -> {} (userId={})",
++                form.getInstanceId(), existing.getLocked(), form.getLocked(), SecurityUtils.getUserId());
++        return updated;
++    }
++
++    // ---------- 待升级清单 ----------
++
++    @Override
++    public Page<TemplateUpgradeRowVO> selectUpgradeList(Long templateId, Integer pageNum, Integer pageSize) {
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("模板不存在或已删除: " + templateId);
++        }
++        int currentVersion = template.getVersion() == null ? 0 : template.getVersion();
++        int safePageNum = (pageNum == null || pageNum < 1) ? 1 : pageNum;
++        int safePageSize = (pageSize == null || pageSize < 1) ? 10 : pageSize;
++        Page<TemplateUpgradeRowVO> page = new Page<>(safePageNum, safePageSize);
++
++        // 数据权限裁剪（实例域读范式）：可见集空且无 createByOnly → 空集短路（避免空转查询）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && scope.instanceIds().isEmpty() && !scope.createByOnly()) {
++            page.setRecords(List.of());
++            page.setTotal(0);
++            return page;
++        }
++
++        // 一次查出该模板全部实例后内存判定（0012 树裁剪同范式；id 升序稳定序）
++        List<IotModelInstance> instances = instanceMapper.selectList(new LambdaQueryWrapper<IotModelInstance>()
++                .eq(IotModelInstance::getTemplateId, templateId)
++                .orderByAsc(IotModelInstance::getId));
++
++        Long currentUserId = SecurityUtils.getUserId();
++        List<IotModelInstance> lagging = new ArrayList<>();
++        List<Long> rollbackIds = new ArrayList<>();
++        for (IotModelInstance inst : instances) {
++            Integer applied = inst.getAppliedTemplateVersion();
++            if (applied == null) {
++                // 无已应用版本（脏数据防御）——无法判定滞后，跳过
++                continue;
++            }
++            if (applied > currentVersion) {
++                // 模板回退（current < applied，理论上不发生——版本单调）防御性跳过并 WARN（brief 决策 5）
++                rollbackIds.add(inst.getId());
++                continue;
++            }
++            if (applied == currentVersion) {
++                // 无版本差异的实例不出现在清单（brief 决策 5）
++                continue;
++            }
++            if (!isReadableByUser(scope, currentUserId, inst)) {
++                // 数据权限裁剪：id ∈ 可见集 OR (createByOnly 且 create_by=本人)——实例列表 OR 分支同口径
++                continue;
++            }
++            lagging.add(inst);
++        }
++        if (!rollbackIds.isEmpty()) {
++            log.warn("[TEMPLATE-UPGRADE] template rollback detected (current < applied) templateId={} "
++                    + "currentVersion={} skippedInstanceIds={}", templateId, currentVersion, rollbackIds);
++        }
++
++        page.setTotal(lagging.size());
++        int from = Math.min((safePageNum - 1) * safePageSize, lagging.size());
++        int to = Math.min(from + safePageSize, lagging.size());
++        List<IotModelInstance> pageRows = lagging.subList(from, to);
++        if (pageRows.isEmpty()) {
++            page.setRecords(List.of());
++            return page;
++        }
++
++        // 当前内容快照一次构建；diff 按已应用版本缓存（diff 只依赖 applied 版本，与实例无关）
++        String currentContent = templateVersionService.buildCurrentContentJson(templateId);
++        JsonNode currentNode = parse(currentContent);
++        Map<Integer, List<TemplateChangeEntry>> diffCache = new HashMap<>();
++        List<TemplateUpgradeRowVO> rows = new ArrayList<>(pageRows.size());
++        for (IotModelInstance inst : pageRows) {
++            List<TemplateChangeEntry> entries = diffCache.computeIfAbsent(inst.getAppliedTemplateVersion(),
++                    applied -> diffForVersion(templateId, applied, currentNode));
++            TemplateUpgradeRowVO vo = new TemplateUpgradeRowVO();
++            vo.setInstanceId(inst.getId());
++            vo.setInstanceCode(inst.getInstanceCode());
++            vo.setInstanceName(inst.getInstanceName());
++            vo.setAppliedTemplateVersion(inst.getAppliedTemplateVersion());
++            vo.setCurrentVersion(currentVersion);
++            vo.setLocked(inst.getLocked());
++            vo.setTierSummary(TemplateTierRuleTable.formatSummary(entries));
++            vo.setDiff(entries.stream().map(TemplateChangeEntryVO::from).collect(Collectors.toList()));
++            rows.add(vo);
++        }
++        page.setRecords(rows);
++        return page;
++    }
++
++    /**
++     * 单个已应用版本的待生效 diff（0015 引擎）：基线=版本历史行 (templateId, applied) 的
++     * content 快照；无历史基线（存量模板 0015 前建库）或基线 content 缺失 → diff 留空
++     * （无从对比——降级同 0015 影响预览口径，不误计全量 ADDED）。
++     */
++    private List<TemplateChangeEntry> diffForVersion(Long templateId, int appliedVersion, JsonNode currentNode) {
++        IotModelTemplateVersion row = versionMapper.selectOne(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .eq(IotModelTemplateVersion::getTemplateId, templateId)
++                .eq(IotModelTemplateVersion::getVersion, appliedVersion)
++                .last("LIMIT 1"));
++        if (row == null || row.getContent() == null || row.getContent().isBlank()) {
++            return List.of();
++        }
++        JsonNode baseline = parse(row.getContent());
++        if (baseline == null) {
++            return List.of();
++        }
++        return TemplateContentDiffEngine.diff(baseline, currentNode);
++    }
++
++    // ---------- 逐台/批量确认升级 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public int confirmUpgrade(TemplateUpgradeConfirmForm form) {
++        List<Long> ids = form.getInstanceIds();
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要确认升级的实例");
++        }
++        List<Long> distinctIds = ids.stream().distinct().collect(Collectors.toList());
++
++        // fail-closed：批内全部 id 必须存在且活跃（@TableLogic 过滤已删行），缺失即整批拒绝（不半成功）
++        List<IotModelInstance> existingList = instanceMapper.selectByIds(distinctIds);
++        if (existingList.size() < distinctIds.size()) {
++            Map<Long, IotModelInstance> found = existingList.stream()
++                    .collect(Collectors.toMap(IotModelInstance::getId, inst -> inst));
++            List<Long> missing = distinctIds.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("实例不存在或已删除: " + missing);
++        }
++
++        // 写路径数据权限防线（0012 修订轮 I-1 范式）：批内任一不可见即整批拒绝（403 不泄露标识）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant()) {
++            for (IotModelInstance target : existingList) {
++                if (!scope.instanceIds().contains(target.getId())) {
++                    throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该实例（数据权限不命中）");
++                }
++            }
++        }
++
++        // 批内同模板校验（清单页按模板维度操作；模板从实例行解析——brief 请求体无 templateId）
++        Set<Long> templateIds = existingList.stream()
++                .map(IotModelInstance::getTemplateId)
++                .collect(Collectors.toSet());
++        if (templateIds.size() != 1 || templateIds.contains(null)) {
++            throw paramError("批量确认仅允许同一模板的实例（清单页按模板维度操作）");
++        }
++        Long templateId = existingList.get(0).getTemplateId();
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("模板不存在或已删除: " + templateId);
++        }
++
++        // 目标版本校验：必须等于模板当前版本（不允许任意目标版——ADR-0008 升级语义）
++        Integer currentVersion = template.getVersion();
++        if (currentVersion == null || !currentVersion.equals(form.getTargetVersion())) {
++            throw paramError("目标版本必须等于模板当前版本 " + currentVersion + "（不允许任意目标版）");
++        }
++
++        // 逐台乐观锁更新：SET applied=target WHERE id=? AND applied=旧值（任一失败整批回滚）
++        int confirmed = 0;
++        for (IotModelInstance target : existingList) {
++            Integer applied = target.getAppliedTemplateVersion();
++            if (applied == null) {
++                throw paramError("实例无已应用版本，无法确认升级: " + target.getInstanceCode());
++            }
++            if (applied > currentVersion) {
++                // 模板回退场景防御——确认只升不降
++                throw paramError("实例已应用版本高于目标版本，禁止降级确认: " + target.getInstanceCode());
++            }
++            if (applied.intValue() == currentVersion) {
++                // 已在目标版本（他端已确认/重复提交）→ 4002 冲突口径整批拒绝（同值 UPDATE 的影响行数
++                // 受驱动 affected 口径歧义——显式前置判定消除歧义；幂等重放需刷新清单重选余下实例）
++                throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                        "实例已在目标版本（并发确认或重复提交），请刷新待升级清单后重试: " + target.getInstanceCode());
++            }
++            LambdaUpdateWrapper<IotModelInstance> upd = new LambdaUpdateWrapper<IotModelInstance>()
++                    .eq(IotModelInstance::getId, target.getId())
++                    .eq(IotModelInstance::getAppliedTemplateVersion, applied)
++                    .set(IotModelInstance::getAppliedTemplateVersion, currentVersion);
++            int rows = instanceMapper.update(null, upd);
++            if (rows == 0) {
++                // 乐观锁冲突（并发确认已推进该实例版本）→ 映射 4002 业务码（0015 修订轮 M-2 范式，
++                // 不裸 500）；@Transactional 整批回滚——不半成功
++                throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                        "实例版本并发确认冲突，请重试（刷新待升级清单）: instanceId=" + target.getId());
++            }
++            confirmed++;
++            // 逐台留痕（控制器 @OperateLog 记请求级；此处逐台 INFO 补运行轨迹）
++            log.info("[INSTANCE-UPGRADE] confirmed instanceId={} templateId={} applied {} -> {} (userId={})",
++                    target.getId(), templateId, applied, currentVersion, SecurityUtils.getUserId());
++        }
++        return confirmed;
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /**
++     * 实例读路径可见性判定（照 0012 实例列表 OR 分支口径，ADR-0016 裁决 3/4）：id ∈ 可见集
++     * OR（createByOnly 且实例 create_by=当前用户）。
++     */
++    private boolean isReadableByUser(VisibleScope scope, Long currentUserId, IotModelInstance instance) {
++        return scope.allTenant()
++                || scope.instanceIds().contains(instance.getId())
++                || (scope.createByOnly() && instance.getCreateBy() != null
++                    && instance.getCreateBy().equals(currentUserId));
++    }
++
++    /**
++     * 写路径数据权限防线（0012 修订轮 I-1 范式）：resolve(当前用户) → VisibleScope，allTenant
++     * 直过；否则目标实例必须 ∈ 可见集，不在即 403——文案不泄露实例标识（照详情范式）。
++     */
++    private void requireDataPerm(Long targetId) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(targetId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该实例（数据权限不命中）");
++        }
++    }
++
++    private JsonNode parse(String json) {
++        if (json == null || json.isBlank()) {
++            return null;
++        }
++        try {
++            return PARSE_MAPPER.readTree(json);
++        } catch (Exception e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "模板内容快照解析失败: " + e.getMessage());
++        }
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+index 1aed317..ec79919 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+@@ -283,6 +283,23 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+         return vo;
+     }
+ 
++    // ---------- 当前内容快照（TASK-0016 待升级清单 diff 基线复用） ----------
++
++    /**
++     * 当前模板内容快照（接口契约见 {@link IotTemplateVersionService#buildCurrentContentJson}）：
++     * 与 recordBaseline / recordContentChange 落库的 content 同一 {@link #buildContentJson}
++     * 构建器同一 canonical 形态——两次构建逐字节一致，是 TASK-0016 待升级清单「applied 版本
++     * content vs 当前版本 content」diff 相等性判断的直接前提（形态漂移会产出伪 diff 条目）。
++     */
++    @Override
++    public String buildCurrentContentJson(Long templateId) {
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("模板不存在或已删除: " + templateId);
++        }
++        return buildContentJson(template, loadItems(templateId), loadRules(templateId));
++    }
++
+     // ---------- 确认门判档 ----------
+ 
+     @Override
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockControllerTest.java
+new file mode 100644
+index 0000000..f47411b
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotInstanceLockControllerTest.java
+@@ -0,0 +1,124 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
++import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 实例锁定开关控制器测试（TASK-0016 接口层）
++ *
++ * <p>standalone MockMvc + Mockito（照 IotModelTemplateControllerTest 范式）：权限注解以
++ * 反射断言（复用既有 iot:instance:edit——brief 决策 4 不新增种子），路由与参数校验走真实
++ * MockMvc 请求。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotInstanceLockControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotInstanceUpgradeService instanceUpgradeService;
++
++    private IotInstanceLockController controller;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        controller = new IotInstanceLockController();
++        ReflectionTestUtils.setField(controller, "instanceUpgradeService", instanceUpgradeService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(controller)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    @Test
++    @DisplayName("权限注解 - PUT /iot/instance/lock 复用既有 iot:instance:edit（brief 决策 1，不新增种子）")
++    void testPermissionAnnotation() throws Exception {
++        assertEquals("iot:instance:edit", IotInstanceLockController.class
++                .getMethod("setLock", IotInstanceLockForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 锁定开关挂 @OperateLog（UPDATE，逐台留痕）")
++    void testOperateLogAnnotation() throws Exception {
++        OperateLog annotation = IotInstanceLockController.class
++                .getMethod("setLock", IotInstanceLockForm.class).getAnnotation(OperateLog.class);
++        assertNotNull(annotation);
++        assertEquals(BusinessType.UPDATE, annotation.businessType());
++    }
++
++    @Test
++    @DisplayName("锁定置位 - PUT /iot/instance/lock {instanceId, locked:1} → 200 且服务收到表单")
++    void testSetLock_Success() throws Exception {
++        IotInstanceLockForm form = new IotInstanceLockForm();
++        form.setInstanceId(4L);
++        form.setLocked(1);
++
++        mockMvc.perform(put("/iot/instance/lock")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(instanceUpgradeService).setLock(any(IotInstanceLockForm.class));
++    }
++
++    @Test
++    @DisplayName("参数校验 - instanceId 缺失 → 业务码 400，服务不触达")
++    void testSetLock_InstanceIdMissing() throws Exception {
++        IotInstanceLockForm form = new IotInstanceLockForm();
++        form.setLocked(1);
++
++        mockMvc.perform(put("/iot/instance/lock")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceUpgradeService, never()).setLock(any());
++    }
++
++    @Test
++    @DisplayName("参数校验 - locked=2 超出 0/1 值域 → 业务码 400（@Min/@Max），服务不触达")
++    void testSetLock_InvalidLockedValue() throws Exception {
++        IotInstanceLockForm form = new IotInstanceLockForm();
++        form.setInstanceId(4L);
++        form.setLocked(2);
++
++        mockMvc.perform(put("/iot/instance/lock")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceUpgradeService, never()).setLock(any());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeControllerTest.java
+new file mode 100644
+index 0000000..6581b2e
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeControllerTest.java
+@@ -0,0 +1,168 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
++import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 待升级清单控制器测试（TASK-0016 接口层，brief 接口 2/3）
++ *
++ * <p>standalone MockMvc + Mockito（照 IotModelTemplateControllerTest 范式）：权限注解以
++ * 反射断言（清单 iot:template:query / 确认 iot:instance:edit——brief 决策 4 复用既有种子），
++ * 路由与参数校验走真实 MockMvc 请求。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotTemplateUpgradeControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotInstanceUpgradeService instanceUpgradeService;
++
++    private IotTemplateUpgradeController controller;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        controller = new IotTemplateUpgradeController();
++        ReflectionTestUtils.setField(controller, "instanceUpgradeService", instanceUpgradeService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(controller)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private TemplateUpgradeRowVO row() {
++        TemplateUpgradeRowVO vo = new TemplateUpgradeRowVO();
++        vo.setInstanceId(11L);
++        vo.setInstanceCode("F01.EQ11");
++        vo.setInstanceName("设备11");
++        vo.setAppliedTemplateVersion(2);
++        vo.setCurrentVersion(3);
++        vo.setLocked(1);
++        vo.setTierSummary("T2:1");
++        vo.setDiff(List.of(new TemplateChangeEntryVO(
++                "dataItem", "ELEC_CONS", "CHANGED", "defaultFormula", "a", "b", "T2")));
++        return vo;
++    }
++
++    @Test
++    @DisplayName("权限注解 - 清单 iot:template:query（0015 影响预览同款）/ 确认 iot:instance:edit（实例写操作）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:template:query", IotTemplateUpgradeController.class
++                .getMethod("list", Long.class, Integer.class, Integer.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:instance:edit", IotTemplateUpgradeController.class
++                .getMethod("confirm", TemplateUpgradeConfirmForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 确认升级挂 @OperateLog（UPDATE，参数含全量 instanceIds 逐台留痕）；清单查询不挂")
++    void testOperateLogAnnotations() throws Exception {
++        assertNotNull(IotTemplateUpgradeController.class
++                .getMethod("confirm", TemplateUpgradeConfirmForm.class).getAnnotation(OperateLog.class));
++        assertEquals(BusinessType.UPDATE, IotTemplateUpgradeController.class
++                .getMethod("confirm", TemplateUpgradeConfirmForm.class)
++                .getAnnotation(OperateLog.class).businessType());
++    }
++
++    @Test
++    @DisplayName("清单查询 - GET /iot/template/upgrade/list?templateId= 返回分页行（diff 带档位）")
++    void testList_Success() throws Exception {
++        Page<TemplateUpgradeRowVO> page = new Page<>(1, 10);
++        page.setRecords(List.of(row()));
++        page.setTotal(1);
++        when(instanceUpgradeService.selectUpgradeList(eq(9L), eq(1), eq(10))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/template/upgrade/list")
++                        .param("templateId", "9")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].instanceId").value(11))
++                .andExpect(jsonPath("$.data.records[0].instanceCode").value("F01.EQ11"))
++                .andExpect(jsonPath("$.data.records[0].appliedTemplateVersion").value(2))
++                .andExpect(jsonPath("$.data.records[0].currentVersion").value(3))
++                .andExpect(jsonPath("$.data.records[0].locked").value(1))
++                .andExpect(jsonPath("$.data.records[0].tierSummary").value("T2:1"))
++                .andExpect(jsonPath("$.data.records[0].diff[0].tier").value("T2"));
++
++        verify(instanceUpgradeService).selectUpgradeList(eq(9L), eq(1), eq(10));
++    }
++
++    @Test
++    @DisplayName("确认升级 - POST /iot/template/upgrade/confirm → 200 且服务收到表单")
++    void testConfirm_Success() throws Exception {
++        TemplateUpgradeConfirmForm form = new TemplateUpgradeConfirmForm();
++        form.setInstanceIds(List.of(11L, 12L));
++        form.setTargetVersion(3);
++
++        mockMvc.perform(post("/iot/template/upgrade/confirm")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(instanceUpgradeService).confirmUpgrade(any(TemplateUpgradeConfirmForm.class));
++    }
++
++    @Test
++    @DisplayName("确认校验 - instanceIds 空清单 → 业务码 400；targetVersion 缺失 → 业务码 400")
++    void testConfirm_Validation() throws Exception {
++        TemplateUpgradeConfirmForm emptyIds = new TemplateUpgradeConfirmForm();
++        emptyIds.setInstanceIds(List.of());
++        emptyIds.setTargetVersion(3);
++        mockMvc.perform(post("/iot/template/upgrade/confirm")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(emptyIds)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        TemplateUpgradeConfirmForm noVersion = new TemplateUpgradeConfirmForm();
++        noVersion.setInstanceIds(List.of(11L));
++        mockMvc.perform(post("/iot/template/upgrade/confirm")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(noVersion)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(instanceUpgradeService, never()).confirmUpgrade(any());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java
+new file mode 100644
+index 0000000..7cd2472
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java
+@@ -0,0 +1,534 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.Collection;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 实例版本锁定与待升级清单服务单元测试（TASK-0016，brief 测试口径：锁定开关置位/解除/
++ * locked=1 编辑受限由 0012 既有测试锁定；清单 applied&lt;current 筛选/无差异不出现/diff 复用
++ * 0015 引擎逐条目档位/分页；确认单台/批量/applied 更新/乐观锁冲突 4002/无效 id 整批拒绝/
++ * locked 实例确认通过；数据权限裁剪）。
++ *
++ * <p>standalone Mockito 范式（照 IotTemplateVersionServiceImplTest）：Mapper/版本服务全 mock；
++ * SecurityUtils 静态 mock 供数据权限 resolve 取当前用户。diff 基线/当前内容以字面 JSON 提供
++ * （diff 引擎只依赖内容结构——0015 测试同技巧），分档走真实 TemplateTierRuleTable。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotInstanceUpgradeServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long TEMPLATE_ID = 9L;
++    private static final int CURRENT_VERSION = 3;
++
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Mock
++    private IotModelTemplateVersionMapper versionMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private IotTemplateVersionService templateVersionService;
++
++    private IotInstanceUpgradeServiceImpl service;
++
++    private AutoCloseable mocks;
++
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplateVersion.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        securityUtils = mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(1L);
++        service = new IotInstanceUpgradeServiceImpl();
++        ReflectionTestUtils.setField(service, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(service, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(service, "versionMapper", versionMapper);
++        ReflectionTestUtils.setField(service, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(service, "templateVersionService", templateVersionService);
++        // 默认全租户可见域（0012 测试同款）；受限场景在各用例内显式覆盖 resolve(1L)
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(CURRENT_VERSION));
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++        securityUtils.close();
++    }
++
++    // ---------- 数据工厂 ----------
++
++    private IotModelTemplate template(int version) {
++        IotModelTemplate template = new IotModelTemplate();
++        template.setId(TEMPLATE_ID);
++        template.setTenantId(TENANT);
++        template.setTemplateCode("AIR_COMPRESSOR");
++        template.setTemplateName("空压机模板");
++        template.setNodeType(4);
++        template.setStatus(1);
++        template.setVersion(version);
++        return template;
++    }
++
++    private IotModelInstance instance(long id, Integer applied, int locked) {
++        return instance(id, applied, locked, TEMPLATE_ID);
++    }
++
++    private IotModelInstance instance(long id, Integer applied, int locked, Long templateId) {
++        IotModelInstance instance = new IotModelInstance();
++        instance.setId(id);
++        instance.setTenantId(TENANT);
++        instance.setInstanceCode("F01.EQ" + id);
++        instance.setInstanceName("设备" + id);
++        instance.setTemplateId(templateId);
++        instance.setNodeType(4);
++        instance.setStatus(1);
++        instance.setCreateBy(7L);
++        instance.setAppliedTemplateVersion(applied);
++        instance.setLocked(locked);
++        return instance;
++    }
++
++    private IotModelTemplateVersion historyRow(int version, String content) {
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setId((long) version);
++        row.setTenantId(TENANT);
++        row.setTemplateId(TEMPLATE_ID);
++        row.setVersion(version);
++        row.setContent(content);
++        return row;
++    }
++
++    /** 字面内容 JSON（与 0015 canonical 形态同构；formula 参数化驱动 diff） */
++    private String contentJson(String formula) {
++        return "{\"template\":{\"nodeType\":4,\"remark\":\"smoke\",\"templateCode\":\"AIR_COMPRESSOR\","
++                + "\"templateName\":\"空压机模板\"},\"dataItems\":[{\"aggMethod\":\"SUM\",\"category\":\"ELEC\","
++                + "\"dataCode\":\"ELEC_CONS\",\"dataName\":\"项-ELEC_CONS\",\"defaultAlarmHigh\":90,"
++                + "\"defaultAlarmLow\":1,\"defaultCalcPeriod\":\"DAY\",\"defaultFormula\":\"" + formula + "\","
++                + "\"defaultSourceType\":2,\"defaultValidMax\":100,\"defaultValidMin\":0,\"unit\":\"kWh\","
++                + "\"valueKind\":2}],\"statusRules\":[]}";
++    }
++
++    private IotInstanceLockForm lockForm(long instanceId, int locked) {
++        IotInstanceLockForm form = new IotInstanceLockForm();
++        form.setInstanceId(instanceId);
++        form.setLocked(locked);
++        return form;
++    }
++
++    private TemplateUpgradeConfirmForm confirmForm(List<Long> ids, int targetVersion) {
++        TemplateUpgradeConfirmForm form = new TemplateUpgradeConfirmForm();
++        form.setInstanceIds(ids);
++        form.setTargetVersion(targetVersion);
++        return form;
++    }
++
++    // ---------- 锁定开关（brief 测试口径：置位/解除） ----------
++
++    @Test
++    @DisplayName("锁定置位 - locked 0→1：更新集仅含 locked 列（白名单构建，不携带其他字段）")
++    void lockApplied() {
++        IotModelInstance existing = instance(4L, 2, 0);
++        when(instanceMapper.selectById(4L)).thenReturn(existing);
++        when(instanceMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        assertTrue(service.setLock(lockForm(4L, 1)));
++
++        ArgumentCaptor<IotModelInstance> captor = ArgumentCaptor.captor();
++        verify(instanceMapper).updateById(captor.capture());
++        IotModelInstance upd = captor.getValue();
++        assertEquals(4L, upd.getId());
++        assertEquals(Integer.valueOf(1), upd.getLocked());
++        assertNull(upd.getInstanceName(), "更新集白名单——除锁定列外不携带任何字段");
++        assertNull(upd.getStatus(), "锁定开关不改变实例状态");
++    }
++
++    @Test
++    @DisplayName("锁定解除 - locked 1→0：解除后实例回归跟随面")
++    void lockReleased() {
++        IotModelInstance existing = instance(4L, 2, 1);
++        when(instanceMapper.selectById(4L)).thenReturn(existing);
++        when(instanceMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        assertTrue(service.setLock(lockForm(4L, 0)));
++
++        ArgumentCaptor<IotModelInstance> captor = ArgumentCaptor.captor();
++        verify(instanceMapper).updateById(captor.capture());
++        assertEquals(Integer.valueOf(0), captor.getValue().getLocked());
++    }
++
++    @Test
++    @DisplayName("锁定防御 - locked 非 0/1 服务层拒绝（bean 校验之外的防御兜底）；实例不存在 400")
++    void lockInvalidValueAndMissingInstance() {
++        BusinessException invalid = assertThrows(BusinessException.class, () -> service.setLock(lockForm(4L, 2)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), invalid.getCode());
++        verify(instanceMapper, never()).updateById(any(IotModelInstance.class));
++
++        when(instanceMapper.selectById(4L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class, () -> service.setLock(lockForm(4L, 1)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++        assertTrue(missing.getMessage().contains("不存在"));
++        verify(instanceMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("锁定数据权限 - 目标实例 ∉ 可见集 403（0012 写路径防线范式，先于锁定校验）")
++    void lockPermDenied() {
++        IotModelInstance existing = instance(4L, 2, 0);
++        when(instanceMapper.selectById(4L)).thenReturn(existing);
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(99L), false));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> service.setLock(lockForm(4L, 1)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode(), "写路径不命中 → 403（非 400 不泄露存在性）");
++        verify(instanceMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    // ---------- 待升级清单（brief 测试口径：筛选/无差异不出现/diff 档位/分页） ----------
++
++    @Test
++    @DisplayName("清单行与 diff 档位 - applied<current 出现（锁定/未锁定都在清单）；applied=current 与 "
++            + "无已应用版本不出现；diff=0015 引擎逐条目（改公式 T2）、同版本共享同一 diff")
++    void listRowsAndDiffWithTiers() {
++        IotModelInstance a = instance(11L, 2, 0);
++        IotModelInstance b = instance(12L, 2, 1);
++        IotModelInstance c = instance(13L, CURRENT_VERSION, 0);
++        IotModelInstance d = instance(14L, null, 0);
++        when(instanceMapper.selectList(any())).thenReturn(List.of(a, b, c, d));
++        when(templateVersionService.buildCurrentContentJson(TEMPLATE_ID)).thenReturn(contentJson("{SELF.ELEC}/1000"));
++        when(versionMapper.selectOne(any())).thenReturn(historyRow(2, contentJson("{SELF.ELEC}/100")));
++
++        Page<TemplateUpgradeRowVO> page = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++
++        assertEquals(2L, page.getTotal(), "滞后实例=applied<current（C 无差异/D 无版本被排除）");
++        assertEquals(2, page.getRecords().size());
++        TemplateUpgradeRowVO rowA = page.getRecords().get(0);
++        assertEquals(11L, rowA.getInstanceId());
++        assertEquals("F01.EQ11", rowA.getInstanceCode(), "纯增量展示字段");
++        assertEquals("设备11", rowA.getInstanceName());
++        assertEquals(Integer.valueOf(2), rowA.getAppliedTemplateVersion());
++        assertEquals(Integer.valueOf(CURRENT_VERSION), rowA.getCurrentVersion());
++        assertEquals(Integer.valueOf(0), rowA.getLocked());
++        assertEquals("T2:1", rowA.getTierSummary(), "档位摘要=改默认公式（二档）");
++        assertEquals(1, rowA.getDiff().size());
++        assertEquals("dataItem", rowA.getDiff().get(0).getObjectType());
++        assertEquals("ELEC_CONS", rowA.getDiff().get(0).getObjectKey());
++        assertEquals("CHANGED", rowA.getDiff().get(0).getChangeType());
++        assertEquals("defaultFormula", rowA.getDiff().get(0).getField());
++        assertEquals("T2", rowA.getDiff().get(0).getTier(), "T2 段=锁定实例待确认项（brief 接口 2）");
++        TemplateUpgradeRowVO rowB = page.getRecords().get(1);
++        assertEquals(12L, rowB.getInstanceId());
++        assertEquals(Integer.valueOf(1), rowB.getLocked(), "锁定实例同样出现在清单（不自动跟随、逐台确认）");
++        assertEquals(rowA.getDiff(), rowB.getDiff(), "同 applied 版本共享同一 diff（缓存）");
++        verify(versionMapper, times(1)).selectOne(any()); // diff 按版本缓存——同版本只算一次
++    }
++
++    @Test
++    @DisplayName("清单 T3 条目 - 删除模板数据项（三档）逐条目带档位（T3 段=逐台迁移项）")
++    void listRowWithTier3Entry() {
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(11L, 2, 0)));
++        // 当前内容比 applied 版本少了 ELEC_CONS（模板删除该项——三档 REMOVED；模板头与基线一致，
++        // 只动数据项面——排除夹具噪声）
++        when(templateVersionService.buildCurrentContentJson(TEMPLATE_ID)).thenReturn(
++                "{\"template\":{\"nodeType\":4,\"remark\":\"smoke\",\"templateCode\":\"AIR_COMPRESSOR\","
++                        + "\"templateName\":\"空压机模板\"},\"dataItems\":[],\"statusRules\":[]}");
++        when(versionMapper.selectOne(any())).thenReturn(historyRow(2, contentJson("{SELF.ELEC}/100")));
++
++        Page<TemplateUpgradeRowVO> page = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++
++        assertEquals(1, page.getRecords().size());
++        TemplateUpgradeRowVO row = page.getRecords().get(0);
++        assertEquals("T3:1", row.getTierSummary(), "删除模板数据项=三档（TemplateTierRuleTable REMOVE_TIERS）");
++        assertEquals("T3", row.getDiff().get(0).getTier());
++        assertEquals("REMOVED", row.getDiff().get(0).getChangeType());
++    }
++
++    @Test
++    @DisplayName("清单空态 - 全部实例无版本差异 → 空清单、不触发内容构建与 diff 查询（零开销）")
++    void listNoDiffNoRow() {
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(11L, CURRENT_VERSION, 0)));
++
++        Page<TemplateUpgradeRowVO> page = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++
++        assertEquals(0L, page.getTotal());
++        assertTrue(page.getRecords().isEmpty(), "无版本差异的实例不出现在清单（brief 决策 5）");
++        verify(templateVersionService, never()).buildCurrentContentJson(any());
++        verify(versionMapper, never()).selectOne(any());
++    }
++
++    @Test
++    @DisplayName("清单分页 - 15 行滞后 pageSize=5 第 3 页 → 5 行、total=15、pages=3；越界页空 records 保 total")
++    void listPagination() {
++        List<IotModelInstance> lagging = new java.util.ArrayList<>();
++        for (long id = 1; id <= 15; id++) {
++            lagging.add(instance(id, 2, 0));
++        }
++        when(instanceMapper.selectList(any())).thenReturn(lagging);
++        when(templateVersionService.buildCurrentContentJson(TEMPLATE_ID)).thenReturn(contentJson("{SELF.ELEC}/1000"));
++        when(versionMapper.selectOne(any())).thenReturn(historyRow(2, contentJson("{SELF.ELEC}/100")));
++
++        Page<TemplateUpgradeRowVO> page3 = service.selectUpgradeList(TEMPLATE_ID, 3, 5);
++        assertEquals(15L, page3.getTotal());
++        assertEquals(3L, page3.getCurrent());
++        assertEquals(5, page3.getRecords().size());
++        assertEquals(3L, page3.getPages());
++        assertEquals(11L, page3.getRecords().get(0).getInstanceId(), "第 3 页起始=id 11（id 升序稳定分页）");
++
++        Page<TemplateUpgradeRowVO> beyond = service.selectUpgradeList(TEMPLATE_ID, 9, 5);
++        assertEquals(15L, beyond.getTotal(), "越界页 total 不变");
++        assertTrue(beyond.getRecords().isEmpty());
++    }
++
++    @Test
++    @DisplayName("清单数据权限裁剪 - 受限用户只保留可见集实例（读范式：id ∈ 可见集）；"
++            + "createByOnly 且可见集空 → 仅 create_by=本人实例（ADR-0016 裁决 4 OR 分支）")
++    void listPermTrim() {
++        IotModelInstance a = instance(11L, 2, 0);
++        IotModelInstance b = instance(12L, 2, 0);
++        when(instanceMapper.selectList(any())).thenReturn(List.of(a, b));
++        when(templateVersionService.buildCurrentContentJson(TEMPLATE_ID)).thenReturn(contentJson("{SELF.ELEC}/1000"));
++        when(versionMapper.selectOne(any())).thenReturn(historyRow(2, contentJson("{SELF.ELEC}/100")));
++
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(11L), false));
++        Page<TemplateUpgradeRowVO> scoped = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++        assertEquals(1L, scoped.getTotal());
++        assertEquals(11L, scoped.getRecords().get(0).getInstanceId());
++
++        // 可见集空 + createByOnly：实例 12 create_by=7（≠当前用户 1）→ 不可见；空集短路不查
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(), true));
++        Page<TemplateUpgradeRowVO> createOnly = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++        assertEquals(0L, createOnly.getTotal(), "可见集空且实例非本人创建 → 空清单（fail-closed）");
++
++        // 可见集空 + createByOnly：本人创建的实例可见
++        IotModelInstance mine = instance(13L, 2, 0);
++        mine.setCreateBy(1L);
++        when(instanceMapper.selectList(any())).thenReturn(List.of(mine));
++        Page<TemplateUpgradeRowVO> own = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++        assertEquals(1L, own.getTotal(), "createByOnly OR 分支：本人创建实例出现在清单");
++    }
++
++    @Test
++    @DisplayName("清单边界 - 模板不存在 400；模板回退（current<applied 防御性跳过）；无历史基线 diff 留空")
++    void listEdgeCases() {
++        when(modelTemplateMapper.selectById(999L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> service.selectUpgradeList(999L, 1, 10));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        // 模板回退（理论上不发生——版本单调）：applied=5 > current=3 → 防御性跳过不入清单
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(11L, 5, 0)));
++        Page<TemplateUpgradeRowVO> rollback = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++        assertEquals(0L, rollback.getTotal(), "回退实例防御性跳过（WARN 留痕）");
++
++        // 无历史基线（存量模板 0015 前建库）：diff 留空、tierSummary null，行保留（降级同 0015 口径）
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(11L, 2, 0)));
++        when(templateVersionService.buildCurrentContentJson(TEMPLATE_ID)).thenReturn(contentJson("{SELF.ELEC}/1000"));
++        when(versionMapper.selectOne(any())).thenReturn(null);
++        Page<TemplateUpgradeRowVO> noBaseline = service.selectUpgradeList(TEMPLATE_ID, 1, 10);
++        assertEquals(1L, noBaseline.getTotal());
++        assertNull(noBaseline.getRecords().get(0).getTierSummary());
++        assertTrue(noBaseline.getRecords().get(0).getDiff().isEmpty(), "无从对比——diff 留空不误计全量 ADDED");
++    }
++
++    // ---------- 逐台/批量确认升级（brief 测试口径：单台/批量/乐观锁 4002/整批拒绝/locked 可确认） ----------
++
++    @Test
++    @DisplayName("单台确认 - applied 2→3 乐观锁更新（SET applied=3 WHERE id AND applied=2）；locked 实例同样确认通过")
++    void confirmSingleAndLockedInstance() {
++        IotModelInstance a = instance(11L, 2, 0);
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a));
++        when(instanceMapper.update(isNull(), any())).thenReturn(1);
++
++        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++
++        ArgumentCaptor<LambdaUpdateWrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(instanceMapper).update(isNull(), captor.capture());
++        LambdaUpdateWrapper<IotModelInstance> wrapper = captor.getValue();
++        assertTrue(wrapper.getSqlSet().contains("applied_template_version"), "更新集仅 applied_template_version 列");
++        assertTrue(wrapper.getSqlSegment().contains("applied_template_version"), "乐观锁守卫：WHERE applied=旧值");
++        assertTrue(wrapper.getParamNameValuePairs().containsValue(2), "守卫旧值=确认前 applied");
++        assertTrue(wrapper.getParamNameValuePairs().containsValue(CURRENT_VERSION), "目标值=模板当前版本");
++
++        // locked=1 实例：确认通过（这正是锁定实例的升级通道——锁定只限制编辑面字段）
++        IotModelInstance locked = instance(12L, 2, 1);
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(locked));
++        when(instanceMapper.update(isNull(), any())).thenReturn(1);
++        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(12L), CURRENT_VERSION)));
++        verify(instanceMapper, times(2)).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("批量确认 - 同模板两台逐台更新（每台独立乐观锁）；返回确认台数")
++    void confirmBatch() {
++        IotModelInstance a = instance(11L, 2, 0);
++        IotModelInstance b = instance(12L, 1, 0);
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a, b));
++        when(instanceMapper.update(isNull(), any())).thenReturn(1);
++
++        assertEquals(2, service.confirmUpgrade(confirmForm(List.of(11L, 12L), CURRENT_VERSION)));
++        verify(instanceMapper, times(2)).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("无效 id 整批拒绝 - 批内含不存在 id → 400 且零更新（不半成功）")
++    void confirmInvalidIdBatchRejected() {
++        IotModelInstance a = instance(11L, 2, 0);
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L, 999L), CURRENT_VERSION)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("999"));
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("数据权限整批拒绝 - 批内任一实例不可见 → 403 且零更新（写路径防线照 0012 删除范式）")
++    void confirmPermDenied() {
++        when(instanceMapper.selectByIds(anyCollection()))
++                .thenReturn(List.of(instance(11L, 2, 0), instance(12L, 2, 0)));
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(11L), false));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L, 12L), CURRENT_VERSION)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("目标版本校验 - targetVersion != 模板当前版本 → 400（不允许任意目标版）；模板不存在 400")
++    void confirmTargetVersionMismatch() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(11L, 2, 0)));
++
++        BusinessException mismatch = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), 2)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), mismatch.getCode());
++        assertTrue(mismatch.getMessage().contains("当前版本"));
++        verify(instanceMapper, never()).update(isNull(), any());
++
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(null);
++        BusinessException noTemplate = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), noTemplate.getCode());
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("批内同源校验 - 跨模板混批 → 400 整批拒绝（清单页按模板维度操作）")
++    void confirmMixedTemplateRejected() {
++        when(instanceMapper.selectByIds(anyCollection()))
++                .thenReturn(List.of(instance(11L, 2, 0), instance(12L, 2, 0, 10L)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L, 12L), CURRENT_VERSION)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("同一模板"));
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("乐观锁冲突 - UPDATE 影响行数 0（并发确认已推进）→ 4002 业务码（0015 修订轮 M-2 范式）")
++    void confirmOptimisticConflict() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(11L, 2, 0)));
++        when(instanceMapper.update(isNull(), any())).thenReturn(0);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode(), "冲突映射 4002（非裸 500）");
++        assertTrue(e.getMessage().contains("并发"));
++    }
++
++    @Test
++    @DisplayName("已在目标版本 - applied == targetVersion（重复提交/他端已确认）→ 4002 提示刷新清单（"
++            + "守卫 UPDATE 对同值更新受驱动 affected 口径歧义，显式前置判定消除歧义）")
++    void confirmAlreadyAtTarget() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(11L, CURRENT_VERSION, 0)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("目标版本"));
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("回退防御 - applied > targetVersion（模板回退场景）→ 400 拒绝降级确认")
++    void confirmRollbackRejected() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(11L, 5, 0)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("高于目标版本"));
++        verify(instanceMapper, never()).update(isNull(), any());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+index 6146919..0c31fbc 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+@@ -408,6 +408,30 @@ class IotTemplateVersionServiceImplTest {
+         assertTrue(vo.getDiff().isEmpty(), "无未锁定跟随实例 → 无待生效 diff（锁定实例归待升级清单 TASK-0016）");
+     }
+ 
++    // ---------- 当前内容快照（TASK-0016 待升级清单 diff 基线复用） ----------
++
++    @Test
++    @DisplayName("当前内容快照（TASK-0016）- buildCurrentContentJson 与基线落库 content 逐字节一致"
++            + "（同一 canonical 构建器——待升级清单 diff 相等性的直接前提，形态漂移即伪 diff）")
++    void buildCurrentContentJsonMatchesBaselineContent() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> captor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(captor.capture());
++        String baselineContent = captor.getValue().getContent();
++
++        assertEquals(baselineContent, service.buildCurrentContentJson(TEMPLATE_ID),
++                "同一构建器同一 canonical 形态——两次构建逐字节一致");
++    }
++
++    @Test
++    @DisplayName("当前内容快照（TASK-0016）- 模板不存在 → 400（与影响预览同文案口径）")
++    void buildCurrentContentJsonTemplateMissing() {
++        when(modelTemplateMapper.selectById(999L)).thenReturn(null);
++        assertThrows(BusinessException.class, () -> service.buildCurrentContentJson(999L));
++    }
++
+     /** 构造基线内容 JSON（测试侧以字面 JSON 提供历史行——diff 引擎只依赖内容结构） */
+     private String baselineJsonOf(String formula) {
+         return "{\"template\":{\"nodeType\":4,\"remark\":\"smoke\",\"status\":1,"

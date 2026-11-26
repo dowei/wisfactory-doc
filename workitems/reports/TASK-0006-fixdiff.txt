@@ -1,0 +1,112 @@
+commit 1065f9a75faa2940542ce0c9c20fa8f7c59d9359
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 07:51:48 2026 +0800
+
+    fix(iot): 实例创建/删除补可见集缓存全量失效——评审退回修订轮 I-2（TASK-0006 修订轮）
+    
+    - 评审 I-2 必修：createInstance/deleteInstances 各补一行 evictAll（afterCommit 随事务提交发布）——
+      新建实例对 dept-scoped 用户最迟 10 分钟不可见/已删实例滞留可见集，相对 0005 每请求现算是行为回退；
+      协调者授权把 brief「实例侧仅一处」扩展为 create/update/delete 三处全覆盖
+    - 红转绿：红 2（create/delete 无失效）→ 实现 → 绿；IotModelInstanceServiceImplTest 60/60
+      （新增 4 用例：create 成功发布/撞码失败不发布/delete 成功发布/删除被拒不发布）
+    - I-1 接受为残余风险（TD-0055 登记），本项不改代码；Minor 6 条不动记 deferred
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+index cf6bc5c..71c9713 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+@@ -206,6 +206,9 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         // 实例行一并回滚）；无模板实例（组织节点）在生成服务内零生成 no-op。
+         // 新增项默认不参与上级汇总（ADR-0008 一档，生成服务只写出边不改上级引用集）。
+         dataItemService.generateForInstance(entity.getId());
++        // 实例树新增（含子级建树）：可见集缓存全量失效（提交后发布）——0006 修订轮 I-2：
++        // 新建实例对 dept-scoped 用户最迟 10 分钟不可见，相对 0005 每请求现算是行为回退
++        dataPermCacheEvictPublisher.evictAll();
+         return true;
+     }
+ 
+@@ -438,8 +441,13 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+             throw paramError("实例存在数据项，禁止删除（先清理数据项: " + joinLimit(itemSources) + "）");
+         }
+ 
+-        // 无引用：逻辑删（@TableLogic，deleted=1）
+-        return this.removeByIds(ids);
++        // 无引用：逻辑删（@TableLogic，deleted=1）；成功即全量失效——0006 修订轮 I-2：
++        // 已删实例滞留他人可见集 ≤600s（残留引用被 deleted=0 过滤，窗口内仅查询空转）
++        boolean removed = this.removeByIds(ids);
++        if (removed) {
++            dataPermCacheEvictPublisher.evictAll();
++        }
++        return removed;
+     }
+ 
+     // ---------- 树查询（数据权限裁剪——本任务核心） ----------
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+index 81842d3..d1b5633 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+@@ -1239,4 +1239,64 @@ class IotModelInstanceServiceImplTest {
+ 
+         verify(dataPermCacheEvictPublisher, never()).evictAll();
+     }
++
++    // ---------- 修订轮 I-2：create/delete 补全量失效（评审退回，协调者授权扩为三处挂点） ----------
++
++    @Test
++    @DisplayName("创建绑部门实例成功 - 全量失效事件发布一次（新建实例对 dept-scoped 用户最迟 10 分钟不可见是回退）")
++    void testCreate_publishesEvictAll() {
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(Collections.emptyList());
++        when(baseMapper.insert(any(IotModelInstance.class))).thenReturn(1);
++
++        assertTrue(instanceService.createInstance(createForm("F06", 1, null, null, 10L)));
++
++        verify(dataPermCacheEvictPublisher, times(1)).evictAll();
++        verify(dataPermCacheEvictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("创建失败（撞码 4002）- 写失败不发布失效事件")
++    void testCreateDuplicate_noEvent() {
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection()))
++                .thenReturn(List.of(occupiedRow("F06", 0)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("F06", 1, null, null, 10L)));
++
++        assertEquals(4002, e.getCode());
++        verify(dataPermCacheEvictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("删除实例成功 - 全量失效事件发布一次（已删实例滞留可见集 ≤600s 是回退）")
++    void testDelete_publishesEvictAll() {
++        IotModelInstance eq = instance(9L, "T06D", 0L, "0", 1, 4L, 1, 1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(eq));
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(dataItemService.countByInstanceIds(List.of(9L))).thenReturn(Map.of());
++        when(baseMapper.deleteByIds(any())).thenReturn(1);
++
++        assertTrue(instanceService.deleteInstances(List.of(9L)));
++
++        verify(dataPermCacheEvictPublisher, times(1)).evictAll();
++        verify(dataPermCacheEvictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("删除被拒（存在数据项）- 不发布失效事件")
++    void testDeleteRejected_noEvent() {
++        IotModelInstance eq = instance(9L, "T06D", 0L, "0", 1, 4L, 1, 1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(eq));
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(dataItemService.countByInstanceIds(List.of(9L))).thenReturn(Map.of(9L, 3L));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.deleteInstances(List.of(9L)));
++
++        assertTrue(e.getMessage().contains("数据项"), e.getMessage());
++        verify(dataPermCacheEvictPublisher, never()).evictAll();
++    }
+ }

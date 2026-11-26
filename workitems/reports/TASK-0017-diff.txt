@@ -1,0 +1,3154 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java
+new file mode 100644
+index 0000000..898c738
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.gateway.auth;
++
++import org.springframework.context.annotation.Configuration;
++import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
++import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
++
++/**
++ * 网关内部接口拦截器注册（TASK-0017）。
++ *
++ * <p>仅拦 /internal/v1/gateway/**（物理隔离原则，详细设计 §3 p20「内部系统间接口用
++ * /internal/v1 前缀，与管理面、对外面物理隔离（不同网关路由与鉴权）」）；管理面
++ * /iot/gateway/** 与其余路径不挂本拦截器。认证实现为
++ * {@link StaticTokenInternalAuthChecker}（占位——完整网关令牌链归 0019/0020，接线
++ * 义务登记遗留）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Configuration
++public class GatewayInternalAuthConfig implements WebMvcConfigurer {
++
++    private final InternalAuthChecker internalAuthChecker;
++
++    public GatewayInternalAuthConfig(InternalAuthChecker internalAuthChecker) {
++        this.internalAuthChecker = internalAuthChecker;
++    }
++
++    @Override
++    public void addInterceptors(InterceptorRegistry registry) {
++        registry.addInterceptor(new InternalAuthInterceptor(internalAuthChecker))
++                .addPathPatterns("/internal/v1/gateway/**");
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java
+new file mode 100644
+index 0000000..631d9b1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java
+@@ -0,0 +1,29 @@
++package net.otlab.admin.module.iot.gateway.auth;
++
++import jakarta.servlet.http.HttpServletRequest;
++
++/**
++ * 内部接口认证检查器（TASK-0017，占位裁决——brief「内部认证裁决（占位）」）
++ *
++ * <p>内部回写接口（/internal/v1/gateway/**）<b>无 Sa-Token</b>（管理面登录令牌体系不适用
++ * 于服务间调用），认证由本检查器承担：调用方须通过（静态令牌 + IP 白名单）双道校验。
++ * 校验入口统一收敛在 {@code check(HttpServletRequest)}——由拦截器层
++ * （{@link InternalAuthInterceptor}）在控制器之前调用，失败抛 BusinessException
++ * （401 令牌无效 / 403 白名单外），由 GlobalExceptionHandler 统一转框架响应体。
++ *
++ * <p><b>接线义务（占位升级路径）</b>：本期为「配置静态令牌 + IP 白名单」占位实现
++ * （{@link StaticTokenInternalAuthChecker}）；完整网关令牌链归 TASK-0019（凭据域）与
++ * TASK-0020（LWT/接入准入）裁决升级——届时替换实现类而非扩散调用点（接口即接缝）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface InternalAuthChecker {
++
++    /**
++     * 校验内部请求（令牌 + 来源 IP）。失败抛 BusinessException，通过静默返回。
++     *
++     * @param request 当前内部请求
++     */
++    void check(HttpServletRequest request);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java
+new file mode 100644
+index 0000000..01ab0a8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.gateway.auth;
++
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import org.springframework.web.servlet.HandlerInterceptor;
++
++/**
++ * 内部接口认证拦截器（TASK-0017）——brief 裁决「校验在过滤器/拦截器层」。
++ *
++ * <p>挂在 /internal/v1/gateway/**（{@link GatewayInternalAuthConfig}），控制器之前调用
++ * {@link InternalAuthChecker#check}（静态令牌 + IP 白名单）；失败抛 BusinessException
++ * 由 GlobalExceptionHandler 统一转框架响应体（HTTP 200 + 业务码 401/403）。
++ *
++ * <p>管理面五接口不受影响（路径前缀不同）；完整网关令牌链归 0019/0020。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public class InternalAuthInterceptor implements HandlerInterceptor {
++
++    private final InternalAuthChecker internalAuthChecker;
++
++    public InternalAuthInterceptor(InternalAuthChecker internalAuthChecker) {
++        this.internalAuthChecker = internalAuthChecker;
++    }
++
++    @Override
++    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
++        internalAuthChecker.check(request);
++        return true;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java
+new file mode 100644
+index 0000000..b1ec0c2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java
+@@ -0,0 +1,101 @@
++package net.otlab.admin.module.iot.gateway.auth;
++
++import jakarta.servlet.http.HttpServletRequest;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.OtIpUtils;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Component;
++
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.util.Arrays;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * 内部认证检查器·配置静态令牌 + IP 白名单实现（TASK-0017 占位裁决，brief「内部认证裁决
++ * （占位）」）
++ *
++ * <p><b>静态令牌</b>：{@code ot.gateway.internal-token} 经环境变量注入（yml 占位键为
++ * 本任务唯一新增键），比对请求头 {@code X-Internal-Token}——常量时间比较（MessageDigest
++ * .isEqual，防逐字节时序侧信道）。<b>fail-closed</b>：配置为空（未注入）时一律拒绝并
++ * WARN，绝不放行。
++ *
++ * <p><b>IP 白名单</b>：{@code ot.gateway.internal-ip-whitelist}（默认 127.0.0.1，逗号分隔，
++ * 代码默认值——brief 只授权 yml 新增 internal-token 一个键，故白名单键经 @Value 默认值
++ * 交付，部署时可经环境变量 OT_GATEWAY_INTERNAL_IP_WHITELIST 覆盖）。来源 IP 取
++ * {@link OtIpUtils#getClientIp}（受 ot.ip.behind-proxy 开关控制，防伪造转发头）。
++ *
++ * <p>校验在拦截器层触发（{@link InternalAuthInterceptor}）；完整网关令牌链归 0019/0020。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class StaticTokenInternalAuthChecker implements InternalAuthChecker {
++
++    /** 内部令牌请求头（brief 裁决：header X-Internal-Token 比对） */
++    public static final String TOKEN_HEADER = "X-Internal-Token";
++
++    /** 令牌配置键（application.yml 唯一新增键，env 注入） */
++    private static final String TOKEN_CONFIG_KEY = "${ot.gateway.internal-token:}";
++
++    /** IP 白名单配置键（代码默认 127.0.0.1；部署经环境变量覆盖） */
++    private static final String WHITELIST_CONFIG_KEY = "${ot.gateway.internal-ip-whitelist:127.0.0.1}";
++
++    @Value(TOKEN_CONFIG_KEY)
++    private String configuredToken;
++
++    @Value(WHITELIST_CONFIG_KEY)
++    private String ipWhitelistRaw;
++
++    @Override
++    public void check(HttpServletRequest request) {
++        checkToken(request);
++        checkIpWhitelist(request);
++    }
++
++    /** 令牌校验：配置为空 fail-closed；头缺失/不匹配 401（常量时间比较） */
++    private void checkToken(HttpServletRequest request) {
++        if (configuredToken == null || configuredToken.isBlank()) {
++            log.warn("[GATEWAY-INTERNAL] internal token not configured, reject all (fail-closed) ip={}",
++                    OtIpUtils.getClientIp(request));
++            throw new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌未配置，回写接口拒绝访问（fail-closed）");
++        }
++        String presented = request.getHeader(TOKEN_HEADER);
++        if (presented == null || presented.isBlank()
++                || !MessageDigest.isEqual(configuredToken.getBytes(StandardCharsets.UTF_8),
++                        presented.getBytes(StandardCharsets.UTF_8))) {
++            log.warn("[GATEWAY-INTERNAL] invalid internal token, ip={}", OtIpUtils.getClientIp(request));
++            throw new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效");
++        }
++    }
++
++    /** IP 白名单校验：来源 IP ∈ 白名单（逗号分隔，去空白），白名单外 403 */
++    private void checkIpWhitelist(HttpServletRequest request) {
++        Set<String> whitelist = parseWhitelist(ipWhitelistRaw);
++        String clientIp = OtIpUtils.getClientIp(request);
++        if (!whitelist.contains(clientIp)) {
++            log.warn("[GATEWAY-INTERNAL] ip not in internal whitelist, ip={} whitelist={}", clientIp, whitelist);
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "来源 IP 不在内部接口白名单");
++        }
++    }
++
++    /** 解析逗号分隔白名单（去空白、小写归一，IPv6 场景友好） */
++    private Set<String> parseWhitelist(String raw) {
++        Set<String> result = new HashSet<>();
++        if (raw == null || raw.isBlank()) {
++            return result;
++        }
++        Arrays.stream(raw.split(","))
++                .map(String::trim)
++                .filter(s -> !s.isEmpty())
++                .map(s -> s.toLowerCase(Locale.ROOT))
++                .forEach(result::add);
++        return result;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java
+new file mode 100644
+index 0000000..eabf67d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java
+@@ -0,0 +1,85 @@
++package net.otlab.admin.module.iot.gateway.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 网关控制器（TASK-0017，管理面 CRUD——详细设计 §3.1 p21 逐行）
++ *
++ * <p>路径命名空间 /iot/gateway（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
++ * iot:gateway:*（sys_menu 4041-4045，网关管理页 4012 之下）。§3.1 p21 网关段为四行
++ * （list/add/edit/remove，无 detail 行）——brief 裁决「无则 list/detail 合并按 list 权限」，
++ * 故不设 detail 端点（iot:gateway:query 行按 brief 五行要求预登记，供前端详情弹层预留）。
++ *
++ * <p>删除为软删（@TableLogic deleted=1）；名下有通道/点位时拒绝（guard 结构就位，本期
++ * 恒零引用——接线义务登记 0018/0021 brief）。列表含在线状态与心跳时间列（REQ-0009 验收 2
++ * 的运维监控数据源）。回写字段组五字段为接入服务回写专属，本控制器不提供任何写入路径。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "采集网关")
++@RestController
++@RequestMapping("/iot/gateway")
++public class IotGatewayController {
++
++    @Autowired
++    private IotGatewayService gatewayService;
++
++    @Operation(summary = "网关分页列表（过滤 gatewayCode/gatewayName/status/onlineStatus；含在线状态与心跳时间列）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:gateway:list")
++    public Result<Page<IotGateway>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                         @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                         IotGateway query) {
++        Page<IotGateway> page = new Page<>(pageNum, pageSize);
++        return Result.success(gatewayService.selectGatewayList(page, query));
++    }
++
++    @OperateLog(title = "采集网关", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增网关（编码租户内唯一双道闸 4002；字符集 [A-Za-z0-9_]；挂实例/绑部门校验）")
++    @PostMapping
++    @SaCheckPermission("iot:gateway:add")
++    public Result<Void> add(@Valid @RequestBody IotGatewayCreateForm form) {
++        gatewayService.createGateway(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "采集网关", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改网关（gateway_code 不可改；白名单 gatewayName/instanceId/deptId/heartbeatPeriod/status）")
++    @PutMapping
++    @SaCheckPermission("iot:gateway:edit")
++    public Result<Void> edit(@Valid @RequestBody IotGatewayUpdateForm form) {
++        gatewayService.updateGateway(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "采集网关", businessType = BusinessType.DELETE)
++    @Operation(summary = "删除网关（软删除；名下有通道/点位时拒绝并提示——guard 结构就位，本期恒零引用）")
++    @DeleteMapping("/{id}")
++    @SaCheckPermission("iot:gateway:remove")
++    public Result<Void> remove(@PathVariable("id") Long id) {
++        gatewayService.deleteGateway(id);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java
+new file mode 100644
+index 0000000..6d7bc1e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java
+@@ -0,0 +1,219 @@
++package net.otlab.admin.module.iot.gateway.controller;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.time.Instant;
++import java.time.LocalDateTime;
++import java.time.ZoneId;
++import java.time.format.DateTimeFormatter;
++import java.time.format.DateTimeParseException;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 网关内部回写控制器（TASK-0017，POST /internal/v1/gateway/heartbeat）
++ *
++ * <p><b>无 Sa-Token</b>：内部系统间接口（详细设计 §3 p20「/internal/v1 前缀，与管理面、
++ * 对外面物理隔离（不同网关路由与鉴权）」）——@Anonymous 跳过管理面登录校验，认证由
++ * InternalAuthChecker 承担（拦截器层 {@code InternalAuthInterceptor} 先于本控制器执行：
++ * 静态令牌 X-Internal-Token + IP 白名单，占位实现；完整网关令牌链归 0019/0020）。
++ *
++ * <p><b>回写字段组白名单</b>（REQ-0009 验收 4「回写仅限既定字段组（越界 UPDATE 被拒）」）：
++ * 本方法以原始 JSON Map 接收——顶层键只允许 tenantCode/items，条目键只允许 gatewayCode +
++ * onlineStatus/lastHeartbeatTime/ipAddr/version/configVersion 五字段组，<b>多余字段在此层
++ * 直接拒绝</b>（PARAM_ERROR，明确报出越界键——不静默丢弃造成「看似成功实则没写」）；
++ * 归一化后的 typed 载荷进服务层，服务层构建更新集亦只含五字段（第二道保险）。
++ *
++ * <p><b>不写操作日志</b>：本方法不挂 @OperateLog——心跳回写高频（默认周期 30 秒），落
++ * sys_operate_log 会淹没有效审计面（brief 明文口径，报告登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "网关内部回写（服务间）")
++@RestController
++@RequestMapping("/internal/v1/gateway")
++public class IotGatewayInternalController {
++
++    /** 顶层键白名单（多余键拒绝——REQ-0009 验收 4 的第一道闸） */
++    private static final Set<String> TOP_LEVEL_KEYS = Set.of("tenantCode", "items");
++
++    /** 条目键白名单：定位键 gatewayCode + 回写字段组五字段（业务库中唯一允许接入服务回写的字段组） */
++    private static final Set<String> ITEM_KEYS = Set.of(
++            "gatewayCode", "onlineStatus", "lastHeartbeatTime", "ipAddr", "version", "configVersion");
++
++    /** 管理面日期时间口径（详细设计 §3 p20；字符串入参按此解析） */
++    private static final DateTimeFormatter DATETIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
++
++    /** varchar 限长（与 DDL 一致）：ip_addr 64 / version 32 */
++    private static final int MAX_LEN_IP_ADDR = 64;
++    private static final int MAX_LEN_VERSION = 32;
++
++    @Autowired
++    private IotGatewayService gatewayService;
++
++    @Autowired
++    private InternalAuthChecker internalAuthChecker;
++
++    /**
++     * 心跳批量回写：body {tenantCode, items[{gatewayCode, onlineStatus, lastHeartbeatTime,
++     * ipAddr, version, configVersion}]}；整批事务 all-or-nothing，返回实际回写网关数。
++     */
++    @Anonymous
++    @Operation(summary = "心跳批量回写（内部接口：令牌+IP 白名单；字段组白名单五字段；高频不记操作日志）")
++    @PostMapping("/heartbeat")
++    public Result<Integer> heartbeat(HttpServletRequest request, @RequestBody Map<String, Object> body) {
++        // 控制器层显式调用认证检查器（拦截器层已先行校验——此处为拦截器缺席场景的纵深
++        // 防御与 standalone 测试可达性；认证先于一切载荷处理——未认证请求不享受解析行为）
++        internalAuthChecker.check(request);
++        GatewayHeartbeatForm form = parseForm(body);
++        return Result.success(gatewayService.writeHeartbeats(form));
++    }
++
++    /**
++     * 原始 JSON 层字段组白名单校验 + 类型归一化：越界键/越界类型/越界值在此直接拒绝，
++     * 产出只含白名单字段的 typed 载荷。
++     */
++    private GatewayHeartbeatForm parseForm(Map<String, Object> body) {
++        if (body == null || body.isEmpty()) {
++            throw paramError("回写请求体为空");
++        }
++        Set<String> unknownTop = diffKeys(body.keySet(), TOP_LEVEL_KEYS);
++        if (!unknownTop.isEmpty()) {
++            throw paramError("回写字段越界（顶层不支持的键: " + unknownTop + "）——仅允许 tenantCode/items");
++        }
++        Object tenantCodeRaw = body.get("tenantCode");
++        if (!(tenantCodeRaw instanceof String tenantCode) || tenantCode.isBlank()) {
++            throw paramError("回写请求缺少 tenantCode（字符串）");
++        }
++
++        Object itemsRaw = body.get("items");
++        if (!(itemsRaw instanceof List<?> itemList) || itemList.isEmpty()) {
++            throw paramError("回写条目 items 必须为非空数组");
++        }
++        GatewayHeartbeatForm form = new GatewayHeartbeatForm();
++        form.setTenantCode(tenantCode);
++        form.setItems(new java.util.ArrayList<>());
++        for (Object entry : itemList) {
++            if (!(entry instanceof Map<?, ?> itemMap)) {
++                throw paramError("回写条目必须为对象");
++            }
++            form.getItems().add(parseItem(itemMap));
++        }
++        return form;
++    }
++
++    /** 条目级白名单校验 + 类型归一化（gatewayCode 必填；onlineStatus 0/1；时间支持字符串/毫秒） */
++    private GatewayHeartbeatItem parseItem(Map<?, ?> item) {
++        Set<String> unknown = diffKeys(item.keySet(), ITEM_KEYS);
++        if (!unknown.isEmpty()) {
++            throw paramError("回写字段越界（条目不支持的键: " + unknown + "）——回写字段组固定为 "
++                    + ITEM_KEYS);
++        }
++        GatewayHeartbeatItem result = new GatewayHeartbeatItem();
++        Object codeRaw = item.get("gatewayCode");
++        if (!(codeRaw instanceof String gatewayCode) || gatewayCode.isBlank()) {
++            throw paramError("回写条目缺少 gatewayCode（字符串）");
++        }
++        result.setGatewayCode(gatewayCode);
++
++        Object onlineRaw = item.get("onlineStatus");
++        if (onlineRaw instanceof Number onlineNumber) {
++            int online = onlineNumber.intValue();
++            if (online != 0 && online != 1) {
++                throw paramError("回写字段越界值: onlineStatus 仅允许 0/1: " + gatewayCode);
++            }
++            result.setOnlineStatus(online);
++        } else {
++            throw paramError("回写条目 onlineStatus 必填（数值 0/1）: " + gatewayCode);
++        }
++
++        if (item.containsKey("lastHeartbeatTime") && item.get("lastHeartbeatTime") != null) {
++            result.setLastHeartbeatTime(parseHeartbeatTime(item.get("lastHeartbeatTime"), gatewayCode));
++        }
++        if (item.get("ipAddr") != null) {
++            String ipAddr = requireString(item.get("ipAddr"), "ipAddr", gatewayCode);
++            if (ipAddr.length() > MAX_LEN_IP_ADDR) {
++                throw paramError("回写字段超长: ipAddr 上限 " + MAX_LEN_IP_ADDR + ": " + gatewayCode);
++            }
++            result.setIpAddr(ipAddr);
++        }
++        if (item.get("version") != null) {
++            String version = requireString(item.get("version"), "version", gatewayCode);
++            if (version.length() > MAX_LEN_VERSION) {
++                throw paramError("回写字段超长: version 上限 " + MAX_LEN_VERSION + ": " + gatewayCode);
++            }
++            result.setVersion(version);
++        }
++        if (item.get("configVersion") != null) {
++            if (!(item.get("configVersion") instanceof Number configNumber)) {
++                throw paramError("回写字段类型错误: configVersion 必须为数值: " + gatewayCode);
++            }
++            result.setConfigVersion(configNumber.longValue());
++        }
++        return result;
++    }
++
++    /**
++     * 心跳时间归一化：字符串 {@code yyyy-MM-dd HH:mm:ss}（管理面口径，ISO 兼容）或毫秒
++     * 时间戳（消息/接入侧口径，详细设计 §3 p20 时间格式约定）——其他类型拒绝。
++     */
++    private LocalDateTime parseHeartbeatTime(Object raw, String gatewayCode) {
++        if (raw instanceof Number epochMilli) {
++            return LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMilli.longValue()), ZoneId.systemDefault());
++        }
++        if (raw instanceof String text) {
++            String trimmed = text.trim();
++            try {
++                if (trimmed.length() == 19) {
++                    return LocalDateTime.parse(trimmed, DATETIME_FORMAT);
++                }
++                return LocalDateTime.parse(trimmed);
++            } catch (DateTimeParseException e) {
++                throw paramError("回写字段格式错误: lastHeartbeatTime 须为 yyyy-MM-dd HH:mm:ss 或毫秒时间戳: "
++                        + gatewayCode);
++            }
++        }
++        throw paramError("回写字段类型错误: lastHeartbeatTime 须为字符串或毫秒时间戳: " + gatewayCode);
++    }
++
++    private String requireString(Object raw, String field, String gatewayCode) {
++        if (raw instanceof String text && !text.isBlank()) {
++            return text;
++        }
++        throw paramError("回写字段类型错误: " + field + " 必须为非空字符串: " + gatewayCode);
++    }
++
++    /** 实际键 − 白名单键（保序去重，越界文案可读；JSON 反序列化产物键恒为 String） */
++    private Set<String> diffKeys(Set<?> actual, Set<String> whitelist) {
++        Set<String> unknown = new LinkedHashSet<>();
++        for (Object key : actual) {
++            String k = String.valueOf(key);
++            if (!whitelist.contains(k)) {
++                unknown.add(k);
++            }
++        }
++        return unknown;
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatForm.java
+new file mode 100644
+index 0000000..a616b9c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatForm.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.gateway.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 心跳回写批量请求表单（TASK-0017 内部回写接口 POST /internal/v1/gateway/heartbeat）
++ *
++ * <p>tenantCode 由 body 携带（接入服务侧租户由令牌/主题解析，完整令牌链归 TASK-0019/
++ * 0020——本期接口按 body 解析，租户不存在/禁用拒，brief 裁决）；items 为批量条目
++ * （上限 500，照框架批量口径）。
++ *
++ * <p>本类是控制器在原始 JSON 层做字段组白名单校验并归一化类型后的 typed 载荷——
++ * 顶层键只允许 tenantCode/items、条目键只允许 gatewayCode + 五字段组，多余键在控制器
++ * 直接拒绝（PARAM_ERROR），不带进服务层。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "心跳回写批量请求（TASK-0017 内部接口）")
++public class GatewayHeartbeatForm {
++
++    @Schema(description = "租户编码（接入服务侧本期由 body 携带解析；不存在/禁用拒）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String tenantCode;
++
++    @Schema(description = "回写条目（1-500 条；全部成功或整批失败）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<GatewayHeartbeatItem> items;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatItem.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatItem.java
+new file mode 100644
+index 0000000..d9aa7db
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayHeartbeatItem.java
+@@ -0,0 +1,46 @@
++package net.otlab.admin.module.iot.gateway.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.time.LocalDateTime;
++
++/**
++ * 心跳回写单条条目（TASK-0017 内部回写接口 typed 载荷）
++ *
++ * <p><b>字段组白名单</b>（REQ-0009 验收 4「回写仅限既定字段组」）：本类只有
++ * gatewayCode 定位键 + 回写字段组五字段（onlineStatus/lastHeartbeatTime/ipAddr/
++ * version/configVersion）——请求体的多余字段由内部控制器在原始 JSON 层直接拒绝
++ * （不进本类，杜绝静默丢弃造成的「看似成功实则没写」），服务层构建更新集亦只含
++ * 五字段（双保险）。
++ *
++ * <p>lastHeartbeatTime 支持两种来源形态（由控制器归一化）：字符串
++ * {@code yyyy-MM-dd HH:mm:ss}（管理面口径）或毫秒时间戳（消息/接入侧口径，详细设计
++ * §3 p20 时间格式约定）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "心跳回写条目（字段组白名单：gatewayCode + 五字段）")
++public class GatewayHeartbeatItem {
++
++    @Schema(description = "网关编码（定位键，配合 tenantCode 定位网关行）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String gatewayCode;
++
++    @Schema(description = "在线状态 0 离线 1 在线", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer onlineStatus;
++
++    @Schema(description = "最后心跳时间（缺省不更新该列）")
++    private LocalDateTime lastHeartbeatTime;
++
++    @Schema(description = "最近连接来源 IP（缺省不更新该列）")
++    private String ipAddr;
++
++    @Schema(description = "网关程序版本（缺省不更新该列）")
++    private String version;
++
++    @Schema(description = "当前已生效配置版本号（缺省不更新该列）")
++    private Long configVersion;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayCreateForm.java
+new file mode 100644
+index 0000000..b7647f4
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayCreateForm.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.gateway.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 网关创建请求表单（TASK-0017，REQ-0009 业务能力）
++ *
++ * <p>gateway_code 即 MQTT 主题与设备身份段：字符集 [A-Za-z0-9_]（与实例短码同口径，防
++ * 主题分段歧义）、长度上限 64（DB varchar(64)）；租户内唯一（双道闸 4002）且创建后不可改。
++ *
++ * <p>表单只含配置面字段：<b>不携带</b>回写字段组五字段（onlineStatus/lastHeartbeatTime/
++ * ipAddr/version/configVersion——接入服务心跳回写专属，REQ-0009 验收 4）与 status（新建
++ * 一律启用，启停走编辑接口）、tenantId（服务层会话覆盖）。表单无 remark 字段——
++ * iot_gateway 附录 A p30 逐字 DDL 无 remark 列，brief「remark 类按库内实际列」收窄。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "网关创建表单（TASK-0017）")
++public class IotGatewayCreateForm {
++
++    @NotBlank(message = "网关编码不能为空")
++    @Pattern(regexp = "[A-Za-z0-9_]+", message = "网关编码仅允许字母/数字/下划线（作 MQTT 主题与设备身份段）")
++    @Size(max = 64, message = "网关编码长度不能超过 64")
++    @Schema(description = "网关编码（租户内唯一，[A-Za-z0-9_]，创建后不可改）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String gatewayCode;
++
++    @NotBlank(message = "网关名称不能为空")
++    @Size(max = 100, message = "网关名称长度不能超过 100")
++    @Schema(description = "网关名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String gatewayName;
++
++    @Schema(description = "所属模型实例ID（携带时校验：存在/同租户/启用）")
++    private Long instanceId;
++
++    @Schema(description = "绑定部门ID（携带时校验：存在/同租户）")
++    private Long deptId;
++
++    @Schema(description = "心跳周期（秒），未携带落库默认 30")
++    private Integer heartbeatPeriod;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayUpdateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayUpdateForm.java
+new file mode 100644
+index 0000000..7933928
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/IotGatewayUpdateForm.java
+@@ -0,0 +1,52 @@
++package net.otlab.admin.module.iot.gateway.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 网关编辑请求表单（TASK-0017）
++ *
++ * <p><b>gateway_code 不可改</b>（REQ-0009 核心规则——编码即 MQTT 主题与设备身份）：表单
++ * 允许携带（前端回显场景），服务层校验「与库中一致」，携带不一致一律拒绝。
++ *
++ * <p>可变字段白名单（brief「gatewayName/instanceId/deptId/heartbeatPeriod/remark 类按库内
++ * 实际列」——iot_gateway 附录 A p30 逐字 DDL 无 remark 列，按库内实际可变集落地）：
++ * gatewayName / instanceId / deptId / heartbeatPeriod / status（网关启停走编辑，§3.1 无
++ * changeStatus 行）。<b>回写字段组五字段不进表单也不进更新集</b>（心跳回写专属，
++ * REQ-0009 验收 4）。
++ *
++ * <p>更新走字段白名单构建（不直接 updateById 请求实体，杜绝 mass assignment）：审计字段由
++ * MetaObjectHandler 回填、tenant_id 不进更新集、id 为路由主键。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "网关编辑表单（编码不可改；可变白名单 gatewayName/instanceId/deptId/heartbeatPeriod/status）")
++public class IotGatewayUpdateForm {
++
++    @NotNull(message = "网关ID不能为空")
++    @Schema(description = "网关ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long id;
++
++    @Schema(description = "网关编码（仅作一致性核对：携带不一致即拒，创建后不可改）")
++    private String gatewayCode;
++
++    @Size(max = 100, message = "网关名称长度不能超过 100")
++    @Schema(description = "网关名称")
++    private String gatewayName;
++
++    @Schema(description = "所属模型实例ID（携带时校验：存在/同租户/启用）")
++    private Long instanceId;
++
++    @Schema(description = "绑定部门ID（携带时校验：存在/同租户）")
++    private Long deptId;
++
++    @Schema(description = "心跳周期（秒，1-86400）")
++    private Integer heartbeatPeriod;
++
++    @Schema(description = "状态 0 禁用 1 启用")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java
+new file mode 100644
+index 0000000..82c10b3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java
+@@ -0,0 +1,79 @@
++package net.otlab.admin.module.iot.gateway.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.time.LocalDateTime;
++
++/**
++ * 网关实体类（TASK-0017，详细设计 §1.3 p7 / 附录 A p30）
++ *
++ * <p>iot_gateway 表随本任务升级脚本（20261122_iot_gateway_domain.sql）建立，DDL 逐字照
++ * 附录 A p30。gateway_code 即 MQTT 主题与设备身份段（REQ-0009 业务能力），租户内唯一
++ * （uk_tenant_gateway_code 物理唯一索引）且创建后不可改；在线状态五字段组
++ * （online_status/last_heartbeat_time/ip_addr/version/config_version）由接入服务经内部
++ * 接口心跳回写（业务库中唯一允许接入服务回写的字段组，REQ-0009 核心规则），管理面
++ * CRUD 不开放这五字段的写入（字段白名单，杜绝越界 UPDATE）。
++ *
++ * <p>instance_id 归属模型实例（决定点位数据归属工厂/车间）、dept_id 绑部门（运维分工
++ * 与数据权限锚点）；heartbeat_period 心跳周期（秒），超时判定（如 3 个周期）由接入服务
++ * 执行；status=0 禁用后拒绝接入（准入拦截归接入服务 /ingest/v1/auth/mqtt 链路，
++ * TASK-0020 交付）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_gateway")
++@Schema(description = "采集网关（TASK-0017）")
++public class IotGateway extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "网关ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "网关编码（租户内唯一，作 MQTT 主题与设备身份段；创建后不可改）")
++    private String gatewayCode;
++
++    @Schema(description = "网关名称")
++    private String gatewayName;
++
++    @Schema(description = "所属模型实例ID（iot_model_instance.id）")
++    private Long instanceId;
++
++    @Schema(description = "绑定部门ID（sys_dept.id）")
++    private Long deptId;
++
++    @Schema(description = "在线状态 0 离线 1 在线（心跳回写维护，管理面只读）")
++    private Integer onlineStatus;
++
++    @Schema(description = "最后心跳时间（心跳回写维护，管理面只读）")
++    private LocalDateTime lastHeartbeatTime;
++
++    @Schema(description = "心跳周期（秒），默认 30")
++    private Integer heartbeatPeriod;
++
++    @Schema(description = "网关程序版本（心跳回写回填，管理面只读）")
++    private String version;
++
++    @Schema(description = "当前已生效的配置版本号（与 iot_config_version 对应，心跳回写回填）")
++    private Long configVersion;
++
++    @Schema(description = "最近一次连接来源 IP（心跳回写维护，管理面只读）")
++    private String ipAddr;
++
++    @Schema(description = "状态 0 禁用 1 启用（禁用后拒绝接入）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeMapper.java
+new file mode 100644
+index 0000000..99eac47
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeMapper.java
+@@ -0,0 +1,46 @@
++package net.otlab.admin.module.iot.gateway.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 网关编码占用旁路 Mapper（TASK-0017，uk_tenant_gateway_code 双道闸第一道预检专用）。
++ *
++ * <p><b>含已删行</b>：uk_tenant_gateway_code 为 (tenant_id, gateway_code) 物理唯一索引、
++ * 不含 deleted 列，逻辑删行仍占用编码且编码不复用（REQ-0009 核心规则——gateway_code 即
++ * MQTT 主题与设备身份，复用会串到历史设备的主题与令牌归属）——预检若只看活跃行
++ * （@TableLogic 过滤），重存同码必撞物理索引且被误报为瞬态并发冲突。故本方法绕过
++ * @TableLogic（原生 @Select 不过逻辑删注入）返回占用行的 deleted 标记，由调用方区分
++ * 文案（0011/0012 修订轮 I-1 同款口径）。
++ *
++ * <p>旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}，照 TASK-0012
++ * IotInstanceCodeMapper 显式条件范式）：显式条件为 tenant_id + gateway_code——tenant_id
++ * 显式取会话租户（调用方传入），预检语义与物理唯一索引的作用域 (tenant_id, gateway_code)
++ * 精确一致。调用方保证 codes 非空（空集走调用方短路，不发 IN ()）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotGatewayCodeMapper {
++
++    /**
++     * 按 (tenant_id, gateway_code) 显式查占用行（含已删行，携带 deleted 标记）
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param codes    待预检编码集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, gateway_code, deleted FROM iot_gateway "
++            + "WHERE tenant_id = #{tenantId} AND gateway_code IN "
++            + "<foreach collection='codes' item='code' open='(' separator=',' close=')'>#{code}</foreach>"
++            + "</script>")
++    List<IotGatewayCodeRow> selectOccupiedByCodes(@Param("tenantId") Long tenantId,
++                                                  @Param("codes") Collection<String> codes);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeRow.java
+new file mode 100644
+index 0000000..d3190ec
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayCodeRow.java
+@@ -0,0 +1,23 @@
++package net.otlab.admin.module.iot.gateway.mapper;
++
++import lombok.Data;
++
++/**
++ * 网关编码占用行（uk_tenant_gateway_code 双道闸预检的旁路查询结果行，TASK-0017）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、编码、deleted 标记——deleted=1 为逻辑删行
++ * （uk_tenant_gateway_code 物理唯一索引不含 deleted 列，逻辑删行永久占用编码），
++ * 调用方据此区分「已存在」/「已被删除记录占用，不可复用」文案（0011/0012 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotGatewayCodeRow {
++
++    private Long id;
++
++    private String gatewayCode;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayMapper.java
+new file mode 100644
+index 0000000..c16dadf
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/mapper/IotGatewayMapper.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.gateway.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 网关数据访问层（TASK-0017）
++ *
++ * <p>空 BaseMapper：CRUD 与心跳回写全部经 MyBatis-Plus 通用方法 + Lambda 条件构造。
++ * iot_ 前缀表的多租户条件由 TASK-0002 TenantLineInnerInterceptor 自动注入——管理面
++ * 会话链路天然只读本租户网关；内部心跳回写链路无 Sa-Token 会话（插件跳过注入），
++ * 查询/更新条件由服务层显式携带 (tenant_id, gateway_code)（见 IotGatewayServiceImpl）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotGatewayMapper extends BaseMapper<IotGateway> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java
+new file mode 100644
+index 0000000..4fd8b1f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.gateway.service;
++
++/**
++ * 网关删除保护·引用计数接缝（TASK-0017 guard 结构就位，brief「删除保护 guard 结构就位
++ * （引用计数调用点按表扩展），本期实际恒零引用，接线义务登记 0018/0021 brief」）
++ *
++ * <p>网关删除时其下有点位/通道则拒绝（REQ-0009 核心规则「删除网关时其下有点位/通道
++ * 则拒绝」；详细设计 §3.1 p21「其下有点位时拒绝并提示」）。两表尚未建：iot_channel 归
++ * TASK-0018 建表（引用列 gateway_id）、iot_point 归 TASK-0021 建表——本期占位实现恒返回 0
++ * （{@code PlaceholderGatewayReferenceGuard}），删除 guard 的<b>调用点与拒绝分支</b>在本
++ * 服务内先行就位并被单测固化（计数 &gt; 0 即拒绝）；0018/0021 建表后<b>按表扩展计数实现</b>
++ * （替换占位实现，不改调用点）。
++ *
++ * <p>计数语义：活跃行（@TableLogic 过滤）且归属目标网关——通道按 gateway_id 直引；
++ * 点位按其建表后的归属列（直引 gateway_id 或经通道间接，由 0021 brief 裁决）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface GatewayReferenceGuard {
++
++    /**
++     * 统计网关名下活跃采集通道数（iot_channel.gateway_id；表归 TASK-0018 建表，本期恒 0）
++     *
++     * @param gatewayId 网关 id
++     * @return 引用数
++     */
++    long countChannels(Long gatewayId);
++
++    /**
++     * 统计网关名下活跃点位数（iot_point 归属列以 TASK-0021 建表裁决为准，本期恒 0）
++     *
++     * @param gatewayId 网关 id
++     * @return 引用数
++     */
++    long countPoints(Long gatewayId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java
+new file mode 100644
+index 0000000..453a14d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.iot.gateway.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++
++/**
++ * 网关服务接口（TASK-0017）：管理面 CRUD + 内部心跳回写。
++ *
++ * <p>照实例/模板域范式：接口不继承 IService（实现类 ServiceImpl 承载通用方法），
++ * 领域方法显式声明。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotGatewayService {
++
++    /** 分页查询网关（过滤 gatewayCode/gatewayName/status/onlineStatus，含在线状态与心跳时间列） */
++    Page<IotGateway> selectGatewayList(Page<IotGateway> page, IotGateway query);
++
++    /** 新增网关（编码租户内唯一双道闸 4002；instance/dept 校验；heartbeat_period 默认 30） */
++    boolean createGateway(IotGatewayCreateForm form);
++
++    /** 编辑网关（gateway_code 不可改；白名单 gatewayName/instanceId/deptId/heartbeatPeriod/status） */
++    boolean updateGateway(IotGatewayUpdateForm form);
++
++    /** 删除网关（软删；名下有通道/点位时拒绝——guard 结构就位，本期恒零引用） */
++    boolean deleteGateway(Long id);
++
++    /**
++     * 心跳批量回写（内部接口）：字段组白名单只含
++     * online_status/last_heartbeat_time/ip_addr/version/config_version 五字段（REQ-0009 验收 4）；
++     * 按 body tenantCode + gatewayCode 定位，租户不存在/禁用拒、未知编码整批拒。
++     *
++     * @param form 已过控制器原始 JSON 字段组白名单校验的 typed 载荷
++     * @return 实际回写的网关数
++     */
++    int writeHeartbeats(GatewayHeartbeatForm form);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+new file mode 100644
+index 0000000..e09d2ea
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+@@ -0,0 +1,396 @@
++package net.otlab.admin.module.iot.gateway.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeMapper;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeRow;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++
++/**
++ * 网关服务实现类（TASK-0017）
++ *
++ * <p><b>编码纪律</b>（REQ-0009 业务能力/核心规则）：gateway_code 即 MQTT 主题与设备身份
++ * 段——字符集 [A-Za-z0-9_]（表单 @Pattern + 服务层双保险）、长度 ≤64（DB varchar(64)）；
++ * 租户内唯一双道闸 4002（含已删行旁路预检 {@link IotGatewayCodeMapper} + DuplicateKey
++ * 兜底，0011/0012 修订轮 I-1 同款口径——uk 不含 deleted 列，逻辑删行永久占用编码，
++ * 编码不复用）；创建后不可改（改码即改设备身份与主题归属，编辑仅核对一致性）。
++ *
++ * <p><b>归属校验</b>：instance_id 携带时校验存在/同租户/status=1（多租户插件注入会话
++ * 租户条件即同租户保证，照 0012 resolveParent/validateDeptForCreate 范式）；dept_id 携带
++ * 时校验存在/同租户（brief 口径，不强制启用——运维可挂停用部门下的网关台账）。
++ * heartbeat_period 未携带落库默认 30（DDL DEFAULT '30' 同值），携带时 1-86400。
++ *
++ * <p><b>字段白名单</b>：新增/更新均不直接落请求实体——status 创建时强制 1、tenant_id
++ * 会话覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经 API 注入；<b>回写字段组
++ * 五字段（onlineStatus/lastHeartbeatTime/ipAddr/version/configVersion）不进管理面创建/
++ * 更新集</b>（REQ-0009 验收 4——业务库中唯一允许接入服务回写的字段组，管理面只读）；
++ * 更新仅 gatewayName/instanceId/deptId/heartbeatPeriod/status 可变（brief「remark 类」
++ * 按库内实际列——p30 DDL 无 remark 列），杜绝 mass assignment。
++ *
++ * <p><b>删除保护 guard 结构就位</b>：{@link GatewayReferenceGuard} 双计数（通道/点位）
++ * 调用点与拒绝分支先行就位并被单测固化；两表归 0018/0021 建表，占位实现恒零引用——
++ * 接线义务登记 0018/0021 brief（届时按表扩展计数实现，不改调用点）。
++ *
++ * <p><b>心跳回写</b>（内部接口，无 Sa-Token 会话）：多租户插件对无会话链路跳过注入
++ * （OtTenantLineHandler ignoreTable 短路），全部查询/更新显式携带 (tenant_id, gateway_code)
++ * 条件（防御纵深：即使异常会话存在，插件条件与本显式条件叠加只会更严不会更宽）；租户
++ * 按 body tenantCode 解析（sys_tenant 非插件覆盖表，显式查询），不存在/禁用拒；服务层
++ * 构建更新集<b>只含五字段</b>（请求体多余字段已在控制器原始 JSON 层拒绝，此处为第二道
++ * 保险）；整批事务（fail-closed all-or-nothing）；禁用网关不拦回写（准入拦截在接入服务
++ * /ingest/v1/auth/mqtt 链路归 0020——禁用网关的 LWT/离线态仍应可落，保状态准确）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGateway> implements IotGatewayService {
++
++    /** varchar 限长口径（与 iot_gateway DDL 一致；表无 remark 列） */
++    private static final int MAX_LEN_GATEWAY_CODE = 64;
++    private static final int MAX_LEN_GATEWAY_NAME = 100;
++
++    /** 编码字符集（与创建表单 @Pattern 一致：作 MQTT 主题与设备身份段） */
++    private static final String GATEWAY_CODE_PATTERN = "[A-Za-z0-9_]+";
++
++    /** 心跳周期边界（秒）：未携带落库默认 30（DDL DEFAULT '30' 同值） */
++    private static final int DEFAULT_HEARTBEAT_PERIOD = 30;
++    private static final int MIN_HEARTBEAT_PERIOD = 1;
++    private static final int MAX_HEARTBEAT_PERIOD = 86400;
++
++    /** 单批回写条目上限（照框架批量口径 pageSize 上限 500；超限网关侧拆包） */
++    private static final int MAX_HEARTBEAT_BATCH = 500;
++
++    /** 回写字段组（服务层更新集白名单——REQ-0009 验收 4 的第二道保险） */
++    private static final Set<Integer> ONLINE_STATUS_VALUES = Set.of(0, 1);
++
++    @Autowired
++    private IotGatewayCodeMapper gatewayCodeMapper;
++
++    @Autowired
++    private IotModelInstanceMapper instanceMapper;
++
++    @Autowired
++    private SysDeptMapper deptMapper;
++
++    @Autowired
++    private SysTenantMapper tenantMapper;
++
++    @Autowired
++    private GatewayReferenceGuard referenceGuard;
++
++    // ---------- 列表 ----------
++
++    @Override
++    public Page<IotGateway> selectGatewayList(Page<IotGateway> page, IotGateway query) {
++        // 多租户条件由插件注入（会话链路）；deleted 由 @TableLogic 运行时过滤
++        LambdaQueryWrapper<IotGateway> wrapper = new LambdaQueryWrapper<>();
++        if (query.getGatewayCode() != null) {
++            wrapper.like(IotGateway::getGatewayCode, SqlLikeUtils.escape(query.getGatewayCode()));
++        }
++        if (query.getGatewayName() != null) {
++            wrapper.like(IotGateway::getGatewayName, SqlLikeUtils.escape(query.getGatewayName()));
++        }
++        if (query.getStatus() != null) {
++            wrapper.eq(IotGateway::getStatus, query.getStatus());
++        }
++        if (query.getOnlineStatus() != null) {
++            wrapper.eq(IotGateway::getOnlineStatus, query.getOnlineStatus());
++        }
++        wrapper.orderByAsc(IotGateway::getId);
++        return this.page(page, wrapper);
++    }
++
++    // ---------- 创建 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createGateway(IotGatewayCreateForm form) {
++        validateGatewayCode(form.getGatewayCode());
++        if (form.getGatewayName() == null || form.getGatewayName().length() > MAX_LEN_GATEWAY_NAME) {
++            throw paramError("网关名称必填且长度不能超过 " + MAX_LEN_GATEWAY_NAME);
++        }
++        Integer heartbeatPeriod = resolveHeartbeatPeriod(form.getHeartbeatPeriod());
++
++        // 归属校验（携带时）：实例存在/同租户/启用；部门存在/同租户（多租户插件注入会话租户条件）
++        validateInstance(form.getInstanceId());
++        validateDept(form.getDeptId());
++
++        // 字段白名单构建新增实体（照 IotModelInstanceServiceImpl.createInstance 范式）：
++        // 1) status 强制 1：新建网关一律启用（启停走编辑接口）；
++        // 2) online_status 创建时强制 0（离线起步，心跳链路接管）；回写字段组其余四字段
++        //    不落任何请求携带值（管理面只读）；
++        // 3) id / 审计字段不复制（框架自增 + MetaObjectHandler 回填）；
++        // 4) tenant_id 服务层从会话覆盖（插件对 iot_ 前缀表 INSERT 自动补列与会话租户同值，
++        //    双保险口径同模板/实例域）。
++        IotGateway entity = new IotGateway();
++        entity.setGatewayCode(form.getGatewayCode());
++        entity.setGatewayName(form.getGatewayName());
++        entity.setInstanceId(form.getInstanceId());
++        entity.setDeptId(form.getDeptId());
++        entity.setHeartbeatPeriod(heartbeatPeriod);
++        entity.setOnlineStatus(0);
++        entity.setStatus(1);
++        entity.setTenantId(TenantContext.getTenantId());
++
++        // 双道闸第一道：含已删行占用预检（uk_tenant_gateway_code 不含 deleted 列，逻辑删行
++        // 永久占用编码——文案区分活跃行「已存在」/已删行「已被删除记录占用」）
++        Long tenantId = TenantContext.getTenantId();
++        List<IotGatewayCodeRow> occupied = gatewayCodeMapper.selectOccupiedByCodes(tenantId, List.of(form.getGatewayCode()));
++        if (!occupied.isEmpty()) {
++            throw duplicateGatewayCode(occupied.get(0));
++        }
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的真实并发插入窗口（物理唯一索引；重存同码撞已删行
++            // 场景已在预检拦截，不会走到此处）
++            throw duplicateCode4002("网关编码已存在: " + form.getGatewayCode());
++        }
++        return true;
++    }
++
++    /** 编码校验：非空、字符集 [A-Za-z0-9_]、长度 ≤64（表单 @Pattern/@Size 之外的服务层双保险） */
++    private void validateGatewayCode(String gatewayCode) {
++        if (gatewayCode == null || gatewayCode.isBlank()) {
++            throw paramError("网关编码不能为空");
++        }
++        if (!gatewayCode.matches(GATEWAY_CODE_PATTERN)) {
++            throw paramError("网关编码仅允许字母/数字/下划线（作 MQTT 主题与设备身份段）: " + gatewayCode);
++        }
++        if (gatewayCode.length() > MAX_LEN_GATEWAY_CODE) {
++            throw paramError("网关编码超长（上限 " + MAX_LEN_GATEWAY_CODE + " 字符）");
++        }
++    }
++
++    /** 心跳周期：未携带默认 30（DDL DEFAULT '30' 同值）；携带时 1-86400 */
++    private Integer resolveHeartbeatPeriod(Integer heartbeatPeriod) {
++        if (heartbeatPeriod == null) {
++            return DEFAULT_HEARTBEAT_PERIOD;
++        }
++        if (heartbeatPeriod < MIN_HEARTBEAT_PERIOD || heartbeatPeriod > MAX_HEARTBEAT_PERIOD) {
++            throw paramError("心跳周期仅允许 " + MIN_HEARTBEAT_PERIOD + "-" + MAX_HEARTBEAT_PERIOD + " 秒");
++        }
++        return heartbeatPeriod;
++    }
++
++    /**
++     * 实例归属校验：存在（iot_ 前缀表多租户插件注入会话租户条件即同租户保证）、status=1
++     * （禁用实例不可挂载网关——照 0012 resolveParent 口径）
++     */
++    private void validateInstance(Long instanceId) {
++        if (instanceId == null) {
++            return;
++        }
++        IotModelInstance instance = instanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + instanceId);
++        }
++        if (instance.getStatus() == null || instance.getStatus() != 1) {
++            throw paramError("实例已禁用，不可挂载网关: " + instance.getInstanceCode());
++        }
++    }
++
++    /** 部门校验：存在（sys_dept 在插件覆盖表清单内，selectById 注入会话租户条件即同租户保证） */
++    private void validateDept(Long deptId) {
++        if (deptId == null) {
++            return;
++        }
++        SysDept dept = deptMapper.selectById(deptId);
++        if (dept == null) {
++            throw paramError("部门不存在或已删除: " + deptId);
++        }
++    }
++
++    // ---------- 编辑 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateGateway(IotGatewayUpdateForm form) {
++        IotGateway existing = this.getById(form.getId());
++        if (existing == null) {
++            throw paramError("网关不存在或已删除");
++        }
++        // gateway_code 不可改（REQ-0009 核心规则）：请求携带不一致一律拒绝（携带同值为 no-op 不拦）
++        if (form.getGatewayCode() != null && !form.getGatewayCode().equals(existing.getGatewayCode())) {
++            throw paramError("网关编码不允许修改: " + existing.getGatewayCode());
++        }
++        if (form.getGatewayName() != null && form.getGatewayName().length() > MAX_LEN_GATEWAY_NAME) {
++            throw paramError("网关名称长度不能超过 " + MAX_LEN_GATEWAY_NAME);
++        }
++        if (form.getStatus() != null && form.getStatus() != 0 && form.getStatus() != 1) {
++            throw paramError("网关状态仅允许 0 禁用 / 1 启用");
++        }
++        if (form.getHeartbeatPeriod() != null) {
++            resolveHeartbeatPeriod(form.getHeartbeatPeriod());
++        }
++        validateInstance(form.getInstanceId());
++        validateDept(form.getDeptId());
++
++        // 字段白名单构建更新（不可变字段不回写、连 no-op 都不进 SET；null 不进更新集，
++        // MP 自动跳过保持库内原值）：仅 gatewayName/instanceId/deptId/heartbeatPeriod/status
++        // 可变——回写字段组五字段永不进管理面更新集（REQ-0009 验收 4）
++        IotGateway upd = new IotGateway();
++        upd.setId(existing.getId());
++        upd.setGatewayName(form.getGatewayName());
++        upd.setInstanceId(form.getInstanceId());
++        upd.setDeptId(form.getDeptId());
++        upd.setHeartbeatPeriod(form.getHeartbeatPeriod());
++        upd.setStatus(form.getStatus());
++        return this.updateById(upd);
++    }
++
++    // ---------- 删除 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteGateway(Long id) {
++        if (id == null) {
++            throw paramError("请选择要删除的网关");
++        }
++        IotGateway existing = this.getById(id);
++        if (existing == null) {
++            throw paramError("网关不存在或已删除");
++        }
++
++        // 删除保护 guard（REQ-0009 核心规则「删除网关时其下有点位/通道则拒绝」）：双计数
++        // 调用点就位——通道/点位两表归 0018/0021 建表，占位实现本期恒零引用（接线义务
++        // 登记 0018/0021 brief；届时按表扩展计数实现，不改本调用点）
++        long channelCount = referenceGuard.countChannels(id);
++        if (channelCount > 0) {
++            throw paramError("网关存在采集通道，禁止删除（通道 " + channelCount + " 条，先清理通道）");
++        }
++        long pointCount = referenceGuard.countPoints(id);
++        if (pointCount > 0) {
++            throw paramError("网关存在点位，禁止删除（点位 " + pointCount + " 个，先清理点位）");
++        }
++
++        // 无引用：逻辑删（@TableLogic，deleted=1）；编码不复用（预检含已删行）
++        return this.removeById(id);
++    }
++
++    // ---------- 心跳回写（内部接口，无 Sa-Token 会话） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public int writeHeartbeats(GatewayHeartbeatForm form) {
++        if (form.getTenantCode() == null || form.getTenantCode().isBlank()) {
++            throw paramError("回写请求缺少 tenantCode");
++        }
++        List<GatewayHeartbeatItem> items = form.getItems();
++        if (items == null || items.isEmpty()) {
++            throw paramError("回写条目为空");
++        }
++        if (items.size() > MAX_HEARTBEAT_BATCH) {
++            throw paramError("单批回写条目超限（上限 " + MAX_HEARTBEAT_BATCH + "），接入侧拆包");
++        }
++        for (GatewayHeartbeatItem item : items) {
++            if (item.getGatewayCode() == null || item.getGatewayCode().isBlank()
++                    || item.getGatewayCode().length() > MAX_LEN_GATEWAY_CODE) {
++                throw paramError("回写条目 gatewayCode 必填且长度不能超过 " + MAX_LEN_GATEWAY_CODE);
++            }
++            if (item.getOnlineStatus() == null || !ONLINE_STATUS_VALUES.contains(item.getOnlineStatus())) {
++                throw paramError("回写条目 onlineStatus 仅允许 0 离线 / 1 在线: " + item.getGatewayCode());
++            }
++        }
++
++        // 租户解析（brief：本期接口按 body 携带 tenantCode 解析，租户不存在/禁用拒）。
++        // sys_tenant 非多租户插件覆盖表（租户主数据），显式查询；逻辑删行由 @TableLogic 过滤。
++        SysTenant tenant = tenantMapper.selectOne(new LambdaQueryWrapper<SysTenant>()
++                .eq(SysTenant::getTenantCode, form.getTenantCode()));
++        if (tenant == null) {
++            throw paramError("租户不存在: " + form.getTenantCode());
++        }
++        if (tenant.getStatus() == null || tenant.getStatus() != 1) {
++            throw paramError("租户已禁用: " + form.getTenantCode());
++        }
++
++        // 批量定位网关（fail-closed：任一未知编码整批拒绝，不半批落库）。无 Sa-Token 会话
++        // → 多租户插件跳过注入，显式 (tenant_id, gateway_code) 条件即定位语义（与物理唯一
++        // 索引作用域精确一致）；异常会话场景下插件条件与本条件叠加只会更严（防御纵深）。
++        List<String> codes = items.stream()
++                .map(GatewayHeartbeatItem::getGatewayCode)
++                .distinct()
++                .collect(Collectors.toList());
++        Map<String, IotGateway> gateways = this.list(new LambdaQueryWrapper<IotGateway>()
++                        .select(IotGateway::getId, IotGateway::getGatewayCode)
++                        .eq(IotGateway::getTenantId, tenant.getId())
++                        .in(IotGateway::getGatewayCode, codes))
++                .stream()
++                .collect(Collectors.toMap(IotGateway::getGatewayCode, Function.identity(),
++                        (a, b) -> a, LinkedHashMap::new));
++        List<String> missing = codes.stream()
++                .filter(code -> !gateways.containsKey(code))
++                .collect(Collectors.toList());
++        if (!missing.isEmpty()) {
++            throw paramError("网关编码不存在或已删除: " + missing);
++        }
++
++        // 逐网关回写：服务层构建更新集<b>只含五字段</b>（REQ-0009 验收 4 第二道保险——
++        // 请求体多余字段已在控制器原始 JSON 层拒绝，typed 载荷亦只承载五字段）；null 字段
++        // 不进 SET（MP 跳过），更新 WHERE 显式 (id, tenant_id, gateway_code) 定位。
++        for (GatewayHeartbeatItem item : items) {
++            IotGateway target = gateways.get(item.getGatewayCode());
++            IotGateway upd = new IotGateway();
++            upd.setOnlineStatus(item.getOnlineStatus());
++            upd.setLastHeartbeatTime(item.getLastHeartbeatTime());
++            upd.setIpAddr(item.getIpAddr());
++            upd.setVersion(item.getVersion());
++            upd.setConfigVersion(item.getConfigVersion());
++            this.update(upd, new LambdaUpdateWrapper<IotGateway>()
++                    .eq(IotGateway::getId, target.getId())
++                    .eq(IotGateway::getTenantId, tenant.getId())
++                    .eq(IotGateway::getGatewayCode, item.getGatewayCode()));
++        }
++        return items.size();
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011 修订轮口径） */
++    private BusinessException duplicateGatewayCode(IotGatewayCodeRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return duplicateCode4002("网关编码已被删除记录占用，不可复用: " + row.getGatewayCode());
++        }
++        return duplicateCode4002("网关编码已存在: " + row.getGatewayCode());
++    }
++
++    private BusinessException duplicateCode4002(String message) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java
+new file mode 100644
+index 0000000..f007c3a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.gateway.service.impl;
++
++import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
++import org.springframework.stereotype.Component;
++
++/**
++ * 网关删除保护·引用计数占位实现（TASK-0017，恒零引用）。
++ *
++ * <p>iot_channel（TASK-0018）/ iot_point（TASK-0021）两表尚未建，本期计数恒 0——删除
++ * guard 的拒绝分支实际不可达（结构就位、单测以 mock 计数固化）；0018/0021 建表后<b>按表
++ * 扩展本实现</b>（多租户条件由插件注入即同租户保证，照 0012 countByInstanceIds 接线范式），
++ * 接线义务已登记 0018/0021 brief。替换本实现时不得改动
++ * {@code IotGatewayServiceImpl.deleteGateway} 的调用点与拒绝语义。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class PlaceholderGatewayReferenceGuard implements GatewayReferenceGuard {
++
++    @Override
++    public long countChannels(Long gatewayId) {
++        // TODO(TASK-0018 接线)：建表后改为 SELECT COUNT(*) FROM iot_channel WHERE gateway_id = ?
++        //   （活跃行，多租户条件由插件注入；照 0012 dataItemService.countByInstanceIds 范式）
++        return 0L;
++    }
++
++    @Override
++    public long countPoints(Long gatewayId) {
++        // TODO(TASK-0021 接线)：建表后按点位归属列（gateway_id 直引或经通道间接，0021 brief 裁决）计数
++        return 0L;
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index b4df574..6d9cd8d 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -25,6 +25,8 @@ ot:
+       lock-minutes: 10    # 锁定时长（分钟）
+   tenant:
+     default-code: ${OT_TENANT_DEFAULT_CODE:default}   # 登录缺省租户编码（TASK-0002 / TD-0040）：登录请求显式 tenantCode 优先，缺省走此值；私有化单租户包注入默认租户后用户无感（01_base 种子约定 default 租户 id=1）
++  gateway:
++    internal-token: ${OT_GATEWAY_INTERNAL_TOKEN:}   # 网关内部回写静态令牌占位（TASK-0017）：header X-Internal-Token 比对；空值 fail-closed 拒绝全部内部回写请求，部署必须经环境变量 OT_GATEWAY_INTERNAL_TOKEN 注入。完整网关令牌链归 TASK-0019（凭据）/0020（LWT）升级替换；IP 白名单 ot.gateway.internal-ip-whitelist 默认 127.0.0.1（代码默认值，可经 OT_GATEWAY_INTERNAL_IP_WHITELIST 覆盖）
+   tdengine:
+     # TDengine 管理通道（TASK-0003）：taosAdapter REST。库名一律 iot_<tenant_code> 只由 tenant_code 派生（REQ-0001 核心规则，禁外部传参）；
+     # 连接失败/超时抛业务异常由调用方捕获计数（fail-soft 边界），开通主流程不因 TDengine 可用性阻塞（建库异步化+扫描重试）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthCheckerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthCheckerTest.java
+new file mode 100644
+index 0000000..a87b603
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthCheckerTest.java
+@@ -0,0 +1,131 @@
++package net.otlab.admin.module.iot.gateway.auth;
++
++import jakarta.servlet.http.HttpServletRequest;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.OtIpUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * 内部认证检查器单元测试（TASK-0017 占位实现 StaticTokenInternalAuthChecker）
++ *
++ * <p>纪律：令牌头 X-Internal-Token 常量时间比对（错值/缺值 401）；配置空值 fail-closed
++ * （未注入即拒绝全部，绝不放行）；IP 白名单（逗号分隔，默认 127.0.0.1，白名单外 403）。
++ * OtIpUtils behindProxy 静态态在测试内显式归位（false = 取 TCP 连接地址，防伪造转发头口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class StaticTokenInternalAuthCheckerTest {
++
++    private StaticTokenInternalAuthChecker checker;
++
++    private HttpServletRequest request;
++
++    @BeforeEach
++    void setUp() {
++        checker = new StaticTokenInternalAuthChecker();
++        ReflectionTestUtils.setField(checker, "configuredToken", "tok-123");
++        ReflectionTestUtils.setField(checker, "ipWhitelistRaw", "127.0.0.1, 10.0.0.5 ");
++        request = mock(HttpServletRequest.class);
++        // IpConfig 启动注入的静态态在 standalone 测试中显式归位（防其他用例污染）
++        OtIpUtils.setBehindProxy(false);
++    }
++
++    @AfterEach
++    void tearDown() {
++        OtIpUtils.setBehindProxy(false);
++    }
++
++    private void stubIp(String ip) {
++        when(request.getRemoteAddr()).thenReturn(ip);
++    }
++
++    @Test
++    @DisplayName("通过 - 正确令牌 + 白名单内 IP（127.0.0.1）静默放行")
++    void testCheck_Passes() {
++        stubIp("127.0.0.1");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-123");
++        assertDoesNotThrow(() -> checker.check(request));
++    }
++
++    @Test
++    @DisplayName("通过 - IPv6 环回归一（0:0:0:0:0:0:0:1 → 127.0.0.1，OtIpUtils 口径）+ 白名单多段含空白")
++    void testCheck_Ipv6LoopbackNormalized() {
++        stubIp("0:0:0:0:0:0:0:1");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-123");
++        assertDoesNotThrow(() -> checker.check(request));
++    }
++
++    @Test
++    @DisplayName("拒绝 - 令牌缺失/错值 → 401（白名单内 IP 也不放行）")
++    void testCheck_InvalidToken401() {
++        stubIp("127.0.0.1");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.UNAUTHORIZED.getCode(), e1.getCode());
++        assertTrue(e1.getMessage().contains("内部令牌无效"));
++
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-wrong");
++        BusinessException e2 = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.UNAUTHORIZED.getCode(), e2.getCode());
++    }
++
++    @Test
++    @DisplayName("拒绝 - 配置令牌为空（未注入）fail-closed：一律 401，绝不放行")
++    void testCheck_BlankConfiguredTokenFailClosed() {
++        ReflectionTestUtils.setField(checker, "configuredToken", "");
++        stubIp("127.0.0.1");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("anything");
++        BusinessException e = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.UNAUTHORIZED.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("fail-closed"));
++
++        ReflectionTestUtils.setField(checker, "configuredToken", null);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.UNAUTHORIZED.getCode(), e2.getCode());
++    }
++
++    @Test
++    @DisplayName("拒绝 - 白名单外 IP → 403（令牌正确也不放行）")
++    void testCheck_IpOutsideWhitelist403() {
++        stubIp("192.168.10.66");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-123");
++        BusinessException e = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("来源 IP 不在内部接口白名单"));
++    }
++
++    @Test
++    @DisplayName("拒绝 - 白名单段 10.0.0.5 放行、10.0.0.6 拒绝（多段解析正确性）")
++    void testCheck_WhitelistMultipleEntries() {
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-123");
++
++        stubIp("10.0.0.5");
++        assertDoesNotThrow(() -> checker.check(request));
++
++        stubIp("10.0.0.6");
++        BusinessException e = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++    }
++
++    @Test
++    @DisplayName("令牌比较 - 常量时间比对不抛异常且前缀撞库不可过（tok-12 vs tok-123）")
++    void testCheck_PrefixTokenRejected() {
++        stubIp("127.0.0.1");
++        when(request.getHeader(StaticTokenInternalAuthChecker.TOKEN_HEADER)).thenReturn("tok-12");
++        BusinessException e = assertThrows(BusinessException.class, () -> checker.check(request));
++        assertEquals(ResultCode.UNAUTHORIZED.getCode(), e.getCode());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/config/IotGatewayMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/config/IotGatewayMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..4ca3fcf
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/config/IotGatewayMenuPermissionGuardTest.java
+@@ -0,0 +1,139 @@
++package net.otlab.admin.module.iot.gateway.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.gateway.controller.IotGatewayController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0017 守卫测试：网关域菜单权限（sys_menu 4041-4045 五行）与控制器接口清单核对。
++ *
++ * <p>brief 硬要求「权限与接口一一对应」；网关域的形态：§3.1 p21 网关段<b>四行接口</b>
++ * （list/add/edit/remove，无 detail 行——brief 裁决 list/detail 合并按 list 权限）+ 菜单
++ * <b>五行种子</b>（brief 明文：list/query/add/edit/remove，query 行供前端详情弹层预留、
++ * 不挂端点）。本测试锁定（照 IotInstanceMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_gateway_domain.sql 的 sys_menu 五行种子
++ *     （id 4041-4045，parent_id=4012）权限码必须恰好等于预期的五值映射——删行/换码/
++ *     挪 parent 即红；</li>
++ * <li>代码侧：网关管理面 @SaCheckPermission 权限码并集必须恰好等于四值集合（多注解/
++ *     漏注解/写错码即红），且 ⊆ SQL 登记集（SaPermissionRegistryConsistencyTest 全局
++ *     同口径的域内精确版）；</li>
++ * <li>双向核对（四端点全部被 SQL 登记；query 行预留不挂端点的差异被显式断言固化）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotGatewayMenuPermissionGuardTest {
++
++    /** 五行菜单种子的预期映射（id → perms），与升级脚本 4041-4045 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4041L, "iot:gateway:list",
++            4042L, "iot:gateway:query",
++            4043L, "iot:gateway:add",
++            4044L, "iot:gateway:edit",
++            4045L, "iot:gateway:remove");
++
++    /** 管理面控制器预期权限码（§3.1 p21 四行；query 无端点为 brief 预登记差异） */
++    private static final Set<String> EXPECTED_CONTROLLER_PERMS = Set.of(
++            "iot:gateway:list", "iot:gateway:add", "iot:gateway:edit", "iot:gateway:remove");
++
++    /** 升级脚本路径（从模块目录或仓库根目录向上定位 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_gateway_domain.sql";
++
++    /** 菜单种子行形如 (4041, 4012, 4, '网关查询', 3, NULL, NULL, NULL, 'iot:gateway:list', ...） */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((404\\d),\\s*4012,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的网关菜单行恰好等于预期五值映射（4041-4045，parent 4012）")
++    void scriptRegistersExactlyTheFiveMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4041-4045 五行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 网关管理面控制器权限码并集恰好等于四值集合（§3.1 四行，无 detail）")
++    void controllerPermissionsAreExactlyTheFourPerms() {
++        Set<String> annotated = collectControllerPerms();
++        assertEquals(EXPECTED_CONTROLLER_PERMS, annotated,
++                "网关管理面 @SaCheckPermission 权限码并集必须恰好等于 §3.1 四行（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向核对 - 四端点权限码全部被 SQL 登记（query 行预留不挂端点，差异显式固化）")
++    void controllerPermsAllRegisteredInSql() throws Exception {
++        Set<String> fromSql = new TreeSet<>(parseMenuRows(readScript()).values());
++        Set<String> fromCode = collectControllerPerms();
++        assertTrue(fromSql.containsAll(fromCode),
++                "管理面权限码必须全部在 sys_menu SQL 登记（BUG-0046 口径）——否则任何角色（含超管）都无法持有");
++        assertTrue(fromSql.contains("iot:gateway:query"),
++                "query 行为 brief 五行种子要求的前端预留（不挂端点），删除该行即失败");
++    }
++
++    /** 收集网关管理面控制器的全部 @SaCheckPermission 权限码（方法级 + 类级；内部控制器不挂注解不入集） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = IotGatewayController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（网关管理页 4012 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript() throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(SCRIPT_RELATIVE);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java
+new file mode 100644
+index 0000000..75e084e
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java
+@@ -0,0 +1,290 @@
++package net.otlab.admin.module.iot.gateway.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 网关控制器测试（TASK-0017 接口层，管理面 CRUD）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），权限注解以反射断言，路由与
++ * 参数校验走真实 MockMvc 请求（照 IotModelInstanceControllerTest 范式）。接口契约照
++ * 详细设计 §3.1 p21 四行（list/add/edit/remove，无 detail 行——brief 裁决 list/detail
++ * 合并按 list 权限，iot:gateway:query 为前端预留不挂端点）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotGatewayControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotGatewayService gatewayService;
++
++    private IotGatewayController gatewayController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        gatewayController = new IotGatewayController();
++        ReflectionTestUtils.setField(gatewayController, "gatewayService", gatewayService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(gatewayController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private IotGatewayCreateForm createForm() {
++        IotGatewayCreateForm form = new IotGatewayCreateForm();
++        form.setGatewayCode("GW_F01_01");
++        form.setGatewayName("一号空压机网关");
++        form.setInstanceId(2L);
++        form.setDeptId(10L);
++        form.setHeartbeatPeriod(15);
++        return form;
++    }
++
++    private IotGateway testGateway() {
++        IotGateway gw = new IotGateway();
++        gw.setId(1L);
++        gw.setTenantId(1L);
++        gw.setGatewayCode("GW_F01_01");
++        gw.setGatewayName("一号空压机网关");
++        gw.setInstanceId(2L);
++        gw.setDeptId(10L);
++        gw.setOnlineStatus(1);
++        gw.setHeartbeatPeriod(15);
++        gw.setStatus(1);
++        return gw;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 四个端点 @SaCheckPermission 取值符合 iot:gateway:* 契约；无 detail 端点（§3.1 无行，list/detail 合并）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:gateway:list", IotGatewayController.class
++                .getMethod("list", Integer.class, Integer.class, IotGateway.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:gateway:add", IotGatewayController.class
++                .getMethod("add", IotGatewayCreateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:gateway:edit", IotGatewayController.class
++                .getMethod("edit", IotGatewayUpdateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:gateway:remove", IotGatewayController.class
++                .getMethod("remove", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        // §3.1 p21 网关段无 detail 行：不得出现 GET /{id} 详情端点（brief 裁决 list/detail 合并）
++        for (Method method : IotGatewayController.class.getDeclaredMethods()) {
++            if (method.isAnnotationPresent(org.springframework.web.bind.annotation.GetMapping.class)) {
++                String path = method.getAnnotation(org.springframework.web.bind.annotation.GetMapping.class).value()[0];
++                assertEquals("/list", path, "管理面控制器只允许 list 一个 GET 端点（无 detail）");
++            }
++        }
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 三个写操作（新增/编辑/删除）均有 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method add = IotGatewayController.class.getMethod("add", IotGatewayCreateForm.class);
++        Method edit = IotGatewayController.class.getMethod("edit", IotGatewayUpdateForm.class);
++        Method remove = IotGatewayController.class.getMethod("remove", Long.class);
++        for (Method method : List.of(add, edit, remove)) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, add.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, edit.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.DELETE, remove.getAnnotation(OperateLog.class).businessType());
++    }
++
++    // ---------- 路由（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("分页列表 - GET /iot/gateway/list 返回分页数据（含在线状态与心跳时间列）")
++    void testList_Success() throws Exception {
++        Page<IotGateway> page = new Page<>(1, 10);
++        page.setRecords(List.of(testGateway()));
++        page.setTotal(1);
++        when(gatewayService.selectGatewayList(any(), any(IotGateway.class))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/gateway/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10")
++                        .param("gatewayCode", "GW_F01")
++                        .param("status", "1")
++                        .param("onlineStatus", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.records").isArray())
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].gatewayCode").value("GW_F01_01"))
++                .andExpect(jsonPath("$.data.records[0].onlineStatus").value(1));
++    }
++
++    @Test
++    @DisplayName("新增 - POST /iot/gateway 正常返回 200")
++    void testAdd_Success() throws Exception {
++        when(gatewayService.createGateway(any(IotGatewayCreateForm.class))).thenReturn(true);
++
++        mockMvc.perform(post("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(gatewayService).createGateway(any(IotGatewayCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：编码缺失返回业务码 400，服务不被触达")
++    void testAdd_CodeMissing() throws Exception {
++        IotGatewayCreateForm form = createForm();
++        form.setGatewayCode(null);
++
++        mockMvc.perform(post("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(gatewayService, org.mockito.Mockito.never()).createGateway(any(IotGatewayCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：编码含非法字符被 @Pattern 拒（MQTT 主题段纪律）")
++    void testAdd_CodePatternViolated() throws Exception {
++        IotGatewayCreateForm form = createForm();
++        form.setGatewayCode("GW-F01");
++
++        mockMvc.perform(post("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(gatewayService, org.mockito.Mockito.never()).createGateway(any(IotGatewayCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 重复编码透传服务层 4002")
++    void testAdd_DuplicateCode() throws Exception {
++        when(gatewayService.createGateway(any(IotGatewayCreateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "网关编码已存在: GW_F01_01"));
++
++        mockMvc.perform(post("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4002));
++    }
++
++    // ---------- 编辑 / 删除 ----------
++
++    @Test
++    @DisplayName("编辑 - PUT /iot/gateway 正常返回 200")
++    void testEdit_Success() throws Exception {
++        when(gatewayService.updateGateway(any(IotGatewayUpdateForm.class))).thenReturn(true);
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setId(1L);
++        form.setGatewayName("改名网关");
++
++        mockMvc.perform(put("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(gatewayService).updateGateway(any(IotGatewayUpdateForm.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 改码被服务层拒绝（PARAM_ERROR 透传）")
++    void testEdit_RejectCodeChange() throws Exception {
++        when(gatewayService.updateGateway(any(IotGatewayUpdateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关编码不允许修改: GW_F01_01"));
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setId(1L);
++        form.setGatewayCode("GW_NEW");
++
++        mockMvc.perform(put("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("编辑 - id 缺失被 bean 校验拒绝")
++    void testEdit_IdMissing() throws Exception {
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setGatewayName("无 id 编辑");
++
++        mockMvc.perform(put("/iot/gateway")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(gatewayService, org.mockito.Mockito.never()).updateGateway(any(IotGatewayUpdateForm.class));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /iot/gateway/{id} 透传服务层（§3.1 单 id 路径）")
++    void testRemove_Success() throws Exception {
++        when(gatewayService.deleteGateway(1L)).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/gateway/{id}", 1L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(gatewayService).deleteGateway(1L);
++    }
++
++    @Test
++    @DisplayName("删除 - 有引用透传服务层参数错误（guard 分支）")
++    void testRemove_ReferenceProtected() throws Exception {
++        when(gatewayService.deleteGateway(1L))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "网关存在采集通道，禁止删除（通道 2 条，先清理通道）"));
++
++        mockMvc.perform(delete("/iot/gateway/{id}", 1L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java
+new file mode 100644
+index 0000000..1d630ff
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java
+@@ -0,0 +1,280 @@
++package net.otlab.admin.module.iot.gateway.controller;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthInterceptor;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 网关内部回写控制器测试（TASK-0017，POST /internal/v1/gateway/heartbeat）
++ *
++ * <p>核心契约（REQ-0009 验收 4 + brief）：无 Sa-Token 注解（@Anonymous 跳过管理面登录）
++ * 但有 InternalAuthChecker 调用断言（拦截器层 + 控制器层双调用同一实现）；回写字段组
++ * 白名单在原始 JSON 层强制——顶层多余键 / 条目多余键 / 越界值直接 PARAM_ERROR 拒绝，
++ * 服务层不被触达；路由 /internal/v1/gateway/heartbeat；不写操作日志（高频心跳）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotGatewayInternalControllerTest {
++
++    private static final String HEARTBEAT_URL = "/internal/v1/gateway/heartbeat";
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotGatewayService gatewayService;
++
++    @Mock
++    private InternalAuthChecker internalAuthChecker;
++
++    private IotGatewayInternalController internalController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        internalController = new IotGatewayInternalController();
++        ReflectionTestUtils.setField(internalController, "gatewayService", gatewayService);
++        ReflectionTestUtils.setField(internalController, "internalAuthChecker", internalAuthChecker);
++        objectMapper = new ObjectMapper();
++        // 拦截器层接线（与 GatewayInternalAuthConfig 同构）：checker 先于控制器执行
++        mockMvc = MockMvcBuilders.standaloneSetup(internalController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .addInterceptors(new InternalAuthInterceptor(internalAuthChecker))
++                .build();
++    }
++
++    private String validBody() {
++        return """
++                {
++                  "tenantCode": "default",
++                  "items": [
++                    {"gatewayCode": "GW_F01_01", "onlineStatus": 1, "lastHeartbeatTime": "2026-11-22 10:00:00",
++                     "ipAddr": "192.168.1.12", "version": "v1.2.0", "configVersion": 17},
++                    {"gatewayCode": "GW_F01_02", "onlineStatus": 0, "lastHeartbeatTime": 1795212000000}
++                  ]
++                }
++                """;
++    }
++
++    // ---------- 注解与路由契约 ----------
++
++    @Test
++    @DisplayName("注解契约 - @Anonymous 跳过管理面登录；无 @SaCheckPermission；无 @OperateLog（高频心跳不写操作日志）")
++    void testAnnotationContract() throws Exception {
++        Method heartbeat = IotGatewayInternalController.class
++                .getMethod("heartbeat", jakarta.servlet.http.HttpServletRequest.class, java.util.Map.class);
++        assertNotNull(heartbeat.getAnnotation(Anonymous.class), "内部接口须 @Anonymous 跳过 Sa-Token 登录校验");
++        assertEquals(null, heartbeat.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "内部接口不得挂管理面权限注解");
++        assertEquals(null, heartbeat.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "高频心跳回写不写操作日志（brief 明文口径）");
++        assertTrue(heartbeat.getAnnotation(org.springframework.web.bind.annotation.PostMapping.class).value()[0]
++                .startsWith("/heartbeat"), "路由 POST /internal/v1/gateway/heartbeat");
++    }
++
++    @Test
++    @DisplayName("内部认证 - InternalAuthChecker 被调用（拦截器层 + 控制器层），通过后服务层执行")
++    void testHeartbeat_InvokesAuthChecker() throws Exception {
++        when(gatewayService.writeHeartbeats(any())).thenReturn(2);
++
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(validBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(2));
++
++        verify(internalAuthChecker, org.mockito.Mockito.times(2)).check(any());
++        verify(gatewayService).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("内部认证 - checker 拒绝（401 令牌无效）→ 403 场景同构透传，服务层不执行")
++    void testHeartbeat_AuthRejected() throws Exception {
++        doThrow(new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效"))
++                .when(internalAuthChecker).check(any());
++
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(validBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(401));
++
++        verify(gatewayService, never()).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("内部认证 - IP 白名单外（403）透传")
++    void testHeartbeat_IpWhitelistRejected() throws Exception {
++        doThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "来源 IP 不在内部接口白名单"))
++                .when(internalAuthChecker).check(any());
++
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(validBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
++
++    // ---------- 字段组白名单（REQ-0009 验收 4：越界 UPDATE 被拒） ----------
++
++    @Test
++    @DisplayName("白名单 - 顶层多余键直接拒绝（status 混入 body → PARAM_ERROR，服务层不执行）")
++    void testHeartbeat_TopLevelExtraKeyRejected() throws Exception {
++        String body = """
++                {"tenantCode": "default", "items": [{"gatewayCode": "GW_F01_01", "onlineStatus": 1}], "status": 0}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(body))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("回写字段越界")))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("status")));
++
++        verify(internalAuthChecker, org.mockito.Mockito.times(2)).check(any());
++        verify(gatewayService, never()).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("白名单 - 条目多余键直接拒绝（gatewayName 混入条目 → PARAM_ERROR，越界键点名）")
++    void testHeartbeat_ItemExtraKeyRejected() throws Exception {
++        String body = """
++                {"tenantCode": "default", "items": [
++                    {"gatewayCode": "GW_F01_01", "onlineStatus": 1, "gatewayName": "越界改名", "heartbeatPeriod": 99}
++                ]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(body))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("回写字段越界")))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("gatewayName")))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("heartbeatPeriod")));
++
++        verify(gatewayService, never()).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("白名单 - 越界值拒绝：onlineStatus=2、configVersion 非数值、lastHeartbeatTime 非法格式")
++    void testHeartbeat_InvalidValuesRejected() throws Exception {
++        String badOnline = """
++                {"tenantCode": "default", "items": [{"gatewayCode": "GW_F01_01", "onlineStatus": 2}]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(badOnline))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("onlineStatus")));
++
++        String badConfigVersion = """
++                {"tenantCode": "default", "items": [
++                    {"gatewayCode": "GW_F01_01", "onlineStatus": 1, "configVersion": "seventeen"}
++                ]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(badConfigVersion))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("configVersion")));
++
++        String badTime = """
++                {"tenantCode": "default", "items": [
++                    {"gatewayCode": "GW_F01_01", "onlineStatus": 1, "lastHeartbeatTime": "yesterday"}
++                ]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(badTime))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("lastHeartbeatTime")));
++
++        verify(gatewayService, never()).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("白名单 - 缺 tenantCode / items 为空数组 / 条目缺 gatewayCode 或 onlineStatus 拒")
++    void testHeartbeat_MissingRequiredRejected() throws Exception {
++        String noTenant = """
++                {"items": [{"gatewayCode": "GW_F01_01", "onlineStatus": 1}]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(noTenant))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        String emptyItems = """
++                {"tenantCode": "default", "items": []}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(emptyItems))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        String noCode = """
++                {"tenantCode": "default", "items": [{"onlineStatus": 1}]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(noCode))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        String noOnline = """
++                {"tenantCode": "default", "items": [{"gatewayCode": "GW_F01_01"}]}
++                """;
++        mockMvc.perform(post(HEARTBEAT_URL).contentType(MediaType.APPLICATION_JSON).content(noOnline))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(gatewayService, never()).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("类型归一化 - 毫秒时间戳与字符串时间、可选字段缺省（null 不进更新集）均合法通过")
++    void testHeartbeat_CoercionAndOptionals() throws Exception {
++        when(gatewayService.writeHeartbeats(any())).thenReturn(2);
++        mockMvc.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(validBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(2));
++        verify(gatewayService).writeHeartbeats(any());
++    }
++
++    @Test
++    @DisplayName("控制器层纵深 - 拦截器缺席时（standalone 直连控制器）控制器仍显式调用 checker")
++    void testHeartbeat_ControllerLevelCheckWithoutInterceptor() throws Exception {
++        MockMvc noInterceptor = MockMvcBuilders.standaloneSetup(internalController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++        when(gatewayService.writeHeartbeats(any())).thenReturn(2);
++
++        noInterceptor.perform(post(HEARTBEAT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(validBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(internalAuthChecker, org.mockito.Mockito.times(1)).check(any());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+new file mode 100644
+index 0000000..a326e23
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+@@ -0,0 +1,700 @@
++package net.otlab.admin.module.iot.gateway.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
++import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
++import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeMapper;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeRow;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.time.LocalDateTime;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 网关服务单元测试（TASK-0017）
++ *
++ * <p>核心业务纪律（详细设计 §1.3 p7/§3.1 p21 / REQ-0009 / brief）：编码租户内唯一双道闸
++ * 4002（含已删行预检 + DuplicateKey 兜底）、字符集 [A-Za-z0-9_] 与长度拒、创建强制
++ * status=1/online_status=0/heartbeat_period 默认 30、instance（存在/启用）与 dept（存在）
++ * 归属校验、编辑改码拒与白名单落库（回写字段组五字段永不进管理面更新集）、删除 guard
++ * 结构（本期恒零引用 + 计数&gt;0 拒绝分支）、心跳回写字段组白名单（五字段更新集 + 显式
++ * (tenant_id, gateway_code) 条件）/批量/租户禁用拒/未知编码整批拒。
++ *
++ * <p>standalone Mockito 范式（照 IotModelInstanceServiceImplTest）：Mapper 全 mock 不触
++ * 真实库；TenantContext 静态 mock 供会话租户取值。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotGatewayServiceImplTest {
++
++    @Mock
++    private IotGatewayMapper baseMapper;
++
++    @Mock
++    private IotGatewayCodeMapper gatewayCodeMapper;
++
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private SysDeptMapper deptMapper;
++
++    @Mock
++    private SysTenantMapper tenantMapper;
++
++    @Mock
++    private GatewayReferenceGuard referenceGuard;
++
++    private IotGatewayServiceImpl gatewayService;
++
++    /** 创建/回写消费会话租户上下文（静态 mock，逐用例注入） */
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotGateway.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, SysDept.class);
++        TableInfoHelper.initTableInfo(assistant, SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        gatewayService = new IotGatewayServiceImpl();
++        ReflectionTestUtils.setField(gatewayService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(gatewayService, "gatewayCodeMapper", gatewayCodeMapper);
++        ReflectionTestUtils.setField(gatewayService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(gatewayService, "deptMapper", deptMapper);
++        ReflectionTestUtils.setField(gatewayService, "tenantMapper", tenantMapper);
++        ReflectionTestUtils.setField(gatewayService, "referenceGuard", referenceGuard);
++        // 删除 guard 本期恒零引用（占位实现默认行为）；拒绝场景在各用例内显式覆盖
++        when(referenceGuard.countChannels(any())).thenReturn(0L);
++        when(referenceGuard.countPoints(any())).thenReturn(0L);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotGatewayCreateForm createForm() {
++        IotGatewayCreateForm form = new IotGatewayCreateForm();
++        form.setGatewayCode("GW_F01_01");
++        form.setGatewayName("一号空压机网关");
++        form.setInstanceId(2L);
++        form.setDeptId(10L);
++        form.setHeartbeatPeriod(15);
++        return form;
++    }
++
++    private IotGateway existingGateway() {
++        IotGateway gw = new IotGateway();
++        gw.setId(1L);
++        gw.setTenantId(1L);
++        gw.setGatewayCode("GW_F01_01");
++        gw.setGatewayName("一号空压机网关");
++        gw.setInstanceId(2L);
++        gw.setDeptId(10L);
++        gw.setOnlineStatus(0);
++        gw.setHeartbeatPeriod(15);
++        gw.setStatus(1);
++        return gw;
++    }
++
++    private GatewayHeartbeatItem heartbeatItem(String code, Integer online) {
++        GatewayHeartbeatItem item = new GatewayHeartbeatItem();
++        item.setGatewayCode(code);
++        item.setOnlineStatus(online);
++        item.setLastHeartbeatTime(LocalDateTime.of(2026, 11, 22, 10, 0, 0));
++        item.setIpAddr("192.168.1.12");
++        item.setVersion("v1.2.0");
++        item.setConfigVersion(17L);
++        return item;
++    }
++
++    private GatewayHeartbeatForm heartbeatForm(String tenantCode, GatewayHeartbeatItem... items) {
++        GatewayHeartbeatForm form = new GatewayHeartbeatForm();
++        form.setTenantCode(tenantCode);
++        form.setItems(new java.util.ArrayList<>(List.of(items)));
++        return form;
++    }
++
++    private SysTenant activeTenant() {
++        SysTenant tenant = new SysTenant();
++        tenant.setId(1L);
++        tenant.setTenantCode("default");
++        tenant.setTenantName("默认租户");
++        tenant.setStatus(1);
++        return tenant;
++    }
++
++    private IotGatewayCodeRow occupiedRow(Integer deleted) {
++        IotGatewayCodeRow row = new IotGatewayCodeRow();
++        row.setId(9L);
++        row.setGatewayCode("GW_F01_01");
++        row.setDeleted(deleted);
++        return row;
++    }
++
++    // ---------- 创建：唯一性双道闸 4002 ----------
++
++    @Test
++    @DisplayName("创建 - 双道闸第一道：活跃行占用预检命中报 4002「已存在」，不触发 save")
++    void testCreate_ActiveRowOccupied4002() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection()))
++                .thenReturn(List.of(occupiedRow(0)));
++        IotGatewayCreateForm form = createForm();
++        form.setInstanceId(null);
++        form.setDeptId(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("网关编码已存在: GW_F01_01"));
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 已删行占用报 4002「已被删除记录占用，不可复用」（编码不复用，uk 不含 deleted）")
++    void testCreate_DeletedRowOccupied4002() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection()))
++                .thenReturn(List.of(occupiedRow(1)));
++        IotGatewayCreateForm form = createForm();
++        form.setInstanceId(null);
++        form.setDeptId(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("已被删除记录占用，不可复用"));
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 双道闸第二道：预检未中但落库撞物理唯一索引（真实并发窗口）→ 兜底 4002")
++    void testCreate_DuplicateKeyFallback4002() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(List.of());
++        when(baseMapper.insert(any(IotGateway.class))).thenThrow(new DuplicateKeyException("uk_tenant_gateway_code"));
++        IotGatewayCreateForm form = createForm();
++        form.setInstanceId(null);
++        form.setDeptId(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("网关编码已存在"));
++    }
++
++    // ---------- 创建：字符集/长度/归属校验/白名单落库 ----------
++
++    @Test
++    @DisplayName("创建 - 字符集拒：编码含非法字符（MQTT 主题段纪律 [A-Za-z0-9_]）")
++    void testCreate_CodeCharsetRejected() {
++        for (String bad : new String[]{"GW-F01", "GW.F01", "GW F01", "网关01"}) {
++            IotGatewayCreateForm form = createForm();
++            form.setGatewayCode(bad);
++            BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form),
++                    "编码 " + bad + " 应被拒");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        }
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 长度拒：编码 65 字符超 DB varchar(64)")
++    void testCreate_CodeTooLongRejected() {
++        IotGatewayCreateForm form = createForm();
++        form.setGatewayCode("A".repeat(65));
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("超长"));
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 归属校验：实例不存在/禁用即拒")
++    void testCreate_InstanceValidation() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(List.of());
++
++        when(instanceMapper.selectById(2L)).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> gatewayService.createGateway(createForm()));
++        assertTrue(e1.getMessage().contains("实例不存在或已删除"));
++
++        IotModelInstance disabled = new IotModelInstance();
++        disabled.setId(2L);
++        disabled.setInstanceCode("F01");
++        disabled.setStatus(0);
++        when(instanceMapper.selectById(2L)).thenReturn(disabled);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> gatewayService.createGateway(createForm()));
++        assertTrue(e2.getMessage().contains("实例已禁用，不可挂载网关"));
++
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 归属校验：部门不存在即拒")
++    void testCreate_DeptValidation() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(List.of());
++        when(instanceMapper.selectById(2L)).thenReturn(activeInstance());
++        when(deptMapper.selectById(10L)).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(createForm()));
++        assertTrue(e.getMessage().contains("部门不存在或已删除"));
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    private IotModelInstance activeInstance() {
++        IotModelInstance instance = new IotModelInstance();
++        instance.setId(2L);
++        instance.setInstanceCode("F01");
++        instance.setStatus(1);
++        return instance;
++    }
++
++    @Test
++    @DisplayName("创建 - 白名单落库：status 强制 1 / online_status 强制 0 / heartbeat_period 未携带默认 30 / tenantId 会话覆盖 / 回写字段组不落请求值")
++    void testCreate_WhitelistFields() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(List.of());
++        when(instanceMapper.selectById(2L)).thenReturn(activeInstance());
++        when(deptMapper.selectById(10L)).thenReturn(new SysDept());
++        when(baseMapper.insert(any(IotGateway.class))).thenReturn(1);
++
++        IotGatewayCreateForm form = createForm();
++        form.setHeartbeatPeriod(null);
++        assertTrue(gatewayService.createGateway(form));
++
++        ArgumentCaptor<IotGateway> captor = ArgumentCaptor.forClass(IotGateway.class);
++        verify(baseMapper).insert(captor.capture());
++        IotGateway saved = captor.getValue();
++        assertEquals("GW_F01_01", saved.getGatewayCode());
++        assertEquals("一号空压机网关", saved.getGatewayName());
++        assertEquals(2L, saved.getInstanceId());
++        assertEquals(10L, saved.getDeptId());
++        assertEquals(30, saved.getHeartbeatPeriod(), "heartbeat_period 未携带落库默认 30（DDL DEFAULT '30' 同值）");
++        assertEquals(1, saved.getStatus(), "新建网关一律启用（启停走编辑接口）");
++        assertEquals(0, saved.getOnlineStatus(), "新建网关离线起步（心跳链路接管）");
++        assertEquals(1L, saved.getTenantId(), "tenant_id 服务层从会话覆盖");
++        assertNull(saved.getLastHeartbeatTime());
++        assertNull(saved.getIpAddr());
++        assertNull(saved.getVersion());
++        assertNull(saved.getConfigVersion());
++    }
++
++    @Test
++    @DisplayName("创建 - 心跳周期边界：0/86401 拒，1/86400 放行")
++    void testCreate_HeartbeatPeriodBounds() {
++        when(gatewayCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(List.of());
++        when(instanceMapper.selectById(2L)).thenReturn(activeInstance());
++        when(deptMapper.selectById(10L)).thenReturn(new SysDept());
++        when(baseMapper.insert(any(IotGateway.class))).thenReturn(1);
++
++        for (Integer bad : new Integer[]{0, -1, 86401}) {
++            IotGatewayCreateForm form = createForm();
++            form.setHeartbeatPeriod(bad);
++            BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form),
++                    "heartbeat_period=" + bad + " 应被拒");
++            assertTrue(e.getMessage().contains("心跳周期"));
++        }
++        for (Integer good : new Integer[]{1, 86400}) {
++            IotGatewayCreateForm form = createForm();
++            form.setHeartbeatPeriod(good);
++            assertTrue(gatewayService.createGateway(form));
++        }
++    }
++
++    @Test
++    @DisplayName("创建 - 名称长度拒（>100）")
++    void testCreate_NameTooLongRejected() {
++        IotGatewayCreateForm form = createForm();
++        form.setGatewayName("名".repeat(101));
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.createGateway(form));
++        assertTrue(e.getMessage().contains("网关名称"));
++        verify(baseMapper, never()).insert(any(IotGateway.class));
++    }
++
++    // ---------- 编辑：改码拒 / 白名单落库 ----------
++
++    @Test
++    @DisplayName("编辑 - gateway_code 不可改：携带不一致即拒（REQ-0009 核心规则）")
++    void testUpdate_CodeChangeRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setId(1L);
++        form.setGatewayCode("GW_NEW");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.updateGateway(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("网关编码不允许修改: GW_F01_01"));
++        verify(baseMapper, never()).updateById(any(IotGateway.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - gateway_code 携带同值为 no-op 不拦（前端回显场景）")
++    void testUpdate_SameCodeNoOpPasses() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(baseMapper.updateById(any(IotGateway.class))).thenReturn(1);
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setId(1L);
++        form.setGatewayCode("GW_F01_01");
++        form.setGatewayName("改名网关");
++
++        assertTrue(gatewayService.updateGateway(form));
++        ArgumentCaptor<IotGateway> captor = ArgumentCaptor.forClass(IotGateway.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals("改名网关", captor.getValue().getGatewayName());
++        assertNull(captor.getValue().getGatewayCode(), "编码不进更新集（不可变字段连 no-op 都不落 SET）");
++    }
++
++    @Test
++    @DisplayName("编辑 - 白名单落库：仅 gatewayName/instanceId/deptId/heartbeatPeriod/status 可变；回写字段组五字段永不进更新集")
++    void testUpdate_WhitelistOnly() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(baseMapper.updateById(any(IotGateway.class))).thenReturn(1);
++
++        IotGatewayUpdateForm form = new IotGatewayUpdateForm();
++        form.setId(1L);
++        form.setGatewayName("改名网关");
++        form.setInstanceId(5L);
++        form.setDeptId(11L);
++        form.setHeartbeatPeriod(60);
++        form.setStatus(0);
++
++        when(instanceMapper.selectById(5L)).thenReturn(activeInstance());
++        when(deptMapper.selectById(11L)).thenReturn(new SysDept());
++
++        assertTrue(gatewayService.updateGateway(form));
++        ArgumentCaptor<IotGateway> captor = ArgumentCaptor.forClass(IotGateway.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotGateway upd = captor.getValue();
++        assertEquals(1L, upd.getId());
++        assertEquals("改名网关", upd.getGatewayName());
++        assertEquals(5L, upd.getInstanceId());
++        assertEquals(11L, upd.getDeptId());
++        assertEquals(60, upd.getHeartbeatPeriod());
++        assertEquals(0, upd.getStatus());
++        // 回写字段组五字段（REQ-0009 验收 4）：管理面编辑永不触碰
++        assertNull(upd.getOnlineStatus());
++        assertNull(upd.getLastHeartbeatTime());
++        assertNull(upd.getIpAddr());
++        assertNull(upd.getVersion());
++        assertNull(upd.getConfigVersion());
++        // 审计/归属字段不进更新集（MetaObjectHandler 回填 + tenant 不动）
++        assertNull(upd.getTenantId());
++        assertNull(upd.getDeleted());
++    }
++
++    @Test
++    @DisplayName("编辑 - 编辑目标不存在即拒；heartbeat_period 越界拒；status 值域拒")
++    void testUpdate_BasicValidation() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++
++        IotGatewayUpdateForm missing = new IotGatewayUpdateForm();
++        missing.setId(99L);
++        BusinessException e0 = assertThrows(BusinessException.class, () -> gatewayService.updateGateway(missing));
++        assertTrue(e0.getMessage().contains("网关不存在或已删除"));
++
++        IotGatewayUpdateForm badPeriod = new IotGatewayUpdateForm();
++        badPeriod.setId(1L);
++        badPeriod.setHeartbeatPeriod(0);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> gatewayService.updateGateway(badPeriod));
++        assertTrue(e1.getMessage().contains("心跳周期"));
++
++        IotGatewayUpdateForm badStatus = new IotGatewayUpdateForm();
++        badStatus.setId(1L);
++        badStatus.setStatus(2);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> gatewayService.updateGateway(badStatus));
++        assertTrue(e2.getMessage().contains("网关状态仅允许"));
++
++        verify(baseMapper, never()).updateById(any(IotGateway.class));
++    }
++
++    // ---------- 删除：guard 结构就位（本期恒零引用） ----------
++
++    @Test
++    @DisplayName("删除 - guard 恒零引用（两表未建）放行：双计数均被调用、removeById 软删")
++    void testDelete_ZeroReferencePasses() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(baseMapper.deleteById(1L)).thenReturn(1);
++
++        assertTrue(gatewayService.deleteGateway(1L));
++        verify(referenceGuard).countChannels(1L);
++        verify(referenceGuard).countPoints(1L);
++        verify(baseMapper).deleteById(1L);
++    }
++
++    @Test
++    @DisplayName("删除 - 有通道引用拒绝（guard 分支固化，0018 建表后计数实现按表扩展）")
++    void testDelete_ChannelReferenceRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(referenceGuard.countChannels(1L)).thenReturn(2L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(1L));
++        assertTrue(e.getMessage().contains("网关存在采集通道，禁止删除"));
++        assertTrue(e.getMessage().contains("2"));
++        verify(referenceGuard, never()).countPoints(any());
++        verify(baseMapper, never()).deleteById(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 有点位引用拒绝（guard 分支固化，0021 建表后计数实现按表扩展）")
++    void testDelete_PointReferenceRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(referenceGuard.countChannels(1L)).thenReturn(0L);
++        when(referenceGuard.countPoints(1L)).thenReturn(3L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(1L));
++        assertTrue(e.getMessage().contains("网关存在点位，禁止删除"));
++        assertTrue(e.getMessage().contains("3"));
++        verify(baseMapper, never()).deleteById(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 目标不存在/未选即拒")
++    void testDelete_MissingRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(1L));
++        assertTrue(e1.getMessage().contains("网关不存在或已删除"));
++
++        BusinessException e2 = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(null));
++        assertTrue(e2.getMessage().contains("请选择要删除的网关"));
++        verify(referenceGuard, never()).countChannels(any());
++    }
++
++    // ---------- 列表 ----------
++
++    @Test
++    @DisplayName("列表 - 过滤条件接线：gatewayCode/gatewayName LIKE + status/onlineStatus eq，含在线状态与心跳时间列")
++    void testList_Filters() {
++        Page<IotGateway> page = new Page<>(1, 10);
++        IotGateway query = new IotGateway();
++        query.setGatewayCode("GWF01");
++        query.setGatewayName("空压机");
++        query.setStatus(1);
++        query.setOnlineStatus(0);
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(page);
++
++        Page<IotGateway> result = gatewayService.selectGatewayList(new Page<>(1, 10), query);
++        assertNotNull(result);
++        ArgumentCaptor<Wrapper<IotGateway>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("gateway_code LIKE"), "编码过滤 LIKE: " + segment);
++        assertTrue(segment.contains("gateway_name LIKE"), "名称过滤 LIKE: " + segment);
++        assertTrue(segment.contains("status ="), "状态过滤 eq: " + segment);
++        assertTrue(segment.contains("online_status ="), "在线状态过滤 eq（REQ-0009 验收 2 可筛出）: " + segment);
++        Map<String, Object> params = ((com.baomidou.mybatisplus.core.conditions.AbstractWrapper<?, ?, ?>) captor.getValue()).getParamNameValuePairs();
++        assertTrue(params.values().stream().anyMatch(v -> String.valueOf(v).contains("GWF01")),
++                "编码过滤参数（LIKE 包裹 %..%，SqlLikeUtils.escape 防通配注入）: " + params.values());
++        assertTrue(params.containsValue(1), "状态过滤参数: " + params.values());
++        assertTrue(params.containsValue(0), "在线状态过滤参数: " + params.values());
++    }
++
++    @Test
++    @DisplayName("列表 - 无过滤条件时只按 id 排序分页")
++    void testList_NoFilter() {
++        Page<IotGateway> page = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(page);
++
++        assertNotNull(gatewayService.selectGatewayList(new Page<>(1, 10), new IotGateway()));
++        ArgumentCaptor<Wrapper<IotGateway>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("ORDER BY id ASC"), "稳定序: " + segment);
++    }
++
++    // ---------- 心跳回写：字段组白名单 / 批量 / 租户 / 定位 ----------
++
++    @Test
++    @DisplayName("回写 - 字段组白名单：服务层构建更新集只含五字段（REQ-0009 验收 4 第二道保险）+ 显式 (tenant_id, gateway_code) 定位")
++    void testHeartbeat_WhitelistUpdateSet() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw = existingGateway();
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        GatewayHeartbeatForm form = heartbeatForm("default",
++                heartbeatItem("GW_F01_01", 1));
++        int count = gatewayService.writeHeartbeats(form);
++        assertEquals(1, count);
++
++        ArgumentCaptor<IotGateway> entityCaptor = ArgumentCaptor.forClass(IotGateway.class);
++        ArgumentCaptor<Wrapper<IotGateway>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).update(entityCaptor.capture(), wrapperCaptor.capture());
++
++        IotGateway upd = entityCaptor.getValue();
++        assertEquals(1, upd.getOnlineStatus());
++        assertEquals(LocalDateTime.of(2026, 11, 22, 10, 0, 0), upd.getLastHeartbeatTime());
++        assertEquals("192.168.1.12", upd.getIpAddr());
++        assertEquals("v1.2.0", upd.getVersion());
++        assertEquals(17L, upd.getConfigVersion());
++        // 更新集只含五字段：id/gatewayCode/名称/归属/状态/审计字段一律不进 SET
++        assertNull(upd.getId());
++        assertNull(upd.getGatewayCode());
++        assertNull(upd.getGatewayName());
++        assertNull(upd.getInstanceId());
++        assertNull(upd.getDeptId());
++        assertNull(upd.getStatus());
++        assertNull(upd.getTenantId());
++        assertNull(upd.getHeartbeatPeriod());
++
++        // 更新 WHERE 显式 (id, tenant_id, gateway_code)——无会话链路的防御纵深定位
++        LambdaUpdateWrapper<IotGateway> wrapper = (LambdaUpdateWrapper<IotGateway>) wrapperCaptor.getValue();
++        String segment = wrapper.getSqlSegment();
++        assertTrue(segment.contains("id ="), "WHERE 显式 id 定位: " + segment);
++        assertTrue(segment.contains("tenant_id ="), "WHERE 显式 tenant_id 定位: " + segment);
++        assertTrue(segment.contains("gateway_code ="), "WHERE 显式 gateway_code 定位: " + segment);
++        Map<String, Object> params = wrapper.getParamNameValuePairs();
++        assertTrue(params.containsValue(1L));
++        assertTrue(params.containsValue("GW_F01_01"));
++    }
++
++    @Test
++    @DisplayName("回写 - 批量多网关：一次定位批量回写 N 条")
++    void testHeartbeat_BatchMultiGateway() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw1 = existingGateway();
++        IotGateway gw2 = existingGateway();
++        gw2.setId(2L);
++        gw2.setGatewayCode("GW_F01_02");
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw1, gw2));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        int count = gatewayService.writeHeartbeats(heartbeatForm("default",
++                heartbeatItem("GW_F01_01", 1), heartbeatItem("GW_F01_02", 0)));
++        assertEquals(2, count);
++        verify(baseMapper, org.mockito.Mockito.times(2)).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("回写 - 租户不存在/禁用拒")
++    void testHeartbeat_TenantValidation() {
++        when(tenantMapper.selectOne(any())).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> gatewayService.writeHeartbeats(heartbeatForm("ghost", heartbeatItem("GW_F01_01", 1))));
++        assertTrue(e1.getMessage().contains("租户不存在: ghost"));
++
++        SysTenant disabled = activeTenant();
++        disabled.setStatus(0);
++        when(tenantMapper.selectOne(any())).thenReturn(disabled);
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> gatewayService.writeHeartbeats(heartbeatForm("default", heartbeatItem("GW_F01_01", 1))));
++        assertTrue(e2.getMessage().contains("租户已禁用"));
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("回写 - 未知网关编码整批拒（fail-closed，不半批落库）")
++    void testHeartbeat_UnknownGatewayRejected() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw1 = existingGateway();
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw1));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> gatewayService.writeHeartbeats(heartbeatForm("default",
++                        heartbeatItem("GW_F01_01", 1), heartbeatItem("GW_GHOST", 1))));
++        assertTrue(e.getMessage().contains("网关编码不存在或已删除"));
++        assertTrue(e.getMessage().contains("GW_GHOST"));
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("回写 - 入参校验：tenantCode 缺失/条目为空/超批上限/编码缺失/onlineStatus 值域拒")
++    void testHeartbeat_BasicValidation() {
++        GatewayHeartbeatForm noTenant = heartbeatForm(null, heartbeatItem("GW_F01_01", 1));
++        BusinessException e1 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(noTenant));
++        assertTrue(e1.getMessage().contains("tenantCode"));
++
++        GatewayHeartbeatForm emptyItems = heartbeatForm("default");
++        BusinessException e2 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(emptyItems));
++        assertTrue(e2.getMessage().contains("回写条目为空"));
++
++        GatewayHeartbeatItem[] tooMany = new GatewayHeartbeatItem[501];
++        for (int i = 0; i < tooMany.length; i++) {
++            tooMany[i] = heartbeatItem("GW_" + i, 1);
++        }
++        GatewayHeartbeatForm oversized = heartbeatForm("default", tooMany);
++        BusinessException e3 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(oversized));
++        assertTrue(e3.getMessage().contains("单批回写条目超限"));
++
++        GatewayHeartbeatItem noCode = heartbeatItem("", 1);
++        GatewayHeartbeatForm blankCode = heartbeatForm("default", noCode);
++        BusinessException e4 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(blankCode));
++        assertTrue(e4.getMessage().contains("gatewayCode 必填"));
++
++        GatewayHeartbeatItem badOnline = heartbeatItem("GW_F01_01", 2);
++        GatewayHeartbeatForm badOnlineForm = heartbeatForm("default", badOnline);
++        BusinessException e5 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(badOnlineForm));
++        assertTrue(e5.getMessage().contains("onlineStatus 仅允许 0 离线 / 1 在线"));
++
++        GatewayHeartbeatItem nullOnline = heartbeatItem("GW_F01_01", null);
++        GatewayHeartbeatForm nullOnlineForm = heartbeatForm("default", nullOnline);
++        BusinessException e6 = assertThrows(BusinessException.class, () -> gatewayService.writeHeartbeats(nullOnlineForm));
++        assertTrue(e6.getMessage().contains("onlineStatus 仅允许 0 离线 / 1 在线"));
++
++        verify(tenantMapper, never()).selectOne(any());
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("回写 - 同码重复条目允许（幂等语义：同内容重复回写结果一致）")
++    void testHeartbeat_DuplicateCodeInBatch() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw = existingGateway();
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        int count = gatewayService.writeHeartbeats(heartbeatForm("default",
++                heartbeatItem("GW_F01_01", 1), heartbeatItem("GW_F01_01", 1)));
++        assertEquals(2, count);
++        verify(baseMapper, org.mockito.Mockito.times(2)).update(any(IotGateway.class), any(Wrapper.class));
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_iot_gateway_domain.sql b/resources/sql/upgrade/20261122_iot_gateway_domain.sql
+new file mode 100644
+index 0000000..aeea88a
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_gateway_domain.sql
+@@ -0,0 +1,105 @@
++-- ============================================================
++-- 存量库升级脚本：iot_gateway 网关表 + 网关管理按钮权限种子（TASK-0017 / FEAT-0006 / REQ-0009）
++--
++-- 用途：
++--   1) 建 iot_gateway 网关表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1 附录 A p30，
++--      字形规范化不改语义）；通道（0018）/凭据（0019）/点位（0021）三表不随本脚本建；
++--   2) sys_menu 登记网关管理页（sys_menu 4012「网关管理」，20261121_iot_console_menus.sql
++--      已建）之下的五个按钮权限行（menu_type=3）：iot:gateway:list/query/add/edit/remove；
++--   3) sys_role_menu 将上述五行授予超级管理员（role_id=1；照 20261122_iot_template_domain.sql 范式）。
++--
++-- 与上游差异（无）：附录 A p30 逐字 DDL 的三处索引（uk_tenant_gateway_code / idx_tenant_instance /
++--   idx_online）在 MySQL 8 InnoDB 键长均可行（utf8mb4×varchar(64)=256+8 字节、
++--   (tinyint,datetime) 组合更短），无需 0011 idx_ancestors 式前缀降级，头注如实登记「无差异」。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 p21 + 本任务 brief）：
++--   iot:gateway:list    GET    /iot/gateway/list（网关分页列表，含在线状态与心跳时间列）
++--   iot:gateway:add     POST   /iot/gateway（新增网关；编码租户内唯一校验，配额无关）
++--   iot:gateway:edit    PUT    /iot/gateway（修改网关；gateway_code 不可改）
++--   iot:gateway:remove  DELETE /iot/gateway/{id}（软删除；其下有点位/通道时拒绝并提示）
++--   iot:gateway:query   （本脚本登记、控制器暂无对应端点）——详细设计 §3.1 p21 网关段无 detail 行，
++--      brief 裁决「无则 list/detail 合并按 list 权限」，query 行按 brief 五行要求预登记
++--      供前端详情弹层预留，勿挪用/复用本号段。
++--   内部回写接口 POST /internal/v1/gateway/heartbeat（无 Sa-Token；InternalAuthChecker
++--      静态令牌 + IP 白名单占位，完整网关令牌链归 TASK-0019 凭据 / TASK-0020 LWT）
++--      不挂权限标识（内部接口不走 sys_menu 权限体系）。
++--   （守卫：backend IotGatewayMenuPermissionGuardTest 强制 SQL 4041-4045 与控制器注解
++--   双向核对；SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4030-4035：TASK-0012 占用（实例按钮六行）；
++--   sys_menu id 4036-4040：TASK-0013 占用（数据项按钮五行）；
++--   本脚本占用 sys_menu id 4041-4045（网关按钮五行，parent_id=4012），连续取号。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.3 p7 / REQ-0009 / ADR-0006）：
++--   uk_tenant_gateway_code 为 (tenant_id, gateway_code) 物理唯一索引；gateway_code 即
++--   MQTT 主题与设备身份段（字符集 [A-Za-z0-9_] 由服务层强制，REQ-0009 业务能力），
++--   创建后不可改（REQ-0009 核心规则）；删除为逻辑删（deleted=1），编码不复用——
++--   双道闸预检含已删行（照 0011/0012 修订轮 I-1 口径）。
++--   回写字段组固定为 online_status/last_heartbeat_time/ip_addr/version/config_version
++--   （REQ-0009 验收 4：越界 UPDATE 被拒；服务层构建更新集只含五字段）。
++--   网关删除保护：其下有点位/通道时拒绝——两表归 0018（通道）/0021（点位）建表，
++--   引用计数调用点本期结构就位、实际恒零引用（接线义务登记 0018/0021 brief）。
++--   多租户：iot_gateway 属 iot_ 前缀表，由 TASK-0002 TenantLineInnerInterceptor
++--   （OtTenantLineHandler 前缀规则）自动按会话租户注入条件，tenant_id 服务层从会话
++--   覆盖、禁前端传参；内部回写链路无会话租户，按 body tenantCode 显式定位（租户
++--   不存在/禁用拒）。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）与 20261121_iot_console_menus.sql
++--   （4012 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_gateway` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '网关 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `gateway_code` varchar(64) NOT NULL COMMENT '网关编码（租户内唯一，用作 MQTT 主题与设备身份）',
++  `gateway_name` varchar(100) NOT NULL COMMENT '网关名称',
++  `instance_id` bigint DEFAULT NULL COMMENT '所属模型实例 ID',
++  `dept_id` bigint DEFAULT NULL COMMENT '绑定部门 ID',
++  `online_status` tinyint DEFAULT '0' COMMENT '在线状态 0 离线 1 在线',
++  `last_heartbeat_time` datetime DEFAULT NULL COMMENT '最后心跳时间',
++  `heartbeat_period` int DEFAULT '30' COMMENT '心跳周期（秒）',
++  `version` varchar(32) DEFAULT NULL COMMENT '网关程序版本',
++  `config_version` bigint DEFAULT NULL COMMENT '当前生效配置版本号',
++  `ip_addr` varchar(64) DEFAULT NULL COMMENT '最近连接来源 IP',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_gateway_code` (`tenant_id`,`gateway_code`),
++  KEY `idx_tenant_instance` (`tenant_id`,`instance_id`),
++  KEY `idx_online` (`online_status`,`last_heartbeat_time`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='网关表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4041, 4012, 4, '网关查询', 3, NULL, NULL, NULL, 'iot:gateway:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4042, 4012, 4, '网关详情', 3, NULL, NULL, NULL, 'iot:gateway:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4043, 4012, 4, '网关新增', 3, NULL, NULL, NULL, 'iot:gateway:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4044, 4012, 4, '网关修改', 3, NULL, NULL, NULL, 'iot:gateway:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4045, 4012, 4, '网关删除', 3, NULL, NULL, NULL, 'iot:gateway:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4041), (1, 4042), (1, 4043), (1, 4044), (1, 4045);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构、第二条应 5 行、第三条应 5 行）：
++--   SHOW CREATE TABLE iot_gateway;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4041 AND 4045;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4041 AND 4045;
++-- ============================================================

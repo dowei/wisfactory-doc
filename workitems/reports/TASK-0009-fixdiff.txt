@@ -1,0 +1,1032 @@
+commit 9045f387c5fa2361f224ab60eea7a3efc3e65f07
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 02:41:22 2026 +0800
+
+    fix(iot): 字典导入解析修订轮——SAX 物理行号保真/首行缺格原始 null/超 5000 行流式中止（TASK-0009 修订轮，评审 I-1/I-2/I-3）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+index df7e0e8..92592bf 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+@@ -1,8 +1,6 @@
+ package net.otlab.admin.module.iot.controller;
+ 
+ import cn.dev33.satoken.annotation.SaCheckPermission;
+-import cn.hutool.core.convert.Convert;
+-import cn.hutool.poi.excel.ExcelReader;
+ import cn.hutool.poi.excel.ExcelUtil;
+ import cn.hutool.poi.excel.ExcelWriter;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+@@ -14,11 +12,14 @@ import net.otlab.admin.module.iot.entity.IotDataDict;
+ import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowLimitException;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
+ import net.otlab.admin.module.iot.service.IotDataDictService;
++import net.otlab.admin.module.iot.service.support.DictImportExcelSaxParser;
+ import net.otlab.core.annotation.OperateLog;
+ import net.otlab.core.annotation.RepeatSubmit;
+ import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.Result;
+ import net.otlab.core.result.ResultCode;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -33,7 +34,7 @@ import java.util.Arrays;
+ import java.util.List;
+ 
+ /**
+- * 业务数据字典控制器（TASK-0008 / TASK-0009）
++ * 业务数据字典控制器（TASK-0008 / TASK-0009 / 修订轮 I-1/I-2/I-3）
+  *
+  * <p>路径命名空间 /iot/dict（本批定版：iot 域控制器统一 /iot/&lt;resource&gt;，
+  * 消除与框架 /dict 等扁平路径的撞名隐患）；权限前缀 iot:dict:*（sys_menu 4018-4023）。
+@@ -44,6 +45,14 @@ import java.util.List;
+  * GET /import/template（模板下载）、POST /import/error-report（错误行清单下载，
+  * 回执失败行渲染 xlsx，复用同一 Hutool Excel 组件）。
+  *
++ * <p>修订轮（评审 I-1/I-2/I-3）：导入解析由 Hutool DOM read(1) 改为
++ * {@link DictImportExcelSaxParser} SAX 流式——① 物理行号保真（r 属性，空行不产生行号前移，
++ * DOM read(1) 的 ignoreEmptyRow=true 会整行跳过导致后续行号前移）；② 任何行缺格保持 null
++ * （DOM read(1) 的 aliasFirstLine 会把首数据行 null 单元格填成 Excel 列名字母 "A"/"B"，
++ * MISSING_REQUIRED 对首行失效、垃圾码静默落库）；③ 数据行超过 5000 在流式中途整批拒绝
++ * （fail fast、内存有界——DOM 全量放大后计数为时已晚）。模板下载与错误清单渲染仍用
++ * Hutool ExcelWriter（写出侧无此三项问题）。
++ *
+  * @author dowei
+  * @date 2026-11-21
+  */
+@@ -52,11 +61,12 @@ import java.util.List;
+ @RequestMapping("/iot/dict")
+ public class IotDataDictController {
+ 
+-    /** 模板说明行文案（首列以「说明：」开头，导入时由服务层自动跳过） */
+-    static final String TEMPLATE_NOTE = "说明：data_code/data_name/data_type 必填；data_type 仅允许 DOUBLE/INT/BOOL/ENUM；"
++    /** 模板说明行文案（首列以 {@link DictImportRow#NOTE_ROW_PREFIX} 开头，导入时由解析/服务层自动跳过） */
++    static final String TEMPLATE_NOTE = DictImportRow.NOTE_ROW_PREFIX
++            + "data_code/data_name/data_type 必填；data_type 仅允许 DOUBLE/INT/BOOL/ENUM；"
+             + "category 仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER（可空）；长度上限 data_code 64、data_name 100、"
+-            + "category/default_unit 32；data_code 租户内唯一且不复用，重复编码拒绝落库；单批上限 5000 行；"
+-            + "示例行导入前请删除或替换；本说明行导入时自动跳过。";
++            + "category/default_unit 32；data_code 租户内唯一且不复用，重复编码拒绝落库；单批上限 "
++            + IotDataDictService.IMPORT_MAX_ROWS + " 行；示例行导入前请删除或替换；本说明行导入时自动跳过。";
+ 
+     @Autowired
+     private IotDataDictService dictService;
+@@ -171,34 +181,19 @@ public class IotDataDictController {
+     }
+ 
+     /**
+-     * Excel 机械解析：行号保持 Excel 物理行号（表头占第 1 行，数据自第 2 行起）；
+-     * 单元格值 trim 后按位映射五列；说明行/空行原样透传（服务层统一裁剪）。
++     * Excel 流式解析（修订轮 I-1/I-2/I-3，详见 {@link DictImportExcelSaxParser}）：
++     * 行号 = Excel 物理行号（r 属性保真，空行不前移）、缺格保持 null（无 alias 列名字母填充）、
++     * 数据行超 {@link IotDataDictService#IMPORT_MAX_ROWS} 在流式中途整批拒绝（fail fast）；
++     * 说明行/空行条目原样透传（服务层统一裁剪）。
+      */
+     private List<DictImportRow> parseImportRows(MultipartFile file) throws IOException {
+-        List<DictImportRow> rows = new ArrayList<>();
+-        try (ExcelReader reader = ExcelUtil.getReader(file.getInputStream())) {
+-            List<List<Object>> dataRows = reader.read(1);
+-            int rowIndex = 2;
+-            for (List<Object> cells : dataRows) {
+-                DictImportRow row = new DictImportRow();
+-                row.setRowIndex(rowIndex++);
+-                row.setDataCode(cell(cells, 0));
+-                row.setDataName(cell(cells, 1));
+-                row.setCategory(cell(cells, 2));
+-                row.setDataType(cell(cells, 3));
+-                row.setDefaultUnit(cell(cells, 4));
+-                rows.add(row);
+-            }
+-        }
+-        return rows;
+-    }
+-
+-    private String cell(List<Object> cells, int index) {
+-        if (cells == null || cells.size() <= index) {
+-            return null;
++        try {
++            return DictImportExcelSaxParser.parse(file.getInputStream(), IotDataDictService.IMPORT_MAX_ROWS);
++        } catch (DictImportRowLimitException e) {
++            // 上限在解析中途触发（fail fast）：整批拒绝（PARAM_ERROR），与批级拒绝同口径
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "单批导入上限 " + IotDataDictService.IMPORT_MAX_ROWS + " 行，当前 " + e.getCount() + " 行");
+         }
+-        String value = Convert.toStr(cells.get(index));
+-        return value == null ? null : value.trim();
+     }
+ 
+     /** xlsx 下载出口（模板与错误清单共用，照 SysUserController.export 范式） */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java
+index b0f31e5..7276303 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java
+@@ -18,13 +18,16 @@ import lombok.Data;
+ @Data
+ public class DictImportRow {
+ 
+-    /** Excel 物理行号（表头=1，数据自 2 起），回执与错误清单按此标注 */
++    /** 模板说明行识别前缀（首列以「说明：」开头的行导入时自动跳过，见模板说明行文案；修订轮自 ServiceImpl 上移至此——控制器流式计数与服务层裁剪共用同一口径） */
++    public static final String NOTE_ROW_PREFIX = "说明：";
++
++    /** Excel 物理行号（表头=1，数据自 2 起），回执与错误清单按此标注（修订轮 I-1：物理行号由解析层从 &lt;row r="N"&gt; 属性保真携带，空行不产生行号前移） */
+     private Integer rowIndex;
+ 
+     /** data_code 列原始值（已 trim） */
+     private String dataCode;
+ 
+-    /** data_name 列原始值（已 trim） */
++    /** data_name 列原始值（已 trim；缺格保持 null——修订轮 I-2 后无 alias 列名字母填充） */
+     private String dataName;
+ 
+     /** category 列原始值（已 trim，可空） */
+@@ -35,4 +38,17 @@ public class DictImportRow {
+ 
+     /** default_unit 列原始值（已 trim，可空） */
+     private String defaultUnit;
++
++    /**
++     * 是否为可跳过行（修订轮 I-3：控制器流式计数与服务层裁剪共用本判定）：
++     * 全空行（分隔空行，无任何意图值）或模板说明行（首列「说明：」前缀）。
++     */
++    public boolean isSkippable() {
++        boolean hasAnyValue = dataCode != null || dataName != null
++                || category != null || dataType != null || defaultUnit != null;
++        if (!hasAnyValue) {
++            return true;
++        }
++        return dataCode != null && dataCode.startsWith(NOTE_ROW_PREFIX);
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowLimitException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowLimitException.java
+new file mode 100644
+index 0000000..7980731
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowLimitException.java
+@@ -0,0 +1,28 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import lombok.Getter;
++
++/**
++ * 字典批量导入行数上限流式中止异常（TASK-0009 修订轮 I-3）
++ *
++ * <p>在 SAX 流式解析的逐行回调中抛出：数据行超过上限立即中止解析（fail fast，
++ * 内存有界——不构造全量行清单、不全量 DOM 放大）。控制器从异常链中识别本类型
++ * （POI/JAXP 可能原样透传 RuntimeException，本类型从回调层直达调用方）后映射
++ * PARAM_ERROR(400) 整批拒绝。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Getter
++public class DictImportRowLimitException extends RuntimeException {
++
++    private static final long serialVersionUID = 1L;
++
++    /** 中止时已解析的数据行数（= 上限 + 1） */
++    private final int count;
++
++    public DictImportRowLimitException(int count) {
++        super("单批导入行数超过上限，中止解析于第 " + count + " 数据行");
++        this.count = count;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+index 4c8d0a8..d673704 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+@@ -16,6 +16,9 @@ import java.util.List;
+  */
+ public interface IotDataDictService extends IService<IotDataDict> {
+ 
++    /** 导入单批上限（brief 裁决 1：超限整批拒绝；修订轮 I-3 起控制器流式解析层与本服务层共用同一口径常量） */
++    int IMPORT_MAX_ROWS = 5000;
++
+     /**
+      * 分页查询字典（过滤 dataCode/dataName 模糊、category/status 精确）。
+      * 租户条件由多租户插件按会话租户自动追加。
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+index 876f3ca..28bda6c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+@@ -53,9 +53,6 @@ import java.util.regex.Pattern;
+ @Service
+ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDataDict> implements IotDataDictService {
+ 
+-    /** 导入单批上限（brief 裁决 1：超限整批拒绝） */
+-    static final int IMPORT_MAX_ROWS = 5000;
+-
+     /** varchar 限长口径（与 iot_data_dict DDL 一致） */
+     private static final int MAX_LEN_DATA_CODE = 64;
+     private static final int MAX_LEN_DATA_NAME = 100;
+@@ -66,9 +63,6 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+     private static final Pattern DATA_TYPE_PATTERN = Pattern.compile("DOUBLE|INT|BOOL|ENUM");
+     private static final Pattern CATEGORY_PATTERN = Pattern.compile("ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER");
+ 
+-    /** 模板说明行识别前缀（首列以「说明：」开头的行导入时自动跳过，见模板说明行文案） */
+-    static final String NOTE_ROW_PREFIX = "说明：";
+-
+     @Override
+     public Page<IotDataDict> selectDictList(Page<IotDataDict> page, IotDataDict query) {
+         LambdaQueryWrapper<IotDataDict> wrapper = new LambdaQueryWrapper<>();
+@@ -180,7 +174,7 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+         }
+         List<DictImportRow> dataRows = new ArrayList<>();
+         for (DictImportRow row : rows) {
+-            if (isSkippableRow(row)) {
++            if (row.isSkippable()) {
+                 continue;
+             }
+             dataRows.add(row);
+@@ -277,18 +271,6 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+         return receipt;
+     }
+ 
+-    /**
+-     * 模板说明行（首列「说明：」前缀）与全空行（分隔空行）不计入数据行。
+-     */
+-    private boolean isSkippableRow(DictImportRow row) {
+-        boolean hasAnyValue = row.getDataCode() != null || row.getDataName() != null
+-                || row.getCategory() != null || row.getDataType() != null || row.getDefaultUnit() != null;
+-        if (!hasAnyValue) {
+-            return true;
+-        }
+-        return row.getDataCode() != null && row.getDataCode().startsWith(NOTE_ROW_PREFIX);
+-    }
+-
+     /**
+      * 字段级校验：必填缺失 → 超长 → 类型非法 → 值域非法（逐行首个命中即返回）。
+      *
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParser.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParser.java
+new file mode 100644
+index 0000000..983c912
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParser.java
+@@ -0,0 +1,361 @@
++package net.otlab.admin.module.iot.service.support;
++
++import cn.hutool.core.io.IORuntimeException;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowLimitException;
++import org.apache.poi.openxml4j.opc.OPCPackage;
++import org.apache.poi.openxml4j.opc.PackagePart;
++import org.apache.poi.openxml4j.opc.PackageRelationship;
++import org.apache.poi.openxml4j.opc.PackageRelationshipTypes;
++import org.apache.poi.util.XMLHelper;
++import org.apache.poi.xssf.eventusermodel.XSSFReader;
++import org.xml.sax.Attributes;
++import org.xml.sax.InputSource;
++import org.xml.sax.SAXException;
++import org.xml.sax.XMLReader;
++import org.xml.sax.helpers.DefaultHandler;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++
++/**
++ * 字典导入 Excel(.xlsx) SAX 流式解析器（TASK-0009 修订轮 I-1/I-2/I-3）
++ *
++ * <p><b>为何不用 Hutool ExcelUtil.readBySax（评审 I-3 字面口径的偏离，附实证）</b>：
++ * hutool 5.8.25 的 {@code SheetDataSaxHandler.startElement} 以 <b>qname</b> 匹配
++ * （字节码：{@code "sheetData".equals(qname)} / {@code ElementName.of(qname)}），而其底层
++ * {@code ExcelSaxUtil.readFrom} 使用 POI {@code org.apache.poi.util.XMLHelper.newXMLReader()}
++ * ——namespace-aware 安全口径下 default-namespace 元素的 qname 为空串，行元素永不匹配，
++ * 实测<b>回调零触发且无任何报错</b>（本机 jshell 探针：Excel07SaxReader.read(File,int|rId1) 与
++ * ExcelUtil.readBySax(File,int) 均「done, no error」零回调，与工程依赖 hutool 5.8.25 + POI 5.2.5
++ * 完全一致）。即 hutool 5.8.25 的 SAX 通道在本工程 classpath 上不可用（升级 hutool 超出本任务
++ * 改动范围）。故按评审 I-3 的「SAX 流式解析」<b>意图</b>改用 POI 原生 XSSFReader + POI 安全
++ * XMLReader（同一 {@code XMLHelper.newXMLReader()}，XXE 防护口径不变）自实现行级回调——
++ * 依赖（poi-ooxml）零新增。
++ *
++ * <p><b>三项评审要点的落实</b>：
++ * <ul>
++ * <li>I-1 物理行号保真：rowIndex 取自 {@code <row r="N">} 的 r 属性（1-based Excel 物理行号），
++ *     XML 中缺失的空行不产出条目、存在于 XML 的空行（如 {@code <row r="3"/>} 占位）产出可跳过
++ *     条目（{@link DictImportRow#isSkippable()}）——两种情况均不产生行号前移，空行裁剪归
++ *     「跳过判空」层（服务层）而非解析层。</li>
++ * <li>I-2 原始 null 保真：SAX 逐单元格取值，无 DOM read(1) 的 aliasFirstLine 列名字母填充，
++ *     首数据行缺格同样保持 null → 服务层 MISSING_REQUIRED 对首行有效，"A"/"B" 垃圾码无落库通道。</li>
++ * <li>I-3 fail fast：逐行回调维护数据行计数（排除可跳过行），超过 maxDataRows 立即抛
++ *     {@link DictImportRowLimitException} 中止解析（RuntimeException 经 JAXP XMLReader.parse
++ *     原样透传）——不构造全量行清单、不全量 DOM 放大，内存 O(共享字符串文本 + 单行)。</li>
++ * </ul>
++ *
++ * <p><b>共享字符串</b>：sharedStrings.xml 部件以 SAX 展平为纯 {@code List<String>}
++ * （{@code <si>} 内全部 {@code <t>} 文本拼接，含富文本 run 拼接；phonetic run 不作区分——
++ * POI/Hutool 生成的文件不含 phonetic，Excel 亦缺省关闭），避免 JAXB 元素树二次放大。
++ *
++ * <p><b>数值单元格归一</b>：整数值（含 "1002.0" 形态）转十进制整数字符串（"1002"），与既有
++ * DOM 口径一致（评审 III 实证 1001/1002.0 → "1001"/"1002"）；非整数值保留原文。
++ *
++ * <p><b>范围口径</b>：仅解析<b>首个 sheet</b>（与既有 {@code ExcelUtil.getReader()} 默认首 sheet
++ * 口径一致）；表头固定为物理第 1 行（照 SysUserController 导入模板范式）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class DictImportExcelSaxParser {
++
++    private DictImportExcelSaxParser() {
++    }
++
++    /**
++     * 流式解析导入文件为原始行清单（含说明行/空行透传条目，行号为 Excel 物理行号）。
++     *
++     * @param xlsxInput   .xlsx 文件输入流（方法内消费并随 OPCPackage 关闭）
++     * @param maxDataRows 数据行（非可跳过行）上限，超过立即中止解析
++     * @return 行清单（按物理行顺序；空表/无行返回空清单，由服务层拒绝）
++     * @throws DictImportRowLimitException 数据行超过 maxDataRows（fail fast 中止）
++     * @throws IORuntimeException          文件损坏/非 xlsx 等解析失败（由全局异常处理器兜底）
++     */
++    public static List<DictImportRow> parse(InputStream xlsxInput, int maxDataRows) {
++        try (OPCPackage pkg = OPCPackage.open(xlsxInput)) {
++            List<String> sharedStrings = loadSharedStrings(pkg);
++            XSSFReader xssf = new XSSFReader(pkg);
++            Iterator<InputStream> sheets = xssf.getSheetsData();
++            if (!sheets.hasNext()) {
++                return new ArrayList<>();
++            }
++            try (InputStream sheet = sheets.next()) {
++                SheetRowHandler handler = new SheetRowHandler(sharedStrings, maxDataRows);
++                XMLReader xmlReader = XMLHelper.newXMLReader();
++                xmlReader.setContentHandler(handler);
++                xmlReader.parse(new InputSource(sheet));
++                return handler.rows;
++            }
++        } catch (DictImportRowLimitException e) {
++            throw e;
++        } catch (SAXException | IOException | javax.xml.parsers.ParserConfigurationException
++                | org.apache.poi.openxml4j.exceptions.OpenXML4JException e) {
++            throw new IORuntimeException("导入 Excel 解析失败: " + e.getMessage(), e);
++        }
++    }
++
++    /** ECMA-376 sharedStrings 关系类型（POI 5.2.5 的 PackageRelationshipTypes 无此常量，XSSFRelation.SHARED_STRINGS 同值） */
++    private static final String SHARED_STRINGS_REL =
++            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
++
++    /**
++     * sharedStrings.xml 部件 SAX 展平（纯文本清单，无 JAXB 元素树）；部件缺失返回空清单。
++     * 关系图：包根 --CORE_DOCUMENT--> workbook 部件 --sharedStrings--> sharedStrings 部件
++     * （sharedStrings 关系挂在 workbook 部件上而非包根，解析挂错层会静默取空清单——修订轮实测）。
++     */
++    private static List<String> loadSharedStrings(OPCPackage pkg) throws SAXException, IOException,
++            javax.xml.parsers.ParserConfigurationException,
++            org.apache.poi.openxml4j.exceptions.InvalidFormatException {
++        List<String> list = new ArrayList<>();
++        PackagePart workbookPart = null;
++        for (PackageRelationship rel : pkg.getRelationshipsByType(PackageRelationshipTypes.CORE_DOCUMENT)) {
++            workbookPart = pkg.getPart(rel);
++            break;
++        }
++        if (workbookPart == null) {
++            return list;
++        }
++        for (PackageRelationship rel : workbookPart.getRelationshipsByType(SHARED_STRINGS_REL)) {
++            PackagePart part = workbookPart.getRelatedPart(rel);
++            if (part == null) {
++                continue;
++            }
++            try (InputStream in = part.getInputStream()) {
++                SharedStringsHandler handler = new SharedStringsHandler(list);
++                XMLReader xmlReader = XMLHelper.newXMLReader();
++                xmlReader.setContentHandler(handler);
++                xmlReader.parse(new InputSource(in));
++            }
++        }
++        return list;
++    }
++
++    /** {@code <si>} 内全部 {@code <t>} 文本拼接（富文本 run 合并为整串）。 */
++    private static final class SharedStringsHandler extends DefaultHandler {
++        private final List<String> list;
++        private final StringBuilder buf = new StringBuilder();
++        private boolean inSi = false;
++        private boolean inT = false;
++
++        SharedStringsHandler(List<String> list) {
++            this.list = list;
++        }
++
++        @Override
++        public void startElement(String uri, String localName, String qName, Attributes attributes) {
++            if ("si".equals(localName)) {
++                inSi = true;
++                buf.setLength(0);
++            } else if ("t".equals(localName) && inSi) {
++                inT = true;
++            }
++        }
++
++        @Override
++        public void characters(char[] ch, int start, int length) {
++            if (inT) {
++                buf.append(ch, start, length);
++            }
++        }
++
++        @Override
++        public void endElement(String uri, String localName, String qName) {
++            if ("t".equals(localName) && inT) {
++                inT = false;
++            } else if ("si".equals(localName) && inSi) {
++                inSi = false;
++                list.add(buf.toString());
++            }
++        }
++    }
++
++    /** 首个 sheet 的行级 ContentHandler：物理行号取 r 属性，逐行产出 {@link DictImportRow}。 */
++    private static final class SheetRowHandler extends DefaultHandler {
++        private final List<String> sharedStrings;
++        private final int maxDataRows;
++        private final List<DictImportRow> rows = new ArrayList<>();
++        private int dataCount = 0;
++
++        private long rowNumber = 0;          // 当前物理行号（r 属性，1-based；缺省时上一行 + 1）
++        private int cellColumn = -1;         // 当前单元格列号（r 属性推导，0-based）
++        private String cellType = null;      // 当前单元格 t 类型（null = "n" 数值）
++        private boolean inValue = false;     // 位于 <v> 内
++        private boolean inInlineText = false; // 位于 inlineStr 的 <is> 内
++        private final StringBuilder buf = new StringBuilder();
++        private List<String> cells = new ArrayList<>(); // 当前行按列位存放（稀疏补 null）
++        private int maxCol = -1;
++
++        SheetRowHandler(List<String> sharedStrings, int maxDataRows) {
++            this.sharedStrings = sharedStrings;
++            this.maxDataRows = maxDataRows;
++        }
++
++        @Override
++        public void startElement(String uri, String localName, String qName, Attributes attributes) {
++            switch (localName) {
++                case "row":
++                    String r = attributes.getValue("r");
++                    rowNumber = r != null ? Long.parseLong(r) : rowNumber + 1;
++                    cells = new ArrayList<>();
++                    maxCol = -1;
++                    break;
++                case "c":
++                    cellColumn = colIndex(attributes.getValue("r"));
++                    cellType = attributes.getValue("t");
++                    buf.setLength(0);
++                    break;
++                case "v":
++                    inValue = true;
++                    buf.setLength(0);
++                    break;
++                case "is":
++                    inInlineText = true;
++                    break;
++                case "t":
++                    if (inInlineText) {
++                        buf.setLength(0);
++                    }
++                    break;
++                default:
++                    break;
++            }
++        }
++
++        @Override
++        public void characters(char[] ch, int start, int length) {
++            if (inValue || inInlineText) {
++                buf.append(ch, start, length);
++            }
++        }
++
++        @Override
++        public void endElement(String uri, String localName, String qName) {
++            switch (localName) {
++                case "v":
++                    setCell(cellValue(cellType, buf.toString()));
++                    inValue = false;
++                    break;
++                case "t":
++                    if (inInlineText) {
++                        setCell(buf.toString());
++                    }
++                    break;
++                case "c":
++                    cellType = null;
++                    inValue = false;
++                    break;
++                case "is":
++                    inInlineText = false;
++                    break;
++                case "row":
++                    finishRow();
++                    break;
++                default:
++                    break;
++            }
++        }
++
++        private void setCell(String value) {
++            if (cellColumn < 0) {
++                return;
++            }
++            // 空串归一 null：hutool 对 null 值写空 inlineStr（<t></t>），Excel 对空单元格同样可能留空串——
++            // 「显式空串」与「缺格」在导入语义上等价（五列均无空串合法值），统一为 null 后
++            // isSkippable（全空行）与 MISSING_REQUIRED（必填缺失）判定对两种编码口径行为一致
++            if (value != null && value.isEmpty()) {
++                value = null;
++            }
++            while (cells.size() <= cellColumn) {
++                cells.add(null);
++            }
++            cells.set(cellColumn, value);
++            if (cellColumn > maxCol) {
++                maxCol = cellColumn;
++            }
++        }
++
++        private String cellValue(String type, String v) {
++            if (v == null || v.isEmpty()) {
++                return null;
++            }
++            if ("s".equals(type)) {
++                // 共享字符串：v 为索引
++                int idx;
++                try {
++                    idx = Integer.parseInt(v.trim());
++                } catch (NumberFormatException e) {
++                    return null;
++                }
++                return idx >= 0 && idx < sharedStrings.size() ? sharedStrings.get(idx) : null;
++            }
++            if ("b".equals(type)) {
++                return "1".equals(v.trim()) ? "true" : "false";
++            }
++            if ("str".equals(type) || "e".equals(type)) {
++                return v; // 公式缓存字符串 / 错误值原样
++            }
++            return numericValue(v); // "n"（缺省类型）
++        }
++
++        /** 整数值（含 1002.0 形态）转十进制整数字符串；非整数保留原文；非法数值原样兜底。 */
++        private static String numericValue(String v) {
++            try {
++                double d = Double.parseDouble(v.trim());
++                if (Double.isFinite(d) && d == Math.rint(d) && Math.abs(d) < 9.0E15) {
++                    return String.valueOf((long) d);
++                }
++                return v;
++            } catch (NumberFormatException e) {
++                return v;
++            }
++        }
++
++        /** Excel 单元格引用（如 B12）→ 0-based 列号；无引用返回 -1。 */
++        private static int colIndex(String ref) {
++            if (ref == null || ref.isEmpty()) {
++                return -1;
++            }
++            int idx = 0;
++            for (int i = 0; i < ref.length(); i++) {
++                char ch = ref.charAt(i);
++                if (ch >= 'A' && ch <= 'Z') {
++                    idx = idx * 26 + (ch - 'A' + 1);
++                } else if (ch >= 'a' && ch <= 'z') {
++                    idx = idx * 26 + (ch - 'a' + 1);
++                } else {
++                    break; // 行号数字段开始，列字母段结束
++                }
++            }
++            return idx - 1; // A → 0
++        }
++
++        private void finishRow() {
++            long physical = rowNumber; // 无 r 属性的行已在 startElement 按「上一行 + 1」递增
++            if (physical <= 1) {
++                return; // 物理第 1 行 = 表头
++            }
++            DictImportRow row = new DictImportRow();
++            row.setRowIndex((int) physical);
++            row.setDataCode(trim(cells, 0));
++            row.setDataName(trim(cells, 1));
++            row.setCategory(trim(cells, 2));
++            row.setDataType(trim(cells, 3));
++            row.setDefaultUnit(trim(cells, 4));
++            rows.add(row);
++            if (!row.isSkippable() && ++dataCount > maxDataRows) {
++                // I-3 fail fast：RuntimeException 经 JAXP XMLReader.parse 原样透传出 parse()
++                throw new DictImportRowLimitException(dataCount);
++            }
++        }
++
++        private static String trim(List<String> cells, int index) {
++            String value = index < cells.size() ? cells.get(index) : null;
++            return value == null ? null : value.trim();
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java
+index 2ca8bf7..fc60f81 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java
+@@ -32,11 +32,13 @@ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.lang.reflect.Method;
++import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.anyList;
+ import static org.mockito.ArgumentMatchers.anyString;
+@@ -124,47 +126,99 @@ class IotDataDictImportControllerTest {
+     // ---------- POST /iot/dict/import ----------
+ 
+     @Test
+-    @DisplayName("导入 - 真实 xlsx 解析：五列按位映射、行号自 2 起、说明行透传给服务层裁剪")
+-    void testImport_ParsesExcelRows() throws Exception {
++    @DisplayName("导入 - 真实 xlsx 解析（I-1）：含空行文件行号保真——空行后数据行 rowIndex=物理行号 4（不前移）")
++    void testImport_ParsesExcelRows_PhysicalAlignmentWithEmptyRow() throws Exception {
+         byte[] bytes = buildExcel(Arrays.asList(
+                 Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
+-                Arrays.asList("说明：data_type 仅允许 DOUBLE/INT/BOOL/ENUM", null, null, null, null),
+                 Arrays.asList("ELEC_CONS", "用电量", "ELEC", "DOUBLE", "kWh"),
++                Arrays.asList(null, null, null, null, null),
+                 Arrays.asList("WATER_CONS", "用水量", "WATER", "INT", "t")));
+         when(dictService.importDicts(anyList())).thenReturn(receiptOf(2, 0, true));
+ 
+         mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.code").value(200))
+-                .andExpect(jsonPath("$.data.successCount").value(2))
+-                .andExpect(jsonPath("$.data.persisted").value(true));
++                .andExpect(jsonPath("$.data.successCount").value(2));
+ 
+         @SuppressWarnings("unchecked")
+         ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
+         verify(dictService).importDicts(captor.capture());
+         List<DictImportRow> parsed = captor.getValue();
+-        assertEquals(3, parsed.size(), "表头被 read(1) 跳过；说明行按原样透传（服务层裁剪）");
++        List<DictImportRow> data = parsed.stream().filter(r -> !r.isSkippable()).collect(java.util.stream.Collectors.toList());
++        assertEquals(2, data.size(), "只有两个数据行（空行不算）");
++        assertEquals(2, data.get(0).getRowIndex(), "首个数据行=物理第 2 行");
++        assertEquals("ELEC_CONS", data.get(0).getDataCode());
++        assertEquals("用电量", data.get(0).getDataName());
++        assertEquals("ELEC", data.get(0).getCategory());
++        assertEquals("DOUBLE", data.get(0).getDataType());
++        assertEquals("kWh", data.get(0).getDefaultUnit());
++        assertEquals(4, data.get(1).getRowIndex(), "空行后数据行仍=物理第 4 行（评审 I-1：行号不得整体前移）");
++        assertEquals("WATER_CONS", data.get(1).getDataCode());
++    }
++
++    @Test
++    @DisplayName("导入 - 说明行透传（服务层裁剪）且行号保真（修订轮 I-1 连带口径）")
++    void testImport_NoteRowPassthrough_KeepsPhysicalRowNumber() throws Exception {
++        byte[] bytes = buildExcel(Arrays.asList(
++                Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
++                Arrays.asList("说明：data_type 仅允许 DOUBLE/INT/BOOL/ENUM", null, null, null, null),
++                Arrays.asList("ELEC_CONS", "用电量", "ELEC", "DOUBLE", "kWh")));
++        when(dictService.importDicts(anyList())).thenReturn(receiptOf(1, 0, true));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
++        verify(dictService).importDicts(captor.capture());
++        List<DictImportRow> parsed = captor.getValue();
++        assertEquals(2, parsed.size(), "说明行按原样透传（服务层裁剪口径不变）");
+         DictImportRow note = parsed.get(0);
+-        assertEquals(2, note.getRowIndex(), "说明行占 Excel 第 2 行，行号保持物理对齐");
++        assertEquals(2, note.getRowIndex(), "说明行占 Excel 第 2 行");
+         assertTrue(note.getDataCode().startsWith("说明："));
++        assertTrue(note.isSkippable(), "说明行可跳过，不计入数据行上限");
+         DictImportRow first = parsed.get(1);
+         assertEquals(3, first.getRowIndex());
+         assertEquals("ELEC_CONS", first.getDataCode());
+-        assertEquals("用电量", first.getDataName());
++        assertEquals("DOUBLE", first.getDataType());
++    }
++
++    @Test
++    @DisplayName("导入 - 首行缺格保持 null（I-2）：dataName=null 触发服务层 MISSING_REQUIRED，而非 alias 列名字母 'B' 落库")
++    void testImport_FirstRowMissingCells_StayNull() throws Exception {
++        byte[] bytes = buildExcel(Arrays.asList(
++                Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
++                Arrays.asList("CODE_X", null, "ELEC", "DOUBLE", "kWh"),
++                Arrays.asList("CODE_Y", "正常行", "WATER", "INT", "t")));
++        when(dictService.importDicts(anyList())).thenReturn(receiptOf(2, 0, true));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
++        verify(dictService).importDicts(captor.capture());
++        List<DictImportRow> parsed = captor.getValue();
++        DictImportRow first = parsed.get(0);
++        assertEquals(2, first.getRowIndex());
++        assertEquals("CODE_X", first.getDataCode());
++        assertNull(first.getDataName(), "首数据行缺格必须保持 null（评审 I-2：DOM read(1) aliasFirstLine 填 'B'，"
++                + "必填缺失对首行失效、'B' 落库成永久占码垃圾条目）");
+         assertEquals("ELEC", first.getCategory());
+         assertEquals("DOUBLE", first.getDataType());
+-        assertEquals("kWh", first.getDefaultUnit());
+-        assertEquals(4, parsed.get(2).getRowIndex());
+-        assertEquals("WATER_CONS", parsed.get(2).getDataCode());
+     }
+ 
+     @Test
+-    @DisplayName("导入 - 空白行同样透传（服务层统一裁剪），单元格值去除首尾空白")
+-    void testImport_TrimsCellsAndKeepsBlankRows() throws Exception {
++    @DisplayName("导入 - 单元格 trim 且含空行文件行号保真（修订轮 I-1 连带名实相符改造）")
++    void testImport_TrimsCells_KeepsPhysicalAlignmentWithGap() throws Exception {
+         byte[] bytes = buildExcel(Arrays.asList(
+                 Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
+-                Arrays.asList("  ELEC_CONS  ", " 用电量 ", null, " DOUBLE ", null)));
+-        when(dictService.importDicts(anyList())).thenReturn(receiptOf(1, 0, true));
++                Arrays.asList("  ELEC_CONS  ", " 用电量 ", null, " DOUBLE ", null),
++                Arrays.asList(null, null, null, null, null),
++                Arrays.asList("WATER_CONS", "用水量", "WATER", "INT", "t")));
++        when(dictService.importDicts(anyList())).thenReturn(receiptOf(2, 0, true));
+ 
+         mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
+                 .andExpect(status().isOk())
+@@ -173,9 +227,34 @@ class IotDataDictImportControllerTest {
+         @SuppressWarnings("unchecked")
+         ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
+         verify(dictService).importDicts(captor.capture());
+-        DictImportRow parsed = captor.getValue().get(0);
+-        assertEquals("ELEC_CONS", parsed.getDataCode(), "单元格值 trim");
+-        assertEquals("DOUBLE", parsed.getDataType());
++        List<DictImportRow> data = captor.getValue().stream()
++                .filter(r -> !r.isSkippable()).collect(java.util.stream.Collectors.toList());
++        assertEquals("ELEC_CONS", data.get(0).getDataCode(), "单元格值 trim");
++        assertEquals("DOUBLE", data.get(0).getDataType());
++        assertEquals(2, data.get(0).getRowIndex());
++        assertEquals(4, data.get(1).getRowIndex(), "空行后行号保真");
++    }
++
++    @Test
++    @DisplayName("导入 - 超 5000 数据行（I-3）：SAX 流式中途整批拒绝（400），服务层零调用，不构造全量行清单")
++    void testImport_Over5000Rows_AbortParsingFast() throws Exception {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"));
++        for (int i = 2; i <= 5002; i++) { // 5001 条数据行
++            rows.add(Arrays.asList("CODE_" + i, "名称" + i, "ELEC", "DOUBLE", "kWh"));
++        }
++        byte[] bytes = buildExcel(rows);
++
++        long start = System.currentTimeMillis();
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("单批导入上限 5000 行，当前 5001 行"));
++        long cost = System.currentTimeMillis() - start;
++        System.out.println("[I-3 冒烟/单测实测] 5001 数据行上传+流式中止耗时 = " + cost + " ms");
++
++        verify(dictService, org.mockito.Mockito.never()).importDicts(anyList());
++        System.out.println("[I-3] 服务层零调用确认（fail fast 于解析层）");
+     }
+ 
+     @Test
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParserTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParserTest.java
+new file mode 100644
+index 0000000..ac1d2f8
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/support/DictImportExcelSaxParserTest.java
+@@ -0,0 +1,227 @@
++package net.otlab.admin.module.iot.service.support;
++
++import cn.hutool.poi.excel.ExcelUtil;
++import cn.hutool.poi.excel.ExcelWriter;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowLimitException;
++import org.apache.poi.ss.usermodel.Workbook;
++import org.apache.poi.xssf.usermodel.XSSFWorkbook;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 字典导入 Excel SAX 流式解析器单元测试（TASK-0009 修订轮 I-1/I-2/I-3）
++ *
++ * <p>夹具双通道：POI XSSFWorkbook（字符串走 sharedStrings 部件，XSSF 默认口径）与
++ * Hutool BigWriter（inlineStr 口径）——两条真实编码路径都必须解析正确。
++ *
++ * <p>核心断言：① rowIndex 一律为 Excel 物理行号（含空行/未触达行的文件，空行后行号不前移）；
++ * ② 任何行的 null 单元格保持 null（首数据行同样，杜绝 alias 列名字母填充）；③ 数据行超过
++ * 上限在流式中途立即中止（fail fast，不构造全量行清单）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DictImportExcelSaxParserTest {
++
++    private static final int MAX_DATA_ROWS = 5000;
++
++    /** POI XSSF 夹具（sharedStrings 编码路径）：createRow 但不 createCell = 空行占位 */
++    private byte[] poiFixture() throws IOException {
++        try (XSSFWorkbook wb = new XSSFWorkbook(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            var sheet = wb.createSheet("Sheet1");
++            var header = sheet.createRow(0);
++            header.createCell(0).setCellValue("data_code");
++            header.createCell(1).setCellValue("data_name");
++            header.createCell(2).setCellValue("category");
++            header.createCell(3).setCellValue("data_type");
++            header.createCell(4).setCellValue("default_unit");
++            var r2 = sheet.createRow(1);
++            r2.createCell(0).setCellValue("CODE_A");
++            r2.createCell(1).setCellValue("名称A");
++            r2.createCell(2).setCellValue("ELEC");
++            r2.createCell(3).setCellValue("DOUBLE");
++            r2.createCell(4).setCellValue("kWh");
++            sheet.createRow(2); // 物理第 3 行：空行（无单元格）
++            var r4 = sheet.createRow(3);
++            r4.createCell(0).setCellValue("CODE_B");
++            r4.createCell(1).setCellValue("名称B");
++            r4.createCell(2).setCellValue("WATER");
++            r4.createCell(3).setCellValue("INT");
++            r4.createCell(4).setCellValue("t");
++            wb.write(out);
++            return out.toByteArray();
++        }
++    }
++
++    /** Hutool BigWriter 夹具（inlineStr 编码路径），含数值单元格与首数据行缺格 */
++    private byte[] hutoolFixture(List<List<Object>> rows) throws IOException {
++        ExcelWriter writer = ExcelUtil.getBigWriter();
++        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            writer.write(rows);
++            writer.flush(out);
++            return out.toByteArray();
++        } finally {
++            writer.close();
++        }
++    }
++
++    /** 取非说明行且非全空行（数据行）的条目 */
++    private List<DictImportRow> dataRowsOf(List<DictImportRow> rows) {
++        List<DictImportRow> data = new ArrayList<>();
++        for (DictImportRow row : rows) {
++            if (!row.isSkippable()) {
++                data.add(row);
++            }
++        }
++        return data;
++    }
++
++    // ---------- I-1 物理行号保真 ----------
++
++    @Test
++    @DisplayName("物理行号 - 含空行文件：空行后的数据行 rowIndex=物理行号 4（不前移为 3），POI sharedStrings 值正确")
++    void testParse_PhysicalRowNumbersWithEmptyRowGap() throws IOException {
++        List<DictImportRow> rows = DictImportExcelSaxParser.parse(
++                new ByteArrayInputStream(poiFixture()), MAX_DATA_ROWS);
++
++        List<DictImportRow> data = dataRowsOf(rows);
++        assertEquals(2, data.size(), "只有两个数据行（空行不算数据行）");
++        assertEquals(2, data.get(0).getRowIndex(), "第 2 物理行");
++        assertEquals("CODE_A", data.get(0).getDataCode());
++        assertEquals("名称A", data.get(0).getDataName(), "POI sharedStrings 编码路径取值正确");
++        assertEquals(4, data.get(1).getRowIndex(), "空行后数据行仍是物理第 4 行——空行不产生行号前移");
++        assertEquals("CODE_B", data.get(1).getDataCode());
++    }
++
++    @Test
++    @DisplayName("物理行号 - 空行可能以全空条目透传（isSkippable），但绝不挤占后续行号")
++    void testParse_EmptyRowEntryIfPresentIsSkippable() throws IOException {
++        List<DictImportRow> rows = DictImportExcelSaxParser.parse(
++                new ByteArrayInputStream(poiFixture()), MAX_DATA_ROWS);
++
++        for (DictImportRow row : rows) {
++            if (row.getRowIndex() != null && row.getRowIndex() == 3) {
++                assertTrue(row.isSkippable(), "第 3 物理行为空行：即便以条目形式透传也必须可跳过");
++                assertNull(row.getDataCode());
++            }
++        }
++        // 无论空行是否产出条目，数据行物理行号不受影响（与上一用例互证）
++        assertEquals(2, dataRowsOf(rows).size());
++    }
++
++    // ---------- I-2 原始 null 保真（首数据行不再被列名字母填充） ----------
++
++    @Test
++    @DisplayName("首行缺格 - 首数据行缺 data_name：保持 null（而非 alias 列名字母 'B'），触发 MISSING_REQUIRED 的解析前提")
++    void testParse_FirstRowMissingCellsStayNull() throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        rows.add(java.util.Arrays.asList("CODE_X", null, "ELEC", "DOUBLE", "kWh")); // 首数据行缺名称
++        rows.add(java.util.Arrays.asList("CODE_Y", "正常行", "WATER", "INT", "t"));
++        byte[] bytes = hutoolFixture(rows);
++
++        List<DictImportRow> parsed = DictImportExcelSaxParser.parse(new ByteArrayInputStream(bytes), MAX_DATA_ROWS);
++
++        List<DictImportRow> data = dataRowsOf(parsed);
++        assertEquals(2, data.size());
++        DictImportRow first = data.get(0);
++        assertEquals(2, first.getRowIndex());
++        assertEquals("CODE_X", first.getDataCode());
++        assertNull(first.getDataName(), "首数据行缺格保持 null（DOM read(1) aliasFirstLine 会填 'B'，必填校验即失效）");
++        assertEquals("ELEC", first.getCategory());
++        assertEquals("DOUBLE", first.getDataType());
++        assertEquals("kWh", first.getDefaultUnit());
++        // 修订轮衔接：dataName=null 由服务层判 MISSING_REQUIRED（IotDataDictImportServiceTest 已覆盖）
++        // 行级垃圾码落库路径（dataName="B" 通过全部校验）随本断言一并封死
++    }
++
++    // ---------- 数值单元格归一（与 DOM 口径一致，评审 III 实证 1001/1002 → "1001"/"1002"） ----------
++
++    @Test
++    @DisplayName("数值单元格 - 1001（整数值）转字符串 '1001'，不带 .0 垃圾尾巴")
++    void testParse_NumericCellNormalized() throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        rows.add(java.util.Arrays.asList(1001, "数值编码", "ELEC", "DOUBLE", "kWh"));
++        rows.add(java.util.Arrays.asList(1002.0, "小数点编码", "ELEC", "DOUBLE", "kWh"));
++        byte[] bytes = hutoolFixture(rows);
++
++        List<DictImportRow> data = dataRowsOf(
++                DictImportExcelSaxParser.parse(new ByteArrayInputStream(bytes), MAX_DATA_ROWS));
++
++        assertEquals("1001", data.get(0).getDataCode());
++        assertEquals("1002", data.get(1).getDataCode());
++    }
++
++    // ---------- I-3 流式中止（fail fast） ----------
++
++    @Test
++    @DisplayName("行数上限 - 5001 数据行在流式中途抛 DictImportRowLimitException（fail fast，不产出全量行清单）")
++    void testParse_AbortsBeyondMaxDataRows() throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        for (int i = 2; i <= 5002; i++) { // 5001 条数据行
++            rows.add(java.util.Arrays.asList("CODE_" + i, "名称" + i, "ELEC", "DOUBLE", "kWh"));
++        }
++        byte[] bytes = hutoolFixture(rows);
++
++        long start = System.currentTimeMillis();
++        DictImportRowLimitException e = assertThrows(DictImportRowLimitException.class,
++                () -> DictImportExcelSaxParser.parse(new ByteArrayInputStream(bytes), MAX_DATA_ROWS));
++        long cost = System.currentTimeMillis() - start;
++
++        assertEquals(MAX_DATA_ROWS + 1, e.getCount(), "中止点=第 5001 条数据行");
++        System.out.println("[I-3 流式中止实测] 5001 数据行 xlsx 中止耗时 = " + cost + " ms");
++        assertTrue(cost < 60_000, "流式中止应在秒级完成（对比全量 DOM 解析）");
++    }
++
++    @Test
++    @DisplayName("边界 - 恰好 5000 数据行不触发中止，全部解析")
++    void testParse_ExactlyAtMaxDataRowsAccepted() throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        for (int i = 2; i <= 5001; i++) { // 恰 5000 条数据行
++            rows.add(java.util.Arrays.asList("CODE_" + i, "名称" + i, "ELEC", "DOUBLE", "kWh"));
++        }
++        byte[] bytes = hutoolFixture(rows);
++
++        List<DictImportRow> parsed = DictImportExcelSaxParser.parse(new ByteArrayInputStream(bytes), MAX_DATA_ROWS);
++
++        assertEquals(MAX_DATA_ROWS, dataRowsOf(parsed).size());
++        assertEquals(5001, dataRowsOf(parsed).get(MAX_DATA_ROWS - 1).getRowIndex(), "末行物理行号=5001");
++    }
++
++    // ---------- 模板说明行与空格行口径（与既有服务层语义对齐） ----------
++
++    @Test
++    @DisplayName("说明行透传 - 「说明：」前缀行按 isSkippable 透传（服务层裁剪），行号保真")
++    void testParse_NoteRowPassthrough() throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        rows.add(java.util.Arrays.asList("说明：data_type 仅允许 DOUBLE/INT/BOOL/ENUM", null, null, null, null));
++        rows.add(java.util.Arrays.asList("CODE_A", "名称A", "ELEC", "DOUBLE", "kWh"));
++        byte[] bytes = hutoolFixture(rows);
++
++        List<DictImportRow> parsed = DictImportExcelSaxParser.parse(new ByteArrayInputStream(bytes), MAX_DATA_ROWS);
++
++        assertEquals(2, parsed.size());
++        assertEquals(2, parsed.get(0).getRowIndex());
++        assertTrue(parsed.get(0).getDataCode().startsWith("说明："));
++        assertTrue(parsed.get(0).isSkippable(), "说明行可跳过，不计入数据行上限");
++        assertEquals(3, parsed.get(1).getRowIndex());
++        assertNotNull(parsed.get(1).getDataCode());
++    }
++}

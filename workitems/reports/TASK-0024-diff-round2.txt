@@ -1,0 +1,651 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index 4616e66..bc11d6f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -50,12 +50,21 @@ import java.util.List;
+  * 版本落库（publish_status=1, publish_time=NOW）→ iot_point/iot_data_item.config_version
+  * 回写（0021/0013 建列时声明「由配置发布链路回写」的承接）。
+  *
+- * <p><b>版本单调与并发（brief D3）</b>：version = selectMaxVersion + 1；同
+- * (tenant, scope) 并发发布的竞态由 {@code uk_scope_version} 物理唯一兜底——第二个
++ * <p><b>版本单调与并发（brief D3；修订轮 C-1 修复）</b>：version = selectMaxVersion + 1；
++ * 同 (tenant, scope) 并发发布的竞态由 {@code uk_scope_version} 物理唯一兜底——第二个
+  * INSERT 撞 {@link DuplicateKeyException}。<b>取舍：撞键即报 5001，不重试</b>——重试会
+  * 把「两人同时发布」的冲突静默变成先后两个新版本，违背 REQ-0033 核心规则「两人同时发布
+  * 报版本冲突 5001」与 TC-0008 步骤 5「后者报 5001」；撞键方持旧内容也复用价值存疑
+- * （发布前应基于最新配置重看影响），由用户刷新后重发。孤儿快照文件补偿删除（best-effort）。
++ * （发布前应基于最新配置重看影响），由用户刷新后重发。
++ *
++ * <p>快照文件<b>两段式落位</b>（修订轮 C-1 修复）：① {@link SnapshotStorage#stage}——
++ * 快照体写唯一暂存文件（随机名一次性，并发发布互不相撞，不占正式名）；② INSERT 成功
++ * （胜者）后 {@link SnapshotStorage#promote}——暂存文件原子落位确定性正式名。撞键败者
++ * 只删除自己的暂存文件（零残留），自始至终不触碰正式名——正式名只被胜者写过一次，胜者
++ * 已提交版本行指向的文件内容哈希与行哈希恒一致。旧实现「store 先写正式名（REPLACE_
++ * EXISTING）+ 撞键补偿 deleteQuietly 正式名」都作用于并发共享的确定性文件名，败者会
++ * 摧毁胜者快照（评审 C-1）——两段式下两个破坏向量同时消除；权衡（暂存孤儿/落位后回滚
++ * 的正式名孤儿均无行引用、可自愈）见 {@link SnapshotStorage} 类注释。
+  *
+  * <p><b>回滚（brief D5 裁决）</b>：新版本行 publish_status=1，snapshot_uri/snapshot_hash
+  * <b>复用 targetVersion 快照文件</b>（版本单调递增但快照复用，哈希同旧快照——不复制
+@@ -144,12 +153,15 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         credentialGuard.check(json);
+         String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+ 
+-        // 存储（一期本地目录）→ 版本落库；撞 uk_scope_version = 并发发布 → 5001（不重试，类注释取舍）
+-        String uri;
++        // 快照两段式落位（修订轮 C-1 修复，类注释「版本单调与并发」）：① stage 唯一暂存文件
++        // （随机名一次性——并发发布互不相撞、不占正式名）；② INSERT 成功（胜者）后 promote
++        // 原子落位确定性正式名。撞 uk_scope_version = 并发发布 → 5001（不重试，类注释取舍）；
++        // 败者只删自己的暂存文件（零残留）——正式名只被胜者写过一次，胜者行哈希与文件内容恒一致。
++        String stagingUri;
+         try {
+-            uri = snapshotStorage.store(tenantId, scopeType, scopeId, version, json);
++            stagingUri = snapshotStorage.stage(tenantId, scopeType, scopeId, version, json);
+         } catch (IOException e) {
+-            log.error("[SNAPSHOT] store failed tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version, e);
++            log.error("[SNAPSHOT] stage failed tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version, e);
+             throw new BusinessException(ResultCode.ERROR.getCode(), "快照存储失败: " + e.getMessage());
+         }
+         IotConfigVersion row = new IotConfigVersion();
+@@ -158,17 +170,27 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         row.setScopeId(scopeId);
+         row.setVersion(version);
+         row.setSnapshotHash(hash);
+-        row.setSnapshotUri(uri);
++        row.setSnapshotUri(SnapshotStorage.relativeUri(tenantId, scopeType, scopeId, version));
+         row.setPublishStatus(PUBLISH_STATUS_PUBLISHED);
+         row.setPublishTime(LocalDateTime.now());
+         try {
+             baseMapper.insert(row);
+         } catch (DuplicateKeyException e) {
+-            snapshotStorage.deleteQuietly(uri);
++            // 败者零残留补偿：只删自己的唯一暂存文件——绝不触碰正式名（胜者已提交版本行指向的文件）
++            snapshotStorage.deleteQuietly(stagingUri);
+             log.warn("[SNAPSHOT] concurrent publish rejected tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version);
+             throw new BusinessException(ResultCode.VERSION_CONFLICT.getCode(),
+                     "版本冲突：该范围存在并发发布，请刷新后重试");
+         }
++        try {
++            snapshotStorage.promote(stagingUri, row.getSnapshotUri());
++        } catch (IOException e) {
++            snapshotStorage.deleteQuietly(stagingUri);
++            log.error("[SNAPSHOT] promote failed tenant={} scope={}-{} version={} staging={}",
++                    tenantId, scopeType, scopeId, version, stagingUri, e);
++            // 抛错令事务回滚（rollbackFor=Exception）——不产生已提交版本行指向缺失的正式名文件
++            throw new BusinessException(ResultCode.ERROR.getCode(), "快照落位失败: " + e.getMessage());
++        }
+ 
+         writeBackConfigVersion(scopeType, version, pointIdsOf(snapshot), dataItemIdsOf(snapshot));
+         return row;
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java
+index 3cafa68..68ef782 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java
+@@ -23,9 +23,28 @@ import java.security.NoSuchAlgorithmException;
+  * （uk_scope_version 以 (tenant_id, scope_type, scope_id, version) 为键，存储键须同粒度）。
+  * snapshot_uri 落库存相对路径（{@code <tenant_id>/<文件名>}）。
+  *
+- * <p>写入原子性：临时文件 + {@link StandardCopyOption#ATOMIC_MOVE} 落位——半截文件不会
+- * 以正式名存在，取回侧哈希核对（{@code sha256Hex(readBytes(uri))} vs 落库
+- * snapshot_hash，不一致 500 告警——存储损坏探测）是最后防线而非常规路径。
++ * <p><b>写入协议（修订轮 C-1 修复——两段式落位）</b>：发布链路不再一步写正式名，拆为
++ * <ol>
++ * <li>{@link #stage}——快照体写入<b>唯一暂存文件</b>
++ *     {@code <tenant_id>/.staging/snapshot-<scope>-<version>-<随机>.json.tmp}
++ *     （随机文件名一次性，并发发布各自暂存互不相撞，不占正式名）；</li>
++ * <li>版本行 INSERT 成功（胜者）后 {@link #promote}——暂存文件<b>原子落位</b>到确定性
++ *     正式名。</li>
++ * </ol>
++ * 正确性核心：正式名<b>只被「INSERT 胜者」写过一次</b>——并发碰撞的败者（撞
++ * uk_scope_version）只删除自己的暂存文件，自始至终不触碰正式名，故胜者已提交版本行指向
++ * 的文件内容哈希与行哈希恒一致、败者零残留（不覆盖、不删除、不留残file）；5001 冲突语义
++ * 不变。旧实现「store 先以 REPLACE_EXISTING 写正式名 + 撞键补偿 deleteQuietly 正式名」
++ * 两个动作都作用于并发共享的确定性文件名，败者会摧毁胜者快照（评审 C-1）——两段式下
++ * 暂存名一次性、正式名胜者独占，两个向量同时消除。
++ *
++ * <p>权衡登记：①进程在「暂存后/落位前」崩溃会遗留唯一名暂存孤儿文件——不指向任何版本行、
++ * 不影响取回，量级为单次崩溃一个文件；②落位后若事务回滚（如回写失败），正式名残留无行
++ * 引用的孤儿文件——下个同版本号发布 promote 时以 REPLACE_EXISTING 覆盖，自愈；两种孤儿
++ * 均无已提交行指向缺失/错位文件的窗口。落位原子性：{@link StandardCopyOption#ATOMIC_MOVE}
++ * （不支持时降级非原子 move）——半截文件不会以正式名存在；取回侧哈希核对
++ * （{@code sha256Hex(readBytes(uri))} vs 落库 snapshot_hash，不一致 500 告警——存储损坏
++ * 探测）仍是最后防线而非常规路径。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -33,6 +52,9 @@ import java.security.NoSuchAlgorithmException;
+ @Component
+ public class SnapshotStorage {
+ 
++    /** 暂存子目录（租户子目录下；正式名命名空间 <type>-<id>-<version>.json 与之无交叠） */
++    static final String STAGING_DIR = ".staging";
++
+     private final PublishProperties properties;
+ 
+     @Autowired
+@@ -41,33 +63,55 @@ public class SnapshotStorage {
+     }
+ 
+     /**
+-     * 存储快照体（临时文件 + 原子落位）
++     * 阶段一：快照体写入唯一暂存文件（并发发布互不相撞，不占正式名——两段式落位之一）。
++     *
++     * <p>暂存文件名含 scope/version 上下文便于运维排查，随机段保证一次性（并发同版本
++     * 发布各自暂存，永不共享文件名——C-1 修复的前提）。
+      *
+      * @param tenantId  租户 id（子目录隔离）
+      * @param scopeType 范围 1 网关 2 计算
+      * @param scopeId   范围对象 ID（2 时为 0）
+      * @param version   版本号
+      * @param json      快照体 JSON（UTF-8）
+-     * @return 相对路径 snapshot_uri（{@code <tenant_id>/<scope_type>-<scope_id>-<version>.json}）
+-     * @throws IOException 目录创建/写入/落位失败
++     * @return 暂存文件相对路径（{@code <tenant_id>/.staging/snapshot-...-<随机>.json.tmp}；
++     *         不落库，仅作 {@link #promote}/{@link #deleteQuietly} 入参）
++     * @throws IOException 目录创建/写入失败
+      */
+-    public String store(Long tenantId, Integer scopeType, Long scopeId, Long version, String json)
++    public String stage(Long tenantId, Integer scopeType, Long scopeId, Long version, String json)
+             throws IOException {
+-        Path target = resolveAbsolutePath(relativeUri(tenantId, scopeType, scopeId, version));
++        Path stagingDir = resolveAbsolutePath(tenantId + "/" + STAGING_DIR);
++        Files.createDirectories(stagingDir);
++        Path file = Files.createTempFile(stagingDir,
++                "snapshot-" + scopeType + "-" + scopeId + "-" + version + "-", ".json.tmp");
++        try {
++            Files.write(file, json.getBytes(StandardCharsets.UTF_8));
++        } catch (IOException writeFailed) {
++            Files.deleteIfExists(file);
++            throw writeFailed;
++        }
++        return tenantId + "/" + STAGING_DIR + "/" + file.getFileName();
++    }
++
++    /**
++     * 阶段二：版本行 INSERT 成功后，把暂存文件原子落位到正式名（两段式落位之二）。
++     *
++     * <p>仅「INSERT 胜者」调用——正式名只被胜者写过一次，并发败者不进入本方法；
++     * REPLACE_EXISTING 覆盖无行引用的历史孤儿（事务回滚残留，自愈路径）。
++     *
++     * @param stagingUri {@link #stage} 返回的暂存相对路径
++     * @param targetUri  正式名相对路径（{@link #relativeUri}，与落库 snapshot_uri 同值）
++     * @throws IOException 落位失败（调用方抛错回滚版本行——无已提交行指向缺失文件）
++     */
++    public void promote(String stagingUri, String targetUri) throws IOException {
++        Path from = resolveAbsolutePath(stagingUri);
++        Path target = resolveAbsolutePath(targetUri);
+         Files.createDirectories(target.getParent());
+-        Path tmp = Files.createTempFile(target.getParent(), "snapshot-", ".tmp");
+         try {
+-            Files.write(tmp, json.getBytes(StandardCharsets.UTF_8));
+-            try {
+-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+-            } catch (IOException atomicUnsupported) {
+-                // 部分文件系统不支持跨目录原子落位——降级非原子替换（仍先写临时文件，半截风险仅剩 move 窗口）
+-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+-            }
+-        } finally {
+-            Files.deleteIfExists(tmp);
++            Files.move(from, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
++        } catch (IOException atomicUnsupported) {
++            // 部分文件系统不支持原子落位——降级非原子替换（仍先写暂存，半截风险仅剩 move 窗口）
++            Files.move(from, target, StandardCopyOption.REPLACE_EXISTING);
+         }
+-        return relativeUri(tenantId, scopeType, scopeId, version);
+     }
+ 
+     /**
+@@ -86,15 +130,19 @@ public class SnapshotStorage {
+     }
+ 
+     /**
+-     * 删除快照文件（发布落库失败的孤儿补偿，best-effort——删除失败仅告警不抛）
++     * 删除快照文件（best-effort——删除失败仅容错不抛）。发布链路的唯一用途：清理撞键
++     * 败者/落位失败方的唯一暂存文件（零残留补偿）。正式名不受任何删除动作作用——正式名
++     * 只属 INSERT 胜者（C-1 教训：删除动作作用于并发共享的确定性正式名会摧毁胜者快照）；
++     * 方法本体保持通用路径删除原语（协议约束靠调用点纪律与并发测试保证——DB 中 uri 的
++     * 根内校验硬化另行登记，不混入本修复）。
+      *
+-     * @param relativeUri 落库 snapshot_uri（相对路径）
++     * @param relativeUri 相对路径（发布链路仅传 {@link #stage} 返回的暂存 uri）
+      */
+     public void deleteQuietly(String relativeUri) {
+         try {
+             Files.deleteIfExists(resolveAbsolutePath(relativeUri));
+         } catch (IOException e) {
+-            // best-effort 补偿：孤儿文件清理失败不影响主流程（下个同版本号发布会覆盖同名文件）
++            // best-effort 补偿：清理失败不影响主流程（暂存孤儿唯一名，不指向任何行）
+         }
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+index 75af56c..2d1820e 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+@@ -40,20 +40,31 @@ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.io.TempDir;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
++import org.mockito.MockedStatic;
+ import org.mockito.Mockito;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.test.util.ReflectionTestUtils;
+ 
++import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.CyclicBarrier;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+-import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -69,8 +80,13 @@ import static org.mockito.Mockito.when;
+  * 快照 / 取回哈希核对与存储损坏探测 / 确认门 NoOp / 数据权限防线红转绿）。
+  *
+  * <p>standalone Mockito 范式：Mapper 全 mock；组装器/终检/存储用真实实现（存储指向
+- * @TempDir——哈希与文件布局端到端校验），并发竞态以「同读末版 + 第二次 INSERT 撞键」
+- * 顺序模拟（uk_scope_version 兜底的物理语义等价）。
++ * @TempDir——哈希与文件布局端到端校验）。并发发布（修订轮 I-1）：真实两工作线程同
++ * scope 栅栏对齐起跑（CyclicBarrier），uk_scope_version 物理唯一在 mock 层等价仿真
++ * （synchronized 判重+占位、撞键抛 DuplicateKeyException）；每轮断言恰好一 200 一
++ * 5001 + 胜者行哈希=文件内容哈希 + 败者零残留，30 轮循环复跑。
++ *
++ * <p>static mock 线程域注意：MockedStatic 只对注册线程生效——工作线程各自注册
++ * TenantContext/SecurityUtils（{@link MockedStatic} per-thread），与主线程注册互不干扰。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -262,26 +278,158 @@ class IotPublishServiceImplTest {
+         verify(pointMapper).update(isNull(), any());
+     }
+ 
+-    // ---------- 并发发布 5001（验收项） ----------
+-
++    // ---------- 并发发布 5001（验收项；修订轮 I-1：真两线程同 scope，栅栏对齐 ×30 轮） ----------
++
++    /**
++     * 真并发测试（修订轮 I-1，替代旧「两次顺序调用 + mock 第二次抛 DuplicateKeyException」
++     * 的顺序模拟——顺序模拟触达不了文件存储交错路径，掩盖了并发竞态对胜者快照文件的破坏）：
++     * <ul>
++     * <li>两个真实工作线程同 scope 栅栏对齐起跑（{@link CyclicBarrier}），都走真实组装器/
++     *     终检/确认门/真实文件存储（@TempDir）；uk_scope_version 物理唯一在 mock 层等价仿真
++     *     （synchronized 判重+占位、撞键抛 {@link DuplicateKeyException}——DB 侧 uk 语义）；</li>
++     * <li>两线程组装内容不同（点位数据按调用序分流）→ 哈希不同——同时覆盖「败者覆盖胜者
++     *     文件」与「败者补偿删除胜者文件」两个破坏向量；</li>
++     * <li>每轮断言：恰好一 200 一 5001；两线程都真实到达 INSERT 边界（insert 调用数=2）；
++     *     胜者版本行指向的文件内容哈希与行哈希一致（C-1 验收口径）；全存储恰余胜者一个
++     *     正式文件（败者零残留）；胜者取回哈希核对通过（retrieveSnapshot 全链路）；</li>
++     * <li>30 轮循环复跑（评审处置建议「多轮重复」——竞态交错窗口全覆盖）。</li>
++     * </ul>
++     */
+     @Test
+-    @DisplayName("并发发布 - 两线程同 scope 同读末版，后者 INSERT 撞 uk_scope_version → 5001（不重试）")
+-    void concurrentPublishSecondGets5001() throws Exception {
+-        // 竞态模拟：两线程同读末版 1 → 各算 version=2；前者 INSERT 成功，后者撞 uk
+-        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(1L);
++    @DisplayName("并发发布 - 真两线程同 scope 栅栏对齐×30轮：恰好一 200 一 5001，胜者行哈希=文件内容哈希，败者零残留")
++    void concurrentPublishTwoThreadsOneWinnerWinnerSnapshotIntactLoserNoTrace() throws Exception {
++        when(versionMapper.selectMaxVersion(anyLong(), org.mockito.ArgumentMatchers.anyInt(), anyLong()))
++                .thenReturn(1L);
+         mockGatewayScopeData();
+-        when(versionMapper.insert(any(IotConfigVersion.class)))
+-                .thenReturn(1)
+-                .thenThrow(new DuplicateKeyException("Duplicate entry '1-1-88-2' for key 'uk_scope_version'"));
+ 
+-        publishService.publish(gatewayForm());
++        // uk_scope_version 物理唯一仿真：committed 键集（synchronized 判重+占位）+ 撞键抛 DuplicateKeyException
++        Set<String> committedKeys = ConcurrentHashMap.newKeySet();
++        AtomicInteger insertCalls = new AtomicInteger();
++        when(versionMapper.insert(any(IotConfigVersion.class))).thenAnswer(invocation -> {
++            IotConfigVersion row = invocation.getArgument(0);
++            String uk = row.getTenantId() + "-" + row.getScopeType() + "-" + row.getScopeId() + "-" + row.getVersion();
++            insertCalls.incrementAndGet();
++            synchronized (committedKeys) {
++                if (!committedKeys.add(uk)) {
++                    throw new DuplicateKeyException("Duplicate entry '" + uk + "' for key 'uk_scope_version'");
++                }
++            }
++            return 1;
++        });
++
++        // 两线程看到不同点位数据 → 两份快照内容不同、哈希不同（覆盖向量也能被哈希断言捕获）
++        AtomicInteger pointReads = new AtomicInteger();
++        IotPoint threadAPoint = racePoint(301L, "P_RACE_THREAD_A");
++        IotPoint threadBPoint = racePoint(302L, "P_RACE_THREAD_B");
++        when(pointMapper.selectList(any())).thenAnswer(invocation ->
++                pointReads.incrementAndGet() == 1 ? List.of(threadAPoint) : List.of(threadBPoint));
++
++        ExecutorService pool = Executors.newFixedThreadPool(2);
++        try {
++            int rounds = 30;
++            for (int round = 1; round <= rounds; round++) {
++                committedKeys.clear();
++                insertCalls.set(0);
++                pointReads.set(0);
++
++                CyclicBarrier barrier = new CyclicBarrier(2);
++                Future<Object> first = pool.submit(() -> publishInWorker(barrier));
++                Future<Object> second = pool.submit(() -> publishInWorker(barrier));
++                List<Object> results;
++                try {
++                    results = List.of(first.get(60, TimeUnit.SECONDS), second.get(60, TimeUnit.SECONDS));
++                } catch (ExecutionException e) {
++                    throw new IllegalStateException("第 " + round + " 轮工作线程异常", e.getCause());
++                } catch (TimeoutException e) {
++                    throw new IllegalStateException("第 " + round + " 轮工作线程超时（栅栏未对齐/死锁）", e);
++                }
++
++                List<IotConfigVersion> winners = new ArrayList<>();
++                List<BusinessException> conflicts = new ArrayList<>();
++                for (Object result : results) {
++                    if (result instanceof IotConfigVersion row) {
++                        winners.add(row);
++                    } else if (result instanceof BusinessException ex) {
++                        conflicts.add(ex);
++                    } else if (result instanceof Throwable t) {
++                        throw new IllegalStateException("第 " + round + " 轮工作线程意外异常", t);
++                    } else {
++                        throw new IllegalStateException("第 " + round + " 轮意外结果: " + result);
++                    }
++                }
++
++                try {
++                    assertEquals(1, winners.size(), "恰好一个发布成功（200）");
++                    assertEquals(1, conflicts.size(), "恰好一个报版本冲突");
++                    assertEquals(ResultCode.VERSION_CONFLICT.getCode(), conflicts.get(0).getCode(),
++                            "冲突方报 5001（TC-0008 步骤 5）");
++                    assertEquals(2, insertCalls.get(), "两线程都真实到达 INSERT 边界（真并发，非顺序模拟）");
++
++                    // 胜者版本行指向的文件实际内容哈希与行哈希恒一致（C-1 验收口径）
++                    IotConfigVersion winner = winners.get(0);
++                    assertEquals(2L, winner.getVersion(), "两线程同读末版 1 各算 version=2，胜者落库 2");
++                    assertEquals(SnapshotStorage.relativeUri(TENANT, 1, GATEWAY_ID, 2L),
++                            winner.getSnapshotUri(), "snapshot_uri=确定性正式名（brief D2）");
++                    byte[] stored = storage.readBytes(winner.getSnapshotUri());
++                    assertNotNull(stored, "胜者版本行指向的文件必须存在（败者不得删除/覆盖胜者文件）");
++                    assertEquals(winner.getSnapshotHash(), SnapshotStorage.sha256Hex(stored),
++                            "胜者行哈希=文件内容实际哈希");
++
++                    // 败者零痕迹：全存储恰余胜者一个正式文件（无败者残file、无暂存残留）
++                    List<Path> allFiles;
++                    try (var walk = Files.walk(tempDir)) {
++                        allFiles = walk.filter(Files::isRegularFile).toList();
++                    }
++                    assertEquals(1, allFiles.size(), "全存储恰余胜者一个正式文件（败者零残留）: " + allFiles);
++                    assertEquals(SnapshotStorage.relativeUri(TENANT, 1, GATEWAY_ID, 2L),
++                            tempDir.relativize(allFiles.get(0)).toString().replace('\\', '/'),
++                            "唯一文件即胜者正式名");
++
++                    // 胜者取回哈希核对一致（retrieveSnapshot 全链路含哈希核对）
++                    when(versionMapper.selectOne(any())).thenReturn(winner);
++                    SnapshotVO vo = publishService.retrieveSnapshot(1, GATEWAY_ID, 2L);
++                    assertEquals(winner.getSnapshotHash(), vo.getSnapshotHash(), "胜者取回哈希核对一致");
++                } catch (AssertionError e) {
++                    throw new AssertionError("第 " + round + "/" + rounds + " 轮: " + e.getMessage(), e);
++                }
++            }
++        } finally {
++            pool.shutdownNow();
++        }
++    }
+ 
+-        BusinessException ex = assertThrows(BusinessException.class,
+-                () -> publishService.publish(gatewayForm()),
+-                "并发发布后者必须报 5001 版本冲突（TC-0008 步骤 5）");
+-        assertEquals(ResultCode.VERSION_CONFLICT.getCode(), ex.getCode());
+-        // 孤儿快照文件补偿删除（撞键方不留半截产物）
+-        assertNull(storage.readBytes("1/1-88-2.json"), "撞键方孤儿快照文件已补偿删除");
++    /**
++     * 工作线程：自注册线程域 static mock（MockedStatic 线程域——主线程注册不跨线程，
++     * 工作线程须各自注册 TenantContext/SecurityUtils），栅栏对齐起跑后发布。
++     */
++    private Object publishInWorker(CyclicBarrier barrier) {
++        try (MockedStatic<TenantContext> tenant = Mockito.mockStatic(TenantContext.class);
++             MockedStatic<SecurityUtils> security = Mockito.mockStatic(SecurityUtils.class)) {
++            tenant.when(TenantContext::getTenantId).thenReturn(TENANT);
++            security.when(SecurityUtils::getUserId).thenReturn(USER_ID);
++            barrier.await(10, TimeUnit.SECONDS);
++            try {
++                return publishService.publish(gatewayForm());
++            } catch (BusinessException e) {
++                return e;
++            }
++        } catch (Exception e) {
++            return e;
++        }
++    }
++
++    /** 并发竞态用点位行（pointCode 不同 → 快照内容不同 → 哈希不同） */
++    private static IotPoint racePoint(long id, String code) {
++        IotPoint point = new IotPoint();
++        point.setId(id);
++        point.setTenantId(TENANT);
++        point.setPointCode(code);
++        point.setPointName(code);
++        point.setDataType(1);
++        point.setValueType("DOUBLE");
++        point.setChannelId(201L);
++        point.setStatus(1);
++        return point;
+     }
+ 
+     // ---------- 回滚：新版本行复用旧快照 ----------
+@@ -293,7 +441,7 @@ class IotPublishServiceImplTest {
+         String targetJson = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
+                 + "\"version\":1,\"points\":[{\"id\":301}],\"channels\":[]}";
+         String targetHash = SnapshotStorage.sha256Hex(targetJson.getBytes(StandardCharsets.UTF_8));
+-        String targetUri = storage.store(TENANT, 1, GATEWAY_ID, 1L, targetJson);
++        String targetUri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 1L, targetJson);
+         IotConfigVersion target = new IotConfigVersion();
+         target.setId(1L);
+         target.setTenantId(TENANT);
+@@ -330,7 +478,7 @@ class IotPublishServiceImplTest {
+         String targetJson = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
+                 + "\"version\":1,\"points\":[],\"channels\":[]}";
+         String tampered = targetJson.replace("1.0.1", "1.0.2");
+-        String targetUri = storage.store(TENANT, 1, GATEWAY_ID, 1L, targetJson);
++        String targetUri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 1L, targetJson);
+         Files.write(tempDir.resolve("1").resolve("1-88-1.json"), tampered.getBytes(StandardCharsets.UTF_8));
+         IotConfigVersion target = new IotConfigVersion();
+         target.setTenantId(TENANT);
+@@ -354,7 +502,7 @@ class IotPublishServiceImplTest {
+     void retrieveSnapshotVerifiesHash() throws Exception {
+         String json = assemblerJsonForGatewayScope(5L);
+         String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+-        String uri = storage.store(TENANT, 1, GATEWAY_ID, 5L, json);
++        String uri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 5L, json);
+         when(versionMapper.selectOne(any())).thenReturn(versionRow(5L, hash, uri));
+ 
+         SnapshotVO vo = publishService.retrieveSnapshot(1, GATEWAY_ID, 5L);
+@@ -369,7 +517,7 @@ class IotPublishServiceImplTest {
+     void retrieveSnapshotDefaultsToLatest() throws Exception {
+         String json = assemblerJsonForGatewayScope(9L);
+         String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+-        String uri = storage.store(TENANT, 1, GATEWAY_ID, 9L, json);
++        String uri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 9L, json);
+         when(versionMapper.selectOne(any())).thenReturn(versionRow(9L, hash, uri));
+ 
+         SnapshotVO vo = publishService.retrieveSnapshot(1, GATEWAY_ID, null);
+@@ -381,7 +529,7 @@ class IotPublishServiceImplTest {
+     void retrieveSnapshotDetectsCorruption() throws Exception {
+         String json = assemblerJsonForGatewayScope(5L);
+         String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+-        String uri = storage.store(TENANT, 1, GATEWAY_ID, 5L, json);
++        String uri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 5L, json);
+         Files.write(tempDir.resolve("1").resolve("1-88-5.json"),
+                 "tampered-body".getBytes(StandardCharsets.UTF_8));
+         when(versionMapper.selectOne(any())).thenReturn(versionRow(5L, hash, uri));
+@@ -496,6 +644,18 @@ class IotPublishServiceImplTest {
+ 
+     // ---------- 夹具 ----------
+ 
++    /**
++     * 夹具：把快照体直接落到正式名的最终态（两段式 stage+promote——C-1 修复后存储协议；
++     * 回滚/取回夹具用，模拟「历史已发布版本」的存储现状）。
++     */
++    private String stageAndPromoteFixture(Long tenantId, int scopeType, long scopeId, long version,
++                                          String json) throws IOException {
++        String stagingUri = storage.stage(tenantId, scopeType, scopeId, version, json);
++        String targetUri = SnapshotStorage.relativeUri(tenantId, scopeType, scopeId, version);
++        storage.promote(stagingUri, targetUri);
++        return targetUri;
++    }
++
+     private PublishForm gatewayForm() {
+         PublishForm form = new PublishForm();
+         form.setScopeType(1);
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java
+index a3dd6f8..cd23bad 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java
+@@ -21,8 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+ /**
+- * 快照本地存储单元测试（TASK-0024，一期本地目录裁决——ot.publish.storage-path；SHA-256
+- * 哈希、原子落位、取回与删除）。
++ * 快照本地存储单元测试（TASK-0024 一期本地目录裁决——ot.publish.storage-path；修订轮
++ * C-1 起两段式写入协议：stage 唯一暂存 → INSERT 胜者 promote 原子落位正式名；SHA-256
++ * 哈希、取回与删除）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -47,29 +48,66 @@ class SnapshotStorageTest {
+     }
+ 
+     @Test
+-    @DisplayName("存储 - 文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，uri 相对路径")
+-    void storeUsesLayoutAndReturnsRelativeUri() throws IOException {
++    @DisplayName("两段式 - stage 唯一暂存不占正式名；promote 原子落位正式名（布局 <root>/<tenant>/<type>-<id>-<version>.json）")
++    void stageThenPromoteUsesLayoutAndKeepsContent() throws IOException {
+         String json = "{\"schemaVersion\":\"1.0.1\"}";
+-        String uri = storage.store(1L, 1, 88L, 17L, json);
+-
+-        assertEquals("1/1-88-17.json", uri, "snapshot_uri 相对路径（租户子目录 + brief 裁决文件名）");
+-        Path file = tempDir.resolve("1").resolve("1-88-17.json");
+-        assertTrue(Files.exists(file), "正式名文件落位");
+-        assertEquals(json, Files.readString(file, StandardCharsets.UTF_8), "内容逐字节一致");
++        String stagingUri = storage.stage(1L, 1, 88L, 17L, json);
++
++        // 暂存阶段：唯一名在 <tenant>/.staging/ 下、正式名不存在（并发败者不触碰正式名的前提）
++        assertTrue(stagingUri.startsWith("1/.staging/snapshot-1-88-17-"),
++                "暂存 uri 在租户 .staging 子目录且含 scope/version 上下文: " + stagingUri);
++        assertTrue(stagingUri.endsWith(".json.tmp"), "暂存文件后缀 .json.tmp");
++        Path stagingFile = tempDir.resolve("1").resolve(".staging")
++                .resolve(stagingUri.substring(stagingUri.lastIndexOf('/') + 1));
++        assertTrue(Files.exists(stagingFile), "暂存文件存在");
++        assertFalse(Files.exists(tempDir.resolve("1").resolve("1-88-17.json")),
++                "暂存阶段不占正式名（C-1：正式名只属 INSERT 胜者）");
++
++        // 落位阶段：正式名内容逐字节一致、暂存文件移走
++        String target = SnapshotStorage.relativeUri(1L, 1, 88L, 17L);
++        assertEquals("1/1-88-17.json", target, "snapshot_uri 相对路径（租户子目录 + brief 裁决文件名）");
++        storage.promote(stagingUri, target);
++        assertEquals(json, Files.readString(tempDir.resolve("1").resolve("1-88-17.json"), StandardCharsets.UTF_8),
++                "落位内容逐字节一致");
++        assertFalse(Files.exists(stagingFile), "落位后暂存文件已移走");
+ 
+         // 计算范围 scope_id=0 与网关 scope 同名不同租户目录隔离
+-        storage.store(2L, 2, 0L, 17L, "{}");
++        String staging2 = storage.stage(2L, 2, 0L, 17L, "{}");
++        storage.promote(staging2, SnapshotStorage.relativeUri(2L, 2, 0L, 17L));
+         assertTrue(Files.exists(tempDir.resolve("2").resolve("2-0-17.json")),
+                 "计算 scope（scopeId=0）文件名在租户子目录下隔离，不与租户 1 相撞");
+     }
+ 
++    @Test
++    @DisplayName("两段式 - 同租户同 scope 同版本两次 stage：暂存文件名唯一互不相撞（C-1 修复前提），先后落位互不破坏")
++    void concurrentSameVersionStagesGetUniqueFiles() throws IOException {
++        String s1 = storage.stage(1L, 1, 88L, 17L, "content-A");
++        String s2 = storage.stage(1L, 1, 88L, 17L, "content-B");
++
++        assertNotEquals(s1, s2, "同 (tenant, scope, version) 的两次暂存文件名必须不同（并发发布各自暂存）");
++        assertArrayEquals("content-A".getBytes(StandardCharsets.UTF_8), storage.readBytes(s1),
++                "暂存 A 内容完整（未被 B 覆盖）");
++        assertArrayEquals("content-B".getBytes(StandardCharsets.UTF_8), storage.readBytes(s2),
++                "暂存 B 内容完整（未被 A 覆盖）");
++
++        // 先后落位：后落者内容生效（REPLACE_EXISTING——历史孤儿自愈路径）；两暂存文件均已移走
++        storage.promote(s1, SnapshotStorage.relativeUri(1L, 1, 88L, 17L));
++        storage.promote(s2, SnapshotStorage.relativeUri(1L, 1, 88L, 17L));
++        assertEquals("content-B", new String(storage.readBytes("1/1-88-17.json"), StandardCharsets.UTF_8));
++        try (var files = Files.list(tempDir.resolve("1").resolve(".staging"))) {
++            List<String> leftovers = files.map(p -> p.getFileName().toString()).toList();
++            assertTrue(leftovers.isEmpty(), "落位后暂存目录清空: " + leftovers);
++        }
++    }
++
+     @Test
+     @DisplayName("取回 - readBytes 原文一致；缺失文件返回 null（存储损坏探测入口）")
+     void readBytesRoundtripAndMissing() throws IOException {
+         byte[] payload = "snapshot-body--json".getBytes(StandardCharsets.UTF_8);
+-        String uri = storage.store(1L, 1, 88L, 17L, new String(payload, StandardCharsets.UTF_8));
++        String staging = storage.stage(1L, 1, 88L, 17L, new String(payload, StandardCharsets.UTF_8));
++        storage.promote(staging, "1/1-88-17.json");
+ 
+-        assertArrayEquals(payload, storage.readBytes(uri));
++        assertArrayEquals(payload, storage.readBytes("1/1-88-17.json"));
+         assertNull(storage.readBytes("1/1-88-99.json"), "不存在返回 null（调用方转 500 快照缺失告警）");
+     }
+ 
+@@ -87,26 +125,30 @@ class SnapshotStorageTest {
+     }
+ 
+     @Test
+-    @DisplayName("覆盖写 - 同文件重复存储替换旧内容（临时文件不残留）")
+-    void overwriteReplacesContent() throws IOException {
+-        storage.store(1L, 1, 88L, 17L, "old");
+-        String uri = storage.store(1L, 1, 88L, 17L, "new-content");
+-
+-        assertEquals("new-content", new String(storage.readBytes(uri), StandardCharsets.UTF_8));
+-        try (var files = Files.list(tempDir.resolve("1"))) {
++    @DisplayName("落位覆盖 - 同正式名重复 promote 替换旧内容（无行引用孤儿自愈），暂存不残留 .tmp")
++    void promoteOverwritesTargetAndLeavesNoLeftover() throws IOException {
++        String s1 = storage.stage(1L, 1, 88L, 17L, "old");
++        storage.promote(s1, "1/1-88-17.json");
++        String s2 = storage.stage(1L, 1, 88L, 17L, "new-content");
++        storage.promote(s2, "1/1-88-17.json");
++
++        assertEquals("new-content", new String(storage.readBytes("1/1-88-17.json"), StandardCharsets.UTF_8));
++        try (var files = Files.list(tempDir.resolve("1").resolve(".staging"))) {
+             List<String> leftovers = files.map(p -> p.getFileName().toString())
+                     .filter(name -> name.endsWith(".tmp")).toList();
+-            assertTrue(leftovers.isEmpty(), "临时文件已清理: " + leftovers);
++            assertTrue(leftovers.isEmpty(), "暂存文件已全部落位移走: " + leftovers);
+         }
+     }
+ 
+     @Test
+-    @DisplayName("删除 - deleteQuietly 删既有/容忍不存在（孤儿补偿 best-effort）")
+-    void deleteQuietly() throws IOException {
+-        String uri = storage.store(1L, 1, 88L, 17L, "x");
+-        storage.deleteQuietly(uri);
+-        assertFalse(Files.exists(tempDir.resolve("1").resolve("1-88-17.json")));
+-        storage.deleteQuietly(uri);
++    @DisplayName("删除 - deleteQuietly 删暂存文件（败者零残留补偿）并容忍不存在（best-effort）")
++    void deleteQuietlyRemovesStagingFileTolerantly() throws IOException {
++        String staging = storage.stage(1L, 1, 88L, 17L, "x");
++        storage.deleteQuietly(staging);
++        assertFalse(Files.exists(tempDir.resolve("1").resolve(".staging")
++                        .resolve(staging.substring(staging.lastIndexOf('/') + 1))),
++                "暂存文件已删（撞键败者零残留）");
++        storage.deleteQuietly(staging);
+         storage.deleteQuietly("99/1-1-1.json");
+     }
+ }

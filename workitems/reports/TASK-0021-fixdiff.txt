@@ -1,0 +1,348 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+index 34117d6..28afd9b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+@@ -81,6 +81,13 @@ import java.util.stream.Collectors;
+  * 口径留痕：点位为资产类非个人创建物，归属以 dept/instance 锚定——与 REQ-0002 裁决 3
+  * 「create_by 分支仅对有创建者语义的查询生效」对齐，故 createByColumn 传 null）。
+  *
++ * <p><b>写路径数据权限防线</b>（修订轮评审 I-2 补齐——brief 层缺口经协调者认账授权修齐）：
++ * updatePoint / changePointStatus / deletePoints 三写原语经 {@link #requireWritePerm}
++ * 判定目标点位可见性（与列表裁剪同条件），不可见 403 且文案不泄露点位标识；批量原语批内
++ * 任一不可见即整批拒绝（fail-closed 不半批变更，删除防线先于绑定校验——不向无权者泄露
++ * 绑定状态，照 0012 修订轮 I-1 同型范式）；纯 scope=4 用户对点位无可见行（资产类无
++ * create_by 分支，保持 fail-closed）。
++ *
+  * <p><b>字段白名单</b>：新增/更新均不直接落请求实体——status 创建时解析（未携带落 1 =
+  * DDL DEFAULT '1' 同值，编辑不承载启停）、tenant_id 会话覆盖、审计字段由 MetaObjectHandler
+  * 回填、configVersion 配置发布链路专属、deleted 不可经 API 注入，杜绝 mass assignment。
+@@ -213,6 +220,34 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+                 || (point.getBoundInstanceId() != null && scope.instanceIds().contains(point.getBoundInstanceId()));
+     }
+ 
++    /**
++     * 写路径数据权限防线（修订轮评审 I-2——updatePoint/changePointStatus/deletePoints 三写
++     * 原语共用，照 0012 修订轮 I-1 同型范式）：resolve(当前用户) → 目标点位可见性判定——
++     * 可见口径与列表裁剪同条件（allTenant，或 dept_id ∈ 部门集，或 bound_instance_id ∈
++     * 可见集；NULL 双条件行 fail-closed）。<b>无 create_by 分支</b>（点位为资产类非个人
++     * 创建物——纯 scope=4 用户对点位无可见行，保持 fail-closed）。不可见 → 403 且文案不
++     * 泄露点位标识；批量原语批内任一不可见即整批拒绝（fail-closed 不半批变更）。
++     */
++    private void requireWritePerm(IotPoint target) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !isPointReadableByUser(scope, target)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该点位（数据权限不命中）");
++        }
++    }
++
++    /** 批量写原语防线入口（逐目标判定，任一不可见即整批拒绝） */
++    private void requireWritePerm(List<IotPoint> targets) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (scope.allTenant()) {
++            return;
++        }
++        for (IotPoint target : targets) {
++            if (!isPointReadableByUser(scope, target)) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该点位（数据权限不命中）");
++            }
++        }
++    }
++
+     // ---------- 创建 ----------
+ 
+     @Override
+@@ -259,6 +294,7 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         entity.setBoundInstanceId(form.getBoundInstanceId());
+         entity.setDeptId(form.getDeptId());
+         entity.setStatus(status);
++        entity.setRemark(form.getRemark());
+ 
+         // 双道闸第一道：含已删行占用预检（uk_tenant_point_code 不含 deleted 列，逻辑删行
+         // 永久占用编码——编码删除归档不复用；文案区分活跃行「已存在」/已删行「已被删除记录
+@@ -290,6 +326,11 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         if (existing == null) {
+             throw paramError("点位不存在或已删除");
+         }
++        // 写路径数据权限防线（修订轮评审 I-2，照 0012 修订轮 I-1 同型范式）：存在性 → 数据权限
++        // → 业务校验。可见口径与列表裁剪同条件（dept_id ∈ 部门集 OR bound_instance_id ∈ 可见集，
++        // NULL 行 fail-closed；无 create_by 分支——点位为资产类非个人创建物）；不可见 403 且
++        // 文案不泄露点位标识
++        requireWritePerm(existing);
+         // point_code 不可改（REQ-0008 核心规则——编码即数据锚点与上报主体标识）：
+         // 携带不一致一律拒（携带同值为 no-op 不拦）
+         if (form.getPointCode() != null && !form.getPointCode().equals(existing.getPointCode())) {
+@@ -356,6 +397,10 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+             throw paramError("点位不存在或已删除: " + missing);
+         }
+ 
++        // 写路径数据权限防线（修订轮评审 I-2）：批内任一不可见即整批拒绝（fail-closed 不半批
++        // 落库，照 0012 修订轮删除防线范式——403 文案不泄露点位标识）；可见口径与列表裁剪同条件
++        requireWritePerm(existingList);
++
+         // 批量启停：只更新状态字段（不夹带其他业务字段）；置 1（启停操作启用）逐点位发
+         // PointEnabledEvent（brief 裁决 4「启停操作置 1」——写入方 TASK-0029 建子表，
+         // 重复置 1 的重复事件由消费方幂等承接）；置 0（停用）不发事件——停用须走配置发布
+@@ -389,6 +434,11 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+             throw paramError("点位不存在或已删除: " + missing);
+         }
+ 
++        // 写路径数据权限防线（修订轮评审 I-2）：批内任一不可见即整批拒绝（防线先于绑定校验
++        // ——照 0012 修订轮「防线先于锁定校验」顺序，不向无权者泄露绑定状态）；可见口径与
++        // 列表裁剪同条件
++        requireWritePerm(existingList);
++
+         // 绑定保护（§3.1 p21「批量软删除（被数据项绑定时拒绝）」）：任一点位被活跃数据项
+         // 绑定（iot_data_item.point_id，source_type=1）即整批拒绝——删除会断数据项取数链
+         Map<Long, Long> bindCounts = dataItemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
+index 0138e5b..dda9d74 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
+@@ -599,6 +599,114 @@ class IotPointServiceImplTest {
+         assertTrue(e.getDefaultMessage().contains("999"));
+     }
+ 
++    // ---------- 修订轮（评审 I-1/I-2）：remark 白名单 + 写路径数据权限防线 ----------
++
++    /** 受限用户可见范围（车间口径：部门 101 + 可见实例 8）——与列表裁剪用例同源 */
++    private static final VisibleScope RESTRICTED = new VisibleScope(false, Set.of(101L), Set.of(8L), false);
++
++    @Test
++    @DisplayName("建档 - remark 白名单落库（评审 I-1）：携带 remark 落库一致（表单字段与白名单一一对应）")
++    void testCreate_RemarkWhitelisted() {
++        dictReady();
++        IotPointCreateForm form = createForm();
++        form.setRemark("建档备注-I1");
++
++        assertTrue(pointService.createPoint(form));
++
++        ArgumentCaptor<IotPoint> captor = ArgumentCaptor.forClass(IotPoint.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals("建档备注-I1", captor.getValue().getRemark(), "remark 进创建白名单落库");
++    }
++
++    @Test
++    @DisplayName("写防线 - 编辑不可见点位 403（dept 201 ∉ 部门集）：不泄露点位标识，updateById 不触达")
++    void testEdit_DataPermForbiddenOnInvisible() {
++        IotPoint invisible = point(300L, "P_B");
++        invisible.setDeptId(201L);
++        when(baseMapper.selectById(300L)).thenReturn(invisible);
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++
++        IotPointUpdateForm form = new IotPointUpdateForm();
++        form.setId(300L);
++        form.setPointName("越权改名");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> pointService.updatePoint(form));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("P_B"), "403 文案不泄露点位编码");
++        verify(baseMapper, never()).updateById(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("写防线 - 编辑可见点位（dept 101 ∈ 部门集）回归正常：防线不误伤")
++    void testEdit_DataPermVisiblePasses() {
++        IotPoint visible = point(300L, "P_A");
++        visible.setDeptId(101L);
++        when(baseMapper.selectById(300L)).thenReturn(visible);
++        when(baseMapper.updateById(any(IotPoint.class))).thenReturn(1);
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++
++        IotPointUpdateForm form = new IotPointUpdateForm();
++        form.setId(300L);
++        form.setPointName("正常改名");
++        assertTrue(pointService.updatePoint(form));
++        verify(baseMapper).updateById(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("写防线 - 批量启停含不可见点位整批 403（fail-closed 不半批落库）；全可见批次放行")
++    void testChangeStatus_DataPermGuard() {
++        IotPoint visible = point(300L, "P_A");
++        visible.setDeptId(101L);
++        IotPoint invisible = point(301L, "P_B");
++        invisible.setDeptId(201L);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(visible, invisible));
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++
++        IotPointStatusForm mixed = new IotPointStatusForm();
++        mixed.setIds(List.of(300L, 301L));
++        mixed.setStatus(0);
++        BusinessException e = assertThrows(BusinessException.class, () -> pointService.changePointStatus(mixed));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("P_B"), "403 文案不泄露点位编码");
++        verify(baseMapper, never()).updateById(any(IotPoint.class));
++        verifyNoInteractions(eventPublisher);
++
++        // 全可见批次：防线放行（禁用不发事件）
++        org.mockito.Mockito.clearInvocations(baseMapper);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(visible));
++        when(baseMapper.updateById(any(IotPoint.class))).thenReturn(1);
++        IotPointStatusForm allVisible = new IotPointStatusForm();
++        allVisible.setIds(List.of(300L));
++        allVisible.setStatus(0);
++        assertTrue(pointService.changePointStatus(allVisible));
++        verify(baseMapper).updateById(any(IotPoint.class));
++        verify(eventPublisher, never()).publishEvent(any(PointEnabledEvent.class));
++    }
++
++    @Test
++    @DisplayName("写防线 - 批量删除含不可见点位整批 403（防线先于绑定校验）；全可见批次放行")
++    void testDelete_DataPermGuard() {
++        IotPoint visible = point(300L, "P_A");
++        visible.setDeptId(101L);
++        IotPoint invisible = point(301L, "P_B");
++        invisible.setBoundInstanceId(9L);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(visible, invisible));
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> pointService.deletePoints(List.of(300L, 301L)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("P_B"), "403 文案不泄露点位编码");
++        verify(baseMapper, never()).deleteByIds(anyCollection());
++        verify(dataItemMapper, never()).selectList(any());
++
++        // 全可见批次：防线放行进入绑定校验（无绑定 → 软删）
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(visible));
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        when(baseMapper.deleteByIds(anyCollection())).thenReturn(1);
++        assertTrue(pointService.deletePoints(List.of(300L)));
++        verify(baseMapper).deleteByIds(anyCollection());
++    }
++
+     // ---------- 列表 / 详情：数据权限裁剪接线（F5 裁决） ----------
+ 
+     @Test
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
+index 9f553bd..bed51cc 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
+@@ -13,6 +13,7 @@ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.ArgumentCaptor;
+ 
++import java.util.List;
+ import java.util.Set;
+ import java.util.stream.Collectors;
+ 
+@@ -21,7 +22,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
+ 
+ /**
+  * 管理面点位域越权红线用例（TASK-0021 F5 裁决接线批，ADR-0016 裁决 2/6 + brief 口径）。
+@@ -185,4 +188,69 @@ class PointRedlineTest {
+         String sql = capturedListSqlSegment();
+         assertTrue(sql.contains("1 = 0"), "FAIL_CLOSED 恒假条件进 wrapper: " + sql);
+     }
++
++    // ---------- 场景 6：写路径数据权限防线（修订轮评审 I-2——三写原语越权 403 / 可见回归） ----------
++
++    private static net.otlab.admin.module.iot.point.dto.IotPointUpdateForm updForm(long id) {
++        net.otlab.admin.module.iot.point.dto.IotPointUpdateForm form =
++                new net.otlab.admin.module.iot.point.dto.IotPointUpdateForm();
++        form.setId(id);
++        form.setPointName("越权改名");
++        return form;
++    }
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号直改 B厂点位：三路径防线之编辑——403 不泄露点位编码，updateById 不触达")
++    void writePath_update_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.pointService.updatePoint(updForm(RedlineFixture.POINT_B_FACTORY)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("F02"), "403 文案不泄露点位编码");
++        org.mockito.Mockito.verify(fx.pointMapper(), never()).updateById(any(IotPoint.class));
++
++        // 可见点位写操作回归正常（dept 101 ∈ A 厂部门集）
++        fx.pointService.updatePoint(updForm(RedlineFixture.POINT_A_FACTORY));
++        org.mockito.Mockito.verify(fx.pointMapper()).updateById(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号启停 B厂点位：三路径防线之批量启停——403（整批 fail-closed）；可见点位禁用放行")
++    void writePath_changeStatus_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        net.otlab.admin.module.iot.point.dto.IotPointStatusForm form =
++                new net.otlab.admin.module.iot.point.dto.IotPointStatusForm();
++        form.setIds(List.of(RedlineFixture.POINT_B_FACTORY));
++        form.setStatus(0);
++        BusinessException e = assertThrows(BusinessException.class, () -> fx.pointService.changePointStatus(form));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        org.mockito.Mockito.verify(fx.pointMapper(), never()).updateById(any(IotPoint.class));
++
++        // 可见点位启停回归正常（status=0 禁用不发事件——夹具事件总线仅分发缓存失效事件）
++        net.otlab.admin.module.iot.point.dto.IotPointStatusForm visibleForm =
++                new net.otlab.admin.module.iot.point.dto.IotPointStatusForm();
++        visibleForm.setIds(List.of(RedlineFixture.POINT_A_FACTORY));
++        visibleForm.setStatus(0);
++        assertTrue(fx.pointService.changePointStatus(visibleForm));
++        org.mockito.Mockito.verify(fx.pointMapper()).updateById(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号删除 B厂点位：三路径防线之删除——403 防线先于绑定校验；可见点位删除放行")
++    void writePath_delete_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.pointService.deletePoints(List.of(RedlineFixture.POINT_B_FACTORY)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("F02"), "403 文案不泄露点位编码");
++        org.mockito.Mockito.verify(fx.pointMapper(), never()).deleteByIds(any());
++
++        // 可见点位删除回归正常（无绑定 → 软删；绑定计数查询重桩为空——夹具默认模拟器仅支持 instance_id 条件）
++        when(fx.itemMapper().selectList(any())).thenReturn(List.of());
++        assertTrue(fx.pointService.deletePoints(List.of(RedlineFixture.POINT_A_FACTORY)));
++        org.mockito.Mockito.verify(fx.pointMapper()).deleteByIds(any());
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+index 39c677b..fb2b4bf 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+@@ -81,6 +81,7 @@ import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ 
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
+ import static org.mockito.ArgumentMatchers.anyLong;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.mockStatic;
+@@ -333,6 +334,11 @@ class RedlineFixture implements AutoCloseable {
+         return pointMapper;
+     }
+ 
++    /** 数据项 Mapper 访问器（写防线可见删除用例重桩绑定计数查询——默认模拟器仅支持 instance_id 条件） */
++    IotDataItemMapper itemMapper() {
++        return itemMapper;
++    }
++
+     /** 网关 Mapper 访问器（用例对查询条件形态做 ArgumentCaptor 回归断言） */
+     IotGatewayMapper gatewayMapper() {
+         return gatewayMapper;
+@@ -615,8 +621,16 @@ class RedlineFixture implements AutoCloseable {
+         when(pointMapper.selectById(anyLong())).thenAnswer(inv -> pointRows.stream()
+                 .filter(p -> p.getId().equals(inv.getArgument(0, Long.class)))
+                 .findFirst().orElse(null));
++        // MP 3.5.17 ServiceImpl.listByIds 委托 baseMapper.selectByIds（写防线批量原语存在性校验入口）
++        when(pointMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return pointRows.stream().filter(p -> ids.contains(p.getId())).collect(Collectors.toList());
++        });
+         // 分页查询：按 wrapper 实际生成的权限条件求值（模拟器——漏拼权限条件即全量放行、断言即红）
+         when(pointMapper.selectPage(any(), any())).thenAnswer(this::emulatePointSelectPage);
++        // 写路径桩（修订轮评审 I-2 写防线用例：可见点位写操作回归正常——403 场景不触达）
++        when(pointMapper.updateById(any(IotPoint.class))).thenReturn(1);
++        when(pointMapper.deleteByIds(anyCollection())).thenReturn(1);
+     }
+ 
+     private void stubGatewayMapper() {

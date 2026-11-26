@@ -1,0 +1,259 @@
+commit 2d20dd57d964035c08b81f5f1397936def9d6b5b
+Author: dowei <douwei@gmail.com>
+Date:   Sat Nov 21 22:52:50 2026 +0800
+
+    fix(iot): 租户管理员角色排除系统监控/日志管理子树，按菜单树祖先遍历判定（TASK-0002 修订轮 / 评审 I-1）
+    
+    - 排除集扩展：租户管理(4001) + 系统监控(110) + 日志管理(140) 三棵运营方专属子树 + iot:tenant:* 前缀兜底
+    - 判定按 parent_id 祖先遍历，不写死后代 id 清单——子树内新增页自动排除（消解评审 M-5）；断链/成环脏数据行 fail-closed 排除
+    - 测试先红后绿：monitor:*/平台日志排除断言（红：授权 14 行 vs 期望 2 行）→ 绿 7/7（新增孤儿行 fail-closed 用例）
+    - 全量 1064 例 0 失败；dev 库 tenant_admin_5-8 四角色授权订正 DELETE 104 行（每角色 146→120，被排除子树授权 0 行）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+index d7bd7e4..ac41f66 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+@@ -26,7 +26,11 @@ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * 租户服务实现类（TASK-0001 / TASK-0002）
+@@ -54,10 +58,20 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+     /** 租户管理员角色名 */
+     private static final String TENANT_ADMIN_ROLE_NAME = "租户管理员";
+ 
+-    /** 租户管理页面行 id（sys_menu 4001）——租户管理员角色不授予租户管理子树 */
+-    private static final long TENANT_MANAGE_MENU_ID = 4001L;
++    /**
++     * 运营方专属子树根（TASK-0002 修订轮 / 评审 I-1）：三个根的<b>后代整体</b>经菜单树遍历排除，
++     * 不写死后代 id 清单——未来监控/日志/租户管理页新增子页自动被排除（消解评审 M-5 的命名约定依赖）。
++     * <ul>
++     * <li>4001 租户管理：建租户/改配额/启停/初始化管理员是运营方职能，租户管理员直调即越权；</li>
++     * <li>110 系统监控：monitor:online:list/forceLogout（枚举并强踢<b>全平台</b>在线用户）、
++     *     monitor:cache:remove（删任意 Redis 键）、monitor:job:*、monitor:actuator:view 均跨租户；</li>
++     * <li>140 日志管理：system:operateLog:* / system:loginLog:* 为平台级日志，同样跨租户。</li>
++     * </ul>
++     * 授予任一即违背 REQ-0001 验收 1「该管理员可登录且只见本租户数据」。
++     */
++    private static final Set<Long> OPERATOR_ONLY_SUBTREE_ROOTS = Set.of(4001L, 110L, 140L);
+ 
+-    /** 运营方专属权限前缀——租户管理员角色一律不授予（建租户/改配额/初始化管理员是运营方职能） */
++    /** 运营方专属权限前缀（兜底规则）：iot:tenant:* 一律不授予——防御未挂到 4001 子树的误挂载行 */
+     private static final String OPERATOR_PERMS_PREFIX = "iot:tenant:";
+ 
+     @Autowired
+@@ -242,10 +256,12 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+             }
+             return existing;
+         }
+-        // 授予菜单（平台级 sys_menu 不分租户；授权行 tenant_id=路径租户），排除租户管理子树
++        // 授予菜单（平台级 sys_menu 不分租户；授权行 tenant_id=路径租户），
++        // 排除运营方专属子树（4001/110/140 及其后代）与 iot:tenant:* 前缀行（TASK-0002 修订轮 / 评审 I-1）
+         List<SysMenu> menus = menuMapper.selectList(new LambdaQueryWrapper<>());
++        Set<Long> operatorOnlyIds = collectOperatorOnlyMenuIds(menus);
+         for (SysMenu menu : menus) {
+-            if (isOperatorOnlyMenu(menu)) {
++            if (menu.getId() != null && operatorOnlyIds.contains(menu.getId())) {
+                 continue;
+             }
+             SysRoleMenu roleMenu = new SysRoleMenu();
+@@ -257,12 +273,59 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+         return role;
+     }
+ 
+-    /** 租户管理页面行与其全部 iot:tenant:* 按钮行归运营方专属，租户管理员不授予 */
+-    private boolean isOperatorOnlyMenu(SysMenu menu) {
+-        if (menu.getId() != null && menu.getId() == TENANT_MANAGE_MENU_ID) {
+-            return true;
++    /**
++     * 收集运营方专属菜单 id 集：逐菜单沿 parent_id 向上判祖先是否落在
++     * 三棵运营方专属子树（{@link #OPERATOR_ONLY_SUBTREE_ROOTS}）之下（递归的迭代形态），
++     * 外加 iot:tenant:* 前缀兜底行。祖先遍历而非写死后代 id——
++     * 子树内新增页自动被排除（消解评审 M-5 的命名约定依赖）。
++     */
++    private Set<Long> collectOperatorOnlyMenuIds(List<SysMenu> menus) {
++        Map<Long, SysMenu> menuById = new HashMap<>();
++        for (SysMenu menu : menus) {
++            if (menu.getId() != null) {
++                menuById.put(menu.getId(), menu);
++            }
++        }
++        Set<Long> excluded = new HashSet<>();
++        for (SysMenu menu : menus) {
++            if (menu.getId() != null && isUnderOperatorSubtree(menu.getId(), menuById, new HashSet<>())) {
++                excluded.add(menu.getId());
++            }
++        }
++        for (SysMenu menu : menus) {
++            if (menu.getId() != null && menu.getPerms() != null
++                    && menu.getPerms().startsWith(OPERATOR_PERMS_PREFIX)) {
++                excluded.add(menu.getId());
++            }
++        }
++        return excluded;
++    }
++
++    /**
++     * 判菜单祖先链是否落在运营方专属子树：沿 parent_id 上溯，命中子树根即排除。
++     * fail-closed 口径（排除方向宁严勿漏）：父链断裂（父行缺失且非顶层 0）与父链成环
++     * 的脏数据行「无法证明未落运营方子树」，一律排除——宁可少授一个脏行，不可误授监控/日志权限。
++     */
++    private boolean isUnderOperatorSubtree(Long menuId, Map<Long, SysMenu> menuById, Set<Long> visited) {
++        Long current = menuId;
++        while (current != null && visited.add(current)) {
++            if (OPERATOR_ONLY_SUBTREE_ROOTS.contains(current)) {
++                return true;
++            }
++            SysMenu parent = menuById.get(current);
++            if (parent == null) {
++                // current 不在菜单集：=0 为正常链尾（顶层），其余为断链脏数据 → fail-closed
++                return current != 0L;
++            }
++            Long parentId = parent.getParentId();
++            if (parentId == null) {
++                // 顶层菜单（无父指针）：链尾正常，未落运营方子树
++                return false;
++            }
++            current = parentId;
+         }
+-        return menu.getPerms() != null && menu.getPerms().startsWith(OPERATOR_PERMS_PREFIX);
++        // 父链成环（visited 拒绝推进）：无法证明未落运营方子树 → fail-closed
++        return true;
+     }
+ 
+     private BusinessException duplicateCode(String tenantCode) {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java
+index 2dd84cf..fd1c0ed 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java
+@@ -213,14 +213,71 @@ class SysTenantInitAdminTest {
+         m2.setId(1002L);
+         m2.setPerms("system:user:list");
+         SysMenu tenantPage = new SysMenu();
+-        tenantPage.setId(4001L); // 租户管理页面行（perms 为空，按 id 排除）
++        tenantPage.setId(4001L); // 租户管理页面行（perms 为空，按子树排除）
+         SysMenu tenantButton = new SysMenu();
+         tenantButton.setId(4002L);
+         tenantButton.setPerms("iot:tenant:list"); // iot:tenant:* 按钮行（按权限前缀排除）
+         SysMenu initAdminButton = new SysMenu();
+         initAdminButton.setId(4017L);
+         initAdminButton.setPerms("iot:tenant:admin");
+-        when(menuMapper.selectList(any())).thenReturn(List.of(m1, m2, tenantPage, tenantButton, initAdminButton));
++        // 系统监控子树（110 及其后代）：平台级监控权限，租户管理员不得持有（I-1）
++        SysMenu monitorDir = new SysMenu();
++        monitorDir.setId(110L);
++        monitorDir.setParentId(0L);
++        monitorDir.setMenuName("系统监控");
++        SysMenu onlinePage = new SysMenu();
++        onlinePage.setId(111L);
++        onlinePage.setParentId(110L);
++        onlinePage.setMenuName("在线用户");
++        SysMenu onlineList = new SysMenu();
++        onlineList.setId(112L);
++        onlineList.setParentId(111L);
++        onlineList.setPerms("monitor:online:list");
++        SysMenu forceLogout = new SysMenu();
++        forceLogout.setId(113L);
++        forceLogout.setParentId(111L);
++        forceLogout.setPerms("monitor:online:forceLogout");
++        SysMenu actuatorView = new SysMenu();
++        actuatorView.setId(150L);
++        actuatorView.setParentId(110L);
++        actuatorView.setPerms("monitor:actuator:view");
++        SysMenu cachePage = new SysMenu();
++        cachePage.setId(168L);
++        cachePage.setParentId(110L);
++        SysMenu cacheRemove = new SysMenu();
++        cacheRemove.setId(170L);
++        cacheRemove.setParentId(168L);
++        cacheRemove.setPerms("monitor:cache:remove");
++        SysMenu jobPage = new SysMenu();
++        jobPage.setId(130L);
++        jobPage.setParentId(110L);
++        SysMenu jobAdd = new SysMenu();
++        jobAdd.setId(132L);
++        jobAdd.setParentId(130L);
++        jobAdd.setPerms("monitor:job:add");
++        // 日志管理子树（140 及其后代）：平台日志跨租户（I-1）
++        SysMenu logDir = new SysMenu();
++        logDir.setId(140L);
++        logDir.setParentId(0L);
++        logDir.setMenuName("日志管理");
++        SysMenu operateLogPage = new SysMenu();
++        operateLogPage.setId(141L);
++        operateLogPage.setParentId(140L);
++        SysMenu operateLogList = new SysMenu();
++        operateLogList.setId(142L);
++        operateLogList.setParentId(141L);
++        operateLogList.setPerms("system:operateLog:list");
++        SysMenu loginLogPage = new SysMenu();
++        loginLogPage.setId(144L);
++        loginLogPage.setParentId(140L);
++        SysMenu loginLogList = new SysMenu();
++        loginLogList.setId(145L);
++        loginLogList.setParentId(144L);
++        loginLogList.setPerms("system:loginLog:list");
++        when(menuMapper.selectList(any())).thenReturn(List.of(m1, m2, tenantPage, tenantButton,
++                initAdminButton, monitorDir, onlinePage, onlineList, forceLogout, actuatorView,
++                cachePage, cacheRemove, jobPage, jobAdd, logDir, operateLogPage, operateLogList,
++                loginLogPage, loginLogList));
+         when(userMapper.countByTenantAndUsername(10L, "operator")).thenReturn(0);
+         stubCreatedUser(99L);
+         when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
+@@ -242,8 +299,10 @@ class SysTenantInitAdminTest {
+         assertEquals("tenant_admin_10", roleCaptor.getValue().getRoleCode());
+         assertEquals("租户管理员", roleCaptor.getValue().getRoleName());
+         assertEquals(10L, roleCaptor.getValue().getTenantId());
+-        // 菜单授权行：tenant_id=路径租户（非会话租户）；租户管理子树（4001 页面 + iot:tenant:* 按钮）
+-        // 不授予——租户管理员不得管理他租户/建租户，否则越权防护（operator 直调 init-admin → 403）失效
++        // 菜单授权行：tenant_id=路径租户（非会话租户）；租户管理子树（4001 及其后代）+ iot:tenant:* 按钮
++        // + 系统监控子树（110 及其后代）+ 日志管理子树（140 及其后代）一律不授予（I-1 修订轮）——
++        // monitor:*/平台日志是平台级权限：在线用户枚举/强踢/删任意 Redis 键/定时任务/平台日志均跨租户，
++        // 授予即违背 REQ-0001 验收 1「该管理员只见本租户数据」
+         ArgumentCaptor<SysRoleMenu> rmCaptor = ArgumentCaptor.captor();
+         verify(roleMenuMapper, times(2)).insert(rmCaptor.capture());
+         assertEquals(List.of(1001L, 1002L), rmCaptor.getAllValues().stream().map(SysRoleMenu::getMenuId).toList());
+@@ -256,6 +315,36 @@ class SysTenantInitAdminTest {
+         assertEquals(10L, urCaptor.getValue().getTenantId());
+     }
+ 
++    @Test
++    @DisplayName("init-admin - 排除判定 fail-closed：父链断裂的孤儿菜单行不授予（无法证明非运营方子树）")
++    void testInitAdmin_OrphanMenuRowNotGranted() {
++        when(baseMapper.selectById(10L)).thenReturn(activeTenant(10L, "tenantA"));
++        when(roleMapper.selectByTenantAndCode(10L, "tenant_admin_10")).thenReturn(null);
++        when(roleMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(55L);
++            return 1;
++        });
++        // 孤儿行：parentId 指向不存在的行（脏数据/父行已删）——祖先链断裂，
++        // 无法证明未落运营方子树，按 fail-closed 排除（宁少授不误授监控/日志权限）
++        SysMenu normal = new SysMenu();
++        normal.setId(1001L);
++        SysMenu orphan = new SysMenu();
++        orphan.setId(999L);
++        orphan.setParentId(888L);
++        orphan.setPerms("monitor:some:newPerm");
++        when(menuMapper.selectList(any())).thenReturn(List.of(normal, orphan));
++        when(userMapper.countByTenantAndUsername(10L, "operator")).thenReturn(0);
++        stubCreatedUser(102L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        Long userId = tenantService.initTenantAdmin(10L, form());
++
++        assertEquals(102L, userId);
++        ArgumentCaptor<SysRoleMenu> rmCaptor = ArgumentCaptor.captor();
++        verify(roleMenuMapper, times(1)).insert(rmCaptor.capture());
++        assertEquals(List.of(1001L), rmCaptor.getAllValues().stream().map(SysRoleMenu::getMenuId).toList());
++    }
++
+     @Test
+     @DisplayName("init-admin - 同名两租户并存：预检按 (tenant_id, username) 精确计数，租户 A 的同名行不影响租户 B")
+     void testInitAdmin_SameUsernameCoexistsAcrossTenants() {

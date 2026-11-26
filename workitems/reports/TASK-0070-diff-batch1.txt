@@ -1,0 +1,1352 @@
+diff --git a/frontend/src/api/iot/credential-api.ts b/frontend/src/api/iot/credential-api.ts
+new file mode 100644
+index 0000000..9e38dd5
+--- /dev/null
++++ b/frontend/src/api/iot/credential-api.ts
+@@ -0,0 +1,44 @@
++/*
++ * 通道凭据（智慧工厂）
++ *
++ * 对接后端 IotCredentialController（TASK-0019，路径前缀 /iot/channel/credential——通道
++ * 资源子资源）。
++ * 权限双轨（ADR-0006 先例）：列表复用 iot:channel:list（4046 不重复登记）；写入/轮换/吊销
++ * iot:credential:edit（4051）；查看明文 iot:credential:view（4052）单设权限——无 view 权限
++ * 角色入口隐藏（v-privilege 整节点移除）且直调 403（PermissionDeniedAuditListener 留痕）。
++ * 列表只返回类型/掩码/key_version/状态，<b>永不返回密文/明文</b>（VO 结构上无密文承载字段）；
++ * 明文唯一管理面出口为 view 接口（审计只记「谁在何时看了哪个凭据」，响应列不落库）。
++ * 同通道同类型重复写入=轮换（key_version 递增不新增行）；吊销=status 置禁用立即生效。
++ */
++import { deleteRequest, getRequest, postRequest } from '/@/lib/axios';
++
++export const credentialApi = {
++  /**
++   * 凭据列表（channelId 必传——按通道查；只含类型/掩码/key_version/状态）
++   */
++  queryCredentialList: (channelId) => {
++    return getRequest('/iot/channel/credential/list', { channelId });
++  },
++
++  /**
++   * 写入/轮换凭据（credential 明文只走 HTTPS 入参，服务端 SM4 加密落 {v1} 密文后即弃；
++   * 同通道同类型重复写入=轮换）
++   */
++  writeCredential: (data) => {
++    return postRequest('/iot/channel/credential', data);
++  },
++
++  /**
++   * 查看凭据明文（iot:credential:view 单设权限；调用即审计留痕，响应列不落库）
++   */
++  viewCredential: (id) => {
++    return getRequest(`/iot/channel/credential/view/${id}`, undefined);
++  },
++
++  /**
++   * 吊销凭据（status 置禁用立即生效——内部拉取接口随即 403；非物理删除，行保留审计）
++   */
++  revokeCredential: (id) => {
++    return deleteRequest(`/iot/channel/credential/${id}`);
++  },
++};
+diff --git a/frontend/src/api/iot/point-api.ts b/frontend/src/api/iot/point-api.ts
+new file mode 100644
+index 0000000..20a21e5
+--- /dev/null
++++ b/frontend/src/api/iot/point-api.ts
+@@ -0,0 +1,40 @@
++/*
++ * 采集点位——批量导入（智慧工厂）
++ *
++ * 对接后端 IotPointController 导入三接口（TASK-0022，共用 iot:point:add 权限位）：
++ * GET /iot/point/import/template（模板下载，表头+示例行+说明行——说明行导入时自动跳过）、
++ * POST /iot/point/import（multipart Excel，单批≤10000 行整批原子：任一行校验失败整批拒绝
++ * body code=400 且 data 携带逐行回执 PointImportReceipt）、POST /iot/point/import/error-report
++ * （错误行清单下载，无状态回传渲染 xlsx——回执失败行→xlsx，无失败行仅表头）。
++ * 点位列表/详情/反查/曲线/批量启停等其余接口随点位管理页（4011）升级批补建，本文件只含
++ * 导入向导（菜单 4016）所需三接口。
++ */
++import { getDownload, postDownload, postRequest } from '/@/lib/axios';
++
++export const pointApi = {
++  /**
++   * 下载点位导入模板（十三列表头+示例行+说明行；示例行导入前请删除或替换）
++   */
++  downloadImportTemplate: () => {
++    return getDownload('/iot/point/import/template');
++  },
++
++  /**
++   * 批量导入点位（multipart Excel，单批≤10000 行，整批原子；失败整批拒绝并返回逐行回执）。
++   * silentError：拒绝时 body code=400 且 data 携带回执清单，由导入向导自行渲染
++   */
++  importPoints: (formData) => {
++    return postRequest('/iot/point/import', formData, {
++      headers: { 'Content-Type': 'multipart/form-data' },
++      timeout: 120000,
++      silentError: true,
++    });
++  },
++
++  /**
++   * 下载导入错误行清单（回执失败行渲染 xlsx，无失败行仅表头）
++   */
++  downloadImportErrorReport: (receipt) => {
++    return postDownload('/iot/point/import/error-report', receipt);
++  },
++};
+diff --git a/frontend/src/api/iot/publish-api.ts b/frontend/src/api/iot/publish-api.ts
+new file mode 100644
+index 0000000..818aa3e
+--- /dev/null
++++ b/frontend/src/api/iot/publish-api.ts
+@@ -0,0 +1,35 @@
++/*
++ * 配置发布（智慧工厂）
++ *
++ * 对接后端 IotPublishController（TASK-0024 建立四端点 / TASK-0025 扩展下发状态查询与重发，
++ * 路径前缀 /iot/publish，权限位 iot:publish:* 与 sys_menu 4070-4074 按钮行一一对应）。
++ * 版本列表 scopeType+scopeId 必传（scopeType=1 网关 id / 2 计算归一 0）；下发状态查询
++ * versionId 或 scopeType+scopeId+version 二选一（都给以 versionId 为准校验一致性）。
++ * 发布/回滚动作（iot:publish:publish/rollback 4072/4073，影响预览+二次确认）待 TASK-0015
++ * 交付后接入，本封装不提供（0070 批次一：版本列表 + 下发状态 + 重发三读写）。
++ */
++import { getRequest, postRequest } from '/@/lib/axios';
++
++export const publishApi = {
++  /**
++   * 版本列表分页（version 降序；scopeType/scopeId 必传，数据权限防线后端裁剪）
++   */
++  queryVersionList: (params?) => {
++    return getRequest('/iot/publish/list', params);
++  },
++
++  /**
++   * 下发状态查询（行列表不分页（每版本目标数≤3）+ 每行 timedOut 派生 + 版本级
++   * publishState 汇总 0 下发中/1 已生效/2 存在失败；versionId 或三元组二选一）
++   */
++  queryPublishLogList: (params?) => {
++    return getRequest('/iot/publish/log/list', params);
++  },
++
++  /**
++   * 下发重发（失败/未回执行重置待确认并触发下发接缝；已生效行后端 400「已生效无需重发」）
++   */
++  resendPublishLog: (data) => {
++    return postRequest('/iot/publish/resend', data);
++  },
++};
+diff --git a/frontend/src/views/iot/channel/components/channel-credential-drawer.vue b/frontend/src/views/iot/channel/components/channel-credential-drawer.vue
+new file mode 100644
+index 0000000..e5d8be6
+--- /dev/null
++++ b/frontend/src/views/iot/channel/components/channel-credential-drawer.vue
+@@ -0,0 +1,344 @@
++<!--
++  * 通道凭据管理抽屉（TASK-0070 批次一，TASK-0019 交付接口的前端闭环）
++  *
++  * 挂接：通道管理页（sys_menu 4013）行操作「凭据」入口——凭据按钮权限行 4051/4052
++  * parent_id=4013；列表接口复用 iot:channel:list（4046，channelId 必传按通道查）。
++  * 对接 IotCredentialController（/iot/channel/credential）：POST 写入/轮换（iot:credential:edit
++  * 4051，同通道同类型重复写入=轮换 key_version 递增）、GET view/{id}（iot:credential:view
++  * 4052 单设权限——入口二次确认 + 操作留痕提示，无权限角色 v-privilege 整节点移除且直调 403）、
++  * DELETE /{id} 吊销（status 置禁用立即生效）。
++  * <b>列表只展示类型/掩码/key_version/状态——永不展示密文</b>（后端 VO 结构上无密文承载字段）；
++  * 明文唯一出口为 view 接口（审计只记「谁在何时看了哪个凭据」，响应列不落库）。
++-->
++<template>
++  <a-drawer :open="visible" :width="720" title="凭据管理" :maskClosable="false" @close="close">
++    <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++      <a-descriptions-item label="所属通道">{{ channelRow?.channelCode ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="通道名称">{{ channelRow?.channelName ?? '-' }}</a-descriptions-item>
++    </a-descriptions>
++
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:credential:edit'" type="primary" @click="openWriteModal">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          写入/轮换凭据
++        </a-button>
++        <span class="credential-tip">同通道同类型重复写入=轮换（key_version 递增）</span>
++      </div>
++    </a-row>
++
++    <a-table size="small" :dataSource="tableData" :columns="columns" :loading="tableLoading" rowKey="id" :pagination="false" bordered>
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'credType'">
++          <a-tag>{{ credTypeLabel(record.credType) }}</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'credentialMask'">
++          <code class="credential-mask">{{ record.credentialMask }}</code>
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">已吊销</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:credential:view'" type="link" @click="confirmView(record)">查看明文</a-button>
++            <a-button v-if="record.status === 1" v-privilege="'iot:credential:edit'" type="link" danger @click="confirmRevoke(record)">
++              吊销
++            </a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <!-- 写入/轮换表单 -->
++    <a-modal :open="writeVisible" title="写入/轮换凭据" :maskClosable="false" @cancel="closeWriteModal" @ok="confirmWrite">
++      <a-alert
++        type="info"
++        show-icon
++        class="ot-margin-bottom10"
++        message="凭据明文只走 HTTPS 入参，服务端 SM4 加密落 {v1} 密文后即弃；同通道同类型重复写入=轮换（key_version 递增，不新增行）；审计参数列不落库（明文不进操作日志）"
++      />
++      <a-form layout="vertical">
++        <a-form-item label="凭据类型" required>
++          <a-select v-model:value="writeForm.credType" placeholder="请选择凭据类型">
++            <a-select-option v-for="opt in CRED_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++              {{ opt.label }}
++            </a-select-option>
++          </a-select>
++        </a-form-item>
++        <a-form-item label="凭据明文" required>
++          <a-textarea
++            v-model:value="writeForm.credential"
++            :rows="3"
++            :maxLength="1000"
++            placeholder="请输入凭据明文（长度 ≤1000，提交后由服务端加密，页面不再回显明文）"
++          />
++        </a-form-item>
++      </a-form>
++    </a-modal>
++
++    <!-- 明文查看结果（唯一明文出口：view 接口，调用前已二次确认） -->
++    <a-modal :open="viewVisible" title="凭据明文（已审计留痕）" :maskClosable="false" @cancel="closeViewModal" :footer="null">
++      <a-alert
++        type="warning"
++        show-icon
++        class="ot-margin-bottom10"
++        message="明文仅限本次查看，请勿复制外传；本次查看已留痕（审计记录谁在何时查看了哪个凭据）"
++      />
++      <code class="credential-plaintext">{{ viewPlaintext || '-' }}</code>
++    </a-modal>
++  </a-drawer>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { PlusOutlined } from '@ant-design/icons-vue';
++  import { credentialApi } from '/@/api/iot/credential-api';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  // CredentialItemVO（后端 TASK-0019：只含 id/channelId/credType/credentialMask/keyVersion/
++  // status——结构上无密文承载字段）
++  interface CredentialItem {
++    id?: number;
++    channelId?: number;
++    credType?: string;
++    credentialMask?: string;
++    keyVersion?: string;
++    status?: number;
++    [key: string]: unknown;
++  }
++
++  // 凭据类型字典（CredentialWriteForm：DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT 四值）
++  const CRED_TYPE_OPTIONS = [
++    { value: 'DEVICE_TOKEN', label: '设备令牌 (DEVICE_TOKEN)' },
++    { value: 'MQTT_PASSWORD', label: 'MQTT 密码 (MQTT_PASSWORD)' },
++    { value: 'HTTP_SECRET', label: 'HTTP 密钥 (HTTP_SECRET)' },
++    { value: 'CERT', label: '证书 (CERT)' },
++  ];
++
++  const columns = ref([
++    {
++      title: '凭据类型',
++      width: 150,
++      dataIndex: 'credType',
++    },
++    {
++      title: '凭据掩码',
++      dataIndex: 'credentialMask',
++    },
++    {
++      title: '密钥版本',
++      width: 110,
++      dataIndex: 'keyVersion',
++    },
++    {
++      title: '状态',
++      width: 90,
++      dataIndex: 'status',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      width: 150,
++    },
++  ]);
++
++  const visible = ref(false);
++  const channelRow = ref<Record<string, unknown> | null>(null);
++  const tableLoading = ref(false);
++  const tableData = ref<CredentialItem[]>([]);
++
++  const writeVisible = ref(false);
++  const writeForm = reactive({
++    credType: undefined,
++    credential: '',
++  });
++  const viewVisible = ref(false);
++  const viewPlaintext = ref('');
++
++  function credTypeLabel(credType?: string) {
++    return CRED_TYPE_OPTIONS.find((opt) => opt.value === credType)?.label || credType || '-';
++  }
++
++  function showModal(rowData) {
++    channelRow.value = rowData;
++    visible.value = true;
++    ajaxQuery();
++  }
++
++  function close() {
++    visible.value = false;
++    channelRow.value = null;
++    tableData.value = [];
++    closeWriteModal();
++    closeViewModal();
++  }
++
++  async function ajaxQuery() {
++    if (!channelRow.value?.id) {
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await credentialApi.queryCredentialList(channelRow.value.id);
++      tableData.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 写入/轮换 -----------------
++
++  function openWriteModal() {
++    writeForm.credType = undefined;
++    writeForm.credential = '';
++    writeVisible.value = true;
++  }
++
++  function closeWriteModal() {
++    writeVisible.value = false;
++    writeForm.credType = undefined;
++    writeForm.credential = '';
++  }
++
++  function confirmWrite() {
++    if (!writeForm.credType) {
++      message.warning('请选择凭据类型');
++      return;
++    }
++    if (!writeForm.credential || !writeForm.credential.trim()) {
++      message.warning('请输入凭据明文');
++      return;
++    }
++    const existing = tableData.value.find((row) => row.credType === writeForm.credType);
++    Modal.confirm({
++      title: '写入/轮换确认',
++      content: existing
++        ? `该通道已存在【${credTypeLabel(writeForm.credType)}】凭据（密钥版本 ${
++            existing.keyVersion ?? '-'
++          }），本次写入=轮换（key_version 递增、旧密文被替换）。确定提交？`
++        : `确定要为该通道写入【${credTypeLabel(writeForm.credType)}】凭据吗？明文由服务端 SM4 加密落库，审计不留明文。`,
++      okText: '确认写入',
++      onOk() {
++        doWrite();
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function doWrite() {
++    try {
++      OtLoading.show();
++      await credentialApi.writeCredential({
++        channelId: channelRow.value?.id,
++        credType: writeForm.credType,
++        credential: writeForm.credential,
++      });
++      message.success('凭据写入成功（已加密落库，写入/轮换动作已审计留痕）');
++      closeWriteModal();
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 查看明文（二次确认 + 留痕提示） -----------------
++
++  function confirmView(rowData: CredentialItem) {
++    Modal.confirm({
++      title: '查看凭据明文确认',
++      content: `确定要查看【${credTypeLabel(rowData.credType)}】凭据（掩码 ${
++        rowData.credentialMask ?? '-'
++      }）的明文吗？本次查看属高危操作，将被审计留痕（记录谁在何时查看了哪个凭据）。`,
++      okText: '查看明文',
++      onOk() {
++        doView(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function doView(rowData: CredentialItem) {
++    try {
++      OtLoading.show();
++      const responseData = await credentialApi.viewCredential(rowData.id);
++      viewPlaintext.value = responseData.data?.credential ?? '';
++      viewVisible.value = true;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  function closeViewModal() {
++    viewVisible.value = false;
++    // 明文用完即弃，不在前端状态中驻留
++    viewPlaintext.value = '';
++  }
++
++  // ---------------- 吊销 -----------------
++
++  function confirmRevoke(rowData: CredentialItem) {
++    Modal.confirm({
++      title: '吊销确认',
++      content: `确定要吊销【${credTypeLabel(rowData.credType)}】凭据（掩码 ${
++        rowData.credentialMask ?? '-'
++      }）吗？吊销立即生效（内部拉取随即 403），非物理删除、行保留审计。`,
++      okText: '吊销',
++      okType: 'danger',
++      onOk() {
++        doRevoke(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function doRevoke(rowData: CredentialItem) {
++    try {
++      OtLoading.show();
++      await credentialApi.revokeCredential(rowData.id);
++      message.success('吊销成功：凭据已置禁用并立即生效（动作已审计留痕）');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
++<style scoped lang="less">
++  .credential-tip {
++    color: #999;
++    font-size: 12px;
++  }
++
++  .credential-mask {
++    font-family: monospace;
++  }
++
++  .credential-plaintext {
++    display: block;
++    padding: 8px;
++    font-family: monospace;
++    word-break: break-all;
++    background-color: #f5f5f5;
++    border: 1px solid #d9d9d9;
++    border-radius: 4px;
++  }
++</style>
+diff --git a/frontend/src/views/iot/channel/index.vue b/frontend/src/views/iot/channel/index.vue
+index c514174..c00c6c3 100644
+--- a/frontend/src/views/iot/channel/index.vue
++++ b/frontend/src/views/iot/channel/index.vue
+@@ -1,5 +1,5 @@
+ <!--
+-  * 采集通道管理（TASK-0056 完整页）
++  * 采集通道管理（TASK-0056 完整页；TASK-0070 批次一加「凭据」入口）
+   *
+   * 对接 IotChannelController（/iot/channel，权限位 iot:channel:* 4046-4050）。
+   * list 按 gatewayId 必传查通道列表（§3.1 口径：通道列表按网关查）——页首网关下拉
+@@ -7,6 +7,8 @@
+   * 协议联动 Schema 前置提示（后端校验为准，brief 决策 1）；MODBUS/OPCUA 可建不可
+   * 启用（status 强制 0，请求携带 1 也落库 0，保存成功文案含「未启用适配器」标注）；
+   * channel_code/gateway_id 创建后不可改；保存≠生效（生效走配置快照发布链路）。
++  * 凭据管理（TASK-0019 接口 + TASK-0070 前端闭环）：行操作「凭据」打开凭据抽屉
++  * （凭据按钮权限行 4051/4052 挂本页 4013 之下；列表只展示掩码，永不展示密文）。
+ -->
+ <template>
+   <a-form class="ot-query-form">
+@@ -83,6 +85,7 @@
+         <template v-if="column.dataIndex === 'action'">
+           <div class="ot-table-operate">
+             <a-button v-privilege="'iot:channel:query'" type="link" @click="showDetail(record)">详情</a-button>
++            <a-button v-privilege="'iot:channel:list'" type="link" @click="showCredentials(record)">凭据</a-button>
+             <a-button v-privilege="'iot:channel:edit'" type="link" @click="addOrUpdateChannel(record)">编辑</a-button>
+             <a-button v-privilege="'iot:channel:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
+           </div>
+@@ -107,11 +110,13 @@
+ 
+     <ChannelFormModal ref="channelFormModalRef" :gateway-options="gatewayOptions" @reloadList="ajaxQuery" />
+     <ChannelDetailModal ref="channelDetailModalRef" />
++    <ChannelCredentialDrawer ref="channelCredentialDrawerRef" />
+   </a-card>
+ </template>
+ <script setup lang="ts">
+   import ChannelFormModal from './components/channel-form-modal.vue';
+   import ChannelDetailModal from './components/channel-detail-modal.vue';
++  import ChannelCredentialDrawer from './components/channel-credential-drawer.vue';
+   import { onMounted, reactive, ref } from 'vue';
+   import { message, Modal } from 'ant-design-vue';
+   import { PlusOutlined, SearchOutlined } from '@ant-design/icons-vue';
+@@ -156,7 +161,7 @@
+       title: '操作',
+       dataIndex: 'action',
+       fixed: 'right',
+-      width: 130,
++      width: 180,
+     },
+   ]);
+ 
+@@ -197,6 +202,7 @@
+   const total = ref(0);
+   const channelFormModalRef = ref();
+   const channelDetailModalRef = ref();
++  const channelCredentialDrawerRef = ref();
+ 
+   function onGatewayChange() {
+     queryForm.pageNum = 1;
+@@ -261,6 +267,11 @@
+     channelDetailModalRef.value.showModal(rowData.id);
+   }
+ 
++  // 凭据管理入口（凭据列表复用 iot:channel:list，4051/4052 按钮行挂 4013 通道页之下）
++  function showCredentials(rowData) {
++    channelCredentialDrawerRef.value.showModal(rowData);
++  }
++
+   function addOrUpdateChannel(rowData?) {
+     channelFormModalRef.value.showModal(rowData, queryForm.gatewayId);
+   }
+diff --git a/frontend/src/views/iot/import/index.vue b/frontend/src/views/iot/import/index.vue
+index 7264d69..0b91878 100644
+--- a/frontend/src/views/iot/import/index.vue
++++ b/frontend/src/views/iot/import/index.vue
+@@ -1,11 +1,293 @@
+ <!--
+-  * 导入向导（占位骨架，TASK-0055）
++  * 批量导入向导——点位批量导入（TASK-0070 批次一完整页，原 TASK-0055 占位骨架升级）
+   *
+-  * 菜单挂载点：sys_menu 4016（/iot/import）。批量导入（模板下载/逐行回执）归 TASK-0056/0070。
++  * 菜单挂载点：sys_menu 4016（/iot/import）。
++  * 对接 IotPointController 导入三接口（TASK-0022，共用 iot:point:add）：
++  * GET /iot/point/import/template（模板下载）→ POST /iot/point/import（multipart Excel，
++  * 单批≤10000 行整批原子——任一行校验失败整批拒绝 body code=400 且 data 携带逐行回执，
++  * silentError 自渲染，失败不中断逐行回执展示）→ 结果汇总 + 错误行清单下载
++  * （POST /import/error-report 无状态回传渲染 xlsx）。
++  * 向导步骤条交互：上传文件 → 回执明细 → 结果汇总；点位管理页（4011）归点位域升级批。
+ -->
+ <template>
+-  <IotPlaceholder title="导入向导" task="TASK-0056 / TASK-0070" />
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-steps :current="currentStep" class="import-steps">
++      <a-step title="上传文件" description="下载模板并填写后上传" />
++      <a-step title="回执明细" description="逐行回执展示（失败不中断）" />
++      <a-step title="结果汇总" description="汇总统计与错误行下载" />
++    </a-steps>
++
++    <!-- 步骤一：上传文件 -->
++    <div v-if="currentStep === 0" class="import-step-body">
++      <a-alert
++        type="info"
++        show-icon
++        class="ot-margin-bottom10"
++        message="单批上限 10000 行，整批原子：任一行校验失败整批拒绝不落库；pointCode 租户内唯一且删除归档不复用；模板说明行导入时自动跳过，示例行导入前请删除或替换"
++      />
++      <a-space class="ot-margin-bottom10">
++        <a-button v-privilege="'iot:point:add'" @click="downloadTemplate">
++          <template #icon>
++            <DownloadOutlined />
++          </template>
++          下载导入模板
++        </a-button>
++      </a-space>
++
++      <a-upload-dragger
++        v-privilege="'iot:point:add'"
++        name="file"
++        accept=".xlsx,.xls"
++        :maxCount="1"
++        :fileList="fileList"
++        :beforeUpload="beforeUpload"
++        @remove="removeFile"
++      >
++        <p class="ant-upload-drag-icon">
++          <InboxOutlined />
++        </p>
++        <p class="ant-upload-text">点击或拖拽选择导入文件（.xlsx）</p>
++      </a-upload-dragger>
++
++      <div class="import-step-actions">
++        <a-button type="primary" :loading="importing" :disabled="!file" @click="startImport">下一步：开始导入</a-button>
++      </div>
++    </div>
++
++    <!-- 步骤二：回执明细（逐行回执展示，失败不中断） -->
++    <div v-else-if="currentStep === 1" class="import-step-body">
++      <a-alert :type="receiptAlertType" show-icon :message="receiptMessage" class="ot-margin-bottom10" />
++
++      <a-row class="import-count-row ot-margin-bottom10">
++        <a-tag>参与校验 {{ receipt?.totalCount ?? '-' }} 行</a-tag>
++        <a-tag color="green">校验通过 {{ receipt?.successCount ?? '-' }} 行</a-tag>
++        <a-tag color="red">校验失败 {{ receipt?.failCount ?? '-' }} 行</a-tag>
++        <a-tag :color="receipt?.persisted === true ? 'green' : 'red'">
++          {{ receipt?.persisted === true ? '已落库' : '整批未落库' }}
++        </a-tag>
++      </a-row>
++
++      <a-table
++        size="small"
++        :dataSource="receipt?.rows || []"
++        :columns="receiptColumns"
++        rowKey="rowIndex"
++        :pagination="false"
++        bordered
++        :scroll="{ y: 320 }"
++      >
++        <template #bodyCell="{ record, column }">
++          <template v-if="column.dataIndex === 'success'">
++            <a-tag v-if="record.success === true" color="green">通过</a-tag>
++            <a-tag v-else color="red">失败</a-tag>
++          </template>
++        </template>
++      </a-table>
++
++      <a-button v-if="failRows.length > 0" class="ot-margin-top10" v-privilege="'iot:point:add'" @click="downloadErrorReport">
++        <template #icon>
++          <DownloadOutlined />
++        </template>
++        下载错误行清单
++      </a-button>
++
++      <div class="import-step-actions">
++        <a-button :disabled="importing" @click="backToUpload">上一步</a-button>
++        <a-button type="primary" :disabled="!receipt" @click="currentStep = 2">下一步：查看汇总</a-button>
++      </div>
++    </div>
++
++    <!-- 步骤三：结果汇总 -->
++    <div v-else class="import-step-body">
++      <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++        <a-descriptions-item label="参与校验行数">{{ receipt?.totalCount ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="校验通过行数">{{ receipt?.successCount ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="校验失败行数">{{ receipt?.failCount ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="落库状态">
++          <a-tag v-if="receipt?.persisted === true" color="green">全部成功入库</a-tag>
++          <a-tag v-else color="red">整批拒绝（任何行未入库）</a-tag>
++        </a-descriptions-item>
++      </a-descriptions>
++
++      <a-alert
++        v-if="receipt?.persisted === true"
++        type="success"
++        show-icon
++        class="ot-margin-bottom10"
++        message="导入完成：校验通过行已全部落库；点位生效走配置发布链（保存≠生效）"
++      />
++      <a-alert
++        v-else
++        type="warning"
++        show-icon
++        class="ot-margin-bottom10"
++        message="导入未完成：整批被拒绝（任一行校验失败整批不落库），请下载错误行清单修正后重新导入"
++      />
++
++      <a-button v-if="failRows.length > 0" class="ot-margin-bottom10" v-privilege="'iot:point:add'" @click="downloadErrorReport">
++        <template #icon>
++          <DownloadOutlined />
++        </template>
++        下载错误行清单
++      </a-button>
++
++      <div class="import-step-actions">
++        <a-button @click="resetWizard">重新导入</a-button>
++      </div>
++    </div>
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import { computed, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { DownloadOutlined, InboxOutlined } from '@ant-design/icons-vue';
++  import { pointApi } from '/@/api/iot/point-api';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  // PointImportRowResult（后端 TASK-0022：rowIndex/pointCode/success/reasonCode/message；
++  // 成功行 reasonCode 为 null）
++  interface PointImportRowResult {
++    rowIndex?: number;
++    pointCode?: string;
++    success?: boolean;
++    reasonCode?: string;
++    message?: string;
++    [key: string]: unknown;
++  }
++  // PointImportReceipt（成败计数 + persisted 整批是否已落库 + 逐行清单）
++  interface PointImportReceipt {
++    totalCount?: number;
++    successCount?: number;
++    failCount?: number;
++    persisted?: boolean;
++    rows?: PointImportRowResult[];
++    [key: string]: unknown;
++  }
++
++  const currentStep = ref(0);
++  const file = ref<File | null>(null);
++  const fileList = ref<Record<string, unknown>[]>([]);
++  const importing = ref(false);
++  const receipt = ref<PointImportReceipt | null>(null);
++
++  const receiptColumns = [
++    { title: '行号', dataIndex: 'rowIndex', width: 70 },
++    { title: '点位编码', dataIndex: 'pointCode', width: 220 },
++    { title: '结果', dataIndex: 'success', width: 80 },
++    { title: '原因码', dataIndex: 'reasonCode', width: 180 },
++    { title: '说明', dataIndex: 'message' },
++  ];
++
++  const failRows = computed(() => (receipt.value?.rows || []).filter((row) => !row.success));
++
++  const receiptAlertType = computed(() => (receipt.value?.persisted === true ? 'success' : 'error'));
++
++  const receiptMessage = computed(() => {
++    if (!receipt.value) {
++      return '';
++    }
++    if (receipt.value.persisted === true) {
++      return `导入成功：共 ${receipt.value.totalCount ?? receipt.value.successCount} 行全部落库`;
++    }
++    return '导入被整批拒绝（任一行校验失败整批不落库），逐行回执明细如下';
++  });
++
++  // ---------------- 步骤一：上传 -----------------
++
++  function downloadTemplate() {
++    pointApi.downloadImportTemplate();
++  }
++
++  // 阻止 antd 自动上传，仅收集文件
++  function beforeUpload(uploadFile) {
++    file.value = uploadFile;
++    fileList.value = [uploadFile];
++    return false;
++  }
++
++  function removeFile() {
++    file.value = null;
++    fileList.value = [];
++    return true;
++  }
++
++  async function startImport() {
++    currentStep.value = 1;
++    await doImport();
++  }
++
++  async function doImport() {
++    const formData = new FormData();
++    formData.append('file', file.value as File);
++    importing.value = true;
++    OtLoading.show();
++    try {
++      // 全部成功：body code=200，data=回执（persisted=true，全部落库）
++      const res = await pointApi.importPoints(formData);
++      receipt.value = res.data;
++      message.success(`导入成功，共 ${res.data.successCount ?? res.data.totalCount} 行落库`);
++      file.value = null;
++      fileList.value = [];
++    } catch (e) {
++      // 整批拒绝：body code=400（PARAM_ERROR）且 data 携带完整逐行回执（silentError 已静默
++      // 全局提示）——失败不中断，逐行回执照常展示
++      const body = (e as { data?: { data?: PointImportReceipt; message?: string } })?.data;
++      if (body?.data) {
++        receipt.value = body.data;
++        message.error('导入被整批拒绝：任一行校验失败整批不落库');
++      } else {
++        // 无回执形态的批级拒绝（如超限 fail fast / 配额 4003）——silentError 已静默，此处补报
++        message.error(body?.message || '导入失败');
++      }
++      otSentry.captureError(e);
++    } finally {
++      importing.value = false;
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 步骤切换 -----------------
++
++  function backToUpload() {
++    currentStep.value = 0;
++    receipt.value = null;
++  }
++
++  function resetWizard() {
++    currentStep.value = 0;
++    receipt.value = null;
++    file.value = null;
++    fileList.value = [];
++  }
++
++  // ---------------- 错误行清单下载（无状态回传） -----------------
++
++  function downloadErrorReport() {
++    if (receipt.value) {
++      pointApi.downloadImportErrorReport(receipt.value);
++    }
++  }
+ </script>
++<style scoped lang="less">
++  .import-steps {
++    max-width: 720px;
++    margin-bottom: 16px;
++  }
++
++  .import-step-body {
++    max-width: 860px;
++    padding-top: 8px;
++  }
++
++  .import-step-actions {
++    margin-top: 16px;
++    text-align: right;
++  }
++
++  .import-count-row {
++    .ant-tag {
++      font-size: 13px;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/iot/publish/components/publish-log-drawer.vue b/frontend/src/views/iot/publish/components/publish-log-drawer.vue
+new file mode 100644
+index 0000000..1cc1c32
+--- /dev/null
++++ b/frontend/src/views/iot/publish/components/publish-log-drawer.vue
+@@ -0,0 +1,230 @@
++<!--
++  * 下发状态抽屉（TASK-0070 批次一，TASK-0025 交付接口的前端闭环）
++  *
++  * 挂发布/版本上下文：从版本列表行打开（携带 versionId/scopeType/scopeId/version），
++  * GET /iot/publish/log/list（iot:publish:list 复用 4070，versionId 定位——后端以 versionId
++  * 为准校验一致性）+ POST /iot/publish/resend（iot:publish:resend 4074——失败/未回执行重置
++  * 待确认并触发下发接缝；已生效行后端 400「已生效无需重发」，前端已生效行按钮置灰不发请求）。
++  * 行展示：ack_status 三态徽标（0 待确认/1 已生效/2 失败）+ timedOut=true（待确认且已超超时窗，
++  * 查询侧派生即时标红，不改行）标红 + ack_time/error_msg；版本级 publishState 汇总徽标
++  * （0 下发中/1 全部生效/2 存在失败）。行集不分页（每版本目标数≤3）。
++-->
++<template>
++  <a-drawer :open="visible" :width="760" title="下发状态" :maskClosable="false" @close="close">
++    <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++      <a-descriptions-item label="配置版本">v{{ versionRow?.version ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="发布范围">{{ scopeLabel }}</a-descriptions-item>
++      <a-descriptions-item label="版本级汇总" :span="2">
++        <a-tag v-if="publishState === 1" color="green">全部生效</a-tag>
++        <a-tag v-else-if="publishState === 2" color="red">存在失败</a-tag>
++        <a-tag v-else-if="publishState === 0" color="orange">下发中</a-tag>
++        <a-tag v-else color="default">-</a-tag>
++      </a-descriptions-item>
++    </a-descriptions>
++
++    <a-row class="ot-margin-bottom10">
++      <a-button v-privilege="'iot:publish:list'" @click="ajaxQuery">
++        <template #icon>
++          <ReloadOutlined />
++        </template>
++        刷新
++      </a-button>
++    </a-row>
++
++    <a-table size="small" :dataSource="rows" :columns="columns" :loading="tableLoading" rowKey="id" :pagination="false" bordered>
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'targetType'">
++          {{ targetTypeLabel(record.targetType) }}
++        </template>
++        <template v-if="column.dataIndex === 'ackStatus'">
++          <a-space>
++            <a-tag v-if="record.ackStatus === 1" color="green">已生效</a-tag>
++            <a-tag v-else-if="record.ackStatus === 2" color="red">失败</a-tag>
++            <a-tag v-else color="orange">待确认</a-tag>
++            <a-tag v-if="record.timedOut === true" color="red">已超时</a-tag>
++          </a-space>
++        </template>
++        <template v-if="column.dataIndex === 'errorMsg'">
++          <a-tooltip v-if="record.errorMsg" :title="record.errorMsg">
++            <span class="publish-log-error">{{ record.errorMsg }}</span>
++          </a-tooltip>
++          <span v-else>-</span>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <a-tooltip v-if="record.ackStatus === 1" title="已生效无需重发">
++            <a-button v-privilege="'iot:publish:resend'" type="link" disabled>重发</a-button>
++          </a-tooltip>
++          <a-button v-else v-privilege="'iot:publish:resend'" type="link" @click="confirmResend(record)">重发</a-button>
++        </template>
++      </template>
++    </a-table>
++  </a-drawer>
++</template>
++<script setup lang="ts">
++  import { computed, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { ReloadOutlined } from '@ant-design/icons-vue';
++  import { publishApi } from '/@/api/iot/publish-api';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  // PublishLogRowVO（后端 TASK-0025：id/versionId/targetType/targetId/ackStatus/ackTime/
++  // errorMsg/createTime/timedOut 派生）
++  interface PublishLogRow {
++    id?: number;
++    versionId?: number;
++    targetType?: number;
++    targetId?: string;
++    ackStatus?: number;
++    ackTime?: string;
++    errorMsg?: string;
++    createTime?: string;
++    timedOut?: boolean;
++    [key: string]: unknown;
++  }
++  // PublishLogListVO（版本信封 + rows + publishState 汇总）
++  interface PublishLogListVO {
++    versionId?: number;
++    scopeType?: number;
++    scopeId?: number;
++    version?: number;
++    publishState?: number;
++    rows?: PublishLogRow[];
++    [key: string]: unknown;
++  }
++
++  const columns = ref([
++    {
++      title: '目标类型',
++      width: 90,
++      dataIndex: 'targetType',
++    },
++    {
++      title: '目标标识',
++      dataIndex: 'targetId',
++    },
++    {
++      title: '回执状态',
++      width: 130,
++      dataIndex: 'ackStatus',
++    },
++    {
++      title: '回执时间',
++      width: 160,
++      dataIndex: 'ackTime',
++    },
++    {
++      title: '失败原因',
++      dataIndex: 'errorMsg',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      width: 80,
++    },
++  ]);
++
++  const visible = ref(false);
++  const versionRow = ref<Record<string, unknown> | null>(null);
++  const tableLoading = ref(false);
++  const rows = ref<PublishLogRow[]>([]);
++  const publishState = ref<number | undefined>(undefined);
++
++  const scopeLabel = computed(() => {
++    const scopeType = versionRow.value?.scopeType;
++    if (scopeType === 1) {
++      return `网关（scopeId=${versionRow.value?.scopeId ?? '-'}）`;
++    }
++    if (scopeType === 2) {
++      return `计算（租户级，scopeId=${versionRow.value?.scopeId ?? 0}）`;
++    }
++    return '-';
++  });
++
++  function targetTypeLabel(targetType?: number) {
++    if (targetType === 1) {
++      return '网关';
++    }
++    if (targetType === 2) {
++      return '接入';
++    }
++    if (targetType === 3) {
++      return '计算';
++    }
++    return '-';
++  }
++
++  function showModal(rowData) {
++    // 版本行携带 id（=versionId）/version/scopeType/scopeId——按 versionId 查询
++    versionRow.value = rowData;
++    visible.value = true;
++    ajaxQuery();
++  }
++
++  function close() {
++    visible.value = false;
++    versionRow.value = null;
++    rows.value = [];
++    publishState.value = undefined;
++  }
++
++  async function ajaxQuery() {
++    if (!versionRow.value?.id) {
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await publishApi.queryPublishLogList({ versionId: versionRow.value.id });
++      const vo: PublishLogListVO = responseData.data;
++      rows.value = vo.rows || [];
++      publishState.value = vo.publishState;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 重发（失败/未回执行；已生效行置灰不发请求） -----------------
++
++  function confirmResend(rowData: PublishLogRow) {
++    Modal.confirm({
++      title: '下发重发确认',
++      content: `确定要向【${rowData.targetId ?? '-'}】重发配置版本 v${
++        versionRow.value?.version ?? '-'
++      } 吗？重发将把该目标回执重置为待确认并重新触发下发。`,
++      okText: '重发',
++      onOk() {
++        resend(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function resend(rowData: PublishLogRow) {
++    try {
++      OtLoading.show();
++      await publishApi.resendPublishLog({
++        versionId: rowData.versionId ?? versionRow.value?.id,
++        targetId: rowData.targetId,
++      });
++      message.success('重发成功：回执已重置为待确认并触发下发');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
++<style scoped lang="less">
++  .publish-log-error {
++    color: #cf1322;
++  }
++</style>
+diff --git a/frontend/src/views/iot/publish/index.vue b/frontend/src/views/iot/publish/index.vue
+index 24554da..d680504 100644
+--- a/frontend/src/views/iot/publish/index.vue
++++ b/frontend/src/views/iot/publish/index.vue
+@@ -1,11 +1,247 @@
+ <!--
+-  * 配置发布（占位骨架，TASK-0055）
++  * 配置发布（TASK-0070 批次一完整页，原 TASK-0055 占位骨架升级）
+   *
+-  * 菜单挂载点：sys_menu 4015（/iot/publish）。配置发布/回滚（高危，REQ-0034）归 TASK-0056/0070。
++  * 菜单挂载点：sys_menu 4015（/iot/publish），按钮权限行 4070-4074。
++  * 对接 IotPublishController：GET /iot/publish/list（iot:publish:list 4070——版本列表分页，
++  * scopeType+scopeId 必传：scopeType=1 网关选 id / 2 计算归一 0）+ 下发状态抽屉
++  * （GET /iot/publish/log/list + POST /iot/publish/resend，iot:publish:resend 4074）。
++  * 发布/回滚动作（4072/4073，影响预览+二次确认）待 TASK-0015 交付后接入——本批不建占位按钮。
++  * 保存≠生效（TD-0034）：版本行只由发布链路写入，本页对版本无任何写操作。
+ -->
+ <template>
+-  <IotPlaceholder title="配置发布" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="发布范围" class="ot-query-form-item" required>
++        <a-select style="width: 120px" v-model:value="queryForm.scopeType" :allowClear="true" placeholder="请选择" @change="onScopeTypeChange">
++          <a-select-option :value="1">网关</a-select-option>
++          <a-select-option :value="2">计算</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item v-if="queryForm.scopeType === 1" label="配置网关" class="ot-query-form-item" required>
++        <a-select
++          style="width: 260px"
++          v-model:value="queryForm.gatewayId"
++          show-search
++          option-filter-prop="label"
++          :options="gatewayOptions"
++          placeholder="请选择网关（scopeId=网关 id）"
++        />
++      </a-form-item>
++      <a-form-item v-if="queryForm.scopeType === 2" label="配置对象" class="ot-query-form-item">
++        <span class="publish-scope-tip">计算配置为租户级对象（scopeId 归一为 0）</span>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:publish:list'" type="primary" :disabled="!queryForm.scopeType" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:publish:list'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <span v-if="!queryForm.scopeType" class="publish-scope-tip">请先选择发布范围（版本列表按 scopeType+scopeId 查询）</span>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="id"
++      :pagination="false"
++      bordered
++      :scroll="{ x: 900 }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'publishStatus'">
++          <a-tag v-if="record.publishStatus === 1" color="green">已发布</a-tag>
++          <a-tag v-else-if="record.publishStatus === 2" color="orange">已回滚</a-tag>
++          <a-tag v-else color="default">{{ record.publishStatus ?? '-' }}</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'snapshotHash'">
++          <a-typography-paragraph
++            :content="record.snapshotHash"
++            :ellipsis="{ rows: 1, tooltip: record.snapshotHash }"
++            copyable
++            style="margin-bottom: 0"
++          />
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:publish:list'" type="link" @click="showPublishLog(record)">下发状态</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <PublishLogDrawer ref="publishLogDrawerRef" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import PublishLogDrawer from './components/publish-log-drawer.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { SearchOutlined, ReloadOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { publishApi } from '/@/api/iot/publish-api';
++  import { gatewayApi } from '/@/api/iot/gateway-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '版本号',
++      width: 90,
++      dataIndex: 'version',
++    },
++    {
++      title: '快照哈希（SHA-256）',
++      dataIndex: 'snapshotHash',
++      width: 340,
++    },
++    {
++      title: '发布状态',
++      width: 90,
++      dataIndex: 'publishStatus',
++    },
++    {
++      title: '发布时间',
++      width: 160,
++      dataIndex: 'publishTime',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 110,
++    },
++  ]);
++
++  // ---------------- 网关下拉（scopeType=1 时 scopeId=网关 id） -----------------
++
++  const gatewayOptions = ref<{ label: string; value: number }[]>([]);
++
++  async function loadGatewayOptions() {
++    try {
++      // pageSize 上限 500 对齐后端 maxLimit（MybatisPlusConfig）
++      const responseData = await gatewayApi.queryGatewayList({ pageNum: 1, pageSize: 500 });
++      gatewayOptions.value = (responseData.data.records || []).map((g) => ({
++        label: `${g.gatewayCode}（${g.gatewayName}）`,
++        value: g.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    scopeType: undefined,
++    gatewayId: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const publishLogDrawerRef = ref();
++
++  function onScopeTypeChange() {
++    // scopeType 切换后原 scopeId 语义失效（1=网关 id / 2=归一 0），一并清空
++    queryForm.gatewayId = undefined;
++    queryForm.pageNum = 1;
++    tableData.value = [];
++    total.value = 0;
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    tableData.value = [];
++    total.value = 0;
++  }
++
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++
++  async function ajaxQuery() {
++    if (!queryForm.scopeType) {
++      // scopeType+scopeId 必传（后端 RequiredRequestParam）——未选范围不发请求
++      tableData.value = [];
++      total.value = 0;
++      return;
++    }
++    if (queryForm.scopeType === 1 && !queryForm.gatewayId) {
++      // scopeType=1 时 scopeId=网关 id 必选
++      tableData.value = [];
++      total.value = 0;
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await publishApi.queryVersionList({
++        pageNum: queryForm.pageNum,
++        pageSize: queryForm.pageSize,
++        scopeType: queryForm.scopeType,
++        // scopeType=2 计算为租户级对象，scopeId 归一为 0（契约 §1.8）
++        scopeId: queryForm.scopeType === 2 ? 0 : queryForm.gatewayId,
++      });
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 下发状态抽屉（挂版本上下文） -----------------
++
++  function showPublishLog(rowData) {
++    publishLogDrawerRef.value.showModal(rowData);
++  }
++
++  onMounted(() => {
++    loadGatewayOptions();
++  });
+ </script>
++<style scoped lang="less">
++  .publish-scope-tip {
++    color: #999;
++    font-size: 12px;
++  }
++</style>

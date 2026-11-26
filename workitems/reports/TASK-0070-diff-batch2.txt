@@ -1,0 +1,1491 @@
+diff --git a/frontend/src/api/iot/publish-api.ts b/frontend/src/api/iot/publish-api.ts
+index 818aa3e..c9f730f 100644
+--- a/frontend/src/api/iot/publish-api.ts
++++ b/frontend/src/api/iot/publish-api.ts
+@@ -1,12 +1,17 @@
+ /*
+  * 配置发布（智慧工厂）
+  *
+- * 对接后端 IotPublishController（TASK-0024 建立四端点 / TASK-0025 扩展下发状态查询与重发，
+- * 路径前缀 /iot/publish，权限位 iot:publish:* 与 sys_menu 4070-4074 按钮行一一对应）。
++ * 对接后端 IotPublishController（TASK-0024 建立四端点 / TASK-0025 扩展下发状态查询与重发 /
++ * TASK-0015 扩展发布确认门 confirmToken，路径前缀 /iot/publish，权限位 iot:publish:* 与
++ * sys_menu 4070-4074 按钮行一一对应）。
+  * 版本列表 scopeType+scopeId 必传（scopeType=1 网关 id / 2 计算归一 0）；下发状态查询
+  * versionId 或 scopeType+scopeId+version 二选一（都给以 versionId 为准校验一致性）。
+- * 发布/回滚动作（iot:publish:publish/rollback 4072/4073，影响预览+二次确认）待 TASK-0015
+- * 交付后接入，本封装不提供（0070 批次一：版本列表 + 下发状态 + 重发三读写）。
++ * 发布（0070 批次二接入）：二档模板变更发布必携 confirmToken（影响预览 previewToken 原样
++ * 回传），缺失/过期/内容漂移报 5002 下发未确认；一档/三档及无变更可缺省直接发布。
++ * 快照取回（0070 批次二接入，iot:publish:query 4071）：version 缺省最新版，服务端取回时
++ * SHA-256 哈希核对（不一致 500 存储损坏告警）。
++ * 回滚动作（iot:publish:rollback 4073）本封装不提供——0070 批次二三件组决策未含回滚交互，
++ * 登记后续批次接入。
+  */
+ import { getRequest, postRequest } from '/@/lib/axios';
+ 
+@@ -32,4 +37,20 @@ export const publishApi = {
+   resendPublishLog: (data) => {
+     return postRequest('/iot/publish/resend', data);
+   },
++
++  /**
++   * 发布配置（{scopeType, scopeId, confirmToken?}；版本同 (tenant, scope) 单调递增，
++   * 并发发布撞 uk_scope_version 后端 5001；silentError 由发布弹窗自渲染错误引导）
++   */
++  publishConfig: (data) => {
++    return postRequest('/iot/publish/publish', data, { silentError: true });
++  },
++
++  /**
++   * 快照取回（scopeType+scopeId 必传，version 缺省最新版；返回 SnapshotVO：信封 +
++   * snapshotBody 快照体 JSON 原文（Schema v1.0.1））
++   */
++  querySnapshot: (params?) => {
++    return getRequest('/iot/publish/snapshot', params);
++  },
+ };
+diff --git a/frontend/src/api/iot/template-api.ts b/frontend/src/api/iot/template-api.ts
+index 9f2b2d6..5852f15 100644
+--- a/frontend/src/api/iot/template-api.ts
++++ b/frontend/src/api/iot/template-api.ts
+@@ -1,10 +1,11 @@
+ /*
+  * 模型模板 + 模板数据项（智慧工厂）
+  *
+- * 对接后端 IotModelTemplateController / IotDataItemTemplateController（TASK-0011 交付，
+- * 路径前缀 /iot/template 与子资源 /iot/template/item；权限位 iot:template:*（4024-4028）
+- * 与 iot:template:item:edit（4029，三个写接口共用；查询共用 iot:template:list））。
+- * template_code 创建后不可改；模板删除为真实逻辑删（有实例/数据项引用时后端拒绝）。
++ * 对接后端 IotModelTemplateController / IotDataItemTemplateController（TASK-0011 交付；
++ * TASK-0015 扩展影响预览端点，路径前缀 /iot/template 与子资源 /iot/template/item；
++ * 权限位 iot:template:*（4024-4028）与 iot:template:item:edit（4029，三个写接口共用；
++ * 查询共用 iot:template:list））。template_code 创建后不可改；模板删除为真实逻辑删
++ * （有实例/数据项引用时后端拒绝）。
+  */
+ import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
+ 
+@@ -16,6 +17,15 @@ export const templateApi = {
+     return getRequest('/iot/template/list', params);
+   },
+ 
++  /**
++   * 模板变更影响预览（TASK-0015，权限复用 iot:template:query 4025）：受影响实例数
++   * （引用且启用，locked 子集单列）+ 待生效 diff（逐条目带档位 T1/T2/T3/FORBIDDEN）+
++   * previewToken（发布请求 confirmToken 原样回传，TTL 见 confirmTokenTtlSeconds 默认 300）
++   */
++  queryImpactPreview: (templateId: number) => {
++    return getRequest('/iot/template/impact-preview', { templateId });
++  },
++
+   /**
+    * 模板详情（withItems=true 聚合模板数据项清单，items 字段仅该模式返回）
+    */
+diff --git a/frontend/src/api/iot/upgrade-api.ts b/frontend/src/api/iot/upgrade-api.ts
+new file mode 100644
+index 0000000..36b9aad
+--- /dev/null
++++ b/frontend/src/api/iot/upgrade-api.ts
+@@ -0,0 +1,38 @@
++/*
++ * 模板变更升级链（智慧工厂）——待升级清单 / 逐台批量确认 / 实例锁定开关
++ *
++ * 对接后端 TASK-0016 三接口（ADR-0008 二/三档政策的实例侧通道）：
++ * - GET  /iot/template/upgrade/list    清单（权限复用 iot:template:query 4025，templateId 必传）
++ * - POST /iot/template/upgrade/confirm 确认升级（权限复用 iot:instance:edit 4034——实例写操作；
++ *        targetVersion 必须等于模板当前版本，逐台乐观锁冲突 4002，整批原子不半成功）
++ * - PUT  /iot/instance/lock            锁定开关（权限复用 iot:instance:edit；锁定实例不自动
++ *        跟随二档变更、进待升级清单逐台确认——这正是锁定实例的升级通道）
++ *
++ * 跨命名空间说明：清单/确认归 IotTemplateUpgradeController（/iot/template/upgrade，模板域
++ * 子资源），锁定开关归 IotInstanceLockController（/iot/instance）——三接口同属 0016 交付组，
++ * 前端归并一个封装文件；权限「视线（template:query）与动作（instance:edit）分离」。
++ */
++import { getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const upgradeApi = {
++  /**
++   * 待升级清单（引用该模板且 appliedTemplateVersion < 模板当前版本的实例，逐行 diff 带档位）
++   */
++  queryUpgradeList: (params?) => {
++    return getRequest('/iot/template/upgrade/list', params);
++  },
++
++  /**
++   * 逐台/批量确认升级（{instanceIds: [], targetVersion}；已在目标版本/并发冲突 4002 整批拒绝）
++   */
++  confirmUpgrade: (data) => {
++    return postRequest('/iot/template/upgrade/confirm', data);
++  },
++
++  /**
++   * 实例锁定开关（{instanceId, locked}：0 解除锁定 / 1 锁定；锁定后实例编辑仅允许 status）
++   */
++  setInstanceLock: (data) => {
++    return putRequest('/iot/instance/lock', data);
++  },
++};
+diff --git a/frontend/src/router/index.ts b/frontend/src/router/index.ts
+index 777d7d0..b4b54cd 100644
+--- a/frontend/src/router/index.ts
++++ b/frontend/src/router/index.ts
+@@ -10,6 +10,7 @@ import { nextTick } from 'vue';
+ import { createRouter, createWebHashHistory } from 'vue-router';
+ import { routerArray } from './routers';
+ import { surveyFormWorkbenchRouters, surveyRecycleRouter, surveyCategoryRouters, surveyTemplatePreviewRouters } from './survey';
++import { iotUpgradeListRouter } from './iot';
+ import { PAGE_PATH_404, PAGE_PATH_LOGIN, HOME_PAGE_PATH, REFRESH_REDIRECT_NAME } from '/@/constants/common-const';
+ import { HOME_PAGE_NAME } from '/@/constants/system/home-const';
+ // FEAT-1100：后台骨架懒加载（同 router/system/home.ts 注释；切断 layout 组件树对首屏静态图的拉入）
+@@ -234,6 +235,9 @@ function buildRouteList(menuList) {
+   // 模板预览页（/survey/template/preview）：无后端菜单项，入口为模板中心卡片「查看」
+   routerList.push(...(surveyTemplatePreviewRouters as never[]));
+ 
++  // 待升级清单（/iot/upgrade）：无后端菜单项（0016 复用既有权限位），入口为模板页行操作
++  routerList.push(iotUpgradeListRouter as never);
++
+   // 标签页"刷新"中转路由：先离开目标页（清缓存后卸载），再由中转页跳回实现重新挂载
+   routerList.push({
+     path: '/refresh/:name',
+diff --git a/frontend/src/router/iot.ts b/frontend/src/router/iot.ts
+index 4d56dfb..90868aa 100644
+--- a/frontend/src/router/iot.ts
++++ b/frontend/src/router/iot.ts
+@@ -6,8 +6,22 @@
+  * router/index.ts 的 buildRoutes() 按 component 路径 import.meta.glob 懒加载动态注册
+  * ——与 system 模块各页面（字典/角色/菜单等）完全同一样式，故静态路由段当前为空。
+  *
+- * 本文件仅预留「无后端菜单项的 iot 页面」静态注册位（照 survey.ts 样式，
+- * 如后续向导子页/详情页无菜单项时在此追加并挂 hideInMenu），当前无内容。
++ * 本文件仅承载「无后端菜单项的 iot 页面」静态注册位（照 survey.ts 样式，挂 hideInMenu，
++ * 由 router/index.ts 的 buildRouteList 挂到布局下）；当前仅待升级清单一页（TASK-0070
++ * 批次二，0016 不新增菜单种子、复用既有权限位）。
+  * 页面可达性由菜单下发与权限点承担（REQ-0034：前端只做显隐，拦截一律后端）。
+  */
+ export default [];
++
++/**
++ * 待升级清单（TASK-0070 批次二）：无后端菜单项（TASK-0016 复用既有权限位不新增菜单种子
++ * ——清单查询 iot:template:query 4025 / 确认与锁定 iot:instance:edit 4034），
++ * 入口为模板管理页（4009）行操作「待升级清单」（携 ?templateId= 预选），页内自带
++ * 模板选择器可独立直达。
++ */
++export const iotUpgradeListRouter = {
++  path: '/iot/upgrade',
++  name: 'IotUpgradeList',
++  component: () => import('/@/views/iot/upgrade/index.vue'),
++  meta: { title: '待升级清单', hideInMenu: true },
++};
+diff --git a/frontend/src/views/iot/channel/components/channel-credential-drawer.vue b/frontend/src/views/iot/channel/components/channel-credential-drawer.vue
+index e5d8be6..3abac02 100644
+--- a/frontend/src/views/iot/channel/components/channel-credential-drawer.vue
++++ b/frontend/src/views/iot/channel/components/channel-credential-drawer.vue
+@@ -220,9 +220,11 @@
+     Modal.confirm({
+       title: '写入/轮换确认',
+       content: existing
+-        ? `该通道已存在【${credTypeLabel(writeForm.credType)}】凭据（密钥版本 ${
+-            existing.keyVersion ?? '-'
+-          }），本次写入=轮换（key_version 递增、旧密文被替换）。确定提交？`
++        ? `该通道已存在【${credTypeLabel(writeForm.credType)}】凭据（密钥版本 ${existing.keyVersion ?? '-'}，当前状态：${
++            existing.status === 1 ? '启用' : '已吊销'
++          }），本次写入=轮换（key_version 递增、旧密文被替换${
++            existing.status === 1 ? '' : '，并将该已吊销凭据复活启用（status 置回启用）'
++          }）。确定提交？`
+         : `确定要为该通道写入【${credTypeLabel(writeForm.credType)}】凭据吗？明文由服务端 SM4 加密落库，审计不留明文。`,
+       okText: '确认写入',
+       onOk() {
+diff --git a/frontend/src/views/iot/import/index.vue b/frontend/src/views/iot/import/index.vue
+index 0b91878..4375d62 100644
+--- a/frontend/src/views/iot/import/index.vue
++++ b/frontend/src/views/iot/import/index.vue
+@@ -37,7 +37,7 @@
+       <a-upload-dragger
+         v-privilege="'iot:point:add'"
+         name="file"
+-        accept=".xlsx,.xls"
++        accept=".xlsx"
+         :maxCount="1"
+         :fileList="fileList"
+         :beforeUpload="beforeUpload"
+@@ -50,7 +50,9 @@
+       </a-upload-dragger>
+ 
+       <div class="import-step-actions">
+-        <a-button type="primary" :loading="importing" :disabled="!file" @click="startImport">下一步：开始导入</a-button>
++        <a-button v-privilege="'iot:point:add'" type="primary" :loading="importing" :disabled="!file" @click="startImport">
++          下一步：开始导入
++        </a-button>
+       </div>
+     </div>
+ 
+diff --git a/frontend/src/views/iot/publish/components/publish-confirm-modal.vue b/frontend/src/views/iot/publish/components/publish-confirm-modal.vue
+new file mode 100644
+index 0000000..76c8a31
+--- /dev/null
++++ b/frontend/src/views/iot/publish/components/publish-confirm-modal.vue
+@@ -0,0 +1,355 @@
++<!--
++  * 发布确认弹窗（TASK-0070 批次二，TASK-0015 影响预览/确认门交付的前端闭环）
++  *
++  * 挂发布范围上下文：从配置发布页查询表单打开（scopeType+scopeId）。
++  * 交互（ADR-0008 三档政策）：发布动作前置影响预览——GET /iot/template/impact-preview
++  * （权限复用 iot:template:query 4025，templateId 维度）→ 展示受影响实例数
++  * （affectedInstanceCount 未锁定跟随 / lockedInstanceCount 锁定单列——进待升级清单）
++  * + 逐条目 diff（档位徽标 T1 随发布自动生效 / T2 强制二次确认 / T3 逐台迁移不随本次发布）
++  * → 用户确认后携 previewToken 调 POST /iot/publish/publish（iot:publish:publish 4072）；
++  * 无 T2 diff（第一档/无模板变更）直接发布不带 token（一档政策）。
++  * 5002 下发未确认（ResultCode，确认门拒绝）错误锚点：未预览直接发布 → 引导先做影响预览；
++  * 带 token 发布再次 5002（token 过期/内容漂移）→ 清空预览态引导重新预览。
++-->
++<template>
++  <a-modal :open="visible" :width="880" title="发布配置（影响预览 + 二次确认）" :maskClosable="false" @cancel="close">
++    <a-alert
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      message="保存≠生效：发布生成新配置版本并触发下发；二档变更（公式/门限等语义变更）发布强制影响预览+二次确认（ADR-0008）"
++    />
++
++    <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++      <a-descriptions-item label="发布范围" :span="2">{{ scopeLabel }}</a-descriptions-item>
++      <a-descriptions-item label="关联模板" :span="2">
++        <a-select
++          style="width: 100%"
++          v-model:value="templateId"
++          show-search
++          option-filter-prop="label"
++          :options="templateOptions"
++          :allowClear="true"
++          placeholder="选择模板用于影响预览（模板内容经计算域快照进入发布链）"
++        />
++      </a-descriptions-item>
++    </a-descriptions>
++
++    <!-- 5002 / 其他发布失败的自渲染引导（silentError：全局 toast 已静默） -->
++    <a-alert v-if="publishError" type="error" show-icon class="ot-margin-bottom10" :message="publishError" />
++
++    <a-row class="ot-margin-bottom10">
++      <a-space>
++        <a-button v-privilege="'iot:template:query'" :loading="previewing" :disabled="!templateId" @click="loadPreview">
++          <template #icon>
++            <EyeOutlined />
++          </template>
++          获取影响预览
++        </a-button>
++        <span v-if="!templateId" class="publish-modal-tip">影响预览需先选择关联模板</span>
++      </a-space>
++    </a-row>
++
++    <!-- 影响预览结果段 -->
++    <template v-if="previewed">
++      <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++        <a-descriptions-item label="受影响实例数">{{ preview?.affectedInstanceCount ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="锁定实例数">
++          {{ preview?.lockedInstanceCount ?? '-' }}
++          <span class="publish-modal-tip">（不随发布，进待升级清单逐台确认）</span>
++        </a-descriptions-item>
++        <a-descriptions-item label="档位摘要">{{ preview?.tierSummary || '（无变更）' }}</a-descriptions-item>
++        <a-descriptions-item label="模板当前版本">v{{ preview?.currentTemplateVersion ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="本次发布版本（计算域）">v{{ preview?.targetVersion ?? '-' }}</a-descriptions-item>
++        <a-descriptions-item label="确认凭据有效期">{{ preview?.confirmTokenTtlSeconds ?? '-' }} 秒</a-descriptions-item>
++      </a-descriptions>
++
++      <!-- 三档政策提示（ADR-0008：T1 随发布生效 / T2 强制确认 / T3 逐台迁移） -->
++      <a-alert
++        v-if="hasTier2"
++        type="warning"
++        show-icon
++        class="ot-margin-bottom10"
++        message="存在第二档变更（语义变更类）：随发布生效但强制二次确认——请核对下方 diff 与影响面，确认后携确认凭据发布"
++      />
++      <a-alert
++        v-else-if="hasTier3"
++        type="warning"
++        show-icon
++        class="ot-margin-bottom10"
++        message="变更均为第三档（结构破坏类）：逐台确认迁移，不随本次发布——可直接发布（不携带确认凭据），迁移请到模板页「待升级清单」逐台处理"
++      />
++      <a-alert
++        v-else
++        type="success"
++        show-icon
++        class="ot-margin-bottom10"
++        message="影响预览为空或均为第一档（纯新增/展示类，不改变任何已有值的含义）：随发布自动生效，直接发布即可（不携带确认凭据）"
++      />
++      <a-alert
++        v-if="hasTier3"
++        type="error"
++        show-icon
++        class="ot-margin-bottom10"
++        message="存在第三档变更（结构破坏类，见 diff 红标）：逐台迁移，不随本次发布——本页发布不含这些变更"
++      />
++
++      <a-table
++        size="small"
++        :dataSource="preview?.diff || []"
++        :columns="diffColumns"
++        rowKey="uid"
++        :pagination="false"
++        bordered
++        class="ot-margin-bottom10"
++        :scroll="{ y: 220 }"
++      >
++        <template #bodyCell="{ record, column }">
++          <template v-if="column.dataIndex === 'objectType'">{{ objectTypeLabel(record.objectType) }}</template>
++          <template v-if="column.dataIndex === 'changeType'">
++            <a-tag v-if="record.changeType === 'ADDED'" color="green">新增</a-tag>
++            <a-tag v-else-if="record.changeType === 'REMOVED'" color="red">删除</a-tag>
++            <a-tag v-else-if="record.changeType === 'CHANGED'" color="orange">修改</a-tag>
++            <a-tag v-else color="default">{{ record.changeType ?? '-' }}</a-tag>
++          </template>
++          <template v-if="column.dataIndex === 'oldValue'">
++            <code class="publish-diff-value">{{ record.oldValue ?? '-' }}</code>
++          </template>
++          <template v-if="column.dataIndex === 'newValue'">
++            <code class="publish-diff-value">{{ record.newValue ?? '-' }}</code>
++          </template>
++          <template v-if="column.dataIndex === 'tier'">
++            <a-space>
++              <a-tag v-if="record.tier === 'T1'" color="green">T1 随发布生效</a-tag>
++              <a-tag v-else-if="record.tier === 'T2'" color="orange">T2 强制确认</a-tag>
++              <a-tag v-else-if="record.tier === 'T3'" color="red">T3 逐台迁移</a-tag>
++              <a-tag v-else color="red">{{ record.tier ?? '-' }} 禁止</a-tag>
++              <a-tag v-if="record.tier === 'T3'" color="red">不随本次发布</a-tag>
++            </a-space>
++          </template>
++        </template>
++      </a-table>
++    </template>
++
++    <template #footer>
++      <a-button @click="close">取消</a-button>
++      <a-button v-privilege="'iot:publish:publish'" type="primary" :loading="publishing" @click="confirmPublish">
++        {{ hasTier2 ? '确认发布（已预览，携确认凭据）' : previewed ? '确认发布' : '直接发布（未预览）' }}
++      </a-button>
++    </template>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { EyeOutlined } from '@ant-design/icons-vue';
++  import { publishApi } from '/@/api/iot/publish-api';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  // TemplateChangeEntryVO（后端 TASK-0015：objectType/objectKey/changeType/field/oldValue/
++  // newValue/tier；uid 为前端渲染补充键）
++  interface TemplateChangeEntry {
++    objectType?: string;
++    objectKey?: string;
++    changeType?: string;
++    field?: string | null;
++    oldValue?: string | null;
++    newValue?: string | null;
++    tier?: string;
++    uid?: number;
++    [key: string]: unknown;
++  }
++  // TemplateImpactPreviewVO（受影响计数分列 + diff + previewToken 二次确认凭据）
++  interface TemplateImpactPreview {
++    templateId?: number;
++    currentTemplateVersion?: number;
++    targetVersion?: number;
++    diff?: TemplateChangeEntry[];
++    tierSummary?: string | null;
++    affectedInstanceCount?: number;
++    lockedInstanceCount?: number;
++    previewToken?: string;
++    confirmScopeType?: number;
++    confirmScopeId?: number;
++    confirmTokenTtlSeconds?: number;
++    [key: string]: unknown;
++  }
++
++  const emit = defineEmits(['published']);
++
++  const diffColumns = [
++    { title: '对象类型', width: 100, dataIndex: 'objectType' },
++    { title: '业务键', width: 130, dataIndex: 'objectKey' },
++    { title: '变更形态', width: 80, dataIndex: 'changeType' },
++    { title: '变更字段', width: 140, dataIndex: 'field' },
++    { title: '旧值', dataIndex: 'oldValue' },
++    { title: '新值', dataIndex: 'newValue' },
++    { title: '档位（ADR-0008）', width: 190, dataIndex: 'tier' },
++  ];
++
++  const visible = ref(false);
++  const scopeLabel = ref('');
++  const scopeType = ref<number | undefined>(undefined);
++  const scopeId = ref<number | undefined>(undefined);
++
++  const templateId = ref<number | undefined>(undefined);
++  const templateOptions = ref<{ label: string; value: number }[]>([]);
++
++  const previewing = ref(false);
++  const previewed = ref(false);
++  const preview = ref<TemplateImpactPreview | null>(null);
++  const publishing = ref(false);
++  const publishError = ref('');
++  let diffUid = 0;
++
++  const hasTier2 = computed(() => (preview.value?.diff || []).some((entry) => entry.tier === 'T2'));
++  const hasTier3 = computed(() => (preview.value?.diff || []).some((entry) => entry.tier === 'T3'));
++
++  function objectTypeLabel(objectType?: string) {
++    if (objectType === 'template') {
++      return '模板头';
++    }
++    if (objectType === 'dataItem') {
++      return '模板数据项';
++    }
++    if (objectType === 'statusRule') {
++      return '状态规则';
++    }
++    return objectType ?? '-';
++  }
++
++  function showModal(scope: { scopeType: number; scopeId: number; scopeLabel: string }) {
++    scopeType.value = scope.scopeType;
++    scopeId.value = scope.scopeId;
++    scopeLabel.value = scope.scopeLabel;
++    templateId.value = undefined;
++    preview.value = null;
++    previewed.value = false;
++    publishError.value = '';
++    visible.value = true;
++    loadTemplateOptions();
++  }
++
++  function close() {
++    visible.value = false;
++    scopeType.value = undefined;
++    scopeId.value = undefined;
++    scopeLabel.value = '';
++    templateId.value = undefined;
++    preview.value = null;
++    previewed.value = false;
++    publishError.value = '';
++  }
++
++  async function loadTemplateOptions() {
++    try {
++      // pageSize 上限 500 对齐后端 maxLimit（MybatisPlusConfig）
++      const responseData = await templateApi.queryTemplateList({ pageNum: 1, pageSize: 500 });
++      templateOptions.value = (responseData.data.records || []).map((t) => ({
++        label: `${t.templateCode}（${t.templateName}）`,
++        value: t.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  // ---------------- 影响预览（发布动作前置） -----------------
++
++  async function loadPreview() {
++    if (!templateId.value) {
++      return;
++    }
++    publishError.value = '';
++    try {
++      previewing.value = true;
++      const responseData = await templateApi.queryImpactPreview(templateId.value);
++      const vo: TemplateImpactPreview = responseData.data;
++      // uid：diff 行前端渲染键（objectKey+field 组合可能重复，递增序保证 rowKey 稳定）
++      vo.diff = (vo.diff || []).map((entry) => ({ ...entry, uid: ++diffUid }));
++      preview.value = vo;
++      previewed.value = true;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      previewing.value = false;
++    }
++  }
++
++  // ---------------- 发布（无 T2 不带 token；5002 下发未确认锚点引导） -----------------
++
++  function confirmPublish() {
++    if (scopeType.value === undefined || scopeId.value === undefined) {
++      return;
++    }
++    if (hasTier2.value && previewed.value) {
++      // 二档变更：Modal.confirm 二次确认（影响面 + 档位摘要核对后携确认凭据发布）
++      Modal.confirm({
++        title: '发布二次确认',
++        content: `存在第二档变更（${preview.value?.tierSummary ?? '-'}）：受影响实例 ${
++          preview.value?.affectedInstanceCount ?? 0
++        } 台（未锁定跟随）、锁定实例 ${preview.value?.lockedInstanceCount ?? 0} 台（不随发布，进待升级清单）。确认发布计算范围 v${
++          preview.value?.targetVersion ?? '-'
++        } 吗？`,
++        okText: '确认发布',
++        onOk() {
++          doPublish(preview.value?.previewToken);
++        },
++        cancelText: '取消',
++        onCancel() {},
++      });
++    } else {
++      // 一档/三档/无变更：直接发布不带 token（一档随发布自动生效；三档逐台迁移不随本次发布）
++      doPublish(undefined);
++    }
++  }
++
++  async function doPublish(confirmToken?: string) {
++    publishing.value = true;
++    try {
++      const responseData = await publishApi.publishConfig({
++        scopeType: scopeType.value,
++        scopeId: scopeId.value,
++        ...(confirmToken ? { confirmToken } : {}),
++      });
++      message.success(`发布成功：已生成配置版本 v${responseData.data?.version ?? '-'}（下发状态见版本行「下发状态」）`);
++      emit('published');
++      close();
++    } catch (e) {
++      // 5002 下发未确认（确认门拒绝，ResultCode）——发布交互的错误处理锚点：
++      // 未预览路径 → 引导先做影响预览；带 token 路径（过期/内容漂移）→ 清空预览态引导重新预览
++      const body = (e as { data?: { code?: number; message?: string } })?.data;
++      if (body?.code === 5002) {
++        if (confirmToken) {
++          publishError.value = '发布未通过确认门（5002 下发未确认）：确认凭据已过期或发布内容已漂移——请重新获取影响预览并再次确认';
++          preview.value = null;
++          previewed.value = false;
++        } else {
++          publishError.value =
++            '发布未通过确认门（5002 下发未确认）：存在待确认的第二档模板变更——请先选择关联模板获取影响预览，核对 diff 后二次确认发布';
++        }
++      } else {
++        publishError.value = body?.message || '发布失败';
++      }
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      publishing.value = false;
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
++<style scoped lang="less">
++  .publish-modal-tip {
++    color: #999;
++    font-size: 12px;
++  }
++
++  .publish-diff-value {
++    word-break: break-all;
++  }
++</style>
+diff --git a/frontend/src/views/iot/publish/components/snapshot-drawer.vue b/frontend/src/views/iot/publish/components/snapshot-drawer.vue
+new file mode 100644
+index 0000000..80b73ad
+--- /dev/null
++++ b/frontend/src/views/iot/publish/components/snapshot-drawer.vue
+@@ -0,0 +1,174 @@
++<!--
++  * 快照查看抽屉（TASK-0070 批次二，TASK-0024 GET /iot/publish/snapshot 交付的前端闭环）
++  *
++  * 挂版本上下文：从配置发布页版本列表行「查看快照」打开（行携带 scopeType/scopeId/version/
++  * snapshotUri）。GET /iot/publish/snapshot（iot:publish:query 4071，version 缺省最新版——
++  * 本入口恒传行版本，定位到该版本）：服务端取回时 SHA-256 哈希核对（不一致 500 存储损坏
++  * 告警），前端展示信封（version/snapshotHash/snapshotUri + Schema 版本解析自快照体顶层
++  * schemaVersion）+ 快照体两种视图切换（折叠树 JsonViewer / 原文 pre）。
++-->
++<template>
++  <a-drawer :open="visible" :width="760" title="配置快照" :maskClosable="false" @close="close">
++    <a-descriptions size="small" bordered :column="2" class="ot-margin-bottom10">
++      <a-descriptions-item label="配置版本">v{{ snapshot?.version ?? versionRow?.version ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="发布范围">{{ scopeLabel }}</a-descriptions-item>
++      <a-descriptions-item label="Schema 版本">{{ schemaVersion ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="快照文件">{{ versionRow?.snapshotUri ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="快照哈希（SHA-256）" :span="2">
++        <a-typography-paragraph :content="snapshot?.snapshotHash ?? ''" copyable class="snapshot-hash" style="margin-bottom: 0" />
++      </a-descriptions-item>
++    </a-descriptions>
++
++    <a-alert
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      message="服务端取回时已做 SHA-256 哈希核对（与落库哈希不一致将报错告警——存储损坏探测）；快照体为 Schema v1.0.1 确定性序列化 JSON"
++    />
++
++    <a-row class="ot-margin-bottom10">
++      <a-space>
++        <a-radio-group v-model:value="bodyView" button-style="solid" size="small">
++          <a-radio-button value="tree">折叠树</a-radio-button>
++          <a-radio-button value="raw">原文</a-radio-button>
++        </a-radio-group>
++        <a-button v-privilege="'iot:publish:query'" size="small" @click="ajaxQuery">
++          <template #icon>
++            <ReloadOutlined />
++          </template>
++          刷新
++        </a-button>
++      </a-space>
++    </a-row>
++
++    <template v-if="snapshot?.snapshotBody">
++      <JsonViewer
++        v-if="bodyView === 'tree' && parsedBody"
++        :value="parsedBody"
++        :expanded="false"
++        :expandDepth="1"
++        copyable
++        boxed
++        sort
++        theme="light"
++        class="snapshot-body-viewer"
++      />
++      <pre v-else class="snapshot-body-raw">{{ snapshot.snapshotBody }}</pre>
++    </template>
++    <a-empty v-else-if="!tableLoading" description="快照体为空" />
++  </a-drawer>
++</template>
++<script setup lang="ts">
++  import { computed, ref } from 'vue';
++  import { ReloadOutlined } from '@ant-design/icons-vue';
++  import { JsonViewer } from 'vue3-json-viewer';
++  import { publishApi } from '/@/api/iot/publish-api';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  // SnapshotVO（后端 TASK-0024：scopeType/scopeId/version/snapshotHash/snapshotBody——
++  // snapshotBody 为 Schema v1.0.1 确定性序列化 JSON 原文，顶层含 schemaVersion）
++  interface SnapshotVO {
++    scopeType?: number;
++    scopeId?: number;
++    version?: number;
++    snapshotHash?: string;
++    snapshotBody?: string;
++    [key: string]: unknown;
++  }
++
++  const visible = ref(false);
++  const versionRow = ref<Record<string, unknown> | null>(null);
++  const tableLoading = ref(false);
++  const snapshot = ref<SnapshotVO | null>(null);
++  const bodyView = ref<'tree' | 'raw'>('tree');
++
++  const scopeLabel = computed(() => {
++    const scopeType = versionRow.value?.scopeType;
++    if (scopeType === 1) {
++      return `网关（scopeId=${versionRow.value?.scopeId ?? '-'}）`;
++    }
++    if (scopeType === 2) {
++      return `计算（租户级，scopeId=${versionRow.value?.scopeId ?? 0}）`;
++    }
++    return '-';
++  });
++
++  // Schema 版本解析自快照体顶层 schemaVersion（信封 VO 无该字段，JSON 原文承载）
++  const parsedBody = computed(() => {
++    if (!snapshot.value?.snapshotBody) {
++      return null;
++    }
++    try {
++      return JSON.parse(snapshot.value.snapshotBody);
++    } catch {
++      // 快照体非合法 JSON（理论不可达：确定性序列化产出）——回落原文视图
++      return null;
++    }
++  });
++
++  const schemaVersion = computed(() => {
++    const body = parsedBody.value as Record<string, unknown> | null;
++    return (body?.schemaVersion as string) ?? null;
++  });
++
++  function showModal(rowData) {
++    versionRow.value = rowData;
++    bodyView.value = 'tree';
++    visible.value = true;
++    ajaxQuery();
++  }
++
++  function close() {
++    visible.value = false;
++    versionRow.value = null;
++    snapshot.value = null;
++    bodyView.value = 'tree';
++  }
++
++  async function ajaxQuery() {
++    if (versionRow.value?.scopeType === undefined || versionRow.value?.scopeId === undefined) {
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await publishApi.querySnapshot({
++        scopeType: versionRow.value.scopeType,
++        scopeId: versionRow.value.scopeId,
++        version: versionRow.value.version,
++      });
++      snapshot.value = responseData.data;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
++<style scoped lang="less">
++  .snapshot-hash {
++    word-break: break-all;
++    font-size: 12px;
++  }
++
++  .snapshot-body-viewer {
++    max-height: 480px;
++    overflow: auto;
++  }
++
++  .snapshot-body-raw {
++    max-height: 480px;
++    overflow: auto;
++    padding: 8px;
++    background: #fafafa;
++    border: 1px solid #eee;
++    border-radius: 4px;
++    font-size: 12px;
++    word-break: break-all;
++    white-space: pre-wrap;
++  }
++</style>
+diff --git a/frontend/src/views/iot/publish/index.vue b/frontend/src/views/iot/publish/index.vue
+index d680504..ca064fe 100644
+--- a/frontend/src/views/iot/publish/index.vue
++++ b/frontend/src/views/iot/publish/index.vue
+@@ -1,12 +1,16 @@
+ <!--
+-  * 配置发布（TASK-0070 批次一完整页，原 TASK-0055 占位骨架升级）
++  * 配置发布（TASK-0070 批次一完整页；批次二升级：发布确认弹窗 + 快照查看入口）
+   *
+   * 菜单挂载点：sys_menu 4015（/iot/publish），按钮权限行 4070-4074。
+   * 对接 IotPublishController：GET /iot/publish/list（iot:publish:list 4070——版本列表分页，
+   * scopeType+scopeId 必传：scopeType=1 网关选 id / 2 计算归一 0）+ 下发状态抽屉
+   * （GET /iot/publish/log/list + POST /iot/publish/resend，iot:publish:resend 4074）。
+-  * 发布/回滚动作（4072/4073，影响预览+二次确认）待 TASK-0015 交付后接入——本批不建占位按钮。
+-  * 保存≠生效（TD-0034）：版本行只由发布链路写入，本页对版本无任何写操作。
++  * 发布动作（4072，批次二）：发布确认弹窗——影响预览（GET /iot/template/impact-preview，
++  * iot:template:query 4025）前置 → diff 展示 + 受影响/锁定实例分列 → 二次确认携
++  * confirmToken 发布（ADR-0008 三档政策，见 publish-confirm-modal）。
++  * 快照查看（4071 iot:publish:query，批次二）：版本行「查看快照」打开快照抽屉
++  * （GET /iot/publish/snapshot，哈希核对 + 折叠树/原文切换）。
++  * 保存≠生效（TD-0034）：版本行只由发布链路写入；回滚动作（4073）批次二三件组未含，未建按钮。
+ -->
+ <template>
+   <a-form class="ot-query-form">
+@@ -32,7 +36,7 @@
+       </a-form-item>
+       <a-form-item class="ot-query-form-item ot-margin-left10">
+         <a-button-group>
+-          <a-button v-privilege="'iot:publish:list'" type="primary" :disabled="!queryForm.scopeType" @click="onSearch">
++          <a-button v-privilege="'iot:publish:list'" type="primary" :disabled="!scopeReady" @click="onSearch">
+             <template #icon>
+               <SearchOutlined />
+             </template>
+@@ -44,6 +48,12 @@
+             </template>
+             重置
+           </a-button>
++          <a-button v-privilege="'iot:publish:publish'" danger :disabled="!scopeReady" @click="openPublishModal">
++            <template #icon>
++              <CloudUploadOutlined />
++            </template>
++            发布
++          </a-button>
+         </a-button-group>
+       </a-form-item>
+     </a-row>
+@@ -81,6 +91,7 @@
+         <template v-if="column.dataIndex === 'action'">
+           <div class="ot-table-operate">
+             <a-button v-privilege="'iot:publish:list'" type="link" @click="showPublishLog(record)">下发状态</a-button>
++            <a-button v-privilege="'iot:publish:query'" type="link" @click="showSnapshot(record)">查看快照</a-button>
+           </div>
+         </template>
+       </template>
+@@ -102,12 +113,16 @@
+     </div>
+ 
+     <PublishLogDrawer ref="publishLogDrawerRef" />
++    <SnapshotDrawer ref="snapshotDrawerRef" />
++    <PublishConfirmModal ref="publishConfirmModalRef" @published="onPublished" />
+   </a-card>
+ </template>
+ <script setup lang="ts">
+   import PublishLogDrawer from './components/publish-log-drawer.vue';
+-  import { onMounted, reactive, ref } from 'vue';
+-  import { SearchOutlined, ReloadOutlined } from '@ant-design/icons-vue';
++  import SnapshotDrawer from './components/snapshot-drawer.vue';
++  import PublishConfirmModal from './components/publish-confirm-modal.vue';
++  import { computed, onMounted, reactive, ref } from 'vue';
++  import { SearchOutlined, ReloadOutlined, CloudUploadOutlined } from '@ant-design/icons-vue';
+   import { OtLoading } from '/@/components/framework/ot-loading';
+   import { publishApi } from '/@/api/iot/publish-api';
+   import { gatewayApi } from '/@/api/iot/gateway-api';
+@@ -144,7 +159,7 @@
+       title: '操作',
+       dataIndex: 'action',
+       fixed: 'right',
+-      width: 110,
++      width: 170,
+     },
+   ]);
+ 
+@@ -178,6 +193,28 @@
+   const tableData = ref([]);
+   const total = ref(0);
+   const publishLogDrawerRef = ref();
++  const snapshotDrawerRef = ref();
++  const publishConfirmModalRef = ref();
++
++  // 发布/查询前置：scopeType 必选，scopeType=1 时网关必选（scopeId 必传契约）
++  const scopeReady = computed(() => {
++    if (!queryForm.scopeType) {
++      return false;
++    }
++    return queryForm.scopeType !== 1 || !!queryForm.gatewayId;
++  });
++
++  // 发布范围展示文案（弹窗头描述）
++  const publishScopeLabel = computed(() => {
++    if (queryForm.scopeType === 1) {
++      const gateway = gatewayOptions.value.find((opt) => opt.value === queryForm.gatewayId);
++      return `网关 ${gateway?.label ?? queryForm.gatewayId ?? '-'}（scopeId=${queryForm.gatewayId ?? '-'}）`;
++    }
++    if (queryForm.scopeType === 2) {
++      return '计算（租户级，scopeId=0）';
++    }
++    return '-';
++  });
+ 
+   function onScopeTypeChange() {
+     // scopeType 切换后原 scopeId 语义失效（1=网关 id / 2=归一 0），一并清空
+@@ -235,6 +272,31 @@
+     publishLogDrawerRef.value.showModal(rowData);
+   }
+ 
++  // ---------------- 快照查看抽屉（挂版本上下文，iot:publish:query 4071） -----------------
++
++  function showSnapshot(rowData) {
++    snapshotDrawerRef.value.showModal(rowData);
++  }
++
++  // ---------------- 发布（影响预览 + 二次确认弹窗，iot:publish:publish 4072） -----------------
++
++  function openPublishModal() {
++    if (!scopeReady.value) {
++      return;
++    }
++    publishConfirmModalRef.value.showModal({
++      scopeType: queryForm.scopeType,
++      // scopeType=2 计算为租户级对象，scopeId 归一为 0（契约 §1.8）
++      scopeId: queryForm.scopeType === 2 ? 0 : queryForm.gatewayId,
++      scopeLabel: publishScopeLabel.value,
++    });
++  }
++
++  // 发布成功回执：刷新版本列表（新版本行由发布链路写入，保存≠生效 TD-0034）
++  function onPublished() {
++    ajaxQuery();
++  }
++
+   onMounted(() => {
+     loadGatewayOptions();
+   });
+diff --git a/frontend/src/views/iot/template/index.vue b/frontend/src/views/iot/template/index.vue
+index 9e5c285..6bac37d 100644
+--- a/frontend/src/views/iot/template/index.vue
++++ b/frontend/src/views/iot/template/index.vue
+@@ -1,12 +1,13 @@
+ <!--
+-  * 模型模板管理（TASK-0056 完整页）
++  * 模型模板管理（TASK-0056 完整页；TASK-0070 批次二补行操作「待升级清单」入口）
+   *
+   * 对接 IotModelTemplateController + IotDataItemTemplateController（/iot/template[，
+   * /item]，权限位 iot:template:* 4024-4029）。模板数据项子表管理入口挂每行
+   * 「数据项」按钮（iot:template:item:edit 4029 控制编辑按钮显隐，查询共用
+-  * iot:template:list）；状态规则配置入口为占位按钮（iot_status_rule 后端未交付，
+-  * 点击提示待 TASK-0048）。template_code 创建后不可改；删除为真实逻辑删
+-  * （有实例引用或模板数据项时后端拒绝并提示引用来源）。
++  * iot:template:list）；「待升级清单」入口（TASK-0016，iot:template:query 4025 控制显隐）
++  * 跳转 /iot/upgrade 静态路由页携 ?templateId= 预选；状态规则配置入口为占位按钮
++  * （iot_status_rule 后端未交付，点击提示待 TASK-0048）。template_code 创建后不可改；
++  * 删除为真实逻辑删（有实例引用或模板数据项时后端拒绝并提示引用来源）。
+ -->
+ <template>
+   <a-form class="ot-query-form">
+@@ -94,6 +95,7 @@
+         <template v-if="column.dataIndex === 'action'">
+           <div class="ot-table-operate">
+             <a-button v-privilege="'iot:template:list'" type="link" @click="openItems(record)">数据项</a-button>
++            <a-button v-privilege="'iot:template:query'" type="link" @click="openUpgradeList(record)">待升级清单</a-button>
+             <a-button v-privilege="'iot:template:edit'" type="link" @click="addOrUpdateTemplate(record)">编辑</a-button>
+             <a-button v-privilege="'iot:template:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
+           </div>
+@@ -124,6 +126,7 @@
+   import TemplateFormModal from './components/template-form-modal.vue';
+   import TemplateItemModal from './components/template-item-modal.vue';
+   import { onMounted, reactive, ref } from 'vue';
++  import { useRouter } from 'vue-router';
+   import { message, Modal } from 'ant-design-vue';
+   import { ApartmentOutlined, DeleteOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
+   import { OtLoading } from '/@/components/framework/ot-loading';
+@@ -133,6 +136,8 @@
+   import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
+   import { IOT_NODE_TYPE_OPTIONS, iotNodeTypeLabel } from '/@/components/iot/iot-consts';
+ 
++  const router = useRouter();
++
+   const columns = ref([
+     {
+       title: 'ID',
+@@ -176,7 +181,7 @@
+       title: '操作',
+       dataIndex: 'action',
+       fixed: 'right',
+-      width: 170,
++      width: 240,
+     },
+   ]);
+ 
+@@ -278,6 +283,15 @@
+     templateItemModalRef.value.showModal(rowData);
+   }
+ 
++  /**
++   * 待升级清单入口（TASK-0070 批次二）：跳转 /iot/upgrade 携 ?templateId= 预选。
++   * 清单查询权限复用 iot:template:query（4025，0016 决策——无权角色入口隐藏）；
++   * 确认升级/锁定开关在清单页内挂 iot:instance:edit（视线与动作分离）。
++   */
++  function openUpgradeList(rowData) {
++    router.push({ path: '/iot/upgrade', query: { templateId: rowData.id } });
++  }
++
+   /**
+    * 状态规则配置入口（占位）：iot_status_rule 域后端未交付（TASK-0048），
+    * 点击提示待交付；按钮显隐暂挂 iot:template:edit（规则配置属模板编辑高危域，
+diff --git a/frontend/src/views/iot/upgrade/index.vue b/frontend/src/views/iot/upgrade/index.vue
+new file mode 100644
+index 0000000..9857e3b
+--- /dev/null
++++ b/frontend/src/views/iot/upgrade/index.vue
+@@ -0,0 +1,508 @@
++<!--
++  * 待升级清单（TASK-0070 批次二新页，TASK-0016 交付接口的前端闭环）
++  *
++  * 无后端菜单行（0016 复用既有权限位不新增菜单种子）：静态路由 /iot/upgrade（hideInMenu，
++  * 见 router/iot.ts），入口为模板管理页（sys_menu 4009）行操作「待升级清单」，携
++  * ?templateId= 预选；页内自带模板选择器，可独立直达。
++  * 对接（ADR-0008 三档政策的实例侧通道）：
++  * - GET /iot/template/upgrade/list（权限复用 iot:template:query 4025）——行=引用该模板且
++  *   appliedTemplateVersion < 模板当前版本的实例，逐行 diff 带档位（行展开展示）；
++  * - POST /iot/template/upgrade/confirm（权限复用 iot:instance:edit 4034）——逐台/批量确认
++  *   升级（targetVersion=模板当前版本；乐观锁冲突/重复提交 4002 整批拒绝；整批原子）；
++  * - PUT /iot/instance/lock（权限复用 iot:instance:edit）——锁定开关入口在行操作列
++  *   （锁定实例不自动跟随二档变更、进本清单逐台确认——这正是锁定实例的升级通道）。
++  * T3 条目（结构破坏类）确认走逐台迁移语义提示；每台迁移结果展示待 TASK-0081 交付后增强。
++-->
++<template>
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="模型模板" class="ot-query-form-item" required>
++        <a-select
++          style="width: 320px"
++          v-model:value="queryForm.templateId"
++          show-search
++          option-filter-prop="label"
++          :options="templateOptions"
++          :allowClear="true"
++          placeholder="请选择模板（清单按模板维度查询）"
++          @change="onTemplateChange"
++        />
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:template:query'" type="primary" :disabled="!queryForm.templateId" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:template:query'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:instance:edit'" type="primary" :disabled="selectedRowKeyList.length === 0" @click="confirmUpgradeBatch">
++          <template #icon>
++            <CheckSquareOutlined />
++          </template>
++          批量确认升级（{{ selectedRowKeyList.length }}）
++        </a-button>
++      </div>
++      <span v-if="!queryForm.templateId" class="upgrade-scope-tip">请先选择模板（清单=引用该模板且模板版本滞后的实例）</span>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="instanceId"
++      :pagination="false"
++      bordered
++      :scroll="{ x: 980 }"
++      :locale="{ emptyText: emptyText }"
++      :row-selection="{ selectedRowKeys: selectedRowKeyList, onChange: onSelectChange }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'versionLag'">
++          <span>v{{ record.appliedTemplateVersion ?? '-' }}</span>
++          <span class="upgrade-lag-arrow"> → </span>
++          <span class="upgrade-lag-target">v{{ record.currentVersion ?? '-' }}</span>
++        </template>
++        <template v-if="column.dataIndex === 'locked'">
++          <a-tag v-if="record.locked === 1" color="orange">已锁定</a-tag>
++          <a-tag v-else color="default">未锁定</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'tierSummary'">
++          <template v-if="record.tierSummary">
++            <a-tag v-for="(seg, index) in String(record.tierSummary).split(',')" :key="index" :color="tierColor(seg.split(':')[0])">
++              {{ seg }}
++            </a-tag>
++          </template>
++          <span v-else>-</span>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:instance:edit'" type="link" @click="confirmUpgradeOne(record)">确认升级</a-button>
++            <a-button v-privilege="'iot:instance:edit'" type="link" @click="confirmToggleLock(record)">
++              {{ record.locked === 1 ? '解锁' : '锁定' }}
++            </a-button>
++          </div>
++        </template>
++      </template>
++      <!-- 行展开：逐台 diff（applied 版本 content vs 当前版本 content，逐条目带档位） -->
++      <template #expandedRowRender="{ record }">
++        <div class="upgrade-diff-panel">
++          <a-alert
++            v-if="diffHasTier3(record)"
++            type="warning"
++            show-icon
++            class="ot-margin-bottom10"
++            message="该实例存在第三档变更（结构破坏类）：逐台确认迁移，永不自动生效；确认升级推进版本簿记，每台迁移结果展示待迁移任务交付后增强"
++          />
++          <a-table size="small" :dataSource="record.diff || []" :columns="diffColumns" rowKey="uid" :pagination="false" bordered>
++            <template #bodyCell="{ record: entry, column }">
++              <template v-if="column.dataIndex === 'objectType'">{{ objectTypeLabel(entry.objectType) }}</template>
++              <template v-if="column.dataIndex === 'changeType'">
++                <a-tag v-if="entry.changeType === 'ADDED'" color="green">新增</a-tag>
++                <a-tag v-else-if="entry.changeType === 'REMOVED'" color="red">删除</a-tag>
++                <a-tag v-else-if="entry.changeType === 'CHANGED'" color="orange">修改</a-tag>
++                <a-tag v-else color="default">{{ entry.changeType ?? '-' }}</a-tag>
++              </template>
++              <template v-if="column.dataIndex === 'oldValue'">
++                <code class="upgrade-diff-value">{{ entry.oldValue ?? '-' }}</code>
++              </template>
++              <template v-if="column.dataIndex === 'newValue'">
++                <code class="upgrade-diff-value">{{ entry.newValue ?? '-' }}</code>
++              </template>
++              <template v-if="column.dataIndex === 'tier'">
++                <a-tag :color="tierColor(entry.tier)">{{ tierLabel(entry.tier) }}</a-tag>
++              </template>
++            </template>
++          </a-table>
++        </div>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted, reactive, ref } from 'vue';
++  import { useRoute } from 'vue-router';
++  import { message, Modal } from 'ant-design-vue';
++  import { CheckSquareOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { upgradeApi } from '/@/api/iot/upgrade-api';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  // TemplateUpgradeRowVO（后端 TASK-0016：instanceId/instanceCode/instanceName/
++  // appliedTemplateVersion/currentVersion/locked/tierSummary/diff；uid 为 diff 行渲染补充键）
++  interface TemplateChangeEntry {
++    objectType?: string;
++    objectKey?: string;
++    changeType?: string;
++    field?: string | null;
++    oldValue?: string | null;
++    newValue?: string | null;
++    tier?: string;
++    uid?: number;
++    [key: string]: unknown;
++  }
++  interface TemplateUpgradeRow {
++    instanceId?: number;
++    instanceCode?: string;
++    instanceName?: string;
++    appliedTemplateVersion?: number;
++    currentVersion?: number;
++    locked?: number;
++    tierSummary?: string | null;
++    diff?: TemplateChangeEntry[];
++    [key: string]: unknown;
++  }
++
++  const columns = ref([
++    {
++      title: '实例ID',
++      width: 80,
++      dataIndex: 'instanceId',
++    },
++    {
++      title: '实例编码',
++      width: 150,
++      dataIndex: 'instanceCode',
++    },
++    {
++      title: '实例名称',
++      width: 150,
++      dataIndex: 'instanceName',
++    },
++    {
++      title: '已应用 → 目标',
++      width: 130,
++      dataIndex: 'versionLag',
++    },
++    {
++      title: '锁定',
++      width: 90,
++      dataIndex: 'locked',
++    },
++    {
++      title: '档位摘要',
++      width: 170,
++      dataIndex: 'tierSummary',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 150,
++    },
++  ]);
++
++  const diffColumns = [
++    { title: '对象类型', width: 100, dataIndex: 'objectType' },
++    { title: '业务键', width: 130, dataIndex: 'objectKey' },
++    { title: '变更形态', width: 80, dataIndex: 'changeType' },
++    { title: '变更字段', width: 140, dataIndex: 'field' },
++    { title: '旧值', dataIndex: 'oldValue' },
++    { title: '新值', dataIndex: 'newValue' },
++    { title: '档位（ADR-0008）', width: 150, dataIndex: 'tier' },
++  ];
++
++  // ---------------- 模板下拉（清单按模板维度查询） -----------------
++
++  const templateOptions = ref<{ label: string; value: number }[]>([]);
++
++  async function loadTemplateOptions() {
++    try {
++      // pageSize 上限 500 对齐后端 maxLimit（MybatisPlusConfig）
++      const responseData = await templateApi.queryTemplateList({ pageNum: 1, pageSize: 500 });
++      templateOptions.value = (responseData.data.records || []).map((t) => ({
++        label: `${t.templateCode}（${t.templateName}）`,
++        value: t.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  // ---------------- 查询数据 -----------------
++
++  const route = useRoute();
++  const queryFormState = {
++    templateId: undefined as number | undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref<TemplateUpgradeRow[]>([]);
++  const total = ref(0);
++
++  const emptyText = computed(() => (queryForm.templateId ? '暂无待升级实例（引用实例的模板版本已全部对齐模板当前版本）' : '请先选择模板'));
++
++  // 确认升级的目标版本=模板当前版本（后端校验必须等于模板当前版本，不允许任意目标版）
++  const targetVersion = computed(() => tableData.value[0]?.currentVersion);
++
++  function onTemplateChange() {
++    queryForm.pageNum = 1;
++    tableData.value = [];
++    total.value = 0;
++    selectedRowKeyList.value = [];
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    tableData.value = [];
++    total.value = 0;
++    selectedRowKeyList.value = [];
++  }
++
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++
++  async function ajaxQuery() {
++    if (!queryForm.templateId) {
++      // templateId 必传（后端 @RequestParam required）——未选模板不发请求
++      tableData.value = [];
++      total.value = 0;
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await upgradeApi.queryUpgradeList({
++        templateId: queryForm.templateId,
++        pageNum: queryForm.pageNum,
++        pageSize: queryForm.pageSize,
++      });
++      const records: TemplateUpgradeRow[] = responseData.data.records || [];
++      // uid：diff 行前端渲染键（objectKey+field 组合可能重复，递增序保证 rowKey 稳定）
++      let diffUid = 0;
++      for (const row of records) {
++        row.diff = (row.diff || []).map((entry) => ({ ...entry, uid: ++diffUid }));
++      }
++      tableData.value = records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 批量选择 -----------------
++
++  const selectedRowKeyList = ref<number[]>([]);
++
++  function onSelectChange(selectedRowKeys) {
++    selectedRowKeyList.value = selectedRowKeys;
++  }
++
++  // ---------------- 档位文案（ADR-0008 三档政策） -----------------
++
++  function tierColor(tier?: string) {
++    if (tier === 'T1') {
++      return 'green';
++    }
++    if (tier === 'T2') {
++      return 'orange';
++    }
++    if (tier === 'T3') {
++      return 'red';
++    }
++    return 'red';
++  }
++
++  function tierLabel(tier?: string) {
++    if (tier === 'T1') {
++      return 'T1 随发布生效';
++    }
++    if (tier === 'T2') {
++      return 'T2 强制确认';
++    }
++    if (tier === 'T3') {
++      return 'T3 逐台迁移';
++    }
++    return `${tier ?? '-'} 禁止`;
++  }
++
++  function objectTypeLabel(objectType?: string) {
++    if (objectType === 'template') {
++      return '模板头';
++    }
++    if (objectType === 'dataItem') {
++      return '模板数据项';
++    }
++    if (objectType === 'statusRule') {
++      return '状态规则';
++    }
++    return objectType ?? '-';
++  }
++
++  function diffHasTier3(row: TemplateUpgradeRow) {
++    return (row.diff || []).some((entry) => entry.tier === 'T3');
++  }
++
++  // ---------------- 确认升级（逐台/批量共用；T3 走逐台迁移语义提示） -----------------
++
++  function upgradeConfirmContent(rows: TemplateUpgradeRow[]) {
++    const target = targetVersion.value ?? '-';
++    if (rows.length === 1) {
++      const row = rows[0];
++      const tier3Tip = diffHasTier3(row)
++        ? '该实例存在第三档变更（结构破坏类）：逐台确认迁移，永不自动生效；确认升级推进版本簿记，每台迁移结果展示待迁移任务交付后增强。'
++        : '';
++      return `确定将实例【${row.instanceCode ?? '-'} ${row.instanceName ?? ''}】从模板版本 v${
++        row.appliedTemplateVersion ?? '-'
++      } 确认升级到 v${target} 吗？确认后该实例对齐模板当前版本（锁定实例同样经此通道升级）。${tier3Tip}`;
++    }
++    const tier3Count = rows.filter((row) => diffHasTier3(row)).length;
++    const tier3Tip = tier3Count > 0 ? `其中 ${tier3Count} 台存在第三档变更（逐台迁移语义，同上）。` : '';
++    return `确定将选中的 ${rows.length} 台实例从各自已应用版本确认升级到模板当前版本 v${target} 吗？整批原子：任一实例校验失败整批拒绝不半成功（冲突 4002 请刷新重试）。${tier3Tip}`;
++  }
++
++  function confirmUpgradeOne(row: TemplateUpgradeRow) {
++    Modal.confirm({
++      title: '确认升级',
++      content: upgradeConfirmContent([row]),
++      okText: '确认升级',
++      onOk() {
++        doConfirmUpgrade([row]);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  function confirmUpgradeBatch() {
++    const rows = tableData.value.filter((row) => selectedRowKeyList.value.includes(row.instanceId as number));
++    if (rows.length === 0 || !targetVersion.value) {
++      return;
++    }
++    Modal.confirm({
++      title: '批量确认升级',
++      content: upgradeConfirmContent(rows),
++      okText: '批量确认',
++      onOk() {
++        doConfirmUpgrade(rows);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function doConfirmUpgrade(rows: TemplateUpgradeRow[]) {
++    try {
++      OtLoading.show();
++      await upgradeApi.confirmUpgrade({
++        instanceIds: rows.map((row) => row.instanceId),
++        // targetVersion 必须等于模板当前版本（后端校验；行集同模板取首行 currentVersion）
++        targetVersion: targetVersion.value,
++      });
++      message.success(`确认升级成功：${rows.length} 台实例已对齐模板当前版本 v${targetVersion.value}`);
++      selectedRowKeyList.value = [];
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++      // 成功后行消失（已对齐不出现）；失败（4002 已在目标版本/并发冲突）提示刷新清单——两态都重查
++      await ajaxQuery();
++    }
++  }
++
++  // ---------------- 锁定开关（行操作列；锁定实例不自动跟随二档变更） -----------------
++
++  function confirmToggleLock(row: TemplateUpgradeRow) {
++    const locking = row.locked !== 1;
++    Modal.confirm({
++      title: locking ? '锁定确认' : '解除锁定确认',
++      content: locking
++        ? `确定锁定实例【${row.instanceCode ?? '-'} ${
++            row.instanceName ?? ''
++          }】吗？锁定后该实例不自动跟随二档变更（语义变更），保留在待升级清单逐台确认后再升级。`
++        : `确定解除实例【${row.instanceCode ?? '-'} ${row.instanceName ?? ''}】的锁定吗？解除后回归跟随面（二档变更随发布自动生效）。`,
++      okText: locking ? '锁定' : '解锁',
++      onOk() {
++        doToggleLock(row, locking);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function doToggleLock(row: TemplateUpgradeRow, locking: boolean) {
++    try {
++      OtLoading.show();
++      await upgradeApi.setInstanceLock({ instanceId: row.instanceId, locked: locking ? 1 : 0 });
++      message.success(locking ? '已锁定：该实例不再自动跟随二档变更' : '已解除锁定：该实例回归跟随面');
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++      // 锁定徽标即时反映（清单行不因锁定变化而消失，但重查保持行数据新鲜）
++      await ajaxQuery();
++    }
++  }
++
++  onMounted(() => {
++    loadTemplateOptions().then(() => {
++      // 模板页入口携 ?templateId= 预选并自动查询
++      const templateIdParam = Number(route.query.templateId);
++      if (templateIdParam > 0 && templateOptions.value.some((opt) => opt.value === templateIdParam)) {
++        queryForm.templateId = templateIdParam;
++        ajaxQuery();
++      }
++    });
++  });
++</script>
++<style scoped lang="less">
++  .upgrade-scope-tip {
++    color: #999;
++    font-size: 12px;
++  }
++
++  .upgrade-lag-arrow {
++    color: #999;
++  }
++
++  .upgrade-lag-target {
++    color: #1677ff;
++    font-weight: 600;
++  }
++
++  .upgrade-diff-panel {
++    padding: 4px 4px 0;
++  }
++
++  .upgrade-diff-value {
++    word-break: break-all;
++  }
++</style>

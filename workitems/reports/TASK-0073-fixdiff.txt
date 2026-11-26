@@ -1,0 +1,1185 @@
+commit c2ff33e5c33139b1785f223cdedcca16c28d85b6
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 01:09:19 2026 +0800
+
+    TASK-0073 修订轮: I1 快照 required 校验 + I2 子表名确定性映射与重排上限
+    
+    I1（评审 Important 1）：五对象补 JSON Schema required 存在性校验（键缺失/null
+    视为缺失，与 enum/maxLength 同层），必填字符串字段非空性在 Validate 层覆盖
+    直接构造结构体的路径；缺任一必填字段 → 校验失败 → 缓存保旧版（§3.3）。
+    I2（评审 Important 2）：childTable 改确定性映射（非 [A-Za-z0-9_] 字节 → _XX
+    十六进制 + FNV 后缀区分恒等集；首字符数字加前缀；超长截断加哈希，TDengine
+    标识符上限 192 字节），任何契约合法 pointCode 不再被写库层拒绝；写失败重排
+    加行级上限 3 次，超限按 DeadLetterInvalidConfig 死信计数不再回灌。
+    新增 7 项测试；无第三方依赖。评审：TASK-0073-review.md（FAIL 0C/2I/9m）。
+
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+index c423c74..5aa1531 100644
+--- a/ingest/internal/pipeline/pipeline.go
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -15,7 +15,8 @@
+ //   - 单 flusher goroutine：按水位（缓冲 ≥ BatchSize）或定时（FlushInterval，FEAT-0009
+ //     「攒批 100-500 条或 200ms」）触发，串行写库并更新缓存。
+ //   - 攒批缓冲有界（BufferCap）：满时丢最旧并计数（对齐 ADR-0014 缓存 FIFO 丢最旧口径），
+-//     绝不无界增长；写失败整批重排回缓冲头部重试（重排后仍受 BufferCap 约束）。
++//     绝不无界增长；写失败整批重排回缓冲头部重试，同一行重排超过 3 次转死信计数并
++//     告警、不再回灌（重排与死信后仍受 BufferCap 约束）。
+ //
+ // 处理顺序（统一消息模型 v1.1.0 §3.2 冻结口径）：验令牌与租户（挂点：租户必须来自
+ // Consumer 侧令牌解析产物，不从消息自带 tenant 选库）→ 按 pointCode 查配置快照 →
+@@ -101,7 +102,8 @@ const (
+ 	DeadLetterDisabledPoint DeadLetterReason = "disabled_point"
+ 	// DeadLetterInvalidEnvelope 信封级整批拒绝（空 points 4001 / 超 500 整批 / 缺 tenant / JSON 非法）。
+ 	DeadLetterInvalidEnvelope DeadLetterReason = "invalid_envelope"
+-	// DeadLetterInvalidConfig 点位配置非法（dataType 越界等，防御分支）。
++	// DeadLetterInvalidConfig 点位配置非法（dataType 越界等防御分支），以及写失败重排
++	// 超过上限（同一行重排 >3 次）——死信计数并告警、不再回灌（修订轮 I2）。
+ 	DeadLetterInvalidConfig DeadLetterReason = "invalid_config"
+ )
+ 
+@@ -148,14 +150,14 @@ type Config struct {
+ 
+ // Deps 组件依赖（全部接口注入；nil 的可选依赖取默认）。
+ type Deps struct {
+-	Consumer  Consumer // 必填
+-	Parser    Parser   // 必填
+-	Snapshots SnapshotLookup // 必填（配置快照缓存）
+-	Batches   BatchDeduper   // 必填（假实现：NewMemoryBatchDeduper）
+-	Points    PointDeduper   // 必填（假实现：NewMemoryPointDeduper）
+-	Judge     QualityJudge   // 可选：nil → PassthroughJudge
+-	Dead      DeadLetterSink // 可选：nil → 丢弃（仅计数不外发）
+-	Writer    Writer         // 必填（假实现：tdengine.Writer + tdengine.FakeExecutor）
++	Consumer  Consumer         // 必填
++	Parser    Parser           // 必填
++	Snapshots SnapshotLookup   // 必填（配置快照缓存）
++	Batches   BatchDeduper     // 必填（假实现：NewMemoryBatchDeduper）
++	Points    PointDeduper     // 必填（假实现：NewMemoryPointDeduper）
++	Judge     QualityJudge     // 可选：nil → PassthroughJudge
++	Dead      DeadLetterSink   // 可选：nil → 丢弃（仅计数不外发）
++	Writer    Writer           // 必填（假实现：tdengine.Writer + tdengine.FakeExecutor）
+ 	Cache     cache.PointCache // 必填（假实现：cache.NewMemoryPointCache）
+ }
+ 
+@@ -168,7 +170,7 @@ type Pipeline struct {
+ 	judge   QualityJudge
+ 
+ 	bufMu   sync.Mutex
+-	buf     []tdengine.PointRow
++	buf     []bufItem
+ 	flushCh chan struct{}
+ 
+ 	stats statsCounters
+@@ -358,6 +360,17 @@ func deptIDOf(p *snapshot.Point) int64 {
+ 
+ // ---- 攒批缓冲（有界，满丢最旧并计数）与 flusher ----
+ 
++// maxWriteRequeues 同一写入行最大重排次数（修订轮 I2）：写失败重排超过 3 次后，
++// 该行按 DeadLetterInvalidConfig 口径死信计数并告警、不再回灌缓冲——写库层持续失败
++// （含不可达写库层错误）只消耗有界重试，杜绝整批无限重排与重复下发。
++const maxWriteRequeues = 3
++
++// bufItem 攒批缓冲条目：写入行 + 已重排次数（行级计数，跨 flush 保留）。
++type bufItem struct {
++	row      tdengine.PointRow
++	requeues int
++}
++
+ // push 入缓冲；满时丢最旧（FIFO，ADR-0014 口径）并计数；达到水位触发立即 flush。
+ func (p *Pipeline) push(row tdengine.PointRow) {
+ 	p.bufMu.Lock()
+@@ -365,7 +378,7 @@ func (p *Pipeline) push(row tdengine.PointRow) {
+ 		p.buf = p.buf[1:]
+ 		p.stats.DroppedOldest.Add(1)
+ 	}
+-	p.buf = append(p.buf, row)
++	p.buf = append(p.buf, bufItem{row: row})
+ 	full := len(p.buf) >= p.cfg.BatchSize
+ 	p.bufMu.Unlock()
+ 	p.stats.AcceptedPoints.Add(1)
+@@ -393,7 +406,8 @@ func (p *Pipeline) flusher(ctx context.Context) {
+ 	}
+ }
+ 
+-// flush 取缓冲头部（最旧）至多 BatchSize 行下发；失败整批重排回缓冲头部。
++// flush 取缓冲头部（最旧）至多 BatchSize 行下发；失败整批重排回缓冲头部
++// （单行重排超上限则死信，见 requeueFront）。
+ func (p *Pipeline) flush(ctx context.Context) {
+ 	p.bufMu.Lock()
+ 	n := p.cfg.BatchSize
+@@ -404,14 +418,18 @@ func (p *Pipeline) flush(ctx context.Context) {
+ 		p.bufMu.Unlock()
+ 		return
+ 	}
+-	batch := make([]tdengine.PointRow, n)
+-	copy(batch, p.buf[:n])
++	items := make([]bufItem, n)
++	copy(items, p.buf[:n])
+ 	p.buf = p.buf[n:]
+ 	p.bufMu.Unlock()
+ 
++	batch := make([]tdengine.PointRow, n)
++	for i := range items {
++		batch[i] = items[i].row
++	}
+ 	if err := p.deps.Writer.WritePoints(ctx, batch); err != nil {
+ 		p.stats.WriteFailures.Add(1)
+-		p.requeueFront(batch)
++		p.requeueFront(items)
+ 		return
+ 	}
+ 	p.stats.WrittenBatches.Add(1)
+@@ -419,19 +437,32 @@ func (p *Pipeline) flush(ctx context.Context) {
+ 	p.updateCache(ctx, batch)
+ }
+ 
+-// requeueFront 失败重排：整批放回缓冲头部重试；总量超上限时丢最旧并计数（不无界增长）。
+-func (p *Pipeline) requeueFront(batch []tdengine.PointRow) {
++// requeueFront 失败重排：整批放回缓冲头部重试（单行重排次数超 maxWriteRequeues 时
++// 死信计数并告警、不回灌）；总量超上限时丢最旧并计数（不无界增长）。
++func (p *Pipeline) requeueFront(items []bufItem) {
++	retry := make([]bufItem, 0, len(items))
++	for i := range items {
++		it := items[i]
++		it.requeues++
++		if it.requeues > maxWriteRequeues {
++			p.stats.DeadLettered.Add(1)
++			p.stats.WriteRetriesExhausted.Add(1)
++			p.deps.Dead.OnDeadLetter(DeadLetterInvalidConfig, it.row.TenantCode, "", nil)
++			continue
++		}
++		retry = append(retry, it)
++	}
+ 	p.bufMu.Lock()
+ 	defer p.bufMu.Unlock()
+-	combined := make([]tdengine.PointRow, 0, len(batch)+len(p.buf))
+-	combined = append(combined, batch...)
++	combined := make([]bufItem, 0, len(retry)+len(p.buf))
++	combined = append(combined, retry...)
+ 	combined = append(combined, p.buf...)
+ 	if over := len(combined) - p.cfg.BufferCap; over > 0 {
+ 		combined = combined[over:]
+ 		p.stats.DroppedOldest.Add(int64(over))
+ 	}
+ 	p.buf = combined
+-	p.stats.RequeuedRows.Add(int64(len(batch)))
++	p.stats.RequeuedRows.Add(int64(len(retry)))
+ }
+ 
+ // updateCache 第 5 步后半：写库成功后更新 Redis 点位缓存（v/q/ts）。
+@@ -447,53 +478,56 @@ func (p *Pipeline) updateCache(ctx context.Context, batch []tdengine.PointRow) {
+ 
+ // Stats 流水线计数快照（运维监控 FEAT-0020 的数据源挂点）。
+ type Stats struct {
+-	ReceivedBatches  int64 // 收到入站消息数
+-	RejectedBatches  int64 // 信封级整批拒绝（空 points 4001 / 超 500 / 缺租户 / JSON 非法）
+-	DuplicateBatches int64 // batchId 整批去重命中数
+-	DuplicatePoints  int64 // (pointCode, ts) 去重命中数
+-	DeadLettered     int64 // 未知编码等死信计数
+-	DisabledDiscarded int64 // 禁用点位丢弃计数
+-	AcceptedPoints   int64 // 进入攒批缓冲的行数
+-	DroppedOldest    int64 // 攒批缓冲满丢最旧行数（ADR-0014 FIFO 口径）
+-	RequeuedRows     int64 // 写失败重排行数
+-	WriteFailures    int64 // 写失败次数
+-	WrittenBatches   int64 // 成功下发攒批次数
+-	WrittenPoints    int64 // 成功写入行数
+-	CacheFailures    int64 // 缓存更新失败次数
++	ReceivedBatches       int64 // 收到入站消息数
++	RejectedBatches       int64 // 信封级整批拒绝（空 points 4001 / 超 500 / 缺租户 / JSON 非法）
++	DuplicateBatches      int64 // batchId 整批去重命中数
++	DuplicatePoints       int64 // (pointCode, ts) 去重命中数
++	DeadLettered          int64 // 未知编码等死信计数
++	DisabledDiscarded     int64 // 禁用点位丢弃计数
++	AcceptedPoints        int64 // 进入攒批缓冲的行数
++	DroppedOldest         int64 // 攒批缓冲满丢最旧行数（ADR-0014 FIFO 口径）
++	RequeuedRows          int64 // 写失败重排行数
++	WriteFailures         int64 // 写失败次数
++	WriteRetriesExhausted int64 // 写失败重排超限（>3 次）转死信行数（修订轮 I2）
++	WrittenBatches        int64 // 成功下发攒批次数
++	WrittenPoints         int64 // 成功写入行数
++	CacheFailures         int64 // 缓存更新失败次数
+ }
+ 
+ type statsCounters struct {
+-	ReceivedBatches   atomic.Int64
+-	RejectedBatches   atomic.Int64
+-	DuplicateBatches  atomic.Int64
+-	DuplicatePoints   atomic.Int64
+-	DeadLettered      atomic.Int64
+-	DisabledDiscarded atomic.Int64
+-	AcceptedPoints    atomic.Int64
+-	DroppedOldest     atomic.Int64
+-	RequeuedRows      atomic.Int64
+-	WriteFailures     atomic.Int64
+-	WrittenBatches    atomic.Int64
+-	WrittenPoints     atomic.Int64
+-	CacheFailures     atomic.Int64
++	ReceivedBatches       atomic.Int64
++	RejectedBatches       atomic.Int64
++	DuplicateBatches      atomic.Int64
++	DuplicatePoints       atomic.Int64
++	DeadLettered          atomic.Int64
++	DisabledDiscarded     atomic.Int64
++	AcceptedPoints        atomic.Int64
++	DroppedOldest         atomic.Int64
++	RequeuedRows          atomic.Int64
++	WriteFailures         atomic.Int64
++	WriteRetriesExhausted atomic.Int64
++	WrittenBatches        atomic.Int64
++	WrittenPoints         atomic.Int64
++	CacheFailures         atomic.Int64
+ }
+ 
+ // Stats 返回计数快照。
+ func (p *Pipeline) Stats() Stats {
+ 	return Stats{
+-		ReceivedBatches:   p.stats.ReceivedBatches.Load(),
+-		RejectedBatches:   p.stats.RejectedBatches.Load(),
+-		DuplicateBatches:  p.stats.DuplicateBatches.Load(),
+-		DuplicatePoints:   p.stats.DuplicatePoints.Load(),
+-		DeadLettered:      p.stats.DeadLettered.Load(),
+-		DisabledDiscarded: p.stats.DisabledDiscarded.Load(),
+-		AcceptedPoints:    p.stats.AcceptedPoints.Load(),
+-		DroppedOldest:     p.stats.DroppedOldest.Load(),
+-		RequeuedRows:      p.stats.RequeuedRows.Load(),
+-		WriteFailures:     p.stats.WriteFailures.Load(),
+-		WrittenBatches:    p.stats.WrittenBatches.Load(),
+-		WrittenPoints:     p.stats.WrittenPoints.Load(),
+-		CacheFailures:     p.stats.CacheFailures.Load(),
++		ReceivedBatches:       p.stats.ReceivedBatches.Load(),
++		RejectedBatches:       p.stats.RejectedBatches.Load(),
++		DuplicateBatches:      p.stats.DuplicateBatches.Load(),
++		DuplicatePoints:       p.stats.DuplicatePoints.Load(),
++		DeadLettered:          p.stats.DeadLettered.Load(),
++		DisabledDiscarded:     p.stats.DisabledDiscarded.Load(),
++		AcceptedPoints:        p.stats.AcceptedPoints.Load(),
++		DroppedOldest:         p.stats.DroppedOldest.Load(),
++		RequeuedRows:          p.stats.RequeuedRows.Load(),
++		WriteFailures:         p.stats.WriteFailures.Load(),
++		WriteRetriesExhausted: p.stats.WriteRetriesExhausted.Load(),
++		WrittenBatches:        p.stats.WrittenBatches.Load(),
++		WrittenPoints:         p.stats.WrittenPoints.Load(),
++		CacheFailures:         p.stats.CacheFailures.Load(),
+ 	}
+ }
+ 
+diff --git a/ingest/internal/pipeline/pipeline_contract_test.go b/ingest/internal/pipeline/pipeline_contract_test.go
+index 4695b53..61450e3 100644
+--- a/ingest/internal/pipeline/pipeline_contract_test.go
++++ b/ingest/internal/pipeline/pipeline_contract_test.go
+@@ -49,7 +49,7 @@ func pointJSON(code string, ts int64, value float64, q int) string {
+ 
+ // recordingSink 死信/丢弃记录（告警挂点假实现）。
+ type recordingSink struct {
+-	mu     sync.Mutex
++	mu      sync.Mutex
+ 	records []pipeline.DeadLetterRecord
+ }
+ 
+@@ -84,11 +84,9 @@ type harness struct {
+ 	statsFn  func() pipeline.Stats
+ }
+ 
+-// 快照预置（派生自配置快照契约 Schema 字段；M01/M02 数值量、S01 状态量，
++// defaultSnapshotJSON 快照预置（派生自配置快照契约 Schema 字段；M01/M02 数值量、S01 状态量，
+ // 编码沿用统一消息模型契约示例）。
+-func preloadSnapshot(t *testing.T) *snapshot.Cache {
+-	t.Helper()
+-	snapJSON := `{
++const defaultSnapshotJSON = `{
+   "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
+   "points": [
+     {"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
+@@ -96,6 +94,9 @@ func preloadSnapshot(t *testing.T) *snapshot.Cache {
+     {"id":103,"tenantId":1,"pointCode":"F01_WS01_EQ001_S01","pointName":"P3","dataType":3,"valueType":"INT","deptId":3,"status":0}
+   ]
+ }`
++
++func preloadSnapshotJSON(t *testing.T, snapJSON string) *snapshot.Cache {
++	t.Helper()
+ 	snap, err := snapshot.ParseSnapshot([]byte(snapJSON))
+ 	if err != nil {
+ 		t.Fatalf("预置快照解析失败: %v", err)
+@@ -107,7 +108,7 @@ func preloadSnapshot(t *testing.T) *snapshot.Cache {
+ 	return c
+ }
+ 
+-func newHarness(t *testing.T, cfg pipeline.Config) *harness {
++func newHarnessWithSnapshotJSON(t *testing.T, cfg pipeline.Config, snapJSON string) *harness {
+ 	t.Helper()
+ 	h := &harness{
+ 		consumer: newFakeConsumer(64),
+@@ -118,7 +119,7 @@ func newHarness(t *testing.T, cfg pipeline.Config) *harness {
+ 	deps := pipeline.Deps{
+ 		Consumer:  h.consumer,
+ 		Parser:    message.Parser{},
+-		Snapshots: preloadSnapshot(t),
++		Snapshots: preloadSnapshotJSON(t, snapJSON),
+ 		Batches:   pipeline.NewMemoryBatchDeduper(65536),
+ 		Points:    pipeline.NewMemoryPointDeduper(65536),
+ 		Judge:     passthroughJudge,
+@@ -134,6 +135,11 @@ func newHarness(t *testing.T, cfg pipeline.Config) *harness {
+ 	return h
+ }
+ 
++func newHarness(t *testing.T, cfg pipeline.Config) *harness {
++	t.Helper()
++	return newHarnessWithSnapshotJSON(t, cfg, defaultSnapshotJSON)
++}
++
+ // eventually 轮询等待条件成立（异步流水线断言辅助）。
+ func eventually(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+ 	t.Helper()
+@@ -479,3 +485,100 @@ func TestContractTenantFromConsumerRequired(t *testing.T) {
+ 	cancel()
+ 	<-done
+ }
++
++// ---- I2 修订轮：重排上限与契约合法 pointCode 端到端 ----
++
++// 契约依据（I2 裁决）：同一批写失败重排次数上限 3 次，超限按 DeadLetterInvalidConfig
++// 口径死信计数并告警、不再回灌缓冲——杜绝写库层持续失败导致的无限重排与重复下发。
++func TestContractWriteRetriesExhaustedDeadLetter(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 20 * time.Millisecond, BufferCap: 8})
++	h.executor.Reset(4) // 连续失败 4 次：第 1-3 次重排，第 4 次超限死信
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-r", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 3*time.Second, "重排 3 次后超限应死信且不再回灌", func() bool {
++		s := h.pipe.Stats()
++		return s.DeadLettered == 1 && s.WriteRetriesExhausted == 1 && s.RequeuedRows == 3
++	})
++	if h.pipe.Stats().WrittenPoints != 0 {
++		t.Errorf("WrittenPoints = %d, want 0", h.pipe.Stats().WrittenPoints)
++	}
++	// 稳定性：再等若干个 flush 周期，计数不得继续增长（无无限重排）
++	time.Sleep(150 * time.Millisecond)
++	s := h.pipe.Stats()
++	if s.DeadLettered != 1 || s.RequeuedRows != 3 || s.WriteRetriesExhausted != 1 {
++		t.Errorf("超限后计数继续变化（仍有回灌）: %+v", s)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据（I2 裁决 + config-snapshot-schema point 对象 pointCode 仅 maxLength 96 无字符集约束）：
++// 含连字符 / 中文 / 首字符数字的 pointCode 是契约合法数据，端到端（快照→管道→WritePoints）
++// 不得被拒，子表名确定性可复现，TAGS 保留原编码。
++func TestContractNonAsciiPointCodeEndToEnd(t *testing.T) {
++	snapJSON := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [
++    {"id":201,"tenantId":1,"pointCode":"F01-WS01-EQ001-M01","pointName":"连字符测点","dataType":1,"valueType":"DOUBLE","deptId":3,"status":1},
++    {"id":202,"tenantId":1,"pointCode":"点位一","pointName":"中文测点","dataType":1,"valueType":"DOUBLE","deptId":3,"status":1},
++    {"id":203,"tenantId":1,"pointCode":"01_M01","pointName":"数字开头测点","dataType":3,"valueType":"INT","deptId":3,"status":1}
++  ]
++}`
++	h := newHarnessWithSnapshotJSON(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond}, snapJSON)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-e2e",
++		pointJSON("F01-WS01-EQ001-M01", 1795211995000, 98231.4, 0),
++		pointJSON("点位一", 1795211995000, 132.5, 0),
++		pointJSON("01_M01", 1795211995000, 1, 0),
++	)
++	eventually(t, 3*time.Second, "三个契约合法 pointCode 应全部写入", func() bool {
++		return h.pipe.Stats().WrittenPoints == 3
++	})
++	// 子表名确定性可复现
++	codes := []string{"F01-WS01-EQ001-M01", "点位一", "01_M01"}
++	want := make(map[string]bool)
++	for _, code := range codes {
++		name, err := tdengine.ChildTableName(code)
++		if err != nil {
++			t.Fatalf("ChildTableName(%q) error: %v", code, err)
++		}
++		again, _ := tdengine.ChildTableName(code)
++		if again != name {
++			t.Errorf("子表名映射不可复现: %q vs %q", name, again)
++		}
++		want[name] = true
++	}
++	var allSQL strings.Builder
++	for _, c := range h.executor.Calls() {
++		allSQL.WriteString(c.SQL)
++		allSQL.WriteByte('\n')
++	}
++	for name := range want {
++		if !strings.Contains(allSQL.String(), "INSERT INTO iot_group_a."+name+" USING") {
++			t.Errorf("写语句未使用映射后的子表名 %q:\n%s", name, allSQL.String())
++		}
++	}
++	// 状态量走 st_point_state、数值量走 st_point_num（分发不受编码字符集影响）
++	if !strings.Contains(allSQL.String(), "USING iot_group_a.st_point_state") {
++		t.Errorf("01_M01（dataType=3）应落 st_point_state:\n%s", allSQL.String())
++	}
++	if !strings.Contains(allSQL.String(), "USING iot_group_a.st_point_num") {
++		t.Errorf("数值量应落 st_point_num:\n%s", allSQL.String())
++	}
++	// TAGS 保留原编码
++	for _, code := range codes {
++		if !strings.Contains(allSQL.String(), "'"+code+"'") {
++			t.Errorf("TAGS 应保留原编码 %q:\n%s", code, allSQL.String())
++		}
++	}
++	cancel()
++	<-done
++}
+diff --git a/ingest/internal/snapshot/snapshot.go b/ingest/internal/snapshot/snapshot.go
+index fa8f299..3a37ec9 100644
+--- a/ingest/internal/snapshot/snapshot.go
++++ b/ingest/internal/snapshot/snapshot.go
+@@ -49,8 +49,8 @@ type Point struct {
+ 	TenantID        int64           `json:"tenantId"`
+ 	PointCode       string          `json:"pointCode"`
+ 	PointName       string          `json:"pointName"`
+-	DataType        int             `json:"dataType"`   // enum [1,2,3,4]
+-	ValueType       string          `json:"valueType"`  // enum [DOUBLE,INT,BOOL,ENUM]
++	DataType        int             `json:"dataType"`  // enum [1,2,3,4]
++	ValueType       string          `json:"valueType"` // enum [DOUBLE,INT,BOOL,ENUM]
+ 	Unit            *string         `json:"unit,omitempty"`
+ 	MinValue        *float64        `json:"minValue,omitempty"` // 有效范围下限；超限只打质量码不丢弃
+ 	MaxValue        *float64        `json:"maxValue,omitempty"` // 有效范围上限
+@@ -75,10 +75,10 @@ type Channel struct {
+ 	GatewayID       int64           `json:"gatewayId"`
+ 	ChannelCode     string          `json:"channelCode"`
+ 	ChannelName     string          `json:"channelName"`
+-	ProtocolType    string          `json:"protocolType"` // enum [MQTT,HTTP,MODBUS,OPCUA]
++	ProtocolType    string          `json:"protocolType"`         // enum [MQTT,HTTP,MODBUS,OPCUA]
+ 	ConnConfig      json.RawMessage `json:"connConfig,omitempty"` // 不含凭据明文；内层键名上游未定版
+ 	Status          *int            `json:"status,omitempty"`
+-	HasCredential   bool            `json:"hasCredential"`   // §1.3A 派生标记（非表列）
++	HasCredential   bool            `json:"hasCredential"`             // §1.3A 派生标记（非表列）
+ 	CredentialTypes []string        `json:"credentialTypes,omitempty"` // 仅类型不含材料
+ }
+ 
+@@ -108,31 +108,79 @@ type DataItem struct {
+ 
+ // Formula 公式对象（映射 iot_data_item_ref 公式引用关系表：引用边行）。
+ type Formula struct {
+-	ID         int64   `json:"id"`
+-	TenantID   int64   `json:"tenantId"`
+-	ItemID     int64   `json:"itemId"`
+-	RefFullKey string  `json:"refFullKey"`
+-	RefType    int     `json:"refType"` // enum [1,2]：1 数据项 2 点位
+-	RefItemID  *int64  `json:"refItemId,omitempty"`
++	ID         int64  `json:"id"`
++	TenantID   int64  `json:"tenantId"`
++	ItemID     int64  `json:"itemId"`
++	RefFullKey string `json:"refFullKey"`
++	RefType    int    `json:"refType"` // enum [1,2]：1 数据项 2 点位
++	RefItemID  *int64 `json:"refItemId,omitempty"`
+ }
+ 
+ // Metric 指标对象（映射 iot_metric）。
+ type Metric struct {
+-	ID             int64    `json:"id"`
+-	TenantID       int64    `json:"tenantId"`
+-	MetricCode     string   `json:"metricCode"`
+-	MetricName     string   `json:"metricName"`
+-	InstanceID     int64    `json:"instanceId"`
+-	SourceItemID   *int64   `json:"sourceItemId,omitempty"`
+-	AggType        int      `json:"aggType"` // enum [1,2,3,4,5]
+-	Period         string   `json:"period"`  // enum [HOUR,DAY,MONTH,YEAR]
+-	CalendarType   *int     `json:"calendarType,omitempty"` // enum [1,2]
+-	RatioNumItemID *int64   `json:"ratioNumItemId,omitempty"`
+-	RatioDenItemID *int64   `json:"ratioDenItemId,omitempty"`
+-	YoyFlag        *int     `json:"yoyFlag,omitempty"`
+-	MomFlag        *int     `json:"momFlag,omitempty"`
+-	DeptID         *int64   `json:"deptId,omitempty"`
+-	Status         *int     `json:"status,omitempty"`
++	ID             int64  `json:"id"`
++	TenantID       int64  `json:"tenantId"`
++	MetricCode     string `json:"metricCode"`
++	MetricName     string `json:"metricName"`
++	InstanceID     int64  `json:"instanceId"`
++	SourceItemID   *int64 `json:"sourceItemId,omitempty"`
++	AggType        int    `json:"aggType"`                // enum [1,2,3,4,5]
++	Period         string `json:"period"`                 // enum [HOUR,DAY,MONTH,YEAR]
++	CalendarType   *int   `json:"calendarType,omitempty"` // enum [1,2]
++	RatioNumItemID *int64 `json:"ratioNumItemId,omitempty"`
++	RatioDenItemID *int64 `json:"ratioDenItemId,omitempty"`
++	YoyFlag        *int   `json:"yoyFlag,omitempty"`
++	MomFlag        *int   `json:"momFlag,omitempty"`
++	DeptID         *int64 `json:"deptId,omitempty"`
++	Status         *int   `json:"status,omitempty"`
++}
++
++// 各对象 JSON Schema "required" 清单（v1.0.1 各对象 Schema，逐字）。
++// required 存在性在原始 JSON 层校验（键缺失/null 视为缺失）；必填字符串字段的
++// 非空性同时在 Validate 层校验（覆盖绕过 JSON 解析直接构造结构体的路径），
++// 必填数值字段由 enum 校验或原始层存在性覆盖（id 类列均为正整数自增，0 不合法）。
++var (
++	pointRequired    = []string{"id", "tenantId", "pointCode", "pointName", "dataType", "valueType"}
++	channelRequired  = []string{"id", "tenantId", "gatewayId", "channelCode", "channelName", "protocolType", "hasCredential"}
++	dataItemRequired = []string{"id", "tenantId", "instanceId", "dataCode", "fullKey", "sourceType"}
++	formulaRequired  = []string{"id", "tenantId", "itemId", "refFullKey", "refType"}
++	metricRequired   = []string{"id", "tenantId", "metricCode", "metricName", "instanceId", "aggType", "period"}
++)
++
++// checkRequiredRaw 校验原始 JSON 对象的 required 键存在性（键缺失或显式 null 均视为缺失）。
++func checkRequiredRaw(data []byte, required []string) error {
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(data, &m); err != nil {
++		return fmt.Errorf("snapshot: required 校验前置解码失败: %w", err)
++	}
++	var missing []string
++	for _, k := range required {
++		v, ok := m[k]
++		if !ok || string(v) == "null" {
++			missing = append(missing, k)
++		}
++	}
++	if len(missing) > 0 {
++		return fmt.Errorf("snapshot: 缺 required 字段 %v（additionalProperties=false 同层纪律）", missing)
++	}
++	return nil
++}
++
++// checkArrayRequired 对快照体对象数组的每个元素做 required 存在性校验。
++func checkArrayRequired(raw json.RawMessage, required []string, field string) error {
++	if len(raw) == 0 {
++		return nil
++	}
++	var elems []json.RawMessage
++	if err := json.Unmarshal(raw, &elems); err != nil {
++		return fmt.Errorf("snapshot: %s 数组元素解码失败: %w", field, err)
++	}
++	for i := range elems {
++		if err := checkRequiredRaw(elems[i], required); err != nil {
++			return fmt.Errorf("snapshot: %s[%d]: %w", field, i, err)
++		}
++	}
++	return nil
+ }
+ 
+ // validateEnum 校验整数枚举。
+@@ -171,8 +219,22 @@ func validateFlagPtr(field string, v *int) error {
+ 	return validateEnum(field, *v, 0, 1)
+ }
+ 
+-// Validate 校验点位对象字段级 Schema（enum + maxLength）。
++// validateRequiredString 校验必填字符串字段非空（空串视为 required 缺失）。
++func validateRequiredString(field, got string) error {
++	if got == "" {
++		return fmt.Errorf("snapshot: %s 必填且非空（required）", field)
++	}
++	return nil
++}
++
++// Validate 校验点位对象字段级 Schema（required 非空 + enum + maxLength）。
+ func (p *Point) Validate() error {
++	if err := validateRequiredString("pointCode", p.PointCode); err != nil {
++		return err
++	}
++	if err := validateRequiredString("pointName", p.PointName); err != nil {
++		return err
++	}
+ 	if err := validateEnum("dataType", p.DataType, 1, 2, 3, 4); err != nil {
+ 		return err
+ 	}
+@@ -200,6 +262,12 @@ func (p *Point) Validate() error {
+ 
+ // Validate 校验通道对象字段级 Schema。
+ func (c *Channel) Validate() error {
++	if err := validateRequiredString("channelCode", c.ChannelCode); err != nil {
++		return err
++	}
++	if err := validateRequiredString("channelName", c.ChannelName); err != nil {
++		return err
++	}
+ 	if err := validateStrEnum("protocolType", c.ProtocolType, "MQTT", "HTTP", "MODBUS", "OPCUA"); err != nil {
+ 		return err
+ 	}
+@@ -214,6 +282,12 @@ func (c *Channel) Validate() error {
+ 
+ // Validate 校验数据项对象字段级 Schema。
+ func (d *DataItem) Validate() error {
++	if err := validateRequiredString("dataCode", d.DataCode); err != nil {
++		return err
++	}
++	if err := validateRequiredString("fullKey", d.FullKey); err != nil {
++		return err
++	}
+ 	if err := validateEnum("sourceType", d.SourceType, 1, 2, 3); err != nil {
+ 		return err
+ 	}
+@@ -233,11 +307,20 @@ func (d *DataItem) Validate() error {
+ 
+ // Validate 校验公式对象字段级 Schema。
+ func (f *Formula) Validate() error {
++	if err := validateRequiredString("refFullKey", f.RefFullKey); err != nil {
++		return err
++	}
+ 	return validateEnum("refType", f.RefType, 1, 2)
+ }
+ 
+ // Validate 校验指标对象字段级 Schema。
+ func (m *Metric) Validate() error {
++	if err := validateRequiredString("metricCode", m.MetricCode); err != nil {
++		return err
++	}
++	if err := validateRequiredString("metricName", m.MetricName); err != nil {
++		return err
++	}
+ 	if err := validateEnum("aggType", m.AggType, 1, 2, 3, 4, 5); err != nil {
+ 		return err
+ 	}
+@@ -272,7 +355,8 @@ func strictDecode(data []byte, v any) error {
+ 	return nil
+ }
+ 
+-// ParseSnapshot 解析并校验快照体顶层结构。未装载对象键省略合法（派生规则 7）。
++// ParseSnapshot 解析并校验快照体顶层结构。未装载对象键省略合法（派生规则 7）；
++// 对象数组逐元素做 required 存在性校验（键缺失/null 视为缺失）。
+ func ParseSnapshot(data []byte) (*Snapshot, error) {
+ 	var s Snapshot
+ 	if err := strictDecode(data, &s); err != nil {
+@@ -281,6 +365,26 @@ func ParseSnapshot(data []byte) (*Snapshot, error) {
+ 	if s.SchemaVersion == "" {
+ 		return nil, errors.New("snapshot: 缺 schemaVersion（§3.3 承诺 Schema 版本号一并下发）")
+ 	}
++	// required 存在性按元素原始 JSON 校验（结构体零值无法区分「缺失」与「零值」，bool 同理）。
++	var rawTop map[string]json.RawMessage
++	if err := json.Unmarshal(data, &rawTop); err != nil {
++		return nil, fmt.Errorf("snapshot: required 校验前置解码失败: %w", err)
++	}
++	for _, arr := range []struct {
++		raw      json.RawMessage
++		required []string
++		field    string
++	}{
++		{rawTop["points"], pointRequired, "points"},
++		{rawTop["channels"], channelRequired, "channels"},
++		{rawTop["dataItems"], dataItemRequired, "dataItems"},
++		{rawTop["formulas"], formulaRequired, "formulas"},
++		{rawTop["metrics"], metricRequired, "metrics"},
++	} {
++		if err := checkArrayRequired(arr.raw, arr.required, arr.field); err != nil {
++			return nil, err
++		}
++	}
+ 	for i := range s.Points {
+ 		if err := s.Points[i].Validate(); err != nil {
+ 			return nil, fmt.Errorf("snapshot: points[%d]: %w", i, err)
+@@ -311,6 +415,9 @@ func ParseSnapshot(data []byte) (*Snapshot, error) {
+ 
+ // ParsePoint 解析并校验点位对象。
+ func ParsePoint(data []byte) (*Point, error) {
++	if err := checkRequiredRaw(data, pointRequired); err != nil {
++		return nil, err
++	}
+ 	var p Point
+ 	if err := strictDecode(data, &p); err != nil {
+ 		return nil, err
+@@ -323,6 +430,9 @@ func ParsePoint(data []byte) (*Point, error) {
+ 
+ // ParseChannel 解析并校验通道对象。
+ func ParseChannel(data []byte) (*Channel, error) {
++	if err := checkRequiredRaw(data, channelRequired); err != nil {
++		return nil, err
++	}
+ 	var c Channel
+ 	if err := strictDecode(data, &c); err != nil {
+ 		return nil, err
+@@ -335,6 +445,9 @@ func ParseChannel(data []byte) (*Channel, error) {
+ 
+ // ParseDataItem 解析并校验数据项对象。
+ func ParseDataItem(data []byte) (*DataItem, error) {
++	if err := checkRequiredRaw(data, dataItemRequired); err != nil {
++		return nil, err
++	}
+ 	var d DataItem
+ 	if err := strictDecode(data, &d); err != nil {
+ 		return nil, err
+@@ -347,6 +460,9 @@ func ParseDataItem(data []byte) (*DataItem, error) {
+ 
+ // ParseFormula 解析并校验公式对象。
+ func ParseFormula(data []byte) (*Formula, error) {
++	if err := checkRequiredRaw(data, formulaRequired); err != nil {
++		return nil, err
++	}
+ 	var f Formula
+ 	if err := strictDecode(data, &f); err != nil {
+ 		return nil, err
+@@ -359,6 +475,9 @@ func ParseFormula(data []byte) (*Formula, error) {
+ 
+ // ParseMetric 解析并校验指标对象。
+ func ParseMetric(data []byte) (*Metric, error) {
++	if err := checkRequiredRaw(data, metricRequired); err != nil {
++		return nil, err
++	}
+ 	var m Metric
+ 	if err := strictDecode(data, &m); err != nil {
+ 		return nil, err
+diff --git a/ingest/internal/snapshot/snapshot_contract_test.go b/ingest/internal/snapshot/snapshot_contract_test.go
+index 88e3769..6d486ce 100644
+--- a/ingest/internal/snapshot/snapshot_contract_test.go
++++ b/ingest/internal/snapshot/snapshot_contract_test.go
+@@ -8,7 +8,7 @@ import (
+ )
+ 
+ // contractTopLevelJSON 逐字取自配置快照契约 v1.0.1「快照体顶层结构」示例
+-//（键名为 v1.0.1 拟定，schemaVersion 一并下发为 §3.3 已承诺）。
++// （键名为 v1.0.1 拟定，schemaVersion 一并下发为 §3.3 已承诺）。
+ const contractTopLevelJSON = `{
+   "schemaVersion": "1.0.1",
+   "tenantId": 1,
+@@ -183,10 +183,8 @@ func TestContractPointObjectAdditionalPropertiesFalse(t *testing.T) {
+ 	}
+ }
+ 
+-// 契约依据：v1.0.1「通道对象 channel」Schema（映射 iot_channel；凭据标记口径 §1.3A——
+-// 只带 hasCredential / credentialTypes 标记，不含任何凭据材料）。
+-func TestContractChannelObjectSchema(t *testing.T) {
+-	ch := `{
++// contractChannelJSON 通道对象样例：字段集合严格取自 v1.0.1 channel Schema（含 required 全集）。
++const contractChannelJSON = `{
+   "id": 11,
+   "tenantId": 1,
+   "gatewayId": 88,
+@@ -198,7 +196,11 @@ func TestContractChannelObjectSchema(t *testing.T) {
+   "hasCredential": true,
+   "credentialTypes": ["DEVICE_TOKEN"]
+ }`
+-	got, err := snapshot.ParseChannel([]byte(ch))
++
++// 契约依据：v1.0.1「通道对象 channel」Schema（映射 iot_channel；凭据标记口径 §1.3A——
++// 只带 hasCredential / credentialTypes 标记，不含任何凭据材料）。
++func TestContractChannelObjectSchema(t *testing.T) {
++	got, err := snapshot.ParseChannel([]byte(contractChannelJSON))
+ 	if err != nil {
+ 		t.Fatalf("ParseChannel error: %v", err)
+ 	}
+@@ -217,14 +219,13 @@ func TestContractChannelObjectSchema(t *testing.T) {
+ 	if len(got.CredentialTypes) != 1 || got.CredentialTypes[0] != "DEVICE_TOKEN" {
+ 		t.Errorf("credentialTypes = %v, want [DEVICE_TOKEN]（仅类型不含材料）", got.CredentialTypes)
+ 	}
+-	if _, err := snapshot.ParseChannel([]byte(strings.Replace(ch, `"protocolType": "MQTT"`, `"protocolType": "SERIAL"`, 1))); err == nil {
++	if _, err := snapshot.ParseChannel([]byte(strings.Replace(contractChannelJSON, `"protocolType": "MQTT"`, `"protocolType": "SERIAL"`, 1))); err == nil {
+ 		t.Error("protocolType=SERIAL（enum 之外）未被拒收")
+ 	}
+ }
+ 
+-// 契约依据：v1.0.1「数据项对象 dataItem」Schema（映射 iot_data_item）。
+-func TestContractDataItemObjectSchema(t *testing.T) {
+-	item := `{
++// contractDataItemJSON 数据项对象样例：字段集合严格取自 v1.0.1 dataItem Schema（含 required 全集）。
++const contractDataItemJSON = `{
+   "id": 501,
+   "tenantId": 1,
+   "instanceId": 88,
+@@ -240,7 +241,10 @@ func TestContractDataItemObjectSchema(t *testing.T) {
+   "configVersion": 17,
+   "status": 1
+ }`
+-	got, err := snapshot.ParseDataItem([]byte(item))
++
++// 契约依据：v1.0.1「数据项对象 dataItem」Schema（映射 iot_data_item）。
++func TestContractDataItemObjectSchema(t *testing.T) {
++	got, err := snapshot.ParseDataItem([]byte(contractDataItemJSON))
+ 	if err != nil {
+ 		t.Fatalf("ParseDataItem error: %v", err)
+ 	}
+@@ -256,14 +260,13 @@ func TestContractDataItemObjectSchema(t *testing.T) {
+ 	if got.PointID == nil || *got.PointID != 101 {
+ 		t.Errorf("pointId = %v, want 101", got.PointID)
+ 	}
+-	if _, err := snapshot.ParseDataItem([]byte(strings.Replace(item, `"sourceType": 1`, `"sourceType": 4`, 1))); err == nil {
++	if _, err := snapshot.ParseDataItem([]byte(strings.Replace(contractDataItemJSON, `"sourceType": 1`, `"sourceType": 4`, 1))); err == nil {
+ 		t.Error("sourceType=4（enum 1/2/3 之外）未被拒收")
+ 	}
+ }
+ 
+-// 契约依据：v1.0.1「公式对象 formula」Schema（映射 iot_data_item_ref 公式引用关系表：引用边行）。
+-func TestContractFormulaObjectSchema(t *testing.T) {
+-	f := `{
++// contractFormulaJSON 公式对象样例：字段集合严格取自 v1.0.1 formula Schema（含 required 全集）。
++const contractFormulaJSON = `{
+   "id": 601,
+   "tenantId": 1,
+   "itemId": 502,
+@@ -271,7 +274,10 @@ func TestContractFormulaObjectSchema(t *testing.T) {
+   "refType": 1,
+   "refItemId": 501
+ }`
+-	got, err := snapshot.ParseFormula([]byte(f))
++
++// 契约依据：v1.0.1「公式对象 formula」Schema（映射 iot_data_item_ref 公式引用关系表：引用边行）。
++func TestContractFormulaObjectSchema(t *testing.T) {
++	got, err := snapshot.ParseFormula([]byte(contractFormulaJSON))
+ 	if err != nil {
+ 		t.Fatalf("ParseFormula error: %v", err)
+ 	}
+@@ -287,14 +293,13 @@ func TestContractFormulaObjectSchema(t *testing.T) {
+ 	if got.RefItemID == nil || *got.RefItemID != 501 {
+ 		t.Errorf("refItemId = %v, want 501", got.RefItemID)
+ 	}
+-	if _, err := snapshot.ParseFormula([]byte(strings.Replace(f, `"refType": 1`, `"refType": 3`, 1))); err == nil {
++	if _, err := snapshot.ParseFormula([]byte(strings.Replace(contractFormulaJSON, `"refType": 1`, `"refType": 3`, 1))); err == nil {
+ 		t.Error("refType=3（enum 1/2 之外）未被拒收")
+ 	}
+ }
+ 
+-// 契约依据：v1.0.1「指标对象 metric」Schema（映射 iot_metric）。
+-func TestContractMetricObjectSchema(t *testing.T) {
+-	m := `{
++// contractMetricJSON 指标对象样例：字段集合严格取自 v1.0.1 metric Schema（含 required 全集）。
++const contractMetricJSON = `{
+   "id": 701,
+   "tenantId": 1,
+   "metricCode": "F01_WATER_AVG_DAY",
+@@ -307,7 +312,10 @@ func TestContractMetricObjectSchema(t *testing.T) {
+   "momFlag": 1,
+   "status": 1
+ }`
+-	got, err := snapshot.ParseMetric([]byte(m))
++
++// 契约依据：v1.0.1「指标对象 metric」Schema（映射 iot_metric）。
++func TestContractMetricObjectSchema(t *testing.T) {
++	got, err := snapshot.ParseMetric([]byte(contractMetricJSON))
+ 	if err != nil {
+ 		t.Fatalf("ParseMetric error: %v", err)
+ 	}
+@@ -326,10 +334,88 @@ func TestContractMetricObjectSchema(t *testing.T) {
+ 	if got.YoyFlag == nil || *got.YoyFlag != 1 {
+ 		t.Errorf("yoyFlag = %v, want 1", got.YoyFlag)
+ 	}
+-	if _, err := snapshot.ParseMetric([]byte(strings.Replace(m, `"aggType": 1`, `"aggType": 6`, 1))); err == nil {
++	if _, err := snapshot.ParseMetric([]byte(strings.Replace(contractMetricJSON, `"aggType": 1`, `"aggType": 6`, 1))); err == nil {
+ 		t.Error("aggType=6（enum 1-5 之外）未被拒收")
+ 	}
+-	if _, err := snapshot.ParseMetric([]byte(strings.Replace(m, `"period": "DAY"`, `"period": "WEEK"`, 1))); err == nil {
++	if _, err := snapshot.ParseMetric([]byte(strings.Replace(contractMetricJSON, `"period": "DAY"`, `"period": "WEEK"`, 1))); err == nil {
+ 		t.Error(`period="WEEK"（enum 之外）未被拒收`)
+ 	}
+ }
++
++// ---- required 清单（I1 修订轮）----
++
++// 契约依据：v1.0.1 point 对象 JSON Schema "required": ["id","tenantId","pointCode",
++// "pointName","dataType","valueType"]——缺任一必填键必须拒收；pointCode 空串视为缺失
++// （required 存在性 + 非空）。
++func TestContractPointObjectRequiredEnforced(t *testing.T) {
++	noName := strings.Replace(contractPointJSON, `"pointName": "一号设备一号测点",`, ``, 1)
++	if _, err := snapshot.ParsePoint([]byte(noName)); err == nil {
++		t.Error("缺 pointName 未被拒收（required）")
++	}
++	noTenant := strings.Replace(contractPointJSON, `"tenantId": 1,`, ``, 1)
++	if _, err := snapshot.ParsePoint([]byte(noTenant)); err == nil {
++		t.Error("缺 tenantId 未被拒收（required）")
++	}
++	emptyCode := strings.Replace(contractPointJSON, `"pointCode": "F01_WS01_EQ001_M01"`, `"pointCode": ""`, 1)
++	if _, err := snapshot.ParsePoint([]byte(emptyCode)); err == nil {
++		t.Error("pointCode 空串未被拒收（required 存在性 + 非空）")
++	}
++	// 快照体路径同样拦截：缺 pointName 的点位进快照体 → ParseSnapshot 整体失败
++	body := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [` + strings.Replace(contractPointJSON, `"pointName": "一号设备一号测点",`, ``, 1) + `]
++}`
++	if _, err := snapshot.ParseSnapshot([]byte(body)); err == nil {
++		t.Error("快照体内缺 pointName 的点位未被拒收（ParseSnapshot required 路径）")
++	}
++}
++
++// 契约依据：v1.0.1 其余四对象 JSON Schema "required" 清单——
++// channel: id/tenantId/gatewayId/channelCode/channelName/protocolType/hasCredential；
++// dataItem: id/tenantId/instanceId/dataCode/fullKey/sourceType；
++// formula: id/tenantId/itemId/refFullKey/refType；
++// metric: id/tenantId/metricCode/metricName/instanceId/aggType/period。
++func TestContractAllFiveObjectsRequiredEnforced(t *testing.T) {
++	chNoCred := strings.Replace(contractChannelJSON, `"hasCredential": true,`, ``, 1)
++	if _, err := snapshot.ParseChannel([]byte(chNoCred)); err == nil {
++		t.Error("channel 缺 hasCredential 未被拒收（required）")
++	}
++	itemNoFullKey := strings.Replace(contractDataItemJSON, `"fullKey": "F01.WATER_IN_DAY",`, ``, 1)
++	if _, err := snapshot.ParseDataItem([]byte(itemNoFullKey)); err == nil {
++		t.Error("dataItem 缺 fullKey 未被拒收（required）")
++	}
++	fNoRef := strings.Replace(contractFormulaJSON, `"refFullKey": "F01.WATER_IN_DAY",`, ``, 1)
++	if _, err := snapshot.ParseFormula([]byte(fNoRef)); err == nil {
++		t.Error("formula 缺 refFullKey 未被拒收（required）")
++	}
++	mNoName := strings.Replace(contractMetricJSON, `"metricName": "一厂日均用水量",`, ``, 1)
++	if _, err := snapshot.ParseMetric([]byte(mNoName)); err == nil {
++		t.Error("metric 缺 metricName 未被拒收（required）")
++	}
++}
++
++// 契约依据：§3.3「新快照校验失败则继续用旧版并回执失败」——必填字段缺失属于校验失败，
++// 缓存保旧版（含绕过 JSON 解析、直接构造结构体的路径：required 字符串字段空串即缺失）。
++func TestContractSnapshotCacheKeepsOldOnRequiredViolation(t *testing.T) {
++	valid17 := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","status":1}]
++}`
++	valid18 := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 18,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","status":1}]
++}`
++	c := snapshot.NewCache()
++	if err := c.Replace(mustParse(t, valid17)); err != nil {
++		t.Fatalf("Replace(valid17) error: %v", err)
++	}
++	// 直接构造结构体的畸形快照（pointName 空串 = required 缺失）→ Replace 拒收并保旧版
++	bad := mustParse(t, valid18)
++	bad.Points[0].PointName = ""
++	if err := c.Replace(bad); err == nil {
++		t.Fatal("Replace(必填字符串字段为空的快照) error = nil, want 拒收")
++	}
++	if got := c.Get(); got == nil || got.Version != 17 {
++		t.Errorf("校验失败后缓存 version = %v, want 保旧版 17", got)
++	}
++}
+diff --git a/ingest/internal/tdengine/tdengine.go b/ingest/internal/tdengine/tdengine.go
+index 3a0fbe2..f17bc03 100644
+--- a/ingest/internal/tdengine/tdengine.go
++++ b/ingest/internal/tdengine/tdengine.go
+@@ -7,14 +7,19 @@
+ //   - 每租户一库，库名 iot_<tenant_code>；防写错靠写方从令牌解析租户选库；
+ //   - 攒批写入（FEAT-0009：禁止逐条写库）——同一子表多行合并单条 INSERT 多 VALUES。
+ //
+-// 实现口径：子表名取点位编码（租户内唯一、每点位一张子表，符合 §2.2 子表粒度；
+-// 命名方案契约未定版，接线时如需调整只改 childTable 函数）；instance_key 标签在快照
+-// v1.0.1 点位对象中无对应字段（上游留白），暂写空串，见 TASK-0073 报告。
++// 实现口径：子表名 = 点位编码的确定性映射（租户内每点位一张子表，符合 §2.2 子表粒度；
++// 命名方案契约未定版，接线时如需调整只改 ChildTableName 函数）。快照 point 对象对
++// pointCode 只约束 maxLength 96、无字符集约束，故映射必须覆盖全部契约合法编码：
++// 全安全字节（[A-Za-z0-9_]）恒等；非安全字节逐字节 _XX 十六进制转义（加 FNV 后缀与
++// 恒等集区分）；首字符数字加前缀；超长截断加哈希后缀（TDengine 标识符上限 192 字节）。
++// 详见 escapeIdentifier。instance_key 标签在快照 v1.0.1 点位对象中无对应字段
++// （上游留白），暂写空串，见 TASK-0073 报告。
+ package tdengine
+ 
+ import (
+ 	"context"
+ 	"fmt"
++	"hash/fnv"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -68,9 +73,74 @@ func StableFor(dataType int) (string, bool) {
+ 	}
+ }
+ 
+-// DBName 每租户一库（附录 B）：iot_<tenant_code>。
++// maxIdentifierLen TDengine 标识符长度上限（192 字节）。
++const maxIdentifierLen = 192
++
++// isSafeIdentByte 报告字节是否属于标识符安全集 [A-Za-z0-9_]。
++func isSafeIdentByte(b byte) bool {
++	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
++}
++
++// fnv64Hex 原文 FNV-64 哈希的 16 位十六进制表示（确定性、定长）。
++func fnv64Hex(s string) string {
++	h := fnv.New64a()
++	_, _ = h.Write([]byte(s))
++	return fmt.Sprintf("%016x", h.Sum64())
++}
++
++// escapeIdentifier 把任意字符串确定性映射为 TDengine 合法标识符（字母或下划线开头、
++// 仅 [A-Za-z0-9_]、≤192 字节）：
++//   - 全安全字节（[A-Za-z0-9_]）且非数字开头：恒等映射（契约示例编码 group_a、
++//     F01_WS01_EQ001_M01 等不受影响）；
++//   - 含非安全字节：逐字节 '_XX' 十六进制转义，并追加 '_' + 原文 FNV-64 后缀——
++//     后缀使转义结果与恒等集区分（如「F01-M01」不会撞上字面编码「F01_2dM01…」），
++//     且逐字节转义本身单射，同一批非安全编码之间互不冲突；
++//   - 首字符为数字：加前缀 "t_"（TDengine 标识符不能以数字开头）；
++//   - 超长：截断 + 哈希后缀保持 ≤192 字节与确定性。
++func escapeIdentifier(s string) string {
++	if s == "" {
++		return ""
++	}
++	allSafe := true
++	for i := 0; i < len(s); i++ {
++		if !isSafeIdentByte(s[i]) {
++			allSafe = false
++			break
++		}
++	}
++	if allSafe {
++		if s[0] >= '0' && s[0] <= '9' {
++			return "t_" + s
++		}
++		return s
++	}
++	const hexd = "0123456789abcdef"
++	var sb strings.Builder
++	for i := 0; i < len(s); i++ {
++		b := s[i]
++		if isSafeIdentByte(b) {
++			sb.WriteByte(b)
++			continue
++		}
++		sb.WriteByte('_')
++		sb.WriteByte(hexd[b>>4])
++		sb.WriteByte(hexd[b&0xF])
++	}
++	out := sb.String()
++	if out[0] >= '0' && out[0] <= '9' {
++		out = "t_" + out
++	}
++	out += "_" + fnv64Hex(s)
++	if len(out) > maxIdentifierLen {
++		out = out[:maxIdentifierLen-17] + "_" + fnv64Hex(s)
++	}
++	return out
++}
++
++// DBName 每租户一库（附录 B）：iot_<tenant_code>。tenant_code 按确定性映射转义
++// （契约示例等安全编码恒等不变），写库层不因编码字符集拒绝契约合法数据。
+ func DBName(tenantCode string) string {
+-	return "iot_" + tenantCode
++	return "iot_" + escapeIdentifier(tenantCode)
+ }
+ 
+ // PointRow 点位写入行（st_point_num / st_point_state）。
+@@ -131,12 +201,20 @@ func safeIdentifier(s string) bool {
+ 	return true
+ }
+ 
+-// childTable 子表名（实现口径：点位编码即子表名，租户内每点位一张）。
+-func childTable(row PointRow) (string, error) {
+-	if !safeIdentifier(row.PointCode) {
+-		return "", fmt.Errorf("tdengine: pointCode %q 不是安全子表名", row.PointCode)
++// ChildTableName 点位编码 → 子表名（确定性映射，规则见 escapeIdentifier；命名方案
++// 契约未定版，0029 接线如需调整只改此映射）。任何契约合法 pointCode 都映射到合法
++// 子表名，不构成对契约合法数据的拒绝路径；safeIdentifier 仅作映射后的不变式断言。
++func ChildTableName(pointCode string) (string, error) {
++	name := escapeIdentifier(pointCode)
++	if !safeIdentifier(name) {
++		return "", fmt.Errorf("tdengine: pointCode %q 映射后的子表名 %q 未通过标识符不变式断言", pointCode, name)
+ 	}
+-	return row.PointCode, nil
++	return name, nil
++}
++
++// childTable 写入行 → 子表名（TAGS 的 point_code 值保留原编码，见 InsertPointSQL）。
++func childTable(row PointRow) (string, error) {
++	return ChildTableName(row.PointCode)
+ }
+ 
+ // InsertPointSQL 构造写入语句：同一子表多行合并单条 INSERT（USING 超级表 TAGS (...)）。
+@@ -147,9 +225,6 @@ func InsertPointSQL(rows []PointRow) (string, error) {
+ 	}
+ 	first := rows[0]
+ 	db := DBName(first.TenantCode)
+-	if !safeIdentifier(first.TenantCode) {
+-		return "", fmt.Errorf("tdengine: tenantCode %q 不是安全库名成分", first.TenantCode)
+-	}
+ 	child, err := childTable(first)
+ 	if err != nil {
+ 		return "", err
+@@ -204,8 +279,8 @@ type ExecCall struct {
+ // FakeExecutor 假 TDengine 执行器：记录调用、不真执行。
+ // failRemaining>0 时前 failRemaining 次 Exec 返回注入错误（攒批失败重排测试用）。
+ type FakeExecutor struct {
+-	mu           sync.Mutex
+-	calls        []ExecCall
++	mu            sync.Mutex
++	calls         []ExecCall
+ 	failRemaining int
+ }
+ 
+diff --git a/ingest/internal/tdengine/tdengine_contract_test.go b/ingest/internal/tdengine/tdengine_contract_test.go
+index 73f6a2e..b8bb63d 100644
+--- a/ingest/internal/tdengine/tdengine_contract_test.go
++++ b/ingest/internal/tdengine/tdengine_contract_test.go
+@@ -178,17 +178,78 @@ func TestFakeExecutorRecordsCallsAndInjectsFailure(t *testing.T) {
+ 	}
+ }
+ 
+-// 契约依据：§2.2「标签值取自配置快照，不取自消息自带字段」+ 附录 B 库名纪律——
+-// 子表名/库名必须是安全标识符，非法字符拒收（防注入，实现口径）。
+-func TestUnsafeIdentifierRejected(t *testing.T) {
+-	if _, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
+-		TenantCode: "group_a", TenantID: 1, PointCode: "M01); DROP DATABASE x", Kind: tdengine.KindInstant,
+-	}}); err == nil {
+-		t.Error("非法子表名未被拒收")
+-	}
+-	if _, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
+-		TenantCode: "group_a'; --", TenantID: 1, PointCode: "M01", Kind: tdengine.KindInstant,
+-	}}); err == nil {
+-		t.Error("非法租户码（库名）未被拒收")
++// 契约依据（I2 修订）：config-snapshot-schema.md point 对象对 pointCode 只约束 maxLength 96、
++// 无字符集约束——含连字符等非安全字节的 pointCode 是契约合法数据，写库层不得拒绝，
++// 必须确定性映射为合法子表名；TAGS 值保留原编码（标签取自配置快照）。
++func TestContractPointCodeMappedNotRejected(t *testing.T) {
++	sql, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a", TenantID: 1, PointCode: "F01-WS01-M01", Kind: tdengine.KindInstant,
++	}})
++	if err != nil {
++		t.Fatalf("含连字符 pointCode 被拒收: %v", err)
++	}
++	if !strings.Contains(sql, "INSERT INTO iot_group_a.F01_2dWS01_2dM01_") {
++		t.Errorf("子表名未按 _XX 十六进制转义（连字符 0x2D → _2d）: %s", sql)
++	}
++	if !strings.Contains(sql, "'F01-WS01-M01'") {
++		t.Errorf("TAGS 应保留原编码: %s", sql)
++	}
++	// 含非 [A-Za-z0-9_] 字节的租户码同样映射不拒绝（防同名拒绝路径复发）
++	sql2, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "tenant; drop", TenantID: 1, PointCode: "M01", Kind: tdengine.KindInstant,
++	}})
++	if err != nil {
++		t.Fatalf("含非安全字节租户码被拒收: %v", err)
++	}
++	wantDB := tdengine.DBName("tenant; drop")
++	if !strings.HasPrefix(wantDB, "iot_tenant_3b_20drop_") || len(wantDB) <= len("iot_tenant_3b_20drop_") {
++		t.Errorf("DBName 未按 _XX 转义（分号 0x3B/空格 0x20）: %q", wantDB)
++	}
++	if !strings.Contains(sql2, "INSERT INTO "+wantDB+".M01") {
++		t.Errorf("SQL 未使用映射后的库名: %s", sql2)
++	}
++}
++
++// 契约依据（I2 修订）：childTable 确定性转义规则——非 [A-Za-z0-9_] 字节 → _XX 十六进制；
++// 首字符数字加前缀；任何契约合法 pointCode（≤96 字符，含中文）都映射到合法且
++// 定长的子表名，映射可复现。
++func TestContractChildTableNameEscaping(t *testing.T) {
++	// 恒等：全安全字节且字母开头
++	got, err := tdengine.ChildTableName("F01_WS01_EQ001_M01")
++	if err != nil || got != "F01_WS01_EQ001_M01" {
++		t.Errorf("safe pointCode = (%q, %v), want 恒等映射", got, err)
++	}
++	// 首字符数字：加前缀
++	got, err = tdengine.ChildTableName("01_M01")
++	if err != nil || got != "t_01_M01" {
++		t.Errorf("digit-first = (%q, %v), want t_01_M01", got, err)
++	}
++	// 连字符 0x2D → _2d（确定性前缀 + 哈希后缀）
++	got, err = tdengine.ChildTableName("F01-WS01-EQ001-M01")
++	if err != nil || !strings.HasPrefix(got, "F01_2dWS01_2dEQ001_2dM01_") {
++		t.Errorf("hyphen = (%q, %v), want F01_2dWS01_2dEQ001_2dM01_<hash>", got, err)
++	}
++	// 中文（UTF-8 多字节）：逐字节转义，确定性
++	got, err = tdengine.ChildTableName("点位一")
++	if err != nil || !strings.HasPrefix(got, "_e7_82_b9_e4_bd_8d_e4_b8_80_") {
++		t.Errorf("chinese = (%q, %v), want _e7_82_b9_e4_bd_8d_e4_b8_80_<hash>", got, err)
++	}
++	// 确定性可复现：两次调用一致
++	again, _ := tdengine.ChildTableName("点位一")
++	if again != got {
++		t.Errorf("映射不可复现: %q vs %q", got, again)
++	}
++	// 96 个中文字符（契约 maxLength 上限）：映射后不超过 192 字节且确定性
++	long := strings.Repeat("点", 96)
++	got, err = tdengine.ChildTableName(long)
++	if err != nil {
++		t.Fatalf("long pointCode error: %v", err)
++	}
++	if len(got) > 192 {
++		t.Errorf("映射后长度 %d 超过 TDengine 标识符上限 192 字节", len(got))
++	}
++	again, _ = tdengine.ChildTableName(long)
++	if again != got {
++		t.Errorf("长编码映射不可复现")
+ 	}
+ }

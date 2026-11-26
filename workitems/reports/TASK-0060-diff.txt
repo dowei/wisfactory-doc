@@ -1,0 +1,967 @@
+diff --git a/frontend/src/api/display/display-api.ts b/frontend/src/api/display/display-api.ts
+index 96d33a4..043f88c 100644
+--- a/frontend/src/api/display/display-api.ts
++++ b/frontend/src/api/display/display-api.ts
+@@ -219,6 +219,47 @@ export interface DisplayMetric {
+   status: number;
+ }
+ 
++// ---------------- TASK-0060：指标看板（卡片/同比环比/趋势叠加）数据源类型 ----------------
++//
++// 冻结契约（TASK-0045，resources/contract/tdengine-super-tables.md v1.0.0）：
++//   st_metric_value 列 =(ts〔窗口起始〕, value, yoy, mom)，标签 =(tenant_id, metric_code,
++//   instance_code, period) 四元组；**无完整度物理列**（完整度由内存/状态视图 /calc/v1/status.metric
++//   承载）。value/yoy/mom 为结果表真实列——看板必须同源展示，不现算（ADR-0011）。
++//
++// 读口事实（本任务 grep 实证，见报告）：
++//   - 管理面 /iot/metric/** 只有指标「定义」（list/detail/CRUD），**无指标值读口**；
++//   - 指标值仅存在于 /openapi/v1/metrics/query（appKey+HMAC，浏览器不可直连，安全红线）；
++//   - 完整度仅在 calc /calc/v1/status.metric（内网观测面，非登录态管理面端点）。
++//   故本服务**只定义类型与纯函数，不写未交付端点的调用**；值/完整度/趋势当前一律空态 +
++//   缺口登记，待管理面登录态指标值读口交付后仅替换取数处（组件/纯函数不动）。
++//   契约字段（value/yoy/mom/ts/period）与同源断言函数在 metric-utils.ts，可直接消费读口响应。
++
++/** 指标值行（对齐 st_metric_value 冻结契约 4 列 + 4 元组标签；同源断言用） */
++export interface MetricValueRow {
++  metricCode: string;
++  instanceCode: string;
++  /** 窗口类型（标签 period：HOUR/DAY/MONTH/YEAR；与 iot_metric.period 同词表） */
++  period: string;
++  /** 窗口起始 epoch 毫秒（ts 列；.valueOf() 原文另存 windowStart 字符串时保持原样） */
++  ts: number;
++  /** 本期值（value 列；null=无值，不写 0 冒充——TASK-0045 L4） */
++  value: number | null;
++  /** 同比（yoy 列；小数比率，0.083=+8.3%；null=上期无值/分母 0，不冒充 0） */
++  yoy: number | null;
++  /** 环比（mom 列；同上） */
++  mom: number | null;
++  /** 单位（来自指标定义/伴随读口，非 st_metric_value 物理列；仅用于展示） */
++  unit?: string | null;
++}
++
++/** 完整度行（对齐 0045 status.metric 内存视图；无物理列，管理面登录态读口缺口当前空态） */
++export interface MetricCompletenessRow {
++  metricCode: string;
++  /** 0..1 到达率；低于阈值（默认 0.8）带标记 */
++  completeness: number;
++  incomplete: boolean;
++}
++
+ /** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
+ interface ResultEnvelope<T> {
+   code: number;
+diff --git a/frontend/src/router/display.ts b/frontend/src/router/display.ts
+index 07f367a..c6489d0 100644
+--- a/frontend/src/router/display.ts
++++ b/frontend/src/router/display.ts
+@@ -7,6 +7,8 @@
+  * - 下钻路径 ≤3 次点击：/display（总览，0）→ /display/factory/:factoryId（1）
+  *   → /display/workshop/:factoryId/:workshopId（2）→ /display/device?instanceId=（3，TASK-0059）。
+  *   设备详情用查询参数 instanceId（brief 口径），从车间页设备色块进入，下钻计数不变。
++ * - 指标看板 /display/metrics（TASK-0060）：展示端独立视图，静态注册同 0058/0059；
++ *   指标卡片 + 趋势叠加，按工厂维度过滤；数据走管理面登录态端点，不直连 HMAC openapi。
+  */
+ import type { RouteRecordRaw } from 'vue-router';
+ 
+@@ -36,4 +38,11 @@ export const displayRouters: Array<RouteRecordRaw> = [
+     component: () => import('/@/views/display/device/index.vue'),
+     meta: { title: '设备详情', hideInMenu: true },
+   },
++  {
++    // 指标看板（TASK-0060）：指标卡片（本期值+同比+环比+完整度标记）+ 趋势图多周期叠加去年同期。
++    path: '/display/metrics',
++    name: 'DisplayMetrics',
++    component: () => import('/@/views/display/metrics/index.vue'),
++    meta: { title: '指标看板', hideInMenu: true },
++  },
+ ];
+diff --git a/frontend/src/views/display/metrics/index.vue b/frontend/src/views/display/metrics/index.vue
+new file mode 100644
+index 0000000..825dc16
+--- /dev/null
++++ b/frontend/src/views/display/metrics/index.vue
+@@ -0,0 +1,183 @@
++<!--
++  * 展示端 · 指标看板（TASK-0060）
++  *
++  * 路由：/display/metrics（展示端独立视图区，静态注册、hideInMenu、需登录，范式同 0058/0059）。
++  *
++  * 数据纪律（硬约束，逐条落地）：
++  * 1) 指标卡片网格：指标定义取管理面 /iot/metric/list（真数据、数据权限裁剪），按工厂维度过滤、
++  *    按周期分组；本期值/同比(yoy)/环比(mom)取 st_metric_value 结果表真实列（TASK-0045 冻结契约），
++  *    卡片与结果表同数——前端不现算（ADR-0011）。
++  * 2) 完整度标记：低于 80% 阈值明显标记（与 0045 completenessMin 同口径）；完整度无物理列
++  *    （由 /calc/v1/status.metric 内存视图承载）。
++  * 3) 趋势图：多周期叠加 + 去年同期对比（同 ts 去年同期真实行；yoy 是比率不可反推历史值），
++  *    降采样明示标注（ADR-0010）。
++  * 4) 安全红线 + 缺口：管理面 /iot/metric/** 只有指标「定义」读口，**无指标值/完整度登录态读口**；
++  *    值只在 /openapi/v1/metrics/query（appKey+HMAC，浏览器不可直连），完整度只在 calc 内网观测面。
++  *    前端零 appKey/secret、零 HMAC 直连、不自造代理——值与完整度当前一律空态 + 页面缺口登记，
++  *    不静默、不造假；读口交付后仅替换「取数处」，卡片/趋势/纯函数不动。
++  * 5) 空态：无指标定义/无值/取数失败均显示空态（「指标数据接入中」），不造假数字。
++  *
++  * 演进位（ADR-0011）：涨跌颜色租户可配、上看板标记真值——接口交付后接入，渲染逻辑不动。
++-->
++<template>
++  <div class="display-page metrics-board">
++    <div class="display-page__header">
++      <div>
++        <h2 class="display-page__title">指标看板</h2>
++        <div class="display-page__subtitle">卡片本期值与结果表同源（value/yoy/mom 真实列，不现算）· 完整度低于 80% 带标记 · 趋势叠去年同期</div>
++      </div>
++      <a-button size="small" :loading="loading" @click="loadAll(true)">
++        <template #icon><ReloadOutlined /></template>
++        刷新
++      </a-button>
++    </div>
++
++    <!-- 管理面指标值读口缺口登记（安全红线：不直连 HMAC openapi、不自造代理） -->
++    <a-alert
++      v-if="readGap"
++      type="warning"
++      show-icon
++      class="display-page__alert"
++      message="管理面指标值读口缺口（空态登记，不造假）"
++      description="管理面 /iot/metric/** 仅提供指标定义，无指标值/完整度登录态读口；指标值仅存于 /openapi/v1/metrics/query（appKey+HMAC，浏览器不可直连），完整度仅存于 calc /calc/v1/status.metric（内网观测面）。前端不持有凭据、不直连 HMAC、不自造代理，故本期值/同比/环比/完整度/趋势均为空态，待管理面登录态读口交付后接入。"
++    />
++
++    <a-alert v-if="treeError" type="error" :message="treeError" show-icon class="display-page__alert" />
++
++    <div class="metrics-board__filter">
++      <span class="metrics-board__filter-label">工厂维度</span>
++      <a-select v-model:value="selectedFactoryId" size="small" style="min-width: 220px" :options="factoryOptions" />
++      <span class="metrics-board__filter-hint">{{ factoryHint }}</span>
++    </div>
++
++    <a-spin :spinning="loading">
++      <template v-if="metrics.length">
++        <div v-for="period in periodSections" :key="period.key" class="display-page__section">
++          <h3 class="display-page__section-title">{{ period.label }}指标（{{ period.items.length }}）</h3>
++          <a-row :gutter="16" class="metrics-board__grid">
++            <a-col v-for="entry in period.items" :key="entry.metric.id" :span="8">
++              <metric-card :metric="entry.metric" :value="valueOf(entry.metric)" :completeness="completenessOf(entry.metric)" />
++            </a-col>
++          </a-row>
++        </div>
++
++        <div class="display-page__section">
++          <metric-trend :rows="valueRows" :loading="loading" @refresh="loadAll(true)" />
++        </div>
++      </template>
++      <a-empty v-else-if="!loading" description="暂无可见指标（空数据=新厂/无权/指标未配置空态）" class="display-page__empty" />
++    </a-spin>
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted, ref } from 'vue';
++  import ReloadOutlined from '@ant-design/icons-vue/ReloadOutlined';
++  import { childrenOf, displayApi, DISPLAY_NODE_TYPE, type DisplayMetric, type MetricValueRow } from '/@/api/display/display-api';
++  import { useDisplayTree } from '../composables/use-display-tree';
++  import MetricCard from './metric-card.vue';
++  import MetricTrend from './metric-trend.vue';
++  import { METRIC_PERIODS, PERIOD_LABEL } from './metric-utils';
++
++  const { tree, error: treeError, loaded, loadTree } = useDisplayTree();
++
++  /** 管理面指标值读口缺口恒为 true（/iot/metric/** 无值读口；当前无登录态指标值端点） */
++  const readGap = ref(true);
++  const loading = ref(false);
++  const selectedFactoryId = ref<number | 'all'>('all');
++
++  const factories = computed(() => childrenOf(tree.value, null).filter((n) => n.nodeType === DISPLAY_NODE_TYPE.FACTORY));
++  const factoryOptions = computed(() => [
++    { label: '全部工厂', value: 'all' as const },
++    ...factories.value.map((f) => ({ label: f.instanceName || f.instanceCode, value: f.id })),
++  ]);
++  const factoryHint = computed(() =>
++    selectedFactoryId.value === 'all' ? `共 ${factories.value.length} 家工厂（按数据权限可见）` : '仅展示所选工厂指标定义'
++  );
++
++  interface MetricEntry {
++    metric: DisplayMetric;
++    factoryId: number;
++  }
++  const metrics = ref<MetricEntry[]>([]);
++
++  /**
++   * 指标值行（st_metric_value 同源）与完整度——当前恒空：管理面无登录态读口。
++   * 演进位：读口交付后，在 loadAll 内把读口响应映射填入 valueRows/completenessMap，
++   * 组件与纯函数（metric-utils/trendDisplay/completenessDisplay/buildMetricTrend）均无需改动。
++   */
++  const valueRows = ref<MetricValueRow[]>([]);
++  const completenessMap = ref<Map<string, number>>(new Map());
++
++  const periodSections = computed(() => {
++    const sections = METRIC_PERIODS.map((p) => ({
++      key: p,
++      label: PERIOD_LABEL[p],
++      items: metrics.value.filter((e) => (e.metric.period ?? 'DAY') === p),
++    }));
++    // 未知 period 归 DAY 段，避免指标丢失（结果仍来自真定义，不造假）
++    return sections;
++  });
++
++  function valueOf(metric: DisplayMetric): MetricValueRow | null {
++    // metric_code 租户内唯一（uk_tenant_metric_code）；结果表按 metricCode 定位本期行（与结果表同数）
++    return valueRows.value.find((r) => r.metricCode === metric.metricCode) ?? null;
++  }
++
++  function completenessOf(metric: DisplayMetric): number | null {
++    return completenessMap.value.get(metric.metricCode) ?? null;
++  }
++
++  async function loadAll(force = false) {
++    loading.value = true;
++    try {
++      await loadTree(force);
++      const targets = factories.value.filter((f) => selectedFactoryId.value === 'all' || f.id === selectedFactoryId.value);
++      const lists = await Promise.all(targets.map((f) => displayApi.queryMetricList(f.id).catch(() => [])));
++      const seen = new Set<number>();
++      const collected: MetricEntry[] = [];
++      lists.forEach((list, i) => {
++        for (const metric of list) {
++          if (seen.has(metric.id)) continue;
++          seen.add(metric.id);
++          collected.push({ metric, factoryId: targets[i].id });
++        }
++      });
++      metrics.value = collected;
++      // 值/完整度保持空态：管理面读口缺口（见 readGap / 页面告警），不自造数据。
++      valueRows.value = [];
++      completenessMap.value = new Map();
++    } catch (e) {
++      metrics.value = [];
++      valueRows.value = [];
++      completenessMap.value = new Map();
++      console.error('[display] metrics board load failed:', e);
++    } finally {
++      loading.value = false;
++    }
++  }
++
++  onMounted(() => void loadAll());
++</script>
++<style scoped lang="less">
++  @import '../display.less';
++  .metrics-board {
++    &__filter {
++      display: flex;
++      gap: 10px;
++      align-items: center;
++      margin-bottom: 16px;
++    }
++    &__filter-label {
++      color: #595959;
++      font-size: 13px;
++    }
++    &__filter-hint {
++      color: #8c8c8c;
++      font-size: 12px;
++    }
++    &__grid {
++      align-items: stretch;
++      row-gap: 16px;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/metrics/metric-card.vue b/frontend/src/views/display/metrics/metric-card.vue
+new file mode 100644
+index 0000000..b7ea8c0
+--- /dev/null
++++ b/frontend/src/views/display/metrics/metric-card.vue
+@@ -0,0 +1,169 @@
++<!--
++  * 指标看板 · 指标卡片（TASK-0060）
++  *
++  * 本期值 + 同比(yoy) + 环比(mom) + 涨跌方向色 + 完整度标记 + ADR-0011 上看板标记。
++  *
++  * 数据纪律（硬约束）：
++  * - 本期值/同比/环比全部取 st_metric_value 结果表真实列（TASK-0045 冻结契约 value/yoy/mom），
++  *   卡片与结果表同数——前端不现算（ADR-0011）、不造假；无值行→「指标数据接入中」空态。
++  * - 完整度无物理列（0045 由 /calc/v1/status.metric 承载）；管理面无登录态读口→null，
++  *   显示「完整度数据接入中（读口待接入）」不静默判完整、不造假。
++  * - 涨跌方向色：本期固定涨绿跌红；租户可配留二期（ADR-0011），演进位在 metric-utils.trendDisplay。
++  * - 上看板标记（ADR-0011）：mark 为真放大+置顶样式，接口未交付前恒缺省。
++-->
++<template>
++  <a-card
++    size="small"
++    :bordered="false"
++    :hoverable="true"
++    class="metric-card"
++    :class="{ 'metric-card--marked': mark, 'metric-card--incomplete': completenessView.incomplete }"
++  >
++    <template #title>
++      <span class="metric-card__title">
++        <span v-if="mark" class="metric-card__mark" title="上看板">上看板</span>
++        <span v-if="completenessView.incomplete" class="metric-card__incomplete-mark" title="完整度低于 80% 阈值">完整度不足</span>
++        {{ metric.metricName || metric.metricCode }}
++      </span>
++    </template>
++    <template #extra>
++      <span class="metric-card__period">{{ periodLabel }}</span>
++    </template>
++
++    <template v-if="value && value.value != null">
++      <div class="metric-card__value">
++        <span class="metric-card__number">{{ formatValue(value.value) }}</span>
++        <span class="metric-card__unit">{{ value.unit ?? '' }}</span>
++      </div>
++      <div class="metric-card__compares">
++        <span class="metric-card__compare">
++          同比
++          <span :style="{ color: yoy.color }">{{ yoy.text }}</span>
++        </span>
++        <span class="metric-card__compare">
++          环比
++          <span :style="{ color: mom.color }">{{ mom.text }}</span>
++        </span>
++      </div>
++    </template>
++    <div v-else class="metric-card__empty">指标数据接入中（无本期值，不造假数据）</div>
++
++    <div class="metric-card__completeness" :class="{ 'metric-card__completeness--low': completenessView.incomplete }">
++      {{ completenessView.text }}
++    </div>
++    <div class="metric-card__code">{{ metric.metricCode }}</div>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed } from 'vue';
++  import type { DisplayMetric, MetricValueRow } from '/@/api/display/display-api';
++  import { completenessDisplay, PERIOD_LABEL, trendDisplay, type MetricPeriod } from './metric-utils';
++
++  const props = defineProps<{
++    /** 指标定义（管理面 /iot/metric/list 真数据，数据权限裁剪） */
++    metric: DisplayMetric;
++    /** 指标结果行（st_metric_value 同源；null=管理面读口缺口→空态，不造假） */
++    value?: MetricValueRow | null;
++    /** 完整度 0..1（无物理列；管理面登录态读口缺口→null→空态不静默） */
++    completeness?: number | null;
++    /** ADR-0011 上看板标记（接口未交付前恒缺省） */
++    mark?: boolean;
++  }>();
++
++  const periodLabel = computed(() => {
++    const p = props.value?.period ?? props.metric.period;
++    return p && p in PERIOD_LABEL ? PERIOD_LABEL[p as MetricPeriod] : p ?? '';
++  });
++
++  const yoy = computed(() => trendDisplay(props.value?.yoy ?? null));
++  const mom = computed(() => trendDisplay(props.value?.mom ?? null));
++  const completenessView = computed(() => completenessDisplay(props.completeness ?? null));
++
++  function formatValue(v: number): string {
++    if (!Number.isFinite(v)) return '—';
++    // 结果表数值原样展示（不做四舍五入伪造精度）；仅超长浮点截断显示用 toPrecision 会改值语义，故直接 String
++    return String(v);
++  }
++</script>
++<style scoped lang="less">
++  .metric-card {
++    height: 100%;
++    &--marked {
++      border-left: 3px solid #1677ff;
++      box-shadow: 0 1px 6px rgba(22, 119, 255, 0.18);
++    }
++    &--incomplete {
++      border-top: 3px solid #fa8c16;
++    }
++    &__title {
++      display: inline-flex;
++      flex-wrap: wrap;
++      gap: 6px;
++      align-items: center;
++    }
++    &__mark,
++    &__incomplete-mark {
++      padding: 0 5px;
++      font-size: 11px;
++      line-height: 18px;
++      border-radius: 3px;
++    }
++    &__mark {
++      color: #1677ff;
++      background: #e6f4ff;
++    }
++    &__incomplete-mark {
++      color: #fa8c16;
++      background: #fff7e6;
++    }
++    &__period {
++      color: #8c8c8c;
++      font-size: 12px;
++    }
++    &__value {
++      display: flex;
++      gap: 6px;
++      align-items: baseline;
++      min-height: 38px;
++    }
++    &__number {
++      font-size: 26px;
++      font-weight: 600;
++    }
++    &__unit {
++      color: #8c8c8c;
++      font-size: 13px;
++    }
++    &__compares {
++      display: flex;
++      gap: 16px;
++      margin-top: 8px;
++      font-size: 13px;
++    }
++    &__compare {
++      color: #595959;
++    }
++    &__empty {
++      min-height: 38px;
++      padding: 8px 0;
++      color: #999;
++      font-size: 12px;
++    }
++    &__completeness {
++      margin-top: 10px;
++      padding-top: 8px;
++      color: #8c8c8c;
++      font-size: 12px;
++      border-top: 1px dashed #f0f0f0;
++      &--low {
++        color: #fa8c16;
++        font-weight: 600;
++      }
++    }
++    &__code {
++      margin-top: 4px;
++      color: #bfbfbf;
++      font-size: 11px;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/metrics/metric-trend.vue b/frontend/src/views/display/metrics/metric-trend.vue
+new file mode 100644
+index 0000000..f383558
+--- /dev/null
++++ b/frontend/src/views/display/metrics/metric-trend.vue
+@@ -0,0 +1,181 @@
++<!--
++  * 指标看板 · 趋势图（多周期叠加 + 去年同期对比）（TASK-0060）
++  *
++  * 数据源：st_metric_value 结果行（本期 value + 同 ts 去年同期真实行；value/yoy/mom 同源，
++  * 不现算、不造假）。管理面登录态指标值读口当前缺口→rows 为空→空态登记，不造曲线。
++  *
++  * 多周期叠加：周期切换 HOUR/DAY/MONTH/YEAR 分图展示（st_metric_value 以 period 标签分区），
++  * 同一周期可叠多条指标曲线；去年同期对比线仅取真实同 ts 去年同期行（yoy 是比率不可反推历史值）。
++  *
++  * 降采样明示（ADR-0010）：按跨度分档，图上方常驻「当前展示为降采样结果：…」或
++  * 「原始粒度，未降采样」；对比缺口同步标注，绝不静默丢点或伪造对比线。
++  *
++  * 安全红线：不持有 appKey/secret、不直连 /openapi/v1 HMAC；本组件只渲染传入的结果行。
++-->
++<template>
++  <a-card size="small" title="指标趋势（多周期叠加 · 去年同期对比）" class="metric-trend">
++    <template #extra>
++      <a-space>
++        <a-select v-model:value="period" size="small" style="width: 120px" :options="periodOptions" />
++        <a-button size="small" :loading="loading" @click="$emit('refresh')">刷新</a-button>
++      </a-space>
++    </template>
++
++    <div class="metric-trend__annotation" :class="{ 'metric-trend__annotation--raw': isRaw }">{{ annotation }}</div>
++
++    <a-spin :spinning="loading">
++      <div v-show="hasData" ref="chartRef" class="metric-trend__chart"></div>
++      <div v-if="!loading && !hasData" class="metric-trend__empty">指标趋势数据接入中（管理面指标值读口待接入；无造假曲线）</div>
++    </a-spin>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
++  import * as echarts from 'echarts';
++  import type { ComposeOption, LineSeriesOption } from 'echarts';
++  import type { MetricValueRow } from '/@/api/display/display-api';
++  import { buildMetricTrend, METRIC_PERIODS, PERIOD_LABEL, type MetricPeriod } from './metric-utils';
++
++  type TrendChartOption = ComposeOption<LineSeriesOption>;
++
++  const props = defineProps<{
++    /** 指标结果行（st_metric_value 同源；空=读口缺口→空态） */
++    rows: MetricValueRow[];
++    /** 是否取数中（管理面读口已调用时置位） */
++    loading?: boolean;
++  }>();
++  defineEmits<{ refresh: [] }>();
++
++  const periodOptions = METRIC_PERIODS.map((p) => ({ label: PERIOD_LABEL[p], value: p }));
++  const period = ref<MetricPeriod>('DAY');
++
++  const chartRef = ref<HTMLDivElement | null>(null);
++  let chart: echarts.ECharts | null = null;
++  const hasData = ref(false);
++  const annotation = ref('当前展示为原始粒度，未降采样');
++  const isRaw = computed(() => annotation.value.includes('原始粒度'));
++
++  const SERIES_COLORS = ['#1677ff', '#52c41a', '#fa8c16', '#722ed1', '#13c2c2', '#eb2f96'];
++
++  function renderChart(series: LineSeriesOption[]) {
++    if (!chartRef.value) return;
++    if (!chart) chart = echarts.init(chartRef.value);
++    const option: TrendChartOption = {
++      animation: false,
++      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
++      legend: { type: 'scroll', bottom: 0 },
++      grid: { left: 8, right: 16, top: 16, bottom: 48, containLabel: true },
++      xAxis: { type: 'time' },
++      yAxis: { type: 'value', scale: true },
++      series,
++    };
++    chart.setOption(option, true);
++    chart.resize();
++  }
++
++  function clearChart() {
++    chart?.clear();
++  }
++
++  async function draw() {
++    // 按 metricCode+instanceCode 分组叠加：同一周期多条指标曲线；每条附去年同期对比线
++    const grouped = new Map<string, MetricValueRow[]>();
++    for (const row of props.rows) {
++      const key = `${row.metricCode}|${row.instanceCode}`;
++      const list = grouped.get(key);
++      if (list) list.push(row);
++      else grouped.set(key, [row]);
++    }
++
++    const series: LineSeriesOption[] = [];
++    let anyNote = '';
++    let idx = 0;
++    for (const [key, rows] of grouped) {
++      const trend = buildMetricTrend(rows, period.value);
++      if (!trend.hasData) continue;
++      const color = SERIES_COLORS[idx % SERIES_COLORS.length];
++      const metricCode = key.split('|')[0];
++      series.push({
++        name: metricCode,
++        type: 'line',
++        showSymbol: false,
++        smooth: false,
++        data: trend.current,
++        lineStyle: { color, width: 2 },
++        itemStyle: { color },
++      });
++      if (trend.lastYear.length) {
++        series.push({
++          name: `${metricCode}（去年同期）`,
++          type: 'line',
++          showSymbol: false,
++          smooth: false,
++          data: trend.lastYear,
++          lineStyle: { color, width: 1.5, type: 'dashed', opacity: 0.7 },
++          itemStyle: { color, opacity: 0.7 },
++        });
++      }
++      anyNote = trend.annotation;
++      idx += 1;
++    }
++
++    hasData.value = series.length > 0;
++    annotation.value = anyNote || '该周期暂无指标数据（指标数据接入中）';
++    if (hasData.value) {
++      await nextTick();
++      renderChart(series);
++    } else {
++      clearChart();
++    }
++  }
++
++  function onResize() {
++    chart?.resize();
++  }
++
++  watch(
++    () => props.rows,
++    () => void draw(),
++    { deep: false }
++  );
++  watch(period, () => void draw());
++
++  onMounted(() => {
++    window.addEventListener('resize', onResize);
++    void draw();
++  });
++  onBeforeUnmount(() => {
++    window.removeEventListener('resize', onResize);
++    chart?.dispose();
++    chart = null;
++  });
++
++  defineExpose({ draw });
++</script>
++<style scoped lang="less">
++  @import '../display.less';
++  .metric-trend {
++    &__annotation {
++      margin-bottom: 8px;
++      padding: 6px 10px;
++      color: #fa8c16;
++      font-size: 12px;
++      background: #fff7e6;
++      border-radius: 4px;
++      &--raw {
++        color: #52c41a;
++        background: #f6ffed;
++      }
++    }
++    &__chart {
++      width: 100%;
++      height: 320px;
++    }
++    &__empty {
++      padding: 60px 0;
++      color: #999;
++      font-size: 12px;
++      text-align: center;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/metrics/metric-utils.ts b/frontend/src/views/display/metrics/metric-utils.ts
+new file mode 100644
+index 0000000..4931e53
+--- /dev/null
++++ b/frontend/src/views/display/metrics/metric-utils.ts
+@@ -0,0 +1,150 @@
++/*
++ * 指标看板纯函数（TASK-0060）
++ *
++ * 集中四类口径，全部 DOM/后端无关，便于单测；不造假数据、不现算 value/yoy/mom：
++ * 1) 同比/环比涨跌方向色（涨绿跌红固定口径）——租户可配留二期（ADR-0011），此处集中一处以备演进；
++ * 2) 完整度阈值标记（与 0045 completenessMin=0.8 同口径，低于阈值明显标记）；
++ * 3) 多周期叠加 + 去年同期对比的序列装配（无真实值行时返回空，不造对比曲线）；
++ * 4) 降采样标注（ADR-0010 留痕，复用 0059 device-utils 的分档，叠加展示不静默丢点）。
++ *
++ * 数据纪律：value/yoy/mom 全部来自 st_metric_value 结果表真实列（TASK-0045 冻结契约），
++ * 本文件只做「展示派生」（方向色/阈值比较/分档），绝不重新计算指标值或伴随值。
++ */
++
++import type { MetricValueRow } from '/@/api/display/display-api';
++import { pickDownsampleTier } from '../device/device-utils';
++
++/** 涨跌方向（服务端 yoy/mom 为小数比率；null=上期无值/分母 0，不冒充无变化） */
++export type TrendDirection = 'up' | 'down' | 'flat' | 'unknown';
++
++export interface TrendDisplay {
++  direction: TrendDirection;
++  /** 百分比展示文案（0.083 → +8.3%；null → '—'） */
++  text: string;
++  /** 方向色：涨绿跌红（本期固定口径；租户可配留二期 ADR-0011） */
++  color: string;
++}
++
++const COLOR_UP = '#52c41a';
++const COLOR_DOWN = '#ff4d4f';
++const COLOR_FLAT = '#8c8c8c';
++
++/**
++ * 同比/环比展示态（不现算比率，比率由服务端 yoy/mom 原样传入）。
++ *
++ * 演进位（ADR-0011）：涨跌颜色租户可配（如能耗上涨红色警示 vs 通用涨绿）为二期独立展示偏好；
++ * 当前固定涨绿跌红，零/未知灰显。接入租户配置时只需替换本函数的颜色来源，调用方不动。
++ */
++export function trendDisplay(ratio: number | null | undefined): TrendDisplay {
++  if (ratio == null || !Number.isFinite(ratio)) {
++    return { direction: 'unknown', text: '—', color: COLOR_FLAT };
++  }
++  const pct = ratio * 100;
++  if (pct > 0) return { direction: 'up', text: `+${pct.toFixed(1)}%`, color: COLOR_UP };
++  if (pct < 0) return { direction: 'down', text: `${pct.toFixed(1)}%`, color: COLOR_DOWN };
++  return { direction: 'flat', text: '0.0%', color: COLOR_FLAT };
++}
++
++/** 完整度阈值（与 0045 CalcProperties.completenessMin 默认 0.8 / brief「80%」同口径） */
++export const COMPLETENESS_MIN = 0.8;
++
++/** 完整度标记态（低于阈值带明显标记；无完整度数据=缺口/空态，不静默判完整） */
++export interface CompletenessDisplay {
++  /** 0..1；null=无完整度数据（管理面读口缺口） */
++  value: number | null;
++  /** 是否低于阈值（null 时不判完整——fail-closed） */
++  incomplete: boolean;
++  /** 展示文案（含缺口口径，不静默） */
++  text: string;
++}
++
++export function completenessDisplay(value: number | null | undefined): CompletenessDisplay {
++  if (value == null || !Number.isFinite(value)) {
++    return { value: null, incomplete: false, text: '完整度数据接入中（读口待接入）' };
++  }
++  const pct = Math.round(value * 1000) / 10;
++  const incomplete = value < COMPLETENESS_MIN;
++  return {
++    value,
++    incomplete,
++    text: `完整度 ${pct}%${incomplete ? ' · 低于 80% 阈值' : ''}`,
++  };
++}
++
++/** 展示周期（标签 period 词表：HOUR/DAY/MONTH/YEAR） */
++export const METRIC_PERIODS = ['HOUR', 'DAY', 'MONTH', 'YEAR'] as const;
++export type MetricPeriod = (typeof METRIC_PERIODS)[number];
++
++export const PERIOD_LABEL: Record<MetricPeriod, string> = {
++  HOUR: '小时',
++  DAY: '日',
++  MONTH: '月',
++  YEAR: '年',
++};
++
++/** 序列装配结果（ECharts 直接消费；annotations 明示降采样与对比缺口） */
++export interface MetricTrendSeries {
++  /** 本期曲线数据点 [ts, value]（按 ts 升序） */
++  current: Array<[number, number]>;
++  /** 去年同期曲线（本期每点 ts - 1 年 + 同 ts 值行；无匹配返回空，不造假对比线） */
++  lastYear: Array<[number, number]>;
++  /** 必展示标注（降采样 + 对比数据缺席说明） */
++  annotation: string;
++  /** 是否装配出任何点（false 时视图渲染空态） */
++  hasData: boolean;
++}
++
++/**
++ * 多周期叠加用：按 period 过滤结果行，装配本期 + 去年同期对比序列。
++ *
++ * 去年同期行识别：结果集中若存在 ts 恰为「某行 +1 年」的行，则较早那行视为对比行（不进本期曲线）。
++ * 对比值取该真实行 value（st_metric_value 同 ts 去年同期行）；无该行时不构造对比线——
++ * 不静默造曲线（yoy 是比率，反推需显式口径，本函数不采用，避免伪精度）。
++ *
++ * 降采样：跨度超阈值时按 device-utils.pickDownsampleTier 分档取桶内最新点，标注必现（ADR-0010）。
++ */
++export function buildMetricTrend(rows: MetricValueRow[], period: MetricPeriod, now = Date.now()): MetricTrendSeries {
++  const filtered = rows.filter((r) => r.period === period && r.value != null && Number.isFinite(r.value)).sort((a, b) => a.ts - b.ts);
++  if (!filtered.length) {
++    return { current: [], lastYear: [], annotation: '该周期暂无指标数据（指标数据接入中）', hasData: false };
++  }
++
++  // 识别对比行：存在恰晚 1 年的同伴行 → 本行是去年同期的对比行，不进本期曲线
++  const valueByTs = new Map(filtered.map((r) => [r.ts, r.value as number]));
++  const comparisonTs = new Set<number>();
++  for (const r of filtered) {
++    const next = new Date(r.ts);
++    next.setFullYear(next.getFullYear() + 1);
++    if (valueByTs.has(next.getTime())) comparisonTs.add(r.ts);
++  }
++  const currentRows = filtered.filter((r) => !comparisonTs.has(r.ts));
++
++  const tier = pickDownsampleTier(currentRows[0].ts, Math.max(currentRows[currentRows.length - 1].ts, now));
++  const buckets = new Map<number, MetricValueRow>();
++  for (const row of currentRows) {
++    const key = tier.bucketMs > 0 ? Math.floor(row.ts / tier.bucketMs) * tier.bucketMs : row.ts;
++    // 同桶取最后一条（按 ts 升序即最新）；原始档同 ts 取最后一条覆盖写语义
++    buckets.set(key, row);
++  }
++  const current: Array<[number, number]> = [];
++  const lastYear: Array<[number, number]> = [];
++  for (const [key, row] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
++    current.push([key, row.value as number]);
++    // 去年同期对齐画在本期 x 上；值取「原 ts -1 年」真实行（用原 ts 而非桶键，避免降采样后错位）
++    const prev = valueByTs.get(oneYearBefore(row.ts));
++    if (prev != null) lastYear.push([key, prev]);
++  }
++
++  const downsampleNote = tier.bucketMs > 0 ? `当前展示为降采样结果：${tier.label.replace(/^降采样结果：/, '')}` : '当前展示为原始粒度，未降采样';
++  const compareNote = lastYear.length
++    ? `去年同期对比点 ${lastYear.length}/${current.length}（仅取真实同 ts 去年同期行）`
++    : '去年同期对比行缺失（不以比率反推历史值，不造假对比曲线）';
++  return { current, lastYear, annotation: `${downsampleNote} · ${compareNote}`, hasData: current.length > 0 };
++}
++
++/** 单元测试辅助：1 年前的 ts（与 buildMetricTrend 同口径，供造测试夹具，不供生产造假数据） */
++export function oneYearBefore(ts: number): number {
++  const d = new Date(ts);
++  d.setFullYear(d.getFullYear() - 1);
++  return d.getTime();
++}
+diff --git a/frontend/src/views/display/overview/index.vue b/frontend/src/views/display/overview/index.vue
+index 948b787..09e11bc 100644
+--- a/frontend/src/views/display/overview/index.vue
++++ b/frontend/src/views/display/overview/index.vue
+@@ -13,10 +13,13 @@
+         <h2 class="display-page__title">工厂总览</h2>
+         <div class="display-page__subtitle">按数据权限展示可见工厂（无权工厂不出现）</div>
+       </div>
+-      <a-button size="small" @click="loadTree(true)">
+-        <template #icon><ReloadOutlined /></template>
+-        刷新
+-      </a-button>
++      <a-space>
++        <a-button size="small" @click="router.push({ name: 'DisplayMetrics' })">指标看板</a-button>
++        <a-button size="small" @click="loadTree(true)">
++          <template #icon><ReloadOutlined /></template>
++          刷新
++        </a-button>
++      </a-space>
+     </div>
+ 
+     <a-alert v-if="error" type="error" :message="error" show-icon class="display-page__alert" />
+diff --git a/frontend/tests/unit/display/display-routes.spec.ts b/frontend/tests/unit/display/display-routes.spec.ts
+index 955c478..dbafcd6 100644
+--- a/frontend/tests/unit/display/display-routes.spec.ts
++++ b/frontend/tests/unit/display/display-routes.spec.ts
+@@ -1,32 +1,40 @@
+ /*
+  * 展示端路由单测（TASK-0058 批次一 / TASK-0059 设备详情页）
+  *
+- * 覆盖：四页路由路径/命名（总览 / 工厂 / 车间 / 设备详情）、下钻深度 ≤3
+- * （总览 0→工厂 1→车间 2→设备详情 3）、需登录（无 meta.public）、
++ * 覆盖：五条展示端路由路径/命名（总览 / 工厂 / 车间 / 设备详情 / 指标看板）、下钻深度 ≤3
++ * （总览 0→工厂 1→车间 2→设备详情 3；指标看板为独立视图不参与下钻链）、需登录（无 meta.public）、
+  * hideInMenu（不进侧栏菜单树）、与管理端 /iot/** 路径不混用。
+  */
+ import { describe, expect, it } from 'vitest';
+ import { displayRouters } from '/@/router/display';
+ 
+ describe('display routes', () => {
+-  it('注册四条展示端路由：总览 / 工厂 / 车间 / 设备详情，均在 /display/** 命名空间', () => {
++  it('注册五条展示端路由：总览 / 工厂 / 车间 / 设备详情 / 指标看板，均在 /display/** 命名空间', () => {
+     expect(displayRouters.map((r) => r.path)).toEqual([
+       '/display',
+       '/display/factory/:factoryId',
+       '/display/workshop/:factoryId/:workshopId',
+       '/display/device',
++      '/display/metrics',
++    ]);
++    expect(displayRouters.map((r) => r.name)).toEqual([
++      'DisplayOverview',
++      'DisplayFactory',
++      'DisplayWorkshop',
++      'DisplayDeviceDetail',
++      'DisplayMetrics',
+     ]);
+-    expect(displayRouters.map((r) => r.name)).toEqual(['DisplayOverview', 'DisplayFactory', 'DisplayWorkshop', 'DisplayDeviceDetail']);
+   });
+ 
+-  it('下钻深度 ≤3：设备详情为第 3 级（/display/device?instanceId=，查询参数不增路径段）', () => {
++  it('下钻深度 ≤3：设备详情为第 3 级（/display/device?instanceId=，查询参数不增路径段）；指标看板为独立视图', () => {
+     const paths = displayRouters.map((r) => r.path);
+     expect(paths).toContain('/display');
+     expect(paths).toContain('/display/factory/:factoryId');
+     expect(paths).toContain('/display/workshop/:factoryId/:workshopId');
+     expect(paths).toContain('/display/device');
+-    // 路径段计数：总览=1、工厂=3、车间=4、设备详情=2（instanceId 走 query 不增段）。
+-    expect(paths.map((p) => p.split('/').filter(Boolean).length)).toEqual([1, 3, 4, 2]);
++    expect(paths).toContain('/display/metrics');
++    // 路径段计数：总览=1、工厂=3、车间=4、设备详情=2（instanceId 走 query 不增段）、指标看板=2（独立视图）。
++    expect(paths.map((p) => p.split('/').filter(Boolean).length)).toEqual([1, 3, 4, 2, 2]);
+   });
+ 
+   it('需登录且不在侧栏菜单显示（与管理端 /iot/** 并存不混用）', () => {
+diff --git a/frontend/tests/unit/display/metric-utils.spec.ts b/frontend/tests/unit/display/metric-utils.spec.ts
+new file mode 100644
+index 0000000..b6739c1
+--- /dev/null
++++ b/frontend/tests/unit/display/metric-utils.spec.ts
+@@ -0,0 +1,103 @@
++/*
++ * 指标看板纯函数单测（TASK-0060）
++ *
++ * 覆盖：
++ * - 同比/环比方向色与文案（涨绿跌红、null 不冒充 0、租户可配演进位留 ADR-0011）；
++ * - 完整度 80% 阈值标记（低于阈值明显标记、null=读口缺口不静默判完整）；
++ * - 趋势装配：按周期过滤、多周期叠加、去年同期仅取真实同 ts 行（yoy 比率不反推历史值、
++ *   无对比行不造曲线）、降采样分档标注必现（ADR-0010）。
++ *
++ * 数据纪律：全部夹具为「假定读口已交付时的契约响应样本」，仅用于验证展示派生纯函数；
++ * 生产代码当前无读口、值恒空态，不在页面造假数据。
++ */
++import { describe, expect, it } from 'vitest';
++import type { MetricValueRow } from '/@/api/display/display-api';
++import { buildMetricTrend, COMPLETENESS_MIN, completenessDisplay, oneYearBefore, trendDisplay } from '/@/views/display/metrics/metric-utils';
++
++const DAY_TS = Date.UTC(2026, 10, 20);
++const LAST_YEAR_TS = oneYearBefore(DAY_TS);
++
++function row(over: Partial<MetricValueRow> = {}): MetricValueRow {
++  return {
++    metricCode: 'M_ENERGY',
++    instanceCode: 'F01',
++    period: 'DAY',
++    ts: DAY_TS,
++    value: 100,
++    yoy: 0.083,
++    mom: -0.021,
++    ...over,
++  };
++}
++
++describe('trendDisplay 同比/环比方向色', () => {
++  it('正数涨绿、负数跌红、零灰显', () => {
++    expect(trendDisplay(0.083)).toEqual({ direction: 'up', text: '+8.3%', color: '#52c41a' });
++    expect(trendDisplay(-0.021)).toEqual({ direction: 'down', text: '-2.1%', color: '#ff4d4f' });
++    expect(trendDisplay(0)).toEqual({ direction: 'flat', text: '0.0%', color: '#8c8c8c' });
++  });
++
++  it('null/非数=未知，文案「—」灰显，不冒充无变化（上期无值/分母0 纪律）', () => {
++    expect(trendDisplay(null).direction).toBe('unknown');
++    expect(trendDisplay(null).text).toBe('—');
++    expect(trendDisplay(undefined).direction).toBe('unknown');
++    expect(trendDisplay(Number.NaN).direction).toBe('unknown');
++  });
++});
++
++describe('completenessDisplay 完整度标记', () => {
++  it('阈值 0.8 与 0045 同口径', () => {
++    expect(COMPLETENESS_MIN).toBe(0.8);
++  });
++
++  it('低于阈值带明显标记，等于/高于阈值不带标记', () => {
++    const low = completenessDisplay(0.6);
++    expect(low.incomplete).toBe(true);
++    expect(low.text).toContain('低于 80% 阈值');
++    expect(completenessDisplay(0.8).incomplete).toBe(false);
++    expect(completenessDisplay(1).incomplete).toBe(false);
++  });
++
++  it('null=读口缺口，显示接入中，不静默判完整', () => {
++    const unknown = completenessDisplay(null);
++    expect(unknown.value).toBeNull();
++    expect(unknown.incomplete).toBe(false);
++    expect(unknown.text).toContain('读口待接入');
++  });
++});
++
++describe('buildMetricTrend 多周期叠加与去年同期', () => {
++  it('无本期行→空序列+空态标注（不造曲线）', () => {
++    const t = buildMetricTrend([], 'DAY', DAY_TS);
++    expect(t.hasData).toBe(false);
++    expect(t.current).toEqual([]);
++    expect(t.annotation).toContain('暂无指标数据');
++  });
++
++  it('按 period 过滤：HOUR 行不进 DAY 序列', () => {
++    const t = buildMetricTrend([row({ period: 'HOUR', ts: DAY_TS, value: 5 }), row({ period: 'DAY', value: 100 })], 'DAY', DAY_TS);
++    expect(t.current).toEqual([[DAY_TS, 100]]);
++  });
++
++  it('去年同期仅取真实同 ts 行；yoy 比率不反推历史值', () => {
++    // 只有本期行 + yoy：不构造去年对比曲线
++    const onlyCurrent = buildMetricTrend([row({ yoy: 0.083 })], 'DAY', DAY_TS);
++    expect(onlyCurrent.lastYear).toEqual([]);
++    expect(onlyCurrent.annotation).toContain('不造假对比曲线');
++
++    // 有一年前真实行：去年对比点出现，值为该行真实 value（非 yoy 反推）
++    const withPrev = buildMetricTrend([row({ value: 110 }), row({ ts: LAST_YEAR_TS, value: 100 })], 'DAY', DAY_TS);
++    expect(withPrev.lastYear).toEqual([[DAY_TS, 100]]);
++    expect(withPrev.annotation).toContain('去年同期对比点 1/1');
++  });
++
++  it('降采样分档标注必现（ADR-0010）：原始档明示未降采样', () => {
++    const t = buildMetricTrend([row({ value: 100 })], 'DAY', DAY_TS);
++    expect(t.annotation).toContain('原始粒度，未降采样');
++  });
++
++  it('同 ts 覆盖写：结果行重复时每桶只取最新一条（不重复画点）', () => {
++    const t = buildMetricTrend([row({ value: 100 }), row({ value: 108 })], 'DAY', DAY_TS);
++    expect(t.current).toEqual([[DAY_TS, 108]]);
++  });
++});

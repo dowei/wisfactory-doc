@@ -1,0 +1,2095 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java
+index 4ad07ee..fd74eb3 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java
+@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.annotation.TableId;
+ import com.baomidou.mybatisplus.annotation.TableName;
+ import io.swagger.v3.oas.annotations.media.Schema;
+ import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Pattern;
+ import jakarta.validation.constraints.Size;
+ import lombok.AllArgsConstructor;
+ import lombok.Data;
+@@ -36,6 +37,9 @@ public class SysTenant extends BaseEntity {
+ 
+     @NotBlank(message = "租户编码不能为空")
+     @Size(max = 32, message = "租户编码长度不能超过 32")
++    // 库名派生安全（TASK-0003 / REQ-0001 核心规则）：iot_<tenant_code> 将拼入 TDengine DDL，
++    // 编码必须为合法标识符片段（字母/数字/下划线），派生入口 TdengineAdmin.databaseName 另有同口径防御
++    @Pattern(regexp = "[A-Za-z0-9_]+", message = "租户编码仅允许字母、数字与下划线")
+     @Schema(description = "租户编码（全局唯一，创建后不可改）", requiredMode = Schema.RequiredMode.REQUIRED)
+     private String tenantCode;
+ 
+@@ -67,4 +71,7 @@ public class SysTenant extends BaseEntity {
+     @Size(max = 500, message = "备注长度不能超过 500")
+     @Schema(description = "备注")
+     private String remark;
++
++    @Schema(description = "TDengine 建库标志 0 待建 1 已建（定时扫描任务维护；请求体携带值一律忽略，落库强制 0）")
++    private Integer dbCreated;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/PointQuotaCounter.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/PointQuotaCounter.java
+new file mode 100644
+index 0000000..92390ab
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/PointQuotaCounter.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.quota;
++
++/**
++ * 点位计数源（TASK-0003 交付校验器，计数实现与调用方接线归 TASK-0021 点位 CRUD——brief 裁决 3）
++ *
++ * <p>ADR-0011 TD-0035：点位配额是授权口径必须硬。计数源独立成接口的原因：
++ * TASK-0003 交付时点位表/CRUD 尚未交付，校验器先行（mock 计数验收），
++ * TASK-0021 交付 iot_point 表后由其提供真实实现（按 tenant_id 计活跃点位数），
++ * 装配进 {@code SysTenantServiceImpl.pointQuotaCounter} 即完成接线，校验器零改动。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public interface PointQuotaCounter {
++
++    /**
++     * 统计指定租户当前活跃点位数（配额校验口径，TASK-0021 定实现：逻辑删除不计、
++     * 越权归属不计——计数条件与点位列表页一致）。
++     *
++     * @param tenantId 租户 ID
++     * @return 当前点位数
++     */
++    int countPoints(Long tenantId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/QuotaProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/QuotaProperties.java
+new file mode 100644
+index 0000000..ba64a62
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/quota/QuotaProperties.java
+@@ -0,0 +1,29 @@
++package net.otlab.admin.module.iot.quota;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * 配额软限告警配置（TASK-0003，配置键 {@code ot.quota.*}）
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.quota")
++public class QuotaProperties {
++
++    /**
++     * 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035 只告警不停写）。
++     * 有效范围 (0,1]，越界视为关闭（防误配刷屏）。
++     */
++    private double storageWarnRatio = 0.8;
++
++    /**
++     * TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴，brief 裁决 4）。
++     * 恢复（出现成功轮）即清零重新计数；&lt;=1 视为每轮都告警（关闭节流）。
++     */
++    private int failLogEveryNRounds = 20;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotQuotaStatsService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotQuotaStatsService.java
+new file mode 100644
+index 0000000..b2c2fe9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotQuotaStatsService.java
+@@ -0,0 +1,25 @@
++package net.otlab.admin.module.iot.service;
++
++/**
++ * 租户配额用量统计与软限告警服务（TASK-0003 / ADR-0011 TD-0035、TD-0041 定版）
++ *
++ * <p>软限口径：存储与吞吐只统计+告警，<b>写入侧绝不因配额停写</b>（数据丢失不可逆、
++ * 超容可扩容补救）。告警格式固定可 grep：
++ * {@code [QUOTA-WARN] tenant=<code> type=storage usage=<bytes> quota=<bytes>}
++ * （吞吐同型 {@code type=throughput}——吞吐用量源归接入侧，随 ingest 交付接线，TD-0053 联调闭合）。
++ *
++ * <p>sys_job 调用目标：{@code iotQuotaStatsServiceImpl.collectAndWarn}（无参方法，
++ * 建议 5min 间隔可配，升级脚本 20261121_tenant_db_task.sql 播种）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public interface IotQuotaStatsService {
++
++    /**
++     * 定时统计入口（sys_job 调用）：逐启用租户查存储用量并做软限比对告警。
++     * TDengine 不可用时本轮跳过——防日志风暴：连续失败仅首轮与每 N 轮
++     * （ot.quota.fail-log-every-n-rounds）记一次 WARN，恢复即清零。
++     */
++    void collectAndWarn();
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+index 6117445..902c1d5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+@@ -46,4 +46,17 @@ public interface SysTenantService extends IService<SysTenant> {
+      * @return 新管理员用户 ID
+      */
+     Long initTenantAdmin(Long tenantId, TenantAdminCreateForm form);
++
++    /**
++     * 点位配额强控校验（TASK-0003 / ADR-0011 TD-0035：点位配额是授权口径必须硬）。
++     *
++     * <p>口径：point_quota 空/0=不限直接过；当前点位数 ≥ 配额即拒绝
++     * （达上限阻断新增，抛 {@code BusinessException(4003, "点位配额不足（上限 N）")}）。
++     * 计数源为 {@code PointQuotaCounter}（实现与调用方接线归 TASK-0021 点位 CRUD；
++     * 未装配的过渡期计数视为 0，放行不误伤）。
++     *
++     * @param tenantId 租户 ID
++     * @throws net.otlab.core.exception.BusinessException 达上限抛业务码 4003（ResultCode.QUOTA_EXCEEDED）
++     */
++    void checkPointQuota(Long tenantId);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/TenantDbProvisionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/TenantDbProvisionService.java
+new file mode 100644
+index 0000000..46175a8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/TenantDbProvisionService.java
+@@ -0,0 +1,49 @@
++package net.otlab.admin.module.iot.service;
++
++import net.otlab.admin.module.iot.entity.SysTenant;
++
++/**
++ * 租户库建库触发与扫描服务（TASK-0003 / REQ-0001 验收 4「租户开通后 iot_&lt;tenant_code&gt; 库自动创建」）
++ *
++ * <p>配套裁决（brief 2026-11-21）：建库异步化+重试——TDengine 故障不阻断租户主数据落库
++ * （数据丢失不可逆、库可补建）。两条触发路径：
++ * <ul>
++ * <li>事件式即时触发：开通事务提交后 {@link #provisionImmediately(Long)} 尝试一次（可加，不替代扫描兜底）；</li>
++ * <li>定时扫描兜底：框架 sys_job 注册 {@link #scanPendingDatabases()}（建议 60s 间隔可配，
++ *     升级脚本 20261121_tenant_db_task.sql 播种）。</li>
++ * </ul>
++ * 失败口径统一：WARN 日志（含 tenant_code、派生库名 iot_&lt;code&gt; 与异常摘要）留待下轮，
++ * 连续失败不升级不阻断。库名只由 tenant_code 派生（TdengineAdmin.databaseName），禁外部传参。
++ *
++ * <p>sys_job 调用目标：{@code tenantDbProvisionServiceImpl.scanPendingDatabases}（无参方法）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public interface TenantDbProvisionService {
++
++    /**
++     * 定时扫描入口（sys_job 调用）：扫 status=1 且 db_created=0 的租户，逐租户建库。
++     *
++     * @return 本轮建库成功数
++     */
++    int scanPendingDatabases();
++
++    /**
++     * 开通事务提交后的即时触发：租户必须存在且 status=1 且 db_created≠1，否则跳过
++     * （禁用租户不建库；已建库不重复尝试）。失败与扫描同口径：WARN 留待下轮。
++     *
++     * @param tenantId 开通事务落库后的租户 ID
++     */
++    void provisionImmediately(Long tenantId);
++
++    /**
++     * 单租户建库尝试：先判存（已存在即自愈置位 db_created=1，覆盖人工补建/部署脚本建库场景），
++     * 再调 {@link net.otlab.admin.module.iot.tdengine.TdengineAdmin#createDatabase(String)}；
++     * 成功置 db_created=1，失败 WARN 留 0 并返回 false。
++     *
++     * @param tenant 待建租户（status=1、db_created=0 由调用方保证）
++     * @return 建库成功（含自愈置位）返回 true
++     */
++    boolean tryProvision(SysTenant tenant);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImpl.java
+new file mode 100644
+index 0000000..1ba1b74
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImpl.java
+@@ -0,0 +1,126 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.quota.QuotaProperties;
++import net.otlab.admin.module.iot.service.IotQuotaStatsService;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.tdengine.TdengineAdmin;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++
++import java.util.List;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * 租户配额用量统计与软限告警服务实现（TASK-0003）
++ *
++ * <p>编排（brief 裁决 4）：逐启用租户调 {@link TdengineAdmin#storageUsageBytes(String)}
++ * → 与 storage_quota_gb/阈值（ot.quota.storage-warn-ratio 默认 0.8）比对 →
++ * 超阈值发固定格式 WARN（[QUOTA-WARN] tenant=&lt;code&gt; type=storage usage=&lt;x&gt; quota=&lt;y&gt;，
++ * 字节口径机器可比）——<b>只告警不停写</b>。TDengine 不可用（含单租户调用失败）不计入
++ * 配额比对，本轮跳过；连续失败仅首轮与每 N 轮 WARN 一次（防日志风暴），恢复即清零。
++ *
++ * <p>吞吐（type=throughput）同型告警：用量源归接入侧（ingest），随其交付接线；
++ * 本任务的告警格式与编排先行就位（TD-0053 联调闭合）。
++ *
++ * <p>依赖 SysTenantService（接口）而非自持 Mapper：sys_tenant 平台级表无租户注入问题，
++ * job 线程查询与登录态无关；无循环依赖（开通挂点在 SysTenantServiceImpl 只依赖触发器）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Slf4j
++@Service
++public class IotQuotaStatsServiceImpl implements IotQuotaStatsService {
++
++    private static final long GB = 1024L * 1024L * 1024L;
++
++    private final SysTenantService tenantService;
++    private final TdengineAdmin tdengineAdmin;
++    private final QuotaProperties quotaProperties;
++
++    /** 连续失败轮计数（防日志风暴）：出现成功轮即清零 */
++    private final AtomicInteger consecutiveFailedRounds = new AtomicInteger(0);
++
++    @Autowired
++    public IotQuotaStatsServiceImpl(SysTenantService tenantService,
++                                    TdengineAdmin tdengineAdmin,
++                                    QuotaProperties quotaProperties) {
++        this.tenantService = tenantService;
++        this.tdengineAdmin = tdengineAdmin;
++        this.quotaProperties = quotaProperties;
++    }
++
++    @Override
++    public void collectAndWarn() {
++        List<SysTenant> tenants = tenantService.list(new LambdaQueryWrapper<SysTenant>()
++                .eq(SysTenant::getStatus, 1));
++        int failures = 0;
++        String lastTenant = null;
++        String lastError = null;
++        for (SysTenant tenant : tenants) {
++            try {
++                long usageBytes = tdengineAdmin.storageUsageBytes(tenant.getTenantCode());
++                warnIfOverThreshold(tenant, usageBytes);
++            } catch (Exception e) {
++                // fail-soft：单租户失败不中断本轮其他租户；聚合进不可用轮统计
++                failures++;
++                lastTenant = tenant.getTenantCode();
++                lastError = e.getMessage();
++            }
++        }
++        recordRoundOutcome(failures, tenants.size(), lastTenant, lastError);
++    }
++
++    /**
++     * 软限比对（ADR-0011 TD-0035）：未设配额（空/0）= 不限永不告警；
++     * 阈值越界（&lt;=0 或 &gt;1）视为告警关闭（防误配刷屏）；
++     * 比对用除法形态（usage/quota ≥ ratio）——乘法形态在 2 次幂边界（如 8GB/10GB@0.8）
++     * 受双精度舍入影响会漏报恰达阈值场景。
++     */
++    private void warnIfOverThreshold(SysTenant tenant, long usageBytes) {
++        Integer quotaGb = tenant.getStorageQuotaGb();
++        if (quotaGb == null || quotaGb <= 0) {
++            return;
++        }
++        double ratio = quotaProperties.getStorageWarnRatio();
++        if (ratio <= 0 || ratio > 1) {
++            return;
++        }
++        long quotaBytes = quotaGb * GB;
++        if ((double) usageBytes / quotaBytes >= ratio) {
++            warnQuota(tenant.getTenantCode(), "storage", usageBytes, quotaBytes);
++        }
++    }
++
++    /**
++     * 固定格式软限告警（可 grep）：[QUOTA-WARN] tenant=&lt;code&gt; type=&lt;storage|throughput&gt;
++     * usage=&lt;bytes&gt; quota=&lt;bytes&gt;。吞吐接线时直接复用本方法。
++     */
++    private void warnQuota(String tenantCode, String type, long usageBytes, long quotaBytes) {
++        log.warn("[QUOTA-WARN] tenant={} type={} usage={} quota={}", tenantCode, type, usageBytes, quotaBytes);
++    }
++
++    /**
++     * 防日志风暴（brief 裁决 4）：连续失败仅首轮与每 N 轮记一次 WARN（含受影响租户数、
++     * 最后失败租户与异常摘要）；有成功轮即清零。恢复沿 INFO 一条（便于运维确认恢复）。
++     */
++    private void recordRoundOutcome(int failures, int total, String lastTenant, String lastError) {
++        if (failures > 0) {
++            int round = consecutiveFailedRounds.incrementAndGet();
++            int everyN = quotaProperties.getFailLogEveryNRounds();
++            if (everyN <= 1 || round == 1 || round % everyN == 0) {
++                log.warn("TDengine 存储统计不可用，本轮跳过（连续失败第 {} 轮，仅首轮与每 {} 轮告警防风暴）："
++                                + "失败租户 {}/{}，最后失败 tenant={} 异常摘要：{}",
++                        round, everyN, failures, total, lastTenant, lastError);
++            }
++            return;
++        }
++        int previous = consecutiveFailedRounds.getAndSet(0);
++        if (previous > 0) {
++            log.info("TDengine 存储统计恢复（此前连续失败 {} 轮）", previous);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+index ac41f66..389b016 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+@@ -3,10 +3,13 @@ package net.otlab.admin.module.iot.service.impl;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.entity.SysTenant;
+ import net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm;
+ import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.quota.PointQuotaCounter;
+ import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.service.TenantDbProvisionService;
+ import net.otlab.admin.module.system.entity.SysMenu;
+ import net.otlab.admin.module.system.entity.SysRole;
+ import net.otlab.admin.module.system.entity.SysRoleMenu;
+@@ -25,6 +28,8 @@ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
+ 
+ import java.util.HashMap;
+ import java.util.HashSet;
+@@ -49,6 +54,7 @@ import java.util.Set;
+  * @author dowei
+  * @date 2026-11-21
+  */
++@Slf4j
+ @Service
+ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant> implements SysTenantService {
+ 
+@@ -92,6 +98,22 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+     @Autowired
+     private SysUserService userService;
+ 
++    /**
++     * 建库触发器（TASK-0003）：开通事务提交后的事件式即时触发（brief 裁决 2「可加，不替代扫描兜底」）。
++     * required=false 容忍极端装配序（触发器依赖 TdengineAdmin；缺失时仅降级为无即时触发，
++     * 定时扫描兜底照常拾取）。本类只传 tenantId，不感知 TdengineAdmin，避免循环依赖。
++     */
++    @Autowired(required = false)
++    private TenantDbProvisionService provisionService;
++
++    /**
++     * 点位计数源（TASK-0003 交付校验器，真实实现与调用方接线归 TASK-0021 点位 CRUD）。
++     * required=false：TASK-0021 交付前的过渡期无实现，计数视为 0（放行不误伤）——
++     * 校验器与提示口径先行就位，接线时零改动。
++     */
++    @Autowired(required = false)
++    private PointQuotaCounter pointQuotaCounter;
++
+     @Override
+     public Page<SysTenant> selectTenantList(Page<SysTenant> page, SysTenant tenant) {
+         LambdaQueryWrapper<SysTenant> wrapper = new LambdaQueryWrapper<>();
+@@ -117,14 +139,47 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+         if (this.count(wrapper) > 0) {
+             throw duplicateCode(tenant.getTenantCode());
+         }
++        // db_created 强制置待建（TASK-0003）：请求体携带 dbCreated=1 不得绕过建库扫描（mass assignment 防护），
++        // 落库行恒以 0 入待建（brief 裁决 2「开通（新建租户 status=1）事务提交后置 db_created=0 入待建」）
++        tenant.setDbCreated(0);
+         try {
+-            return this.save(tenant);
++            boolean saved = this.save(tenant);
++            // 开通（status=1）事务提交后事件式即时触发一次建库尝试；失败不阻断主流程（触发器内部自收敛）。
++            // status=null 视同启用：API 建租户常省略 status，落库走 DDL 默认 1——按内存值判会漏触发（dev 冒烟实证）
++            if (saved && (tenant.getStatus() == null || tenant.getStatus() == 1) && tenant.getId() != null) {
++                registerAfterCommitProvision(tenant.getId());
++            }
++            return saved;
+         } catch (DuplicateKeyException e) {
+             // 兜底：已删除行仍占用编码（物理唯一索引不被逻辑删除释放）
+             throw duplicateCode(tenant.getTenantCode());
+         }
+     }
+ 
++    /**
++     * 开通事务提交后事件式即时触发（TASK-0003 brief 裁决 2）：afterCommit 里调触发器
++     * 尝试一次建库，TDengine 不可用仅 WARN 留待扫描兜底；异常收敛在本钩子内，
++     * 不炸穿已提交的开通事务。无事务同步上下文（非常规调用）时跳过——扫描兜底照常拾取。
++     */
++    private void registerAfterCommitProvision(Long tenantId) {
++        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
++            return;
++        }
++        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++            @Override
++            public void afterCommit() {
++                try {
++                    if (provisionService != null) {
++                        provisionService.provisionImmediately(tenantId);
++                    }
++                } catch (Exception e) {
++                    log.warn("租户开通后即时建库触发失败（不阻断主流程，留待扫描重试）tenantId={} 摘要：{}",
++                            tenantId, e.getMessage());
++                }
++            }
++        });
++    }
++
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean updateTenant(SysTenant tenant) {
+@@ -331,4 +386,26 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+     private BusinessException duplicateCode(String tenantCode) {
+         return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "租户编码已存在: " + tenantCode);
+     }
++
++    /**
++     * 点位配额强控（TASK-0003 / ADR-0011 TD-0035）：point_quota 空/0=不限直接过；
++     * 当前点位数 ≥ 配额即拒绝（达上限阻断新增并明确提示，业务码 4003）。
++     * 只做校验不落库，供点位创建方在插入前置调用（接线归 TASK-0021）。
++     */
++    @Override
++    public void checkPointQuota(Long tenantId) {
++        SysTenant tenant = this.getById(tenantId);
++        if (tenant == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户不存在或已删除");
++        }
++        Integer quota = tenant.getPointQuota();
++        if (quota == null || quota <= 0) {
++            return; // 空/0 = 不限（REQ-0001：点位配额可空）
++        }
++        // 计数源未装配（TASK-0021 前过渡期）视为 0：校验器先就位，接线后自动生效，不误伤
++        int current = pointQuotaCounter != null ? pointQuotaCounter.countPoints(tenantId) : 0;
++        if (current >= quota) {
++            throw new BusinessException(ResultCode.QUOTA_EXCEEDED.getCode(), "点位配额不足（上限 " + quota + "）");
++        }
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImpl.java
+new file mode 100644
+index 0000000..45c2be6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImpl.java
+@@ -0,0 +1,112 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.service.TenantDbProvisionService;
++import net.otlab.admin.module.iot.tdengine.TdengineAdmin;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++
++import java.util.List;
++
++/**
++ * 租户库建库触发与扫描服务实现（TASK-0003）
++ *
++ * <p>编排链（brief 裁决 2）：扫 status=1 且 db_created=0 → 先 {@code databaseExists}
++ * （已存在自愈置位，覆盖部署脚本/人工补建）→ 再 {@code createDatabase}
++ * （IF NOT EXISTS 幂等，重试轮安全）→ 成功置 db_created=1。失败 WARN
++ * （含 tenant_code、iot_&lt;code&gt; 与异常摘要）留待下轮，连续失败不升级不阻断；
++ * 单租户失败不中断同轮其他租户。TdengineAdmin 的 fail-soft 异常在本层收敛为布尔结果，
++ * 不向 sys_job 调度器抛出（避免每轮 job log 记 ERROR 噪音）。
++ *
++ * <p>自持 SysTenantMapper 直查 sys_tenant（平台级表，不在多租户插件白名单内，
++ * job 线程无会话上下文亦不受注入影响）：不走 SysTenantService 以避免与其形成
++ * 「开通挂点 → 触发器 → 租户服务」的循环依赖。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Slf4j
++@Service
++public class TenantDbProvisionServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant>
++        implements TenantDbProvisionService {
++
++    private final TdengineAdmin tdengineAdmin;
++
++    @Autowired
++    public TenantDbProvisionServiceImpl(TdengineAdmin tdengineAdmin) {
++        this.tdengineAdmin = tdengineAdmin;
++    }
++
++    @Override
++    public int scanPendingDatabases() {
++        List<SysTenant> pending = this.list(new LambdaQueryWrapper<SysTenant>()
++                .eq(SysTenant::getStatus, 1)
++                .eq(SysTenant::getDbCreated, 0));
++        int success = 0;
++        for (SysTenant tenant : pending) {
++            if (tryProvision(tenant)) {
++                success++;
++            }
++        }
++        if (!pending.isEmpty()) {
++            log.info("租户库建库扫描完成：待建 {} 个，本轮成功 {} 个", pending.size(), success);
++        }
++        return success;
++    }
++
++    @Override
++    public void provisionImmediately(Long tenantId) {
++        SysTenant tenant = this.getById(tenantId);
++        if (tenant == null || tenant.getStatus() == null || tenant.getStatus() != 1) {
++            return; // 仅开通（启用）租户即时触发；禁用/不存在交给扫描口径（同样只扫 status=1）
++        }
++        if (tenant.getDbCreated() != null && tenant.getDbCreated() == 1) {
++            return; // 已建库（或已自愈置位），不重复尝试
++        }
++        tryProvision(tenant);
++    }
++
++    @Override
++    public boolean tryProvision(SysTenant tenant) {
++        String code = tenant.getTenantCode();
++        String db;
++        try {
++            db = TdengineAdmin.databaseName(code);
++        } catch (IllegalArgumentException e) {
++            // 编码非法（历史脏数据）：无法派生库名，独立 WARN 留 0，不冒充 TDengine 失败
++            log.warn("租户编码非法，无法派生建库名，留待人工处置 tenant={} 摘要：{}", code, e.getMessage());
++            return false;
++        }
++        try {
++            if (tdengineAdmin.databaseExists(code)) {
++                markCreated(tenant.getId());
++                log.info("租户库已存在，自愈置位 db_created=1 tenant={} db={}", code, db);
++                return true;
++            }
++            tdengineAdmin.createDatabase(code);
++            markCreated(tenant.getId());
++            log.info("租户库创建成功 tenant={} db={}", code, db);
++            return true;
++        } catch (Exception e) {
++            // fail-soft：WARN 留待下轮扫描重试（连续失败不升级不阻断），TdengineAdmin 已保证摘要可读
++            log.warn("TDengine 建库失败，留待下轮扫描重试（连续失败不升级不阻断） tenant={} db={} 异常摘要：{}",
++                    code, db, e.getMessage());
++            return false;
++        }
++    }
++
++    /**
++     * 只更新 db_created 单字段（不夹带业务字段）；job 线程无登录态，
++     * update_by/update_time 由 MetaObjectHandler 按空登录者/当前时间回填。
++     */
++    private void markCreated(Long id) {
++        SysTenant upd = new SysTenant();
++        upd.setId(id);
++        upd.setDbCreated(1);
++        this.updateById(upd);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdmin.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdmin.java
+new file mode 100644
+index 0000000..46a7c10
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdmin.java
+@@ -0,0 +1,176 @@
++package net.otlab.admin.module.iot.tdengine;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.core.exception.BusinessException;
++import org.springframework.stereotype.Component;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.Base64;
++
++/**
++ * TDengine 管理抽象的 taosAdapter REST 实现（TASK-0003）
++ *
++ * <p>通道：{@code POST {base}/rest/sql}（无库上下文）与 {@code POST {base}/rest/sql/<db>}
++ * （REST 库上下文替代 USE 语句，taosAdapter 惯例），Basic 认证，应答 JSON
++ * {@code {"code":0,"desc":..,"data":..,"rows":..,"cols":..}}。
++ *
++ * <p>fail-soft 边界（brief 裁决 1）：连接失败/超时/非 0 code/不可解析应答一律抛
++ * {@link BusinessException}（消息含通道描述与异常摘要），由调用方捕获计数——
++ * 本类不重试、不吞错成静默成功。
++ *
++ * <p>真实 taosAdapter 行为（鉴权口径、ins_disk_usage 字段形态等）本机不可验，
++ * TD-0053 登记挂 TASK-0068 联调闭合。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Slf4j
++@Component
++public class HttpTdengineAdmin implements TdengineAdmin {
++
++    /** 超级表契约附录 B：四张超级表 DDL（{} 占位库名不可有，语句本身与库无关，经 REST 库上下文执行） */
++    private static final String[] STABLE_DDL = {
++            "CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT)"
++                    + " TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT)",
++            "CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT)"
++                    + " TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT)",
++            "CREATE STABLE IF NOT EXISTS st_item_value (ts TIMESTAMP, value DOUBLE, quality INT)"
++                    + " TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT)",
++            "CREATE STABLE IF NOT EXISTS st_metric_value (ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE)"
++                    + " TAGS (tenant_id BIGINT, metric_code BINARY(96), instance_code BINARY(96), period BINARY(8))"
++    };
++
++    /**
++     * 存储用量查询（TASK-0003 brief 裁决 4 数据源）：TDengine 3.x information_schema.ins_disk_usage
++     * 按 db_name 汇总 WAL/多级存储/缓存/元数据等磁盘占用（单位 KB）。字段集合以官方文档
++     * （docs.taosdata.com meta 视图）为准；该视图为较新 3.x 版本视图，真实性 TD-0053 联调验证，
++     * 版本不适配时表现为 SQLERROR → 业务异常 → 统计任务按不可用跳轮（fail-soft 不误报）。
++     */
++    private static final String STORAGE_USAGE_SQL =
++            "SELECT SUM(wal_size + data1 + data2 + data3 + cache_rdb + table_meta + ss + raw_data) AS total_kb"
++                    + " FROM information_schema.ins_disk_usage WHERE db_name = '%s'";
++
++    private final TdengineProperties props;
++    private final ObjectMapper objectMapper = new ObjectMapper();
++    private final HttpClient httpClient;
++
++    public HttpTdengineAdmin(TdengineProperties props) {
++        this.props = props;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
++                .build();
++    }
++
++    @Override
++    public void createDatabase(String tenantCode) {
++        String db = TdengineAdmin.databaseName(tenantCode);
++        // 建库：附录 B 参数全写齐（KEEP 1825d DURATION 10d BUFFER 256），IF NOT EXISTS 幂等——重试轮安全
++        execute("CREATE DATABASE IF NOT EXISTS " + db + " KEEP 1825d DURATION 10d BUFFER 256", null, "建库 " + db);
++        // 四张超级表：落在租户库上下文（REST 库上下文替代 USE）
++        for (String ddl : STABLE_DDL) {
++            execute(ddl, db, "初始化超级表 " + db);
++        }
++        log.info("TDengine 租户库就绪: {}（库 + 四张超级表 IF NOT EXISTS）", db);
++    }
++
++    @Override
++    public long storageUsageBytes(String tenantCode) {
++        String db = TdengineAdmin.databaseName(tenantCode);
++        JsonNode root = execute(String.format(STORAGE_USAGE_SQL, db), null, "存储用量 " + db);
++        JsonNode data = root.path("data");
++        if (!data.isArray() || data.isEmpty()) {
++            return 0L; // 无占用行（库刚建/无 vgroup 行）
++        }
++        JsonNode first = data.get(0);
++        if (!first.isArray() || first.isEmpty() || first.get(0) == null || first.get(0).isNull()) {
++            return 0L; // SUM 无行时为 NULL → 0
++        }
++        // 返回单位 KB，换算字节
++        return first.get(0).asLong(0L) * 1024L;
++    }
++
++    @Override
++    public boolean databaseExists(String tenantCode) {
++        String db = TdengineAdmin.databaseName(tenantCode);
++        JsonNode root = execute("SHOW DATABASES", null, "判存 " + db);
++        JsonNode data = root.path("data");
++        if (!data.isArray()) {
++            return false;
++        }
++        for (JsonNode row : data) {
++            // SHOW DATABASES 首列为库名
++            if (row.isArray() && !row.isEmpty() && db.equals(row.get(0).asText())) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * 执行一条 REST SQL：失败抛业务异常（含通道、派生库名与异常摘要），成功返回解析后的应答 JSON。
++     */
++    private JsonNode execute(String sql, String dbContext, String action) {
++        String url = props.getBaseUrl() + "/rest/sql" + (dbContext != null ? "/" + dbContext : "");
++        HttpRequest request;
++        try {
++            request = HttpRequest.newBuilder()
++                    .uri(URI.create(url))
++                    .timeout(Duration.ofMillis(props.getReadTimeoutMs()))
++                    .header("Authorization", basicAuth(props.getUsername(), props.getPassword()))
++                    .header("Content-Type", "text/plain")
++                    .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
++                    .build();
++        } catch (Exception e) {
++            throw new BusinessException(action + "失败：TDengine REST 地址非法 " + props.getBaseUrl() + "（" + e.getMessage() + "）");
++        }
++        HttpResponse<String> response;
++        try {
++            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new BusinessException(action + "失败：TDengine REST 调用被中断");
++        } catch (Exception e) {
++            // 连接拒绝/超时等：摘要取首行，避免异常堆栈进告警日志；
++            // 部分异常（如 JDK ConnectException 某些形态）getMessage() 为 null，回退 toString 保住异常类型信息
++            String detail = (e.getMessage() == null || e.getMessage().isEmpty()) ? e.toString() : e.getMessage();
++            throw new BusinessException(action + "失败：TDengine REST 不可达 " + props.getBaseUrl() + "（" + summarize(detail) + "）");
++        }
++        if (response.statusCode() >= 400) {
++            throw new BusinessException(action + "失败：TDengine REST HTTP " + response.statusCode()
++                    + "（" + summarize(response.body()) + "）");
++        }
++        JsonNode root;
++        try {
++            root = objectMapper.readTree(response.body());
++        } catch (Exception e) {
++            throw new BusinessException(action + "失败：TDengine REST 应答不可解析（可达假地址？）（" + summarize(response.body()) + "）");
++        }
++        int code = root.path("code").asInt(-1);
++        if (code != 0) {
++            throw new BusinessException(action + "失败：TDengine 错误码 " + code
++                    + "（" + summarize(root.path("desc").asText("")) + "）");
++        }
++        return root;
++    }
++
++    private static String basicAuth(String user, String password) {
++        return "Basic " + Base64.getEncoder()
++                .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
++    }
++
++    /** 异常摘要收敛：首行、截断，防告警日志被长堆栈/长应答刷屏 */
++    private static String summarize(String message) {
++        if (message == null) {
++            return "";
++        }
++        String firstLine = message.split("\\R", 2)[0];
++        return firstLine.length() > 200 ? firstLine.substring(0, 200) : firstLine;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineAdmin.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineAdmin.java
+new file mode 100644
+index 0000000..fc9f45e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineAdmin.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.tdengine;
++
++/**
++ * TDengine 管理抽象（TASK-0003 / REQ-0001「租户开通触发 TDengine 建库」）
++ *
++ * <p>本机/现场 TDengine 可用性不可假设（人类裁决 2026-11-21：接口抽象 + mock 单测验收，
++ * 真实建库/统计验证 TD-0053 挂 TASK-0068 联调闭合）。这是管理系统侧的 <b>fail-soft 边界</b>：
++ * 实现失败一律抛 {@link net.otlab.core.exception.BusinessException}（携带异常摘要），
++ * 由调用方（建库扫描/统计任务）捕获计数并 WARN，<b>不重试堆栈、不炸穿主流程</b>——
++ * TDengine 故障不应阻断租户主数据落库（数据丢失不可逆、库可补建）。
++ *
++ * <p>库名规则（REQ-0001 核心规则）：一律 {@code iot_<tenant_code>}，<b>只由 tenant_code 派生，
++ * 禁止外部传参指定库名</b>。派生唯一入口为 {@link #databaseName(String)}，并对编码做
++ * TDengine 标识符安全校验（字母/数字/下划线、≤32 字符）——派生结果要拼进 DDL，
++ * 不得给注入留口。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public interface TdengineAdmin {
++
++    /**
++     * 库名派生唯一入口：iot_&lt;tenant_code&gt;（REQ-0001 核心规则）。
++     *
++     * @param tenantCode 租户编码（取自 sys_tenant.tenant_code）
++     * @return 目标库名
++     * @throws IllegalArgumentException 编码为空、含字母/数字/下划线以外字符或超长时
++     *                                  （派生结果将拼入 DDL，非法编码在入口处拒绝）
++     */
++    static String databaseName(String tenantCode) {
++        if (tenantCode == null || tenantCode.isEmpty()
++                || !tenantCode.matches("[A-Za-z0-9_]+") || tenantCode.length() > 32) {
++            throw new IllegalArgumentException("租户编码不符合 TDengine 标识符安全规则（仅字母/数字/下划线，≤32）: " + tenantCode);
++        }
++        return "iot_" + tenantCode;
++    }
++
++    /**
++     * 建租户库并初始化四张超级表（幂等 IF NOT EXISTS）。
++     *
++     * <p>建库语句按超级表契约附录 B 参数全写齐：
++     * {@code CREATE DATABASE IF NOT EXISTS iot_<tenant_code> KEEP 1825d DURATION 10d BUFFER 256}，
++     * 随后 st_point_num / st_point_state / st_item_value / st_metric_value 四张超级表
++     * （契约冻结稿 v1.0.0 附录 B，标签含 tenant_id BIGINT——ADR-0002 双保险，标签属建表参数）。
++     *
++     * @param tenantCode 租户编码（库名由此派生，禁外部传库名）
++     * @throws net.otlab.core.exception.BusinessException REST 不可达、taosAdapter 非 0 code、
++     *                                                    应答不可解析等一切失败（fail-soft，调用方捕获计数）
++     */
++    void createDatabase(String tenantCode);
++
++    /**
++     * 租户库磁盘用量（字节）——存储软限告警数据源（ADR-0011 TD-0035：只告警不停写）。
++     * TDengine 3.x 经 {@code information_schema.ins_disk_usage} 各占位列求和（KB）换算；
++     * 无占用行/NULL 计 0。该视图为较新 3.x 版本视图，字段适配真实性归 TD-0053 联调验证。
++     *
++     * @param tenantCode 租户编码
++     * @throws net.otlab.core.exception.BusinessException TDengine 不可用等一切失败（调用方按轮次跳过）
++     */
++    long storageUsageBytes(String tenantCode);
++
++    /**
++     * 判断租户库是否已存在——扫描任务的自愈判据：库已存在（如人工补建/部署脚本所建）
++     * 直接置 db_created=1，不再重复建库。
++     *
++     * @param tenantCode 租户编码
++     * @return 库存在返回 true
++     * @throws net.otlab.core.exception.BusinessException TDengine 不可用等失败（与建库失败同口径）
++     */
++    boolean databaseExists(String tenantCode);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineProperties.java
+new file mode 100644
+index 0000000..2a0224d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/tdengine/TdengineProperties.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.tdengine;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * TDengine 管理通道配置（TASK-0003，配置键 {@code ot.tdengine.*}）
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.tdengine")
++public class TdengineProperties {
++
++    /** taosAdapter REST 根地址 */
++    private String baseUrl = "http://localhost:6041";
++
++    /** taosAdapter Basic 认证用户 */
++    private String username = "root";
++
++    /** taosAdapter Basic 认证口令（默认安装值，现场部署经环境变量覆盖） */
++    private String password = "taosdata";
++
++    /** REST 连接超时（毫秒） */
++    private long connectTimeoutMs = 3000;
++
++    /** REST 读超时（毫秒） */
++    private long readTimeoutMs = 5000;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysJobServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysJobServiceImpl.java
+index b027692..75e0662 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysJobServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysJobServiceImpl.java
+@@ -282,7 +282,10 @@ public class SysJobServiceImpl extends ServiceImpl<SysJobMapper, SysJob>
+             "sysPositionServiceImpl",
+             "surveyFormDataServiceImpl",
+             "surveyWebhookServiceImpl",
+-            "wxMpFanServiceImpl"
++            "wxMpFanServiceImpl",
++            // 智慧工厂租户域定时任务（TASK-0003）：租户库建库扫描 + 配额存储统计（升级脚本 20261121_tenant_db_task.sql 播种 sys_job 行）
++            "tenantDbProvisionServiceImpl",
++            "iotQuotaStatsServiceImpl"
+     );
+ 
+     /**
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index 33e4f04..b5260a2 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -25,6 +25,17 @@ ot:
+       lock-minutes: 10    # 锁定时长（分钟）
+   tenant:
+     default-code: ${OT_TENANT_DEFAULT_CODE:default}   # 登录缺省租户编码（TASK-0002 / TD-0040）：登录请求显式 tenantCode 优先，缺省走此值；私有化单租户包注入默认租户后用户无感（01_base 种子约定 default 租户 id=1）
++  tdengine:
++    # TDengine 管理通道（TASK-0003）：taosAdapter REST。库名一律 iot_<tenant_code> 只由 tenant_code 派生（REQ-0001 核心规则，禁外部传参）；
++    # 连接失败/超时抛业务异常由调用方捕获计数（fail-soft 边界），开通主流程不因 TDengine 可用性阻塞（建库异步化+扫描重试）
++    base-url: ${OT_TDENGINE_BASE_URL:http://localhost:6041}    # taosAdapter REST 根地址
++    username: ${OT_TDENGINE_USERNAME:root}                     # taosAdapter Basic 认证用户
++    password: ${OT_TDENGINE_PASSWORD:taosdata}                 # taosAdapter Basic 认证口令（默认安装值，现场部署经环境变量覆盖）
++    connect-timeout-ms: ${OT_TDENGINE_CONNECT_TIMEOUT_MS:3000} # REST 连接超时
++    read-timeout-ms: ${OT_TDENGINE_READ_TIMEOUT_MS:5000}       # REST 读超时
++  quota:
++    storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
++    fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+   crypto:
+     data-key: ${CRYPTO_DATA_KEY:otlab-data260930}    # 敏感数据存储加密密钥（SM4-128，16 字节）；与 sm4.key（登录传输密钥）独立不复用；dev 默认值，生产必须经环境变量 CRYPTO_DATA_KEY 注入；更换需重跑存量迁移
+     index-key: ${CRYPTO_INDEX_KEY:otlab-idx-260930}   # 检索索引 HMAC 密钥（16 字节）；更换需全量重建索引列；生产经 CRYPTO_INDEX_KEY 注入
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImplTest.java
+new file mode 100644
+index 0000000..675609c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotQuotaStatsServiceImplTest.java
+@@ -0,0 +1,216 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.quota.QuotaProperties;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.tdengine.TdengineAdmin;
++import net.otlab.core.exception.BusinessException;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.slf4j.LoggerFactory;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 租户配额存储统计与软限告警单元测试（TASK-0003，mock 验收口径）
++ *
++ * <p>ADR-0011 TD-0035/TD-0041 定版：存储/吞吐软限——只告警不停写。本测试证明编排逻辑：
++ * 逐启用租户调 storageUsageBytes；usage/quota 达 ot.quota.storage-warn-ratio 阈值发
++ * 固定格式 [QUOTA-WARN]（可 grep）；未设配额不告警；TDengine 不可用时本轮跳过且
++ * 防日志风暴（连续失败仅首轮与每 N 轮 WARN，恢复即清零）。
++ * TdengineAdmin 全部 mock（真实库行为 TD-0053 挂 TASK-0068）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class IotQuotaStatsServiceImplTest {
++
++    private static final long GB = 1024L * 1024L * 1024L;
++
++    @Mock
++    private SysTenantService tenantService;
++
++    @Mock
++    private TdengineAdmin tdengineAdmin;
++
++    private IotQuotaStatsServiceImpl statsService;
++
++    private ListAppender<ILoggingEvent> logAppender;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        QuotaProperties props = new QuotaProperties();
++        props.setStorageWarnRatio(0.8);
++        props.setFailLogEveryNRounds(3);
++        statsService = new IotQuotaStatsServiceImpl(tenantService, tdengineAdmin, props);
++        logAppender = new ListAppender<>();
++        logAppender.start();
++        ((Logger) LoggerFactory.getLogger(IotQuotaStatsServiceImpl.class)).addAppender(logAppender);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        ((Logger) LoggerFactory.getLogger(IotQuotaStatsServiceImpl.class)).detachAppender(logAppender);
++        mocks.close();
++    }
++
++    private SysTenant tenant(Long id, String code, Integer storageQuotaGb) {
++        SysTenant t = new SysTenant();
++        t.setId(id);
++        t.setTenantCode(code);
++        t.setTenantName("租户 " + code);
++        t.setStatus(1);
++        t.setStorageQuotaGb(storageQuotaGb);
++        return t;
++    }
++
++    private long warnCount(String contain) {
++        return logAppender.list.stream()
++                .filter(e -> e.getLevel() == Level.WARN && e.getFormattedMessage().contains(contain))
++                .count();
++    }
++
++    private void stubTenantQuery(List<SysTenant> tenants) {
++        when(tenantService.list(any(Wrapper.class))).thenReturn(tenants);
++    }
++
++    @Test
++    @DisplayName("统计 - 只查启用租户（查询条件断言），逐租户以 tenantCode 调 storageUsageBytes")
++    void testCollect_QueriesEnabledTenantsAndCallsPerTenant() {
++        stubTenantQuery(List.of(tenant(1L, "acme", null), tenant(2L, "beta", null)));
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(1L);
++        when(tdengineAdmin.storageUsageBytes("beta")).thenReturn(2L);
++
++        statsService.collectAndWarn();
++
++        org.mockito.ArgumentCaptor<Wrapper<SysTenant>> captor = org.mockito.ArgumentCaptor.captor();
++        verify(tenantService).list(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("status"), "统计任务应只查启用租户（status=1）");
++        verify(tdengineAdmin).storageUsageBytes("acme");
++        verify(tdengineAdmin).storageUsageBytes("beta");
++    }
++
++    @Test
++    @DisplayName("超阈值告警 - usage 9GB/quota 10GB（ratio 0.8）发固定格式 [QUOTA-WARN]，配额换算字节")
++    void testCollect_OverThresholdWarnsInGreppableFormat() {
++        stubTenantQuery(List.of(tenant(1L, "acme", 10)));
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(9L * GB);
++
++        statsService.collectAndWarn();
++
++        assertEquals(1, warnCount("[QUOTA-WARN] tenant=acme type=storage usage=9663676416 quota=10737418240"),
++                "格式固定可 grep：[QUOTA-WARN] tenant=<code> type=storage usage=<bytes> quota=<bytes>");
++    }
++
++    @Test
++    @DisplayName("阈值边界 - usage 恰为 quota×ratio（8GB/10GB@0.8）告警；低于阈值不告警")
++    void testCollect_ThresholdBoundary() {
++        stubTenantQuery(List.of(tenant(1L, "acme", 10)));
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(8L * GB);
++        statsService.collectAndWarn();
++        assertEquals(1, warnCount("[QUOTA-WARN]"), "恰达阈值即告警（≥）");
++
++        logAppender.list.clear();
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(8L * GB - 1);
++        statsService.collectAndWarn();
++        assertEquals(0, warnCount("[QUOTA-WARN]"), "低于阈值不告警");
++    }
++
++    @Test
++    @DisplayName("未设配额（null/0）= 不限：用量再大也不告警")
++    void testCollect_NoQuotaNeverWarns() {
++        stubTenantQuery(List.of(tenant(1L, "acme", null), tenant(2L, "beta", 0)));
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(999L * GB);
++        when(tdengineAdmin.storageUsageBytes("beta")).thenReturn(999L * GB);
++
++        statsService.collectAndWarn();
++
++        assertEquals(0, warnCount("[QUOTA-WARN]"));
++    }
++
++    @Test
++    @DisplayName("不可用静默（防风暴）- 连续失败仅首轮 WARN，随后轮静默，每 N 轮再 WARN，恢复即清零")
++    void testCollect_UnavailableStormGuard() {
++        stubTenantQuery(List.of(tenant(1L, "acme", 10)));
++        // doThrow/doReturn 形态：re-stub 不再触发既有 thenThrow（when() 会真实调用 mock）
++        org.mockito.Mockito.doThrow(new BusinessException("TDengine REST 不可达"))
++                .when(tdengineAdmin).storageUsageBytes("acme");
++
++        statsService.collectAndWarn(); // 第 1 轮：WARN
++        assertEquals(1, warnCount("连续失败第 1 轮"), "首轮应 WARN");
++        assertTrue(warnCount("不可达") >= 1, "不可用 WARN 应含异常摘要");
++
++        statsService.collectAndWarn(); // 第 2 轮：静默
++        assertEquals(1, warnCount("连续失败"), "第 2 轮应静默（N=3）");
++
++        statsService.collectAndWarn(); // 第 3 轮：每 N 轮再 WARN
++        assertEquals(2, warnCount("连续失败"), "第 3 轮（N=3）应再 WARN");
++
++        // 恢复一轮 → 计数清零；再次失败重新从第 1 轮 WARN
++        org.mockito.Mockito.doReturn(1L * GB).when(tdengineAdmin).storageUsageBytes("acme");
++        statsService.collectAndWarn();
++        org.mockito.Mockito.doThrow(new BusinessException("TDengine REST 不可达"))
++                .when(tdengineAdmin).storageUsageBytes("acme");
++        statsService.collectAndWarn();
++        assertEquals(3, warnCount("连续失败"), "恢复后再次失败应重新按首轮 WARN");
++    }
++
++    @Test
++    @DisplayName("不可用轮次 - 成功租户照常比对，失败租户不误报配额告警")
++    void testCollect_PartialFailure() {
++        SysTenant ok = tenant(1L, "acme", 10);
++        SysTenant bad = tenant(2L, "beta", 10);
++        stubTenantQuery(List.of(ok, bad));
++        when(tdengineAdmin.storageUsageBytes("acme")).thenReturn(9L * GB);
++        when(tdengineAdmin.storageUsageBytes("beta")).thenThrow(new BusinessException("TDengine REST 不可达"));
++
++        statsService.collectAndWarn();
++
++        assertEquals(1, warnCount("[QUOTA-WARN] tenant=acme"), "成功租户照常软限比对");
++        assertEquals(0, warnCount("tenant=beta type=storage"), "失败租户不得误报配额告警");
++        assertEquals(1, warnCount("连续失败第 1 轮"), "失败轮按防风暴口径记一次");
++    }
++
++    @Test
++    @DisplayName("无启用租户：静默完成，无告警无不可用计数")
++    void testCollect_NoTenantsQuiet() {
++        stubTenantQuery(List.of());
++
++        statsService.collectAndWarn();
++
++        verify(tdengineAdmin, never()).storageUsageBytes(any());
++        assertEquals(0, warnCount("连续失败"));
++        assertEquals(0, warnCount("[QUOTA-WARN]"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysJobInvokeWhitelistContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysJobInvokeWhitelistContractTest.java
+new file mode 100644
+index 0000000..de278e3
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysJobInvokeWhitelistContractTest.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.lang.reflect.Field;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * sys_job 调用目标 bean 白名单契约测试（TASK-0003）
++ *
++ * <p>框架 SysJobServiceImpl.invokeTarget 仅白名单内的 bean 可被定时任务调用——
++ * TASK-0003 按裁决以框架 sys_job 注册两条任务（升级脚本 20261121_tenant_db_task.sql 播种：
++ * tenantDbProvisionServiceImpl.scanPendingDatabases / iotQuotaStatsServiceImpl.collectAndWarn），
++ * 本测试锁定白名单登记在位，防止后续清理误删导致任务每轮被拒（job log 恒失败）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysJobInvokeWhitelistContractTest {
++
++    @SuppressWarnings("unchecked")
++    private static List<String> whitelist() throws Exception {
++        Field field = Class.forName("net.otlab.admin.module.system.service.impl.SysJobServiceImpl")
++                .getDeclaredField("INVOKE_BEAN_WHITELIST");
++        field.setAccessible(true);
++        return (List<String>) field.get(null);
++    }
++
++    @Test
++    @DisplayName("白名单含租户域两条 sys_job 任务的 bean（触发器与统计）")
++    void testTask0003JobBeansWhitelisted() throws Exception {
++        List<String> whitelist = whitelist();
++        assertTrue(whitelist.contains("tenantDbProvisionServiceImpl"),
++                "租户库建库扫描任务 bean 必须在 sys_job 调用白名单内");
++        assertTrue(whitelist.contains("iotQuotaStatsServiceImpl"),
++                "配额存储统计任务 bean 必须在 sys_job 调用白名单内");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantOpenTriggerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantOpenTriggerTest.java
+new file mode 100644
+index 0000000..2c0e82e
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantOpenTriggerTest.java
+@@ -0,0 +1,181 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.service.TenantDbProvisionService;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 租户开通触发链单元测试（TASK-0003，mock 验收口径）
++ *
++ * <p>brief 裁决 2：开通（新建租户 status=1）事务提交后置 db_created=0 入待建 +
++ * 事件式即时触发（可加，不替代扫描兜底）。本测试证明：落库行 db_created 强制 0
++ * （请求体携带 1 不得绕过建库扫描——mass assignment 防护）；事务提交后即时触发
++ * provisionImmediately；非启用租户不触发；触发失败不炸穿开通主流程。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysTenantOpenTriggerTest {
++
++    @Mock
++    private SysTenantMapper baseMapper;
++
++    @Mock
++    private TenantDbProvisionService provisionService;
++
++    private SysTenantServiceImpl tenantService;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantService = new SysTenantServiceImpl();
++        ReflectionTestUtils.setField(tenantService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(tenantService, "provisionService", provisionService);
++        // insertTenant 依赖事务同步上下文（afterCommit 挂点）
++        TransactionSynchronizationManager.initSynchronization();
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++        mocks.close();
++    }
++
++    private SysTenant newTenant(String code, Integer status) {
++        SysTenant tenant = new SysTenant();
++        tenant.setTenantCode(code);
++        tenant.setTenantName("租户 " + code);
++        tenant.setStatus(status);
++        return tenant;
++    }
++
++    private TransactionSynchronization fireAfterCommitAndClear() throws Exception {
++        verify(provisionService, never()).provisionImmediately(any()); // 提交前不得触发
++        assertTrue(!TransactionSynchronizationManager.getSynchronizations().isEmpty(),
++                "启用租户应注册 afterCommit 同步器");
++        TransactionSynchronization sync = TransactionSynchronizationManager.getSynchronizations().get(0);
++        TransactionSynchronizationManager.clearSynchronization();
++        sync.afterCommit();
++        return sync;
++    }
++
++    @Test
++    @DisplayName("开通 status=1：落库行强制 db_created=0（请求携带 1 被忽略），提交后即时触发一次")
++    void testInsertTenant_Status1_ForcesDbCreated0AndTriggersAfterCommit() throws Exception {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        // 模拟 MP 自增主键回填
++        doAnswer(inv -> {
++            SysTenant arg = inv.getArgument(0);
++            arg.setId(77L);
++            return 1;
++        }).when(baseMapper).insert(any(SysTenant.class));
++
++        SysTenant request = newTenant("acme", 1);
++        request.setDbCreated(1); // 客户端 mass assignment 尝试：绕过建库扫描
++
++        assertTrue(tenantService.insertTenant(request));
++
++        ArgumentCaptor<SysTenant> saved = ArgumentCaptor.captor();
++        verify(baseMapper).insert(saved.capture());
++        assertEquals(0, saved.getValue().getDbCreated(), "落库行必须强制 db_created=0（待建）");
++
++        fireAfterCommitAndClear();
++        verify(provisionService).provisionImmediately(77L);
++    }
++
++    @Test
++    @DisplayName("开通 status=0（禁用态建租户）：不注册触发器（扫描同样只扫启用租户）")
++    void testInsertTenant_Status0_NoTrigger() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        doAnswer(inv -> {
++            inv.<SysTenant>getArgument(0).setId(78L);
++            return 1;
++        }).when(baseMapper).insert(any(SysTenant.class));
++
++        assertTrue(tenantService.insertTenant(newTenant("off", 0)));
++
++        assertTrue(TransactionSynchronizationManager.getSynchronizations().isEmpty(),
++                "非启用租户不注册即时触发");
++        TransactionSynchronizationManager.clearSynchronization();
++    }
++
++    @Test
++    @DisplayName("开通请求未携带 status（落库走 DB 默认 1）：视同启用并注册即时触发（dev 冒烟实证修复）")
++    void testInsertTenant_StatusNull_TreatedAsEnabled() throws Exception {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        doAnswer(inv -> {
++            inv.<SysTenant>getArgument(0).setId(80L);
++            return 1;
++        }).when(baseMapper).insert(any(SysTenant.class));
++
++        SysTenant request = newTenant("e", null); // API 建租户常省略 status，DDL 默认 1
++
++        assertTrue(tenantService.insertTenant(request));
++
++        fireAfterCommitAndClear();
++        verify(provisionService).provisionImmediately(80L);
++    }
++
++    @Test
++    @DisplayName("即时触发抛错不炸穿开通主流程（afterCommit 异常被捕获记 WARN）")
++    void testInsertTenant_TriggerFailureSwallowed() throws Exception {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        doAnswer(inv -> {
++            inv.<SysTenant>getArgument(0).setId(79L);
++            return 1;
++        }).when(baseMapper).insert(any(SysTenant.class));
++        doThrow(new RuntimeException("TDengine REST 不可达")).when(provisionService).provisionImmediately(79L);
++
++        assertTrue(tenantService.insertTenant(newTenant("acme", 1)));
++        fireAfterCommitAndClear(); // 不应向调用方抛出
++        verify(provisionService).provisionImmediately(79L);
++    }
++
++    @Test
++    @DisplayName("编码冲突（DuplicateKey 兜底）不触发建库")
++    void testInsertTenant_DuplicateNoTrigger() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        doThrow(new DuplicateKeyException("Duplicate entry 'acme' for key 'uk_tenant_code'"))
++                .when(baseMapper).insert(any(SysTenant.class));
++
++        org.junit.jupiter.api.Assertions.assertThrows(net.otlab.core.exception.BusinessException.class,
++                () -> tenantService.insertTenant(newTenant("acme", 1)));
++
++        assertTrue(TransactionSynchronizationManager.getSynchronizations().isEmpty(),
++                "落库失败不得注册即时触发");
++        TransactionSynchronizationManager.clearSynchronization();
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantPointQuotaTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantPointQuotaTest.java
+new file mode 100644
+index 0000000..6701a94
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantPointQuotaTest.java
+@@ -0,0 +1,151 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.quota.PointQuotaCounter;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 点位配额强控校验器单元测试（TASK-0003，mock 验收口径）
++ *
++ * <p>ADR-0011 TD-0035 定版：点位配额是授权口径必须硬——达上限阻断新增并明确提示
++ * （业务码 4003 QUOTA_EXCEEDED）。配额口径：point_quota 空/0=不限直接过；当前点位数
++ * ≥ 配额即拒绝（新增第 N+1 个必超）。计数源 {@link PointQuotaCounter} mock——
++ * 真实计数实现与调用方接线归 TASK-0021（点位 CRUD，brief 裁决 3）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysTenantPointQuotaTest {
++
++    @Mock
++    private SysTenantMapper baseMapper;
++
++    @Mock
++    private PointQuotaCounter pointQuotaCounter;
++
++    private SysTenantServiceImpl tenantService;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantService = new SysTenantServiceImpl();
++        ReflectionTestUtils.setField(tenantService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(tenantService, "pointQuotaCounter", pointQuotaCounter);
++    }
++
++    private SysTenant tenant(Integer pointQuota) {
++        SysTenant t = new SysTenant();
++        t.setId(1L);
++        t.setTenantCode("acme");
++        t.setTenantName("Acme 集团");
++        t.setStatus(1);
++        t.setPointQuota(pointQuota);
++        return t;
++    }
++
++    @Test
++    @DisplayName("ResultCode - QUOTA_EXCEEDED 枚举在位且业务码为 4003（4001-4099 参数与校验段，语义全局）")
++    void testResultCodeQuotaExceeded() {
++        assertEquals(4003, ResultCode.QUOTA_EXCEEDED.getCode());
++        assertEquals("配额不足", ResultCode.QUOTA_EXCEEDED.getMessage());
++    }
++
++    @Test
++    @DisplayName("配额空（null）= 不限：直接过，不触发计数")
++    void testCheckPointQuota_NullQuotaUnlimited() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(null));
++
++        assertDoesNotThrow(() -> tenantService.checkPointQuota(1L));
++        verify(pointQuotaCounter, never()).countPoints(any());
++    }
++
++    @Test
++    @DisplayName("配额 0 = 不限：直接过，不触发计数")
++    void testCheckPointQuota_ZeroQuotaUnlimited() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(0));
++
++        assertDoesNotThrow(() -> tenantService.checkPointQuota(1L));
++        verify(pointQuotaCounter, never()).countPoints(any());
++    }
++
++    @Test
++    @DisplayName("未达上限（99/100）：放行")
++    void testCheckPointQuota_BelowLimitPasses() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(100));
++        when(pointQuotaCounter.countPoints(1L)).thenReturn(99);
++
++        assertDoesNotThrow(() -> tenantService.checkPointQuota(1L));
++        verify(pointQuotaCounter).countPoints(1L);
++    }
++
++    @Test
++    @DisplayName("达上限（100/100）拒绝：4003 + 明确提示「点位配额不足（上限 100）」——新增第 101 个点位被拒")
++    void testCheckPointQuota_AtLimitRejectedWithClearMessage() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(100));
++        when(pointQuotaCounter.countPoints(1L)).thenReturn(100);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.checkPointQuota(1L));
++
++        assertEquals(ResultCode.QUOTA_EXCEEDED.getCode(), e.getCode());
++        assertEquals(4003, e.getCode());
++        assertTrue(e.getDefaultMessage().contains("点位配额不足"), "提示应明确点位配额语义");
++        assertTrue(e.getDefaultMessage().contains("上限 100"), "提示应携带上限数值（101 个点位提示明确）");
++    }
++
++    @Test
++    @DisplayName("超上限（101/100，并发漏检兜底口径）同样拒绝")
++    void testCheckPointQuota_OverLimitRejected() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(100));
++        when(pointQuotaCounter.countPoints(1L)).thenReturn(101);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.checkPointQuota(1L));
++        assertEquals(4003, e.getCode());
++    }
++
++    @Test
++    @DisplayName("租户不存在（或已删除）报参数错误，不报配额错")
++    void testCheckPointQuota_TenantMissingParamError() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.checkPointQuota(99L));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(pointQuotaCounter, never()).countPoints(any());
++    }
++
++    @Test
++    @DisplayName("计数源未装配（TASK-0021 前的过渡期）：计数视为 0，校验放行不误伤")
++    void testCheckPointQuota_CounterAbsentTreatedAsZero() {
++        when(baseMapper.selectById(1L)).thenReturn(tenant(100));
++        ReflectionTestUtils.setField(tenantService, "pointQuotaCounter", null);
++
++        assertDoesNotThrow(() -> tenantService.checkPointQuota(1L));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImplTest.java
+new file mode 100644
+index 0000000..efa85de
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/TenantDbProvisionServiceImplTest.java
+@@ -0,0 +1,258 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.tdengine.TdengineAdmin;
++import net.otlab.core.exception.BusinessException;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.slf4j.LoggerFactory;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.core.read.ListAppender;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 租户库建库触发与扫描编排单元测试（TASK-0003，mock 验收口径）
++ *
++ * <p>证明触发与编排逻辑（谁在何时以什么参数调了什么）：扫描任务只扫 status=1 且
++ * db_created=0 的租户；逐租户先判存（自愈）再建库；成功置 db_created=1，失败记 WARN
++ * 留待下轮（连续失败不升级不阻断），且单租户失败不中断同轮其他租户。
++ * TdengineAdmin 全部 mock（人类裁决：本机无 TDengine，真实行为归 TD-0053/TASK-0068）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class TenantDbProvisionServiceImplTest {
++
++    @Mock
++    private SysTenantMapper baseMapper;
++
++    @Mock
++    private TdengineAdmin tdengineAdmin;
++
++    private TenantDbProvisionServiceImpl provisionService;
++
++    private ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> logAppender;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        provisionService = new TenantDbProvisionServiceImpl(tdengineAdmin);
++        ReflectionTestUtils.setField(provisionService, "baseMapper", baseMapper);
++        logAppender = new ListAppender<>();
++        logAppender.start();
++        ((Logger) LoggerFactory.getLogger(TenantDbProvisionServiceImpl.class)).addAppender(logAppender);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        ((Logger) LoggerFactory.getLogger(TenantDbProvisionServiceImpl.class)).detachAppender(logAppender);
++        mocks.close();
++    }
++
++    private SysTenant tenant(Long id, String code, Integer status, Integer dbCreated) {
++        SysTenant t = new SysTenant();
++        t.setId(id);
++        t.setTenantCode(code);
++        t.setTenantName("租户 " + code);
++        t.setStatus(status);
++        t.setDbCreated(dbCreated);
++        return t;
++    }
++
++    private long warnCount(String contain) {
++        return logAppender.list.stream()
++                .filter(e -> e.getLevel() == Level.WARN && e.getFormattedMessage().contains(contain))
++                .count();
++    }
++
++    @Test
++    @DisplayName("扫描 - 只扫 status=1 且 db_created=0 的租户（查询条件断言）")
++    void testScan_QueriesPendingEnabledTenants() {
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of());
++
++        provisionService.scanPendingDatabases();
++
++        ArgumentCaptor<Wrapper<SysTenant>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectList(captor.capture());
++        String seg = captor.getValue().getSqlSegment();
++        assertTrue(seg.contains("status"), "扫描条件应含 status=1");
++        assertTrue(seg.contains("db_created"), "扫描条件应含 db_created=0");
++        verify(tdengineAdmin, never()).createDatabase(any());
++    }
++
++    @Test
++    @DisplayName("扫描 - 建库成功置 db_created=1，建库以 tenantCode 为参（库名在 Admin 内派生）")
++    void testScan_SuccessMarksCreated() {
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(tenant(7L, "acme", 1, 0)));
++        when(tdengineAdmin.databaseExists("acme")).thenReturn(false);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        int success = provisionService.scanPendingDatabases();
++
++        assertEquals(1, success);
++        verify(tdengineAdmin).createDatabase("acme");
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(7L, captor.getValue().getId());
++        assertEquals(1, captor.getValue().getDbCreated(), "成功后置 db_created=1");
++        assertTrue(warnCount("建库失败") == 0, "成功路径不应有 WARN");
++    }
++
++    @Test
++    @DisplayName("扫描 - 库已存在（人工补建/部署脚本建）自愈置位，不再重复建库")
++    void testScan_DatabaseExistsSelfHeal() {
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(tenant(7L, "acme", 1, 0)));
++        when(tdengineAdmin.databaseExists("acme")).thenReturn(true);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        int success = provisionService.scanPendingDatabases();
++
++        assertEquals(1, success);
++        verify(tdengineAdmin, never()).createDatabase(any());
++        verify(baseMapper).updateById(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("扫描 - 建库失败：WARN（含 tenant_code 与 iot_acme 派生库名与异常摘要）、db_created 留 0、不计成功")
++    void testScan_FailureWarnsAndLeavesZero() {
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(tenant(7L, "acme", 1, 0)));
++        when(tdengineAdmin.databaseExists("acme")).thenReturn(false);
++        doThrow(new BusinessException("建库失败：TDengine REST 不可达 http://localhost:6041（Connection refused）"))
++                .when(tdengineAdmin).createDatabase("acme");
++
++        int success = provisionService.scanPendingDatabases();
++
++        assertEquals(0, success);
++        verify(baseMapper, never()).updateById(any(SysTenant.class));
++        assertTrue(warnCount("iot_acme") >= 1, "WARN 应含派生库名 iot_acme");
++        assertTrue(warnCount("acme") >= 1, "WARN 应含 tenant_code");
++        assertTrue(warnCount("Connection refused") >= 1, "WARN 应含异常摘要");
++        assertTrue(warnCount("留待下轮") >= 1, "WARN 应说明留待下轮重试");
++    }
++
++    @Test
++    @DisplayName("扫描 - 单租户失败不中断同轮其他租户（逐租户 try-provision）")
++    void testScan_FailureDoesNotAbortOthers() {
++        SysTenant bad = tenant(7L, "badtenant", 1, 0);
++        SysTenant good = tenant(8L, "goodtenant", 1, 0);
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(bad, good));
++        when(tdengineAdmin.databaseExists("badtenant")).thenReturn(false);
++        when(tdengineAdmin.databaseExists("goodtenant")).thenReturn(false);
++        doThrow(new BusinessException("TDengine REST 不可达")).when(tdengineAdmin).createDatabase("badtenant");
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        int success = provisionService.scanPendingDatabases();
++
++        assertEquals(1, success, "第二个租户应继续被处理");
++        verify(tdengineAdmin).createDatabase("badtenant");
++        verify(tdengineAdmin).createDatabase("goodtenant");
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(8L, captor.getValue().getId(), "只有成功租户被置位");
++    }
++
++    @Test
++    @DisplayName("扫描 - 非法租户编码无法派生库名：WARN 留 0，不中断扫描")
++    void testScan_InvalidCodeFailsSoft() {
++        SysTenant bad = tenant(9L, "bad code", 1, 0);
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(bad));
++
++        int success = provisionService.scanPendingDatabases();
++
++        assertEquals(0, success);
++        verify(tdengineAdmin, never()).createDatabase(any());
++        verify(tdengineAdmin, never()).databaseExists(any());
++        assertTrue(warnCount("非法") >= 1);
++        assertTrue(warnCount("建库失败") == 0, "编码非法走独立 WARN，不冒充 TDengine 失败");
++    }
++
++    @Test
++    @DisplayName("即时触发 - 仅启用（status=1）且未建库的租户尝试一次，禁用/已建跳过")
++    void testProvisionImmediately() {
++        when(baseMapper.selectById(7L)).thenReturn(tenant(7L, "acme", 1, 0));
++        when(tdengineAdmin.databaseExists("acme")).thenReturn(false);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        provisionService.provisionImmediately(7L);
++        verify(tdengineAdmin).createDatabase("acme");
++
++        org.mockito.Mockito.reset(tdengineAdmin);
++        when(baseMapper.selectById(8L)).thenReturn(tenant(8L, "off", 0, 0)); // 禁用
++        provisionService.provisionImmediately(8L);
++        verify(tdengineAdmin, never()).createDatabase(any());
++
++        when(baseMapper.selectById(9L)).thenReturn(tenant(9L, "done", 1, 1)); // 已建
++        provisionService.provisionImmediately(9L);
++        verify(tdengineAdmin, never()).createDatabase(any());
++
++        when(baseMapper.selectById(10L)).thenReturn(null); // 不存在
++        provisionService.provisionImmediately(10L);
++        verify(tdengineAdmin, never()).createDatabase(any());
++    }
++
++    @Test
++    @DisplayName("即时触发 - 失败同样 WARN 留 0（与扫描同一条 try-provision 路径）")
++    void testProvisionImmediately_FailureSamePath() {
++        when(baseMapper.selectById(7L)).thenReturn(tenant(7L, "acme", 1, 0));
++        doThrow(new BusinessException("TDengine REST 不可达")).when(tdengineAdmin).databaseExists("acme");
++
++        provisionService.provisionImmediately(7L);
++
++        verify(baseMapper, never()).updateById(any(SysTenant.class));
++        assertTrue(warnCount("iot_acme") >= 1, "即时触发失败应 WARN（含派生库名）");
++    }
++
++    @Test
++    @DisplayName("扫描 - 无待建租户静默完成（返回 0，无网络调用）")
++    void testScan_EmptyPendingQuiet() {
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of());
++
++        assertEquals(0, provisionService.scanPendingDatabases());
++        verify(tdengineAdmin, never()).databaseExists(any());
++        verify(tdengineAdmin, never()).createDatabase(any());
++    }
++
++    @Test
++    @DisplayName("编排契约 - tryProvision 对判存与建库的实现顺序：先判存（自愈）后建库")
++    void testTryProvision_OrderExistsBeforeCreate() {
++        when(baseMapper.selectById(7L)).thenReturn(tenant(7L, "acme", 1, 0));
++        when(tdengineAdmin.databaseExists("acme")).thenReturn(true);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        assertTrue(provisionService.tryProvision(tenant(7L, "acme", 1, 0)));
++        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(tdengineAdmin);
++        inOrder.verify(tdengineAdmin).databaseExists("acme");
++        inOrder.verify(tdengineAdmin, never()).createDatabase(eq("acme"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdminTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdminTest.java
+new file mode 100644
+index 0000000..9f09772
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/tdengine/HttpTdengineAdminTest.java
+@@ -0,0 +1,212 @@
++package net.otlab.admin.module.iot.tdengine;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TDengine 管理抽象 REST 实现单元测试（TASK-0003，mock 验收口径）
++ *
++ * <p>本机无 TDengine（真实库验证 TD-0053 挂 TASK-0068 联调），以 JDK HttpServer 起
++ * 假 taosAdapter，记录「谁在何时以什么参数调了什么」：建库语句按超级表契约附录 B 参数断言
++ * （库名 iot_&lt;code&gt; 只由 tenant_code 派生、KEEP 1825d/DURATION 10d/BUFFER 256 全写齐、
++ * 四张超级表 DDL 逐条落在租户库上下文）；连接失败/taosAdapter 错误码/非 JSON 应答一律映射
++ * 业务异常（fail-soft 边界，调用方捕获计数，不炸穿主流程）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class HttpTdengineAdminTest {
++
++    private HttpServer server;
++    private final List<String> paths = new ArrayList<>();
++    private final List<String> bodies = new ArrayList<>();
++    private final AtomicReference<String> lastAuth = new AtomicReference<>();
++
++    /** 假 taosAdapter 应答体与状态码：默认成功空应答，用例可覆写 */
++    private final AtomicReference<String> responseBody =
++            new AtomicReference<>("{\"code\":0,\"desc\":\"\",\"rows\":0,\"cols\":[]}");
++    private final AtomicReference<Integer> responseStatus = new AtomicReference<>(200);
++
++    private HttpTdengineAdmin admin;
++
++    @BeforeEach
++    void setUp() throws IOException {
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/", exchange -> {
++            paths.add(exchange.getRequestURI().getPath());
++            bodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
++            lastAuth.set(exchange.getRequestHeaders().getFirst("Authorization"));
++            byte[] payload = responseBody.get().getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().add("Content-Type", "application/json");
++            exchange.sendResponseHeaders(responseStatus.get(), payload.length);
++            try (OutputStream os = exchange.getResponseBody()) {
++                os.write(payload);
++            }
++        });
++        server.start();
++
++        TdengineProperties props = new TdengineProperties();
++        props.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
++        props.setUsername("root");
++        props.setPassword("taosdata");
++        admin = new HttpTdengineAdmin(props);
++    }
++
++    @AfterEach
++    void tearDown() {
++        if (server != null) {
++            server.stop(0);
++        }
++    }
++
++    @Test
++    @DisplayName("库名派生 - 只由 tenant_code 派生为 iot_<code>，非法字符拒绝（禁外部传参的安全前提）")
++    void testDatabaseNameDerivation() {
++        assertEquals("iot_acme", TdengineAdmin.databaseName("acme"));
++        assertEquals("iot_default", TdengineAdmin.databaseName("default"));
++        // 非法字符：空格 / 分号 / 反引号 / 空串 / 超长——库名派生唯一入口处拒绝
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName("a b"));
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName("a;b"));
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName("a`b"));
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName(""));
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName(null));
++        assertThrows(IllegalArgumentException.class, () -> TdengineAdmin.databaseName("x".repeat(33)));
++    }
++
++    @Test
++    @DisplayName("建库 - CREATE DATABASE 按附录 B 参数（iot_<code> + KEEP 1825d/DURATION 10d/BUFFER 256）")
++    void testCreateDatabase_SendsAppendixBStatements() {
++        admin.createDatabase("acme");
++
++        assertEquals(5, paths.size(), "1 条建库 + 4 条超级表，共 5 个 REST 请求");
++        assertEquals("/rest/sql", paths.get(0), "建库语句不带库上下文");
++        assertEquals("CREATE DATABASE IF NOT EXISTS iot_acme KEEP 1825d DURATION 10d BUFFER 256",
++                bodies.get(0), "建库参数按契约附录 B 全写齐，库名只由 tenant_code 派生");
++
++        // 四张超级表经 /rest/sql/iot_<code>（REST 库上下文替代 USE，taosAdapter 惯例）
++        for (int i = 1; i <= 4; i++) {
++            assertEquals("/rest/sql/iot_acme", paths.get(i), "超级表 DDL 必须落在租户库上下文");
++        }
++        assertTrue(bodies.get(1).startsWith("CREATE STABLE IF NOT EXISTS st_point_num")
++                && bodies.get(1).contains("ts TIMESTAMP, value DOUBLE, quality INT")
++                && bodies.get(1).contains("TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT)"),
++                "st_point_num 按契约附录 B 逐字（ADR-0002 标签 tenant_id 在位）");
++        assertTrue(bodies.get(2).startsWith("CREATE STABLE IF NOT EXISTS st_point_state")
++                && bodies.get(2).contains("ts TIMESTAMP, value INT, quality INT")
++                && bodies.get(2).contains("TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT)"),
++                "st_point_state 按契约附录 B 逐字");
++        assertTrue(bodies.get(3).startsWith("CREATE STABLE IF NOT EXISTS st_item_value")
++                && bodies.get(3).contains("ts TIMESTAMP, value DOUBLE, quality INT")
++                && bodies.get(3).contains("TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT)"),
++                "st_item_value 按契约附录 B 逐字");
++        assertTrue(bodies.get(4).startsWith("CREATE STABLE IF NOT EXISTS st_metric_value")
++                && bodies.get(4).contains("ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE")
++                && bodies.get(4).contains("TAGS (tenant_id BIGINT, metric_code BINARY(96), instance_code BINARY(96), period BINARY(8))"),
++                "st_metric_value 按契约附录 B 逐字");
++    }
++
++    @Test
++    @DisplayName("建库 - 携带 taosAdapter Basic 认证头")
++    void testCreateDatabase_SendsBasicAuth() {
++        admin.createDatabase("acme");
++
++        String expected = "Basic " + Base64.getEncoder().encodeToString("root:taosdata".getBytes(StandardCharsets.UTF_8));
++        assertEquals(expected, lastAuth.get(), "REST 请求应携带配置的 Basic 认证");
++    }
++
++    @Test
++    @DisplayName("建库 - taosAdapter 返回非 0 code 映射业务异常（fail-soft）")
++    void testCreateDatabase_ErrorCodeMappedToBusinessException() {
++        responseBody.set("{\"code\":8026,\"desc\":\"database already exists\"}");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> admin.createDatabase("acme"));
++        assertTrue(e.getMessage().contains("8026"), "异常摘要应携带 taosAdapter 错误码供 WARN 日志记录");
++        assertTrue(e.getMessage().contains("iot_acme"), "异常摘要应包含派生库名");
++    }
++
++    @Test
++    @DisplayName("建库 - 连接不可达映射业务异常（不吞成静默成功）")
++    void testCreateDatabase_ConnectionFailureMapped() {
++        TdengineProperties props = new TdengineProperties();
++        props.setBaseUrl("http://127.0.0.1:9"); // discard 端口，本机必然拒绝
++        props.setConnectTimeoutMs(500);
++        props.setReadTimeoutMs(500);
++        HttpTdengineAdmin unreachable = new HttpTdengineAdmin(props);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> unreachable.createDatabase("acme"));
++        assertTrue(e.getMessage().contains("TDengine"), "业务异常应可读地指明 TDengine 通道失败");
++    }
++
++    @Test
++    @DisplayName("判存 - SHOW DATABASES 命中返回 true，未命中返回 false")
++    void testDatabaseExists() {
++        responseBody.set("{\"code\":0,\"data\":[[\"iot_acme\",\"other_db\"]],\"rows\":2,\"cols\":[\"name\"]}");
++
++        assertTrue(admin.databaseExists("acme"));
++        assertEquals("/rest/sql", paths.get(0), "判存走 SHOW DATABASES（无库上下文）");
++        assertEquals("SHOW DATABASES", bodies.get(0));
++
++        responseBody.set("{\"code\":0,\"data\":[[\"other_db\"]],\"rows\":1,\"cols\":[\"name\"]}");
++        paths.clear();
++        bodies.clear();
++        assertTrue(!admin.databaseExists("acme"), "列表不含 iot_acme 应判 false");
++    }
++
++    @Test
++    @DisplayName("存储用量 - ins_disk_usage 各占位列求和（KB）换算字节；无行/NULL 计 0")
++    void testStorageUsageBytes() {
++        responseBody.set("{\"code\":0,\"data\":[[128]],\"rows\":1,\"cols\":[\"total_kb\"]}");
++        long usage = admin.storageUsageBytes("acme");
++        assertEquals(131072L, usage, "128KB × 1024 = 131072 字节");
++        assertTrue(bodies.get(0).contains("information_schema.ins_disk_usage"), "用量统计应查询 ins_disk_usage");
++        assertTrue(bodies.get(0).contains("db_name = 'iot_acme'"), "用量统计必须限定派生库名");
++
++        // 空结果 / NULL：计 0（新租户尚无任何 vgroup 占用行）
++        responseBody.set("{\"code\":0,\"data\":[[null]],\"rows\":1,\"cols\":[\"total_kb\"]}");
++        assertEquals(0L, admin.storageUsageBytes("acme"));
++
++        responseBody.set("{\"code\":0,\"data\":[],\"rows\":0,\"cols\":[\"total_kb\"]}");
++        assertEquals(0L, admin.storageUsageBytes("acme"));
++    }
++
++    @Test
++    @DisplayName("存储用量 - taosAdapter 故障映射业务异常（统计任务按不可用跳轮）")
++    void testStorageUsageBytes_FailureMapped() {
++        responseBody.set("{\"code\":8000,\"desc\":\"invalid sql\"}");
++        BusinessException e = assertThrows(BusinessException.class, () -> admin.storageUsageBytes("acme"));
++        assertTrue(e.getMessage().contains("8000"));
++    }
++
++    @Test
++    @DisplayName("可达假地址（非 JSON 应答）映射业务异常而非误判成功")
++    void testNonJsonResponseMapped() {
++        responseBody.set("<html>not taosAdapter</html>");
++        assertThrows(BusinessException.class, () -> admin.databaseExists("acme"));
++    }
++
++    @Test
++    @DisplayName("HTTP 4xx/5xx 映射业务异常")
++    void testHttpErrorStatusMapped() {
++        responseStatus.set(500);
++        responseBody.set("{\"code\":500,\"desc\":\"boom\"}");
++        assertThrows(BusinessException.class, () -> admin.databaseExists("acme"));
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+index 2c9f81c..1803641 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+@@ -20,7 +20,11 @@ public enum ResultCode {
+ 
+     // 编码重复（详细设计 §3.4 错误码分段：4001-4099 参数与校验，4002=编码重复；
+     // 语义取「编码重复」不取「租户编码重复」，后续 iot_data_dict 等复用）
+-    DUPLICATE_CODE(4002, "编码重复");
++    DUPLICATE_CODE(4002, "编码重复"),
++
++    // 配额不足（TASK-0003 / ADR-0011 TD-0035：点位配额强控阻断新增；语义全局，
++    // 后续导出条数等配额类校验复用；message 为通用兜底文案，具体提示由抛出方携带）
++    QUOTA_EXCEEDED(4003, "配额不足");
+ 
+     private final Integer code;
+     private final String message;
+diff --git a/resources/sql/upgrade/20261121_tenant_db_task.sql b/resources/sql/upgrade/20261121_tenant_db_task.sql
+new file mode 100644
+index 0000000..41b9f6d
+--- /dev/null
++++ b/resources/sql/upgrade/20261121_tenant_db_task.sql
+@@ -0,0 +1,55 @@
++-- ============================================================
++-- 存量库升级脚本：租户建库触发与配额统计任务（TASK-0003 / FEAT-0001 / REQ-0001）
++--
++-- 用途：
++--   1) sys_tenant 加列 db_created tinyint NOT NULL DEFAULT 0——租户开通后置待建标志，
++--      定时扫描任务（sys_job）扫 status=1 且 db_created=0 的租户调 TDengine 建库
++--      （iot_<tenant_code>，KEEP 1825d 等，见 resources/contract/tdengine-super-tables.md 附录 B），
++--      成功置 1；失败 WARN 留待下轮（建库异步化+重试，TASK-0003 brief 配套裁决）；
++--   2) 默认租户 default 置 db_created=1——私有化约定初始库由部署脚本创建（REQ-0001 §0.3），
++--      扫描任务不再对其建库；
++--   3) sys_job 播种两条定时任务（框架动态调度，SysJobServiceImpl 启动注册 status=0 行）：
++--      a) 租户库建库扫描（建议 60s 间隔，cron 0 * * * * ?）；
++--      b) 租户配额存储统计（建议 5min 间隔，cron 0 0/5 * * * ?）——逐启用租户查存储用量，
++--         超阈值 WARN 告警（ADR-0011 TD-0035/TD-0041 定版：软限只告警不停写）。
++--
++-- 适用环境：
++--   已执行 20261121_sys_tenant.sql（sys_tenant 在位）与 01_base.sql（sys_job 在位）的存量库
++--   及全新库均可直接执行。
++--
++-- 幂等口径：
++--   加列以 information_schema 判存（MySQL 8.0 无 ADD COLUMN IF NOT EXISTS，条件化存储过程，
++--   与 20261121_tenant_id_columns.sql 同款）；UPDATE 幂等（重复执行不改变结果）；
++--   sys_job 行以 invoke_target 判存（sys_job 无唯一键，用 INSERT ... SELECT ... WHERE NOT EXISTS）。
++--   可安全重复执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   存储过程体压缩为单行（执行器按行尾分号切块）；语句前可挂 -- 注释行（执行器逐行剥除），
++--   但为稳妥起见语句间只以空行分隔，说明集中在本头部与文件尾。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++DROP PROCEDURE IF EXISTS ot_tdb_addcol;
++CREATE PROCEDURE ot_tdb_addcol(IN tn VARCHAR(64), IN cn VARCHAR(64), IN ddl VARCHAR(1000)) BEGIN DECLARE n INT DEFAULT 0; SELECT COUNT(*) INTO n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = tn AND COLUMN_NAME = cn; IF n = 0 THEN SET @s = ddl; PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st; END IF; END;
++CALL ot_tdb_addcol('sys_tenant', 'db_created', 'ALTER TABLE `sys_tenant` ADD COLUMN `db_created` tinyint NOT NULL DEFAULT 0 COMMENT ''TDengine 建库标志 0 待建 1 已建（定时扫描任务维护，TASK-0003）''');
++DROP PROCEDURE IF EXISTS ot_tdb_addcol;
++
++UPDATE `sys_tenant` SET `db_created` = 1 WHERE `tenant_code` = 'default' AND `deleted` = 0;
++
++INSERT INTO `sys_job` (`job_name`, `invoke_target`, `cron_expression`, `status`, `remark`)
++SELECT '租户库建库扫描', 'tenantDbProvisionServiceImpl.scanPendingDatabases', '0 * * * * ?', 0, '扫 status=1 且 db_created=0 的租户调 TDengine 建库 iot_<tenant_code>（KEEP 1825d，附录 B 参数）；失败 WARN 留待下轮重试，不阻断开通主流程（TASK-0003）'
++WHERE NOT EXISTS (SELECT 1 FROM `sys_job` WHERE `invoke_target` = 'tenantDbProvisionServiceImpl.scanPendingDatabases' AND `deleted` = 0);
++
++INSERT INTO `sys_job` (`job_name`, `invoke_target`, `cron_expression`, `status`, `remark`)
++SELECT '租户配额存储统计', 'iotQuotaStatsServiceImpl.collectAndWarn', '0 0/5 * * * ?', 0, '逐启用租户查 TDengine 存储用量，超 ot.quota.storage-warn-ratio 阈值 WARN（[QUOTA-WARN] 格式可 grep）；软限只告警不停写（ADR-0011 TD-0035/TD-0041，TASK-0003）'
++WHERE NOT EXISTS (SELECT 1 FROM `sys_job` WHERE `invoke_target` = 'iotQuotaStatsServiceImpl.collectAndWarn' AND `deleted` = 0);
++
++-- ============================================================
++-- 执行后核对（验收 2）：
++--   SHOW CREATE TABLE sys_tenant   （db_created tinyint NOT NULL DEFAULT 0 在位）
++--   SELECT id, tenant_code, db_created FROM sys_tenant   （default 应为 1，其余存量租户 0 待扫描）
++--   SELECT job_name, invoke_target, cron_expression, status FROM sys_job WHERE invoke_target IN
++--     ('tenantDbProvisionServiceImpl.scanPendingDatabases', 'iotQuotaStatsServiceImpl.collectAndWarn')
++--   （应 2 行，status=0 正常状态，重复执行不增行）
++-- ============================================================

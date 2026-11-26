@@ -1,0 +1,1463 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryService.java
+new file mode 100644
+index 00000000..c63f47a5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryService.java
+@@ -0,0 +1,22 @@
++package net.otlab.admin.module.iot.statusread;
++
++/**
++ * 工厂子树设备状态数聚合读口服务（TASK-0058 批次二，D1）。
++ *
++ * <p>从数据权限裁剪后的实例树取 factoryInstanceId 子树下 nodeType=4 设备，对每个设备复用
++ * 0050 状态读口的 statusCode（会话租户 + 同租户口径），按编码分类计数；单设备失败按
++ * unknown，整厂异常 fail-soft 全 0 + 接入中。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface FactoryStatusSummaryService {
++
++    /**
++     * 工厂（含子树）设备状态数分类聚合。
++     *
++     * @param factoryInstanceId 工厂实例 id（nodeType=1）；不在可见集/无租户上下文 → 403
++     * @return 分类计数载荷；available=false 表示整厂 fail-soft（全 0 + 接入中，不伪造）
++     */
++    FactoryStatusSummaryVO summary(Long factoryInstanceId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryVO.java
+new file mode 100644
+index 00000000..7c0bc794
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/FactoryStatusSummaryVO.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.statusread;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 工厂子树设备状态数聚合载荷（TASK-0058 批次二，GET /api/v1/iot/status/factory-summary）。
++ *
++ * <p>分类口径与 0050 状态读口 statusCode 判定同源（REQ-0029 验收 2）：RUNNING→running、
++ * FAULT→fault、OFFLINE→offline、其余（含 UNKNOWN/停机/未知自定义态）→unknown；
++ * total = 子树 nodeType=4 设备数 = 四类之和。
++ *
++ * <p><b>不造假纪律</b>：{@code available=false} 表示整厂聚合异常（fail-soft）——此时四类与
++ * total 恒 0 且 message 明确「状态数据接入中」，前端据此渲染空态，不把 0 冒充真 0；
++ * {@code available=true} 时 0 是真 0（新厂/该类无设备），前端显示「0」。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++@NoArgsConstructor
++@Schema(description = "工厂设备状态数聚合（子树分类计数；与状态判定同源）")
++public class FactoryStatusSummaryVO {
++
++    @Schema(description = "运行设备数（RUNNING）")
++    private int running;
++
++    @Schema(description = "异常设备数（FAULT/故障类）")
++    private int fault;
++
++    @Schema(description = "离线设备数（OFFLINE/离线类）")
++    private int offline;
++
++    @Schema(description = "未知设备数（UNKNOWN/停机/其余，不冒充正常）")
++    private int unknown;
++
++    @Schema(description = "子树设备总数（nodeType=4）")
++    private int total;
++
++    @Schema(description = "数据可用性：false=整厂 fail-soft（全 0 + 接入中），前端不得把 0 当真 0")
++    private boolean available;
++
++    @Schema(description = "fail-soft 说明（available=false 时为「状态数据接入中」）")
++    private String message;
++
++    public FactoryStatusSummaryVO(int running, int fault, int offline, int unknown, int total) {
++        this.running = running;
++        this.fault = fault;
++        this.offline = offline;
++        this.unknown = unknown;
++        this.total = total;
++        this.available = true;
++    }
++
++    /** 整厂 fail-soft：全 0 + 明确接入中，不伪造状态数 */
++    public static FactoryStatusSummaryVO unavailable() {
++        FactoryStatusSummaryVO vo = new FactoryStatusSummaryVO(0, 0, 0, 0, 0);
++        vo.setAvailable(false);
++        vo.setMessage("状态数据接入中");
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryController.java
+new file mode 100644
+index 00000000..62137cf3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryController.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.statusread.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryService;
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 工厂状态数聚合读口（TASK-0058 批次二，D1 硬验收 2）：GET /api/v1/iot/status/factory-summary。
++ *
++ * <p>登录态 + {@code @SaCheckPermission("iot:instance:query")}（与 0087 展示读口/实例详情
++ * 同权限码）；读不审（0079 范式，不挂 @OperateLog）。租户/数据权限/分类计数全在 service 层
++ * （{@link FactoryStatusSummaryService#summary(Long)}），控制器只做参数校验与载荷装配。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "设备状态展示读口")
++@RestController
++@RequestMapping("/api/v1/iot/status")
++public class FactoryStatusSummaryController {
++
++    private final FactoryStatusSummaryService summaryService;
++
++    public FactoryStatusSummaryController(FactoryStatusSummaryService summaryService) {
++        this.summaryService = summaryService;
++    }
++
++    @Operation(summary = "工厂子树设备状态数分类聚合（与状态判定同源；无权 403；整厂 fail-soft 全 0+接入中）")
++    @GetMapping("/factory-summary")
++    @SaCheckPermission("iot:instance:query")
++    public Result<FactoryStatusSummaryVO> factorySummary(
++            @RequestParam("factoryInstanceId") Long factoryInstanceId) {
++        if (factoryInstanceId == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "factoryInstanceId 不能为空");
++        }
++        return Result.success(summaryService.summary(factoryInstanceId));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImpl.java
+new file mode 100644
+index 00000000..61b18d94
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImpl.java
+@@ -0,0 +1,177 @@
++package net.otlab.admin.module.iot.statusread.impl;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryService;
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryVO;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.List;
++
++/**
++ * 工厂子树设备状态数聚合实现（TASK-0058 批次二，D1 硬验收 2）。
++ *
++ * <p><b>与状态判定同源（REQ-0029 验收 2）</b>：每个设备的 statusCode 一律经
++ * {@link StatusReadService#currentForClient(Long, Long)}（0050 同一读口、显式会话租户，
++ * 数据服务层不重复裁剪）——分类只对读口返回的 statusCode 做归类，绝不复制状态判定逻辑、
++ * 不读 Redis 原值、不硬编码状态名/色。
++ *
++ * <p><b>数据权限</b>：先会话租户守卫（无上下文 403），再 resolve(userId) 数据权限——
++ * factoryInstanceId 不在可见集即 403（通用文案不回显工厂标识）；实例树本身由
++ * {@link IotModelInstanceService#selectInstanceTree()} 按数据权限裁剪（无权节点/兄弟厂不返回），
++ * 本服务只在该树内做子树遍历，不二次补节点。读不审（0079 范式，与 status current 一致）。
++ *
++ * <p><b>fail-soft 三层</b>：单设备状态读失败 → unknown（不炸全厂）；空子树 → 全 0 真 0
++ * （available=true，新厂空态）；整厂聚合异常（树查询/外层遍历失败）→ 全 0 + available=false
++ * + 「状态数据接入中」（不把 0 冒充真 0）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class FactoryStatusSummaryServiceImpl implements FactoryStatusSummaryService {
++
++    private static final Logger log = LoggerFactory.getLogger(FactoryStatusSummaryServiceImpl.class);
++
++    /** 节点类型（与 IotInstanceTreeVO / DISPLAY_NODE_TYPE 对齐） */
++    private static final int NODE_TYPE_FACTORY = 1;
++    private static final int NODE_TYPE_DEVICE = 4;
++
++    private final IotModelInstanceService instanceService;
++    private final StatusReadService statusReadService;
++    private final DataPermService dataPermService;
++
++    public FactoryStatusSummaryServiceImpl(IotModelInstanceService instanceService,
++                                           StatusReadService statusReadService,
++                                           DataPermService dataPermService) {
++        this.instanceService = instanceService;
++        this.statusReadService = statusReadService;
++        this.dataPermService = dataPermService;
++    }
++
++    @Override
++    public FactoryStatusSummaryVO summary(Long factoryInstanceId) {
++        Long tenantId = requireTenant();
++        requireDataPerm(factoryInstanceId);
++        try {
++            List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++            IotInstanceTreeVO factory = findNode(tree, factoryInstanceId);
++            if (factory == null || !isFactory(factory)) {
++                throw forbidden();
++            }
++            // 子树内只取设备（nodeType=4）；组件（5）不单独计入
++            List<Long> deviceIds = collectDeviceIds(factory);
++            int running = 0;
++            int fault = 0;
++            int offline = 0;
++            int unknown = 0;
++            for (Long deviceId : deviceIds) {
++                String code = readStatusCode(tenantId, deviceId);
++                switch (code) {
++                    case "RUNNING" -> running++;
++                    case "FAULT" -> fault++;
++                    case "OFFLINE" -> offline++;
++                    default -> unknown++; // UNKNOWN/停机/未知自定义态一律 unknown
++                }
++            }
++            return new FactoryStatusSummaryVO(running, fault, offline, unknown, deviceIds.size());
++        } catch (BusinessException e) {
++            throw e; // 权限 403 不吞成 fail-soft
++        } catch (Exception e) {
++            log.warn("[FACTORY-SUMMARY] 整厂聚合异常 fail-soft：factory={}, err={}", factoryInstanceId, e.getMessage());
++            return FactoryStatusSummaryVO.unavailable();
++        }
++    }
++
++    /** 单设备状态读：复用 status current 取 statusCode；失败按 UNKNOWN 计（不炸全厂） */
++    private String readStatusCode(Long tenantId, Long deviceId) {
++        try {
++            StatusCurrentVO current = statusReadService.currentForClient(tenantId, deviceId);
++            return current == null || current.getStatusCode() == null || current.getStatusCode().isBlank()
++                    ? "UNKNOWN" : current.getStatusCode();
++        } catch (Exception e) {
++            log.debug("[FACTORY-SUMMARY] 单设备状态读失败按 unknown：device={}, err={}", deviceId, e.getMessage());
++            return "UNKNOWN";
++        }
++    }
++
++    /** 迭代式子树遍历（防深树栈溢出）：含根节点自身（工厂非设备，自然跳过）与全部后代设备 */
++    private List<Long> collectDeviceIds(IotInstanceTreeVO root) {
++        java.util.List<Long> out = new java.util.ArrayList<>();
++        Deque<IotInstanceTreeVO> stack = new ArrayDeque<>();
++        stack.push(root);
++        while (!stack.isEmpty()) {
++            IotInstanceTreeVO node = stack.pop();
++            if (node == null) {
++                continue;
++            }
++            if (node.getNodeType() != null && node.getNodeType() == NODE_TYPE_DEVICE && node.getId() != null) {
++                out.add(node.getId());
++            }
++            List<IotInstanceTreeVO> children = node.getChildren();
++            if (children != null) {
++                for (IotInstanceTreeVO child : children) {
++                    stack.push(child);
++                }
++            }
++        }
++        return out;
++    }
++
++    private IotInstanceTreeVO findNode(List<IotInstanceTreeVO> tree, Long id) {
++        if (tree == null || id == null) {
++            return null;
++        }
++        Deque<IotInstanceTreeVO> stack = new ArrayDeque<>(tree);
++        while (!stack.isEmpty()) {
++            IotInstanceTreeVO node = stack.pop();
++            if (node == null) {
++                continue;
++            }
++            if (id.equals(node.getId())) {
++                return node;
++            }
++            if (node.getChildren() != null) {
++                stack.addAll(node.getChildren());
++            }
++        }
++        return null;
++    }
++
++    private boolean isFactory(IotInstanceTreeVO node) {
++        return node.getNodeType() != null && node.getNodeType() == NODE_TYPE_FACTORY;
++    }
++
++    /** 会话租户：无租户上下文即 403 fail-closed（不猜默认租户、不跨租户读状态） */
++    private Long requireTenant() {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw forbidden();
++        }
++        return tenantId;
++    }
++
++    /** 数据权限：factoryInstanceId ∈ 可见集（allTenant 直过），否则 403 通用文案不回显标识 */
++    private void requireDataPerm(Long factoryInstanceId) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (scope == null || (!scope.allTenant() && !scope.instanceIds().contains(factoryInstanceId))) {
++            throw forbidden();
++        }
++    }
++
++    private BusinessException forbidden() {
++        return new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该资源");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryControllerTest.java
+new file mode 100644
+index 00000000..677f9fab
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/FactoryStatusSummaryControllerTest.java
+@@ -0,0 +1,96 @@
++package net.otlab.admin.module.iot.statusread.controller;
++
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryVO;
++import net.otlab.admin.module.iot.statusread.FactoryStatusSummaryService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 工厂状态数聚合读口控制器单测（TASK-0058 批次二，D1）。
++ *
++ * <p>控制器只做参数透传与载荷装配；租户/数据权限/聚合在服务层（service.summary）——本测锁定
++ * 该边界，并断言越权 403 由控制器不吞直达。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class FactoryStatusSummaryControllerTest {
++
++    @Mock
++    private FactoryStatusSummaryService summaryService;
++
++    private AutoCloseable mocks;
++    private FactoryStatusSummaryController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new FactoryStatusSummaryController(summaryService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("factory-summary：参数透传，200 载荷含 running/fault/offline/unknown/total")
++    void summaryPassthrough() {
++        FactoryStatusSummaryVO vo = new FactoryStatusSummaryVO(3, 2, 1, 4, 10);
++        vo.setAvailable(true);
++        when(summaryService.summary(1L)).thenReturn(vo);
++
++        Result<FactoryStatusSummaryVO> result = controller.factorySummary(1L);
++
++        assertEquals(200, result.getCode());
++        assertNotNull(result.getData());
++        assertEquals(3, result.getData().getRunning());
++        assertEquals(2, result.getData().getFault());
++        assertEquals(1, result.getData().getOffline());
++        assertEquals(4, result.getData().getUnknown());
++        assertEquals(10, result.getData().getTotal());
++        verify(summaryService).summary(1L);
++    }
++
++    @Test
++    @DisplayName("fail-soft 载荷原样透传：available=false + 接入中，不伪造状态数")
++    void failSoftPassthrough() {
++        FactoryStatusSummaryVO vo = FactoryStatusSummaryVO.unavailable();
++        when(summaryService.summary(1L)).thenReturn(vo);
++
++        Result<FactoryStatusSummaryVO> result = controller.factorySummary(1L);
++
++        assertEquals(200, result.getCode(), "整厂 fail-soft 是 200 + available=false，不是 HTTP 错误");
++        assertEquals(false, result.getData().isAvailable());
++        assertEquals(0, result.getData().getTotal());
++        assertNotNull(result.getData().getMessage());
++    }
++
++    @Test
++    @DisplayName("越权工厂：service 抛 403，控制器不吞（数据权限拦截直达）")
++    void forbiddenPropagates() {
++        when(summaryService.summary(1L)).thenThrow(new BusinessException(403, "无权访问该资源"));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> controller.factorySummary(1L));
++
++        assertEquals(403, ex.getCode());
++    }
++
++    @Test
++    @DisplayName("缺参：factoryInstanceId 为空 → 400")
++    void missingParam() {
++        assertThrows(BusinessException.class, () -> controller.factorySummary(null));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImplTest.java
+new file mode 100644
+index 00000000..8781bc84
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/FactoryStatusSummaryServiceImplTest.java
+@@ -0,0 +1,262 @@
++package net.otlab.admin.module.iot.statusread.impl;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.mockito.MockedStatic;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 工厂状态数聚合服务单测（TASK-0058 批次二，D1 硬验收 2）。
++ *
++ * <p>口径锚定（REQ-0029 验收 2）：分类数必须与 0050 状态读口的 statusCode 判定同源——
++ * 本测 mock {@link StatusReadService#currentForClient(Long, Long)} 返回各设备的 statusCode，
++ * 断言 RUNNING/FAULT/OFFLINE/其余 的分类计数精确；UNKNOWN/停机等一律进 unknown，不冒充正常。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class FactoryStatusSummaryServiceImplTest {
++
++    private static final Long TENANT_ID = 7L;
++    private static final Long USER_ID = 88L;
++    private static final Long FACTORY_ID = 1L;
++
++    @Mock
++    private IotModelInstanceService instanceService;
++    @Mock
++    private StatusReadService statusReadService;
++    @Mock
++    private DataPermService dataPermService;
++
++    private AutoCloseable mocks;
++    private MockedStatic<TenantContext> tenantContext;
++    private MockedStatic<SecurityUtils> securityUtils;
++    private FactoryStatusSummaryServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT_ID);
++        securityUtils = mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(USER_ID);
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        service = new FactoryStatusSummaryServiceImpl(instanceService, statusReadService, dataPermService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private static IotInstanceTreeVO node(long id, int nodeType, IotInstanceTreeVO... children) {
++        IotInstanceTreeVO vo = new IotInstanceTreeVO();
++        vo.setId(id);
++        vo.setNodeType(nodeType);
++        vo.setInstanceCode("N" + id);
++        vo.setInstanceName("节点" + id);
++        vo.setStatus(1);
++        List<IotInstanceTreeVO> list = new ArrayList<>(List.of(children));
++        vo.setChildren(list);
++        return vo;
++    }
++
++    /** 工厂 F01 → 车间 WS01 → 产线 L01 → 设备 EQ01..，另有组件与另一工厂节点 */
++    private static List<IotInstanceTreeVO> treeWithDevices(long... deviceIds) {
++        List<IotInstanceTreeVO> devices = new ArrayList<>();
++        for (long id : deviceIds) {
++            devices.add(node(id, 4, node(id + 1000, 5))); // 设备下挂组件，组件不得计入
++        }
++        IotInstanceTreeVO line = node(30, 3, devices.toArray(new IotInstanceTreeVO[0]));
++        IotInstanceTreeVO workshop = node(20, 2, line);
++        IotInstanceTreeVO factory = node(FACTORY_ID, 1, workshop);
++        return List.of(factory, node(999, 1, node(998, 4))); // 另一工厂设备不得混入
++    }
++
++    private static StatusCurrentVO status(long deviceId, String code) {
++        StatusCurrentVO vo = new StatusCurrentVO();
++        vo.setInstanceId(deviceId);
++        vo.setStatusName(code);
++        vo.setStatusCode(code);
++        return vo;
++    }
++
++    private void stubStatuses(String... codes) {
++        for (int i = 0; i < codes.length; i++) {
++            long deviceId = 100L + i;
++            when(statusReadService.currentForClient(TENANT_ID, deviceId)).thenReturn(status(deviceId, codes[i]));
++        }
++    }
++
++    // ---------- D1 硬验收：分类计数精确 ----------
++
++    @Test
++    @DisplayName("分类计数精确：RUNNING/FAULT/OFFLINE/UNKNOWN/停机/自定义各归其槽，UNKNOWN 不冒充正常")
++    void classifiesStatusCodesExactly() {
++        when(instanceService.selectInstanceTree()).thenReturn(treeWithDevices(100L, 101L, 102L, 103L, 104L, 105L, 106L));
++        stubStatuses("RUNNING", "RUNNING", "FAULT", "OFFLINE", "UNKNOWN", "STOPPED", "CUSTOM_STATE");
++
++        var out = service.summary(FACTORY_ID);
++
++        assertTrue(out.isAvailable());
++        assertEquals(2, out.getRunning());
++        assertEquals(1, out.getFault());
++        assertEquals(1, out.getOffline());
++        assertEquals(3, out.getUnknown(), "UNKNOWN/停机/自定义态一律 unknown，不并入任何正常类");
++        assertEquals(7, out.getTotal());
++    }
++
++    @Test
++    @DisplayName("真 0 是 0：工厂有设备但某类为 0 时计数 0 且 available=true（不是空态）")
++    void realZeroIsZero() {
++        when(instanceService.selectInstanceTree()).thenReturn(treeWithDevices(100L));
++        stubStatuses("RUNNING");
++
++        var out = service.summary(FACTORY_ID);
++
++        assertTrue(out.isAvailable());
++        assertEquals(1, out.getRunning());
++        assertEquals(0, out.getFault());
++        assertEquals(0, out.getOffline());
++        assertEquals(0, out.getUnknown());
++        assertEquals(1, out.getTotal());
++    }
++
++    @Test
++    @DisplayName("空厂：子树无设备时全 0 但 available=true（新厂真 0，非 fail-soft）")
++    void emptyFactoryIsRealZero() {
++        when(instanceService.selectInstanceTree()).thenReturn(List.of(node(FACTORY_ID, 1)));
++
++        var out = service.summary(FACTORY_ID);
++
++        assertTrue(out.isAvailable());
++        assertEquals(0, out.getTotal());
++    }
++
++    // ---------- 子树遍历 / 单设备失败 / 整厂 fail-soft ----------
++
++    @Test
++    @DisplayName("子树遍历：跨车间/产线多层取 nodeType=4 设备，排除组件与其它工厂")
++    void traversesSubtreeOnly() {
++        when(instanceService.selectInstanceTree()).thenReturn(treeWithDevices(100L, 101L));
++        stubStatuses("RUNNING", "FAULT");
++
++        var out = service.summary(FACTORY_ID);
++
++        assertEquals(2, out.getTotal());
++        assertEquals(1, out.getRunning());
++        assertEquals(1, out.getFault());
++        verify(statusReadService, never()).currentForClient(TENANT_ID, 998L); // 另一工厂设备不在本子树
++        verify(statusReadService, never()).currentForClient(TENANT_ID, 1100L); // 组件不是设备
++    }
++
++    @Test
++    @DisplayName("单设备状态读失败：按 unknown 计，不炸全厂（其余设备仍精确计数）")
++    void singleDeviceFailureCountsAsUnknown() {
++        when(instanceService.selectInstanceTree()).thenReturn(treeWithDevices(100L, 101L));
++        stubStatuses("RUNNING");
++        when(statusReadService.currentForClient(TENANT_ID, 101L)).thenThrow(new RuntimeException("redis down"));
++
++        var out = service.summary(FACTORY_ID);
++
++        assertTrue(out.isAvailable());
++        assertEquals(1, out.getRunning());
++        assertEquals(1, out.getUnknown());
++        assertEquals(2, out.getTotal());
++    }
++
++    @Test
++    @DisplayName("整厂聚合异常：全 0 + available=false + 状态数据接入中，绝不伪造状态数")
++    void wholeFactoryFailureIsFailSoft() {
++        when(instanceService.selectInstanceTree()).thenThrow(new RuntimeException("db down"));
++
++        var out = service.summary(FACTORY_ID);
++
++        assertFalse(out.isAvailable());
++        assertEquals(0, out.getRunning());
++        assertEquals(0, out.getFault());
++        assertEquals(0, out.getOffline());
++        assertEquals(0, out.getUnknown());
++        assertEquals(0, out.getTotal());
++        assertTrue(out.getMessage().contains("状态数据接入中"));
++    }
++
++    // ---------- 数据权限 / 租户会话 ----------
++
++    @Test
++    @DisplayName("数据权限：工厂不在可见集 → 403 且不回显工厂标识、不读状态、不查树")
++    void forbiddenWhenFactoryNotVisible() {
++        when(dataPermService.resolve(USER_ID)).thenReturn(new VisibleScope(false, Set.of(), Set.of(2L, 3L), false));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.summary(FACTORY_ID));
++
++        assertEquals(403, ex.getCode());
++        assertFalse(ex.getMessage().contains(String.valueOf(FACTORY_ID)), "403 文案不得回显工厂标识");
++        verify(instanceService, never()).selectInstanceTree();
++        verify(statusReadService, never()).currentForClient(any(), any());
++    }
++
++    @Test
++    @DisplayName("无租户上下文：403 fail-closed，不查树不读状态")
++    void forbiddenWhenNoTenantContext() {
++        tenantContext.when(TenantContext::getTenantId).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.summary(FACTORY_ID));
++
++        assertEquals(403, ex.getCode());
++        verify(instanceService, never()).selectInstanceTree();
++    }
++
++    @Test
++    @DisplayName("tenant 会话注入：每个设备状态读都带会话 tenant，跨租户不串")
++    void usesSessionTenantForEveryDevice() {
++        when(instanceService.selectInstanceTree()).thenReturn(treeWithDevices(100L, 101L));
++        stubStatuses("RUNNING", "OFFLINE");
++
++        service.summary(FACTORY_ID);
++
++        verify(statusReadService).currentForClient(TENANT_ID, 100L);
++        verify(statusReadService).currentForClient(TENANT_ID, 101L);
++    }
++
++    @Test
++    @DisplayName("工厂不存在于可见树：403 fail-closed（不回显标识、不读状态）")
++    void forbiddenWhenFactoryMissing() {
++        when(instanceService.selectInstanceTree()).thenReturn(List.of(node(2L, 1, node(998L, 4))));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.summary(FACTORY_ID));
++
++        assertEquals(403, ex.getCode());
++        verify(statusReadService, never()).currentForClient(any(), any());
++    }
++}
+diff --git a/frontend/src/api/display/display-api.ts b/frontend/src/api/display/display-api.ts
+index a28d9c2e..35573f22 100644
+--- a/frontend/src/api/display/display-api.ts
++++ b/frontend/src/api/display/display-api.ts
+@@ -291,6 +291,26 @@ export interface MetricCompletenessVO {
+   rows: MetricCompletenessRow[];
+ }
+ 
++// ---------------- TASK-0058 批次二：工厂状态数聚合读口（0050 同源分类计数） ----------------
++
++/** 工厂子树设备状态数聚合（D1 GET /api/v1/iot/status/factory-summary 载荷） */
++export interface FactoryStatusSummaryVO {
++  running: number;
++  fault: number;
++  offline: number;
++  unknown: number;
++  total: number;
++  /** false=整厂 fail-soft（全 0 + 接入中），前端必须保持空态，不把 0 当真 0 */
++  available: boolean;
++  /** fail-soft 说明（available=false 时为「状态数据接入中」） */
++  message?: string;
++}
++
++/** 工厂子树设备状态数聚合读口失败兜底：全 0 + available=false + 接入中（不伪造真 0） */
++function unavailableSummary(): FactoryStatusSummaryVO {
++  return { running: 0, fault: 0, offline: 0, unknown: 0, total: 0, available: false };
++}
++
+ /** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
+ interface ResultEnvelope<T> {
+   code: number;
+@@ -332,6 +352,28 @@ export const displayApi = {
+     return asArray(res?.data);
+   },
+ 
++  /**
++   * 工厂（含子树）设备状态数聚合（TASK-0058 批次二，D1 端点；与状态判定同源）。
++   * data 缺失/非对象 → fail-soft 全 0 + available=false（不静默当真 0）；
++   * data.available=true 时 0 是真 0，原样保留交给视图渲染「0」。
++   */
++  async factoryStatusSummary(factoryInstanceId: number): Promise<FactoryStatusSummaryVO> {
++    const res: ResultEnvelope<FactoryStatusSummaryVO> = await getRequest('/api/v1/iot/status/factory-summary', {
++      factoryInstanceId,
++    });
++    const data = res?.data;
++    if (data == null || typeof data !== 'object') return unavailableSummary();
++    return {
++      running: data.running ?? 0,
++      fault: data.fault ?? 0,
++      offline: data.offline ?? 0,
++      unknown: data.unknown ?? 0,
++      total: data.total ?? 0,
++      available: data.available === true,
++      ...(data.message != null ? { message: data.message } : {}),
++    };
++  },
++
+   // -------- 组件清单 / 实时 / 曲线 / 追溯（管理面登录态端点，不触 HMAC openapi/v1） --------
+ 
+   /** 设备下数据项清单（数据权限裁剪，不可见实例返回空清单） */
+diff --git a/frontend/src/views/display/components/display-factory-card.vue b/frontend/src/views/display/components/display-factory-card.vue
+index 9c8cd506..2e237698 100644
+--- a/frontend/src/views/display/components/display-factory-card.vue
++++ b/frontend/src/views/display/components/display-factory-card.vue
+@@ -1,10 +1,12 @@
+ <!--
+-  * 展示端工厂卡片（总览页，TASK-0058 批次一）
++  * 展示端工厂卡片（总览页，TASK-0058 批次一骨架 / 批次二接真值）
+   *
+   * 工厂名/下钻取实例树根级真数据（按数据权限裁剪，无权厂不出现）；
+-  * 运行/异常/离线数与关键数据项均未交付（0050/0045）——只渲染空态槽位，不造假数字。
++  * 运行/异常/离线三槽位取 GET /api/v1/iot/status/factory-summary（批次二，与 0050 状态判定同源）：
++  * available=true 时 0 是真 0 显示「0」；available=false / 读口失败时空态「实时数据接入中」，不造假。
++  * 关键数据项/核心指标仍无数据源（mark 占位未落列 / 无能耗端点，非硬验收）——保持诚实空态。
+   * 上看板标记（ADR-0011）由 mark 字段驱动放大/置顶，接口未交付前恒缺省=普通卡片。
+-  * 点击卡片下钻到工厂页（第 1 次点击）；设备详情入口本批不写死链（批次二 0059 承接）。
++  * 点击卡片下钻到工厂页（第 1 次点击）；设备详情入口本批不写死链（0059 承接）。
+ -->
+ <template>
+   <a-card
+@@ -28,21 +30,53 @@
+     <div class="display-factory-card__meta">{{ node.instanceCode }}</div>
+ 
+     <a-row :gutter="8" class="display-factory-card__slots">
+-      <a-col :span="8"><display-slot-card title="运行" /></a-col>
+-      <a-col :span="8"><display-slot-card title="异常" /></a-col>
+-      <a-col :span="8"><display-slot-card title="离线" /></a-col>
++      <a-col :span="8"><display-slot-card title="运行" :value="running" /></a-col>
++      <a-col :span="8"><display-slot-card title="异常" :value="fault" /></a-col>
++      <a-col :span="8"><display-slot-card title="离线" :value="offline" /></a-col>
+     </a-row>
+     <display-slot-card class="display-factory-card__key" title="关键数据项" />
+     <display-slot-card class="display-factory-card__key" title="核心指标（同比/环比）" />
+   </a-card>
+ </template>
+ <script setup lang="ts">
++  import { computed, ref, watch } from 'vue';
+   import RightOutlined from '@ant-design/icons-vue/RightOutlined';
+-  import type { DisplayTreeNode } from '/@/api/display/display-api';
++  import { displayApi, type DisplayTreeNode } from '/@/api/display/display-api';
+   import DisplaySlotCard from './display-slot-card.vue';
+ 
+-  defineProps<{ node: DisplayTreeNode }>();
++  const props = defineProps<{ node: DisplayTreeNode }>();
+   const emit = defineEmits<{ (e: 'drill', node: DisplayTreeNode): void }>();
++
++  /** 三槽位真值：null=无源/fail-soft（走空态），number（含 0）=真值（显示「0」） */
++  const running = ref<number | null>(null);
++  const fault = ref<number | null>(null);
++  const offline = ref<number | null>(null);
++
++  async function loadSummary() {
++    // 每张卡片按工厂 id 取该工厂（含子树）状态数聚合；加载期间保持空态，不造假数字。
++    running.value = null;
++    fault.value = null;
++    offline.value = null;
++    try {
++      const out = await displayApi.factoryStatusSummary(props.node.id);
++      // available=false（整厂 fail-soft）时保持空态，绝不把全 0 当真 0；true 时 0 是真 0 填进去。
++      if (out.available !== true) return;
++      running.value = out.running;
++      fault.value = out.fault;
++      offline.value = out.offline;
++    } catch (e) {
++      console.error('[display] factory summary load failed:', e);
++    }
++  }
++
++  // 卡片挂载即加载；node.id 变化（列表刷新/复用）时重取。
++  void loadSummary();
++  watch(
++    () => props.node.id,
++    () => void loadSummary()
++  );
++
++  defineExpose({ loadSummary });
+ </script>
+ <style scoped lang="less">
+   .display-factory-card {
+diff --git a/frontend/src/views/display/components/display-slot-card.vue b/frontend/src/views/display/components/display-slot-card.vue
+index 345c0031..59db6b82 100644
+--- a/frontend/src/views/display/components/display-slot-card.vue
++++ b/frontend/src/views/display/components/display-slot-card.vue
+@@ -20,20 +20,34 @@
+       </span>
+     </template>
+     <div class="display-slot-card__body">
+-      <a-skeleton :loading="true" :paragraph="{ rows: 2 }" active />
+-      <div class="display-slot-card__empty">实时数据接入中</div>
++      <!-- 真值模式：value 为 number（含 0）时显示数值；0 是真 0，不是空态 -->
++      <div v-if="isValue" class="display-slot-card__value">{{ value }}</div>
++      <template v-else>
++        <a-skeleton :loading="true" :paragraph="{ rows: 2 }" active />
++        <div class="display-slot-card__empty">实时数据接入中</div>
++      </template>
+     </div>
+   </a-card>
+ </template>
+ <script setup lang="ts">
+-  defineProps<{
++  import { computed } from 'vue';
++
++  const props = defineProps<{
+     /** 槽位标题（如「运行状态」「核心指标」「能耗构成」「实时值」） */
+     title: string;
++    /**
++     * 真值（TASK-0058 批次二）：number 时渲染数值（0 是真 0 显示「0」）；
++     * undefined/null（无数据源/fail-soft）保持空态，绝不把 0 冒充真 0。
++     */
++    value?: number | null;
+     /** ADR-0011 上看板标记：接口未交付，预留可选字段；有标记放大显示 */
+     mark?: boolean;
+     /** 上看板标记卡片置顶（由父级按 mark 排序后传入，或直接用 CSS order） */
+     pinned?: boolean;
+   }>();
++
++  /** 只有 typeof number 才进真值模式；null/undefined/NaN 走空态（数据纪律） */
++  const isValue = computed(() => typeof props.value === 'number' && Number.isFinite(props.value));
+ </script>
+ <style scoped lang="less">
+   .display-slot-card {
+@@ -68,6 +82,15 @@
+       padding: 6px 0 2px;
+     }
+ 
++    &__value {
++      min-height: 38px;
++      padding: 6px 0 2px;
++      color: #1677ff;
++      font-size: 26px;
++      font-weight: 600;
++      line-height: 38px;
++    }
++
+     &__empty {
+       margin-top: 10px;
+       color: #999;
+diff --git a/frontend/src/views/display/factory/index.vue b/frontend/src/views/display/factory/index.vue
+index 732a5fee..cd452ec8 100644
+--- a/frontend/src/views/display/factory/index.vue
++++ b/frontend/src/views/display/factory/index.vue
+@@ -1,10 +1,12 @@
+ <!--
+-  * 展示端工厂页（TASK-0058 批次一）
++  * 展示端工厂页（TASK-0058 批次一骨架 / 批次二接真值）
+   *
+   * 车间列表 = 实例树工厂节点的第二级真数据（nodeType=2，无权重节点后端已裁剪）；
+-  * 工厂指标看板、能耗构成 = 空态槽位（0045 未交付，不造假数字）。
++  * 工厂指标看板 = 0087 登录态 /iot/metric/values 真值（本期值/同比/环比同源不现算，
++  *   按工厂维度取指标定义 + 值行，最大 ts 为本期行；null 不冒充 0）；
++  * 能耗构成（按车间占比）= 空态槽位（无专用端点/无数据源，诚实登记，不造假）；
++  * 关键数据项 = 空态槽位（ADR-0011/0044 mark 占位未落列，无上看板标记数据源）。
+   * 下钻：点击车间 → /display/workshop/:factoryId/:workshopId（第 2 次点击）。
+-  * 设备详情入口本批不写死链（0059 承接）。
+ -->
+ <template>
+   <div class="display-page">
+@@ -50,14 +52,18 @@
+ 
+       <div class="display-page__section">
+         <h3 class="display-page__section-title">工厂指标看板</h3>
+-        <a-row :gutter="16">
+-          <a-col :span="12"><display-slot-card title="当日核心指标" /></a-col>
+-          <a-col :span="12"><display-slot-card title="同比 / 环比" /></a-col>
++        <!-- 0087 metric/values 同源真值：复用 metric-card（value/yoy/mom 不现算、null 不冒充 0） -->
++        <a-row v-if="metricEntries.length" :gutter="16">
++          <a-col v-for="entry in metricEntries" :key="entry.id" :span="12">
++            <metric-card :metric="entry" :value="valueOf(entry)" />
++          </a-col>
+         </a-row>
++        <div v-else class="display-page__metric-empty">指标数据接入中（无本期值/无指标定义，不造假数据）</div>
+       </div>
+ 
+       <div class="display-page__section">
+         <h3 class="display-page__section-title">能耗构成（按车间占比）</h3>
++        <!-- 无专用端点/无数据源：诚实空态，不伪造占比 -->
+         <display-slot-card title="电 / 水 / 气 / 蒸汽" />
+       </div>
+     </template>
+@@ -65,12 +71,21 @@
+   </div>
+ </template>
+ <script setup lang="ts">
+-  import { computed, onMounted } from 'vue';
++  import { computed, onMounted, ref } from 'vue';
+   import { useRoute, useRouter } from 'vue-router';
+   import LeftOutlined from '@ant-design/icons-vue/LeftOutlined';
+   import RightOutlined from '@ant-design/icons-vue/RightOutlined';
+-  import { descendantsOfType, findNode, DISPLAY_NODE_TYPE, type DisplayTreeNode } from '/@/api/display/display-api';
++  import {
++    descendantsOfType,
++    displayApi,
++    findNode,
++    DISPLAY_NODE_TYPE,
++    type DisplayMetric,
++    type DisplayTreeNode,
++    type MetricValueRow,
++  } from '/@/api/display/display-api';
+   import DisplaySlotCard from '../components/display-slot-card.vue';
++  import MetricCard from '../metrics/metric-card.vue';
+   import { useDisplayTree } from '../composables/use-display-tree';
+ 
+   const route = useRoute();
+@@ -83,6 +98,59 @@
+   // ADR-0011：标记置顶（接口未交付前恒缺省）。
+   const sortedWorkshops = computed(() => [...workshops.value].sort((a, b) => Number(!!b.mark) - Number(!!a.mark)));
+ 
++  /** 工厂级指标（按工厂维度取定义 + 0087 值行；value/yoy/mom 同源不现算） */
++  const metricEntries = ref<DisplayMetric[]>([]);
++  const valueRows = ref<MetricValueRow[]>([]);
++
++  function valueOf(metric: DisplayMetric): MetricValueRow | null {
++    // 同码多行取最大 ts（本期行；去年同期对比行 ts 更早），与指标看板 0060/0089 同源口径。
++    let latest: MetricValueRow | null = null;
++    for (const row of valueRows.value) {
++      if (row.metricCode !== metric.metricCode) continue;
++      if (latest == null || row.ts > latest.ts) latest = row;
++    }
++    return latest;
++  }
++
++  async function loadMetrics() {
++    metricEntries.value = [];
++    valueRows.value = [];
++    if (!factory.value) return;
++    try {
++      const defs = await displayApi.queryMetricList(factory.value.id);
++      metricEntries.value = defs;
++      if (!defs.length) return;
++      // 按 period 分组查值（0087 /iot/metric/values 登录态读口；每口独立 fail-soft）。
++      const end = Date.now();
++      const start = end - 366 * 24 * 60 * 60 * 1000;
++      const pairs = new Map<string, string[]>();
++      for (const def of defs) {
++        const period = def.period ?? 'DAY';
++        const codes = pairs.get(period) ?? [];
++        if (!codes.includes(def.metricCode)) codes.push(def.metricCode);
++        pairs.set(period, codes);
++      }
++      const results = await Promise.all(
++        [...pairs.entries()].map(([period, codes]) =>
++          displayApi.metricValues(codes, period, start, end).catch((e) => {
++            console.error('[display] factory metricValues load failed:', e);
++            return [];
++          })
++        )
++      );
++      valueRows.value = results.flat();
++    } catch (e) {
++      metricEntries.value = [];
++      valueRows.value = [];
++      console.error('[display] factory metrics load failed:', e);
++    }
++  }
++
++  onMounted(async () => {
++    await loadTree();
++    await loadMetrics();
++  });
++
+   function onDrill(ws: DisplayTreeNode) {
+     if (ws.status === 0) return;
+     void router.push({
+@@ -90,14 +158,19 @@
+       params: { factoryId: String(factory.value!.id), workshopId: String(ws.id) },
+     });
+   }
+-
+-  onMounted(() => void loadTree());
+ </script>
+ <style scoped lang="less">
+   @import '../display.less';
+   .display-page__pinned {
+     order: -1;
+   }
++  .display-page__metric-empty {
++    padding: 16px;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++    background: #fafafa;
++  }
+   .display-node-card {
+     cursor: pointer;
+     height: 100%;
+@@ -123,7 +196,6 @@
+     }
+     &__meta {
+       color: #999;
+-      font-size: 12px;
+     }
+   }
+ </style>
+diff --git a/frontend/tests/unit/display/factory-card-status-values.spec.ts b/frontend/tests/unit/display/factory-card-status-values.spec.ts
+new file mode 100644
+index 00000000..ecde8567
+--- /dev/null
++++ b/frontend/tests/unit/display/factory-card-status-values.spec.ts
+@@ -0,0 +1,138 @@
++/*
++ * TASK-0058 批次二 · 工厂卡片接 factory-summary 真值（D2 硬验收 2 前端侧）
++ *
++ * 覆盖：
++ * - 卡片挂载时用 node.id 调 factoryStatusSummary，运行/异常/离线三槽位填真值；
++ * - 0 是真 0（available=true 时显示「0」不是空态）；
++ * - fail-soft（available=false / 读口失败）三槽位保持「实时数据接入中」空态，不造假；
++ * - 关键数据项/核心指标仍空态（无数据源，诚实登记）；
++ * - 上看板标记（ADR-0011）保留。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const factoryStatusSummary = vi.hoisted(() => vi.fn());
++const consoleError = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/api/display/display-api', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('/@/api/display/display-api')>();
++  return {
++    ...actual,
++    displayApi: { ...actual.displayApi, factoryStatusSummary },
++  };
++});
++
++import DisplayFactoryCard from '/@/views/display/components/display-factory-card.vue';
++import type { DisplayTreeNode } from '/@/api/display/display-api';
++
++const mountOptions = { global: { plugins: [Antd] } };
++
++const node: DisplayTreeNode = {
++  id: 42,
++  parentId: 0,
++  instanceCode: 'F01',
++  instanceName: '工厂A',
++  nodeType: 1,
++};
++
++function summary(over: Record<string, unknown> = {}) {
++  return { running: 3, fault: 2, offline: 1, unknown: 4, total: 10, available: true, ...over };
++}
++
++/** 卡片三槽位的值文本（按 title 定位 display-slot-card） */
++function slotValues(wrapper: ReturnType<typeof mount>) {
++  return wrapper.findAllComponents({ name: 'DisplaySlotCard' }).map((card) => ({
++    title: card.props('title'),
++    value: card.props('value'),
++    text: card.text(),
++  }));
++}
++
++describe('工厂卡片接状态数真值（TASK-0058 批次二 D2）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    vi.spyOn(console, 'error').mockImplementation(consoleError);
++  });
++
++  it('挂载即用 node.id 取 factory-summary，运行/异常/离线三槽位填真值', async () => {
++    factoryStatusSummary.mockResolvedValue(summary());
++    const wrapper = mount(DisplayFactoryCard, { props: { node }, ...mountOptions });
++    await flushPromises();
++
++    expect(factoryStatusSummary).toHaveBeenCalledWith(42);
++    const slots = slotValues(wrapper);
++    const byTitle = Object.fromEntries(slots.map((s) => [s.title, s]));
++    expect(byTitle['运行'].value).toBe(3);
++    expect(byTitle['异常'].value).toBe(2);
++    expect(byTitle['离线'].value).toBe(1);
++    // 真值渲染在 DOM（不是空态）
++    // 三槽位真值在 DOM（不是空态）；关键数据项/核心指标仍空态（无源诚实登记，故整卡文本仍含空态文案）
++    expect(byTitle['运行'].text).toContain('3');
++    expect(byTitle['异常'].text).toContain('2');
++    expect(byTitle['离线'].text).toContain('1');
++    for (const title of ['运行', '异常', '离线']) {
++      expect(byTitle[title].text).not.toContain('实时数据接入中');
++    }
++    // 关键数据项/核心指标无数据源，仍空态（D2 诚实空态登记）
++    expect(byTitle['关键数据项'].value).toBeUndefined();
++    expect(byTitle['关键数据项'].text).toContain('实时数据接入中');
++    expect(byTitle['核心指标（同比/环比）'].value).toBeUndefined();
++    wrapper.unmount();
++  });
++
++  it('available=true 且全 0：0 是真 0，三槽位显示「0」不是空态', async () => {
++    factoryStatusSummary.mockResolvedValue(summary({ running: 0, fault: 0, offline: 0, total: 0 }));
++    const wrapper = mount(DisplayFactoryCard, { props: { node }, ...mountOptions });
++    await flushPromises();
++
++    const slots = slotValues(wrapper);
++    const byTitle = Object.fromEntries(slots.map((s) => [s.title, s]));
++    for (const title of ['运行', '异常', '离线']) {
++      expect(byTitle[title].value).toBe(0);
++      expect(byTitle[title].text).toContain('0');
++      expect(byTitle[title].text).not.toContain('实时数据接入中');
++    }
++    wrapper.unmount();
++  });
++
++  it('available=false（整厂 fail-soft）：三槽位保持空态，不把全 0 冒充真 0', async () => {
++    factoryStatusSummary.mockResolvedValue(summary({ running: 0, fault: 0, offline: 0, total: 0, available: false, message: '状态数据接入中' }));
++    const wrapper = mount(DisplayFactoryCard, { props: { node }, ...mountOptions });
++    await flushPromises();
++
++    const slots = slotValues(wrapper);
++    const byTitle = Object.fromEntries(slots.map((s) => [s.title, s]));
++    for (const title of ['运行', '异常', '离线']) {
++      // null/undefined 都表示空态（不渲染数值），只断言不是真值 0/数字
++      expect([null, undefined]).toContain(byTitle[title].value);
++      expect(byTitle[title].text).toContain('实时数据接入中');
++    }
++    wrapper.unmount();
++  });
++
++  it('读口失败：console.error + 三槽位空态，不炸页面', async () => {
++    factoryStatusSummary.mockRejectedValue(new Error('read port down'));
++    const wrapper = mount(DisplayFactoryCard, { props: { node }, ...mountOptions });
++    await flushPromises();
++
++    expect(consoleError).toHaveBeenCalled();
++    const slots = slotValues(wrapper);
++    const byTitle = Object.fromEntries(slots.map((s) => [s.title, s]));
++    expect([null, undefined]).toContain(byTitle['运行'].value);
++    expect(byTitle['运行'].text).toContain('实时数据接入中');
++    wrapper.unmount();
++  });
++
++  it('mark 上看板标记保留（ADR-0011 无源时恒缺省，有标记走视觉强调）', async () => {
++    factoryStatusSummary.mockResolvedValue(summary());
++    const wrapper = mount(DisplayFactoryCard, {
++      props: { node: { ...node, mark: true } },
++      ...mountOptions,
++    });
++    await flushPromises();
++    expect(wrapper.find('.display-factory-card--marked').exists()).toBe(true);
++    expect(wrapper.text()).toContain('上看板');
++    wrapper.unmount();
++  });
++});
+diff --git a/frontend/tests/unit/display/factory-card-summary.spec.ts b/frontend/tests/unit/display/factory-card-summary.spec.ts
+new file mode 100644
+index 00000000..2075dcc4
+--- /dev/null
++++ b/frontend/tests/unit/display/factory-card-summary.spec.ts
+@@ -0,0 +1,59 @@
++/*
++ * TASK-0058 批次二 · display-slot-card 真值渲染 + 空态纪律
++ *
++ * 覆盖：
++ * - value 传入时渲染数值（0 是真 0 → 显示「0」不是空态）；
++ * - value 未传/undefined 时保持「实时数据接入中」空态（批次一无源槽位不造假）；
++ * - fail-soft 场景（value=null）同样空态，不把 0 冒充真 0；
++ * - ADR-0011 mark 放大/置顶渲染保留。
++ */
++import { describe, expect, it } from 'vitest';
++import { mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++import DisplaySlotCard from '/@/views/display/components/display-slot-card.vue';
++
++const mountOptions = { global: { plugins: [Antd] } };
++
++describe('display slot card 真值/空态（TASK-0058 批次二 D2）', () => {
++  it('value=0 是真 0：显示「0」，不是「实时数据接入中」空态', () => {
++    const wrapper = mount(DisplaySlotCard, { props: { title: '运行', value: 0 }, ...mountOptions });
++    const text = wrapper.text();
++    expect(text).toContain('运行');
++    expect(text).toContain('0');
++    expect(text).not.toContain('实时数据接入中');
++    expect(wrapper.find('.ant-skeleton').exists()).toBe(false);
++    expect(wrapper.find('.display-slot-card__value').text()).toBe('0');
++    wrapper.unmount();
++  });
++
++  it('value=12 渲染真值数字', () => {
++    const wrapper = mount(DisplaySlotCard, { props: { title: '异常', value: 12 }, ...mountOptions });
++    expect(wrapper.find('.display-slot-card__value').text()).toBe('12');
++    expect(wrapper.text()).not.toContain('实时数据接入中');
++    wrapper.unmount();
++  });
++
++  it('value 缺省（无数据源）→ 保持骨架 + 「实时数据接入中」空态，不造假', () => {
++    const wrapper = mount(DisplaySlotCard, { props: { title: '关键数据项' }, ...mountOptions });
++    expect(wrapper.text()).toContain('实时数据接入中');
++    expect(wrapper.find('.ant-skeleton').exists()).toBe(true);
++    expect(wrapper.find('.display-slot-card__value').exists()).toBe(false);
++    wrapper.unmount();
++  });
++
++  it('value=null（fail-soft）→ 空态，不把 0 冒充真 0', () => {
++    const wrapper = mount(DisplaySlotCard, { props: { title: '离线', value: null }, ...mountOptions });
++    expect(wrapper.text()).toContain('实时数据接入中');
++    expect(wrapper.find('.display-slot-card__value').exists()).toBe(false);
++    wrapper.unmount();
++  });
++
++  it('mark 为真渲染上看板标记与放大/置顶 Class（批次一保留）', () => {
++    const marked = mount(DisplaySlotCard, { props: { title: '核心指标', value: 3, mark: true, pinned: true }, ...mountOptions });
++    expect(marked.find('.display-slot-card__mark').text()).toBe('上看板');
++    expect(marked.find('.display-slot-card--marked').exists()).toBe(true);
++    expect(marked.find('.display-slot-card--pinned').exists()).toBe(true);
++    expect(marked.find('.display-slot-card__value').text()).toBe('3');
++    marked.unmount();
++  });
++});
+diff --git a/frontend/tests/unit/display/factory-page-metrics.spec.ts b/frontend/tests/unit/display/factory-page-metrics.spec.ts
+new file mode 100644
+index 00000000..dcb3db4b
+--- /dev/null
++++ b/frontend/tests/unit/display/factory-page-metrics.spec.ts
+@@ -0,0 +1,99 @@
++/*
++ * TASK-0058 批次二 · 工厂页工厂级指标接 0087 metric/values（D2）
++ *
++ * 覆盖：
++ * - 工厂页按工厂维度调 queryMetricList + metricValues，取本期行（最大 ts）同源展示；
++ * - value/yoy/mom 原样透传、null 不冒充 0；读口失败走空态不炸页面；
++ * - 能耗构成保持「实时数据接入中」空态（无专用端点/无数据源，诚实登记）；
++ * - 关键数据项无源仍空态（mark 占位未落列，ADR-0011/0044）。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const queryInstanceTree = vi.hoisted(() => vi.fn());
++const queryMetricList = vi.hoisted(() => vi.fn());
++const metricValues = vi.hoisted(() => vi.fn());
++const consoleError = vi.hoisted(() => vi.fn());
++const routeParams = vi.hoisted(() => ({ value: { factoryId: '42' } }));
++
++vi.mock('vue-router', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('vue-router')>();
++  return {
++    ...actual,
++    useRoute: () => ({ params: routeParams.value }),
++    useRouter: () => ({ push: vi.fn() }),
++  };
++});
++
++vi.mock('/@/api/display/display-api', async (importOriginal) => {
++  const actual = await importOriginal<typeof import('/@/api/display/display-api')>();
++  return {
++    ...actual,
++    displayApi: { ...actual.displayApi, queryInstanceTree, queryMetricList, metricValues },
++    findNode: (nodes: Array<{ id: number }>, id: number) => nodes.find((n) => n.id === id) ?? null,
++    descendantsOfType: () => [],
++  };
++});
++
++vi.mock('/@/components/framework/ot-loading', () => ({ OtLoading: { show: vi.fn(), hide: vi.fn() } }));
++
++import FactoryPage from '/@/views/display/factory/index.vue';
++
++const mountOptions = { global: { plugins: [Antd] } };
++const TS = Date.UTC(2026, 10, 20);
++const TREE = [{ id: 42, parentId: 0, instanceCode: 'F01', instanceName: '工厂A', nodeType: 1, children: [] }];
++
++describe('工厂页接工厂级指标真值（TASK-0058 批次二 D2）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    vi.spyOn(console, 'error').mockImplementation(consoleError);
++    queryInstanceTree.mockResolvedValue(TREE);
++    queryMetricList.mockResolvedValue([
++      { id: 10, metricCode: 'M_ENERGY', metricName: '用电', instanceId: 42, sourceItemId: null, period: 'DAY', status: 1 },
++      { id: 11, metricCode: 'M_WATER', metricName: '用水', instanceId: 42, sourceItemId: null, period: 'DAY', status: 1 },
++    ]);
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: 0.083, mom: -0.021, unit: 'kWh' },
++      { metricCode: 'M_WATER', instanceCode: 'F01', period: 'DAY', ts: TS, value: null, yoy: null, mom: null, unit: 't' },
++    ]);
++  });
++
++  it('工厂级指标看板：metricValues 同源展示 value/yoy/mom（不现算、null 不冒充 0）', async () => {
++    const wrapper = mount(FactoryPage, { ...mountOptions });
++    await flushPromises();
++
++    expect(queryMetricList).toHaveBeenCalledWith(42);
++    expect(metricValues).toHaveBeenCalled();
++    const text = wrapper.text();
++    expect(text).toContain('412.6');
++    expect(text).toContain('kWh');
++    expect(text).toContain('同比');
++    expect(text).toContain('环比');
++    // 用水 null 值：空态文案，不显示 0
++    expect(text).toContain('指标数据接入中');
++    wrapper.unmount();
++  });
++
++  it('能耗构成保持空态（无数据源，不造假）；关键数据项无源保持空态', async () => {
++    const wrapper = mount(FactoryPage, { ...mountOptions });
++    await flushPromises();
++    const text = wrapper.text();
++    expect(text).toContain('能耗构成');
++    // 能耗槽位仍「实时数据接入中」（专用端点/数据源未交付）
++    const energyCard = wrapper.findAllComponents({ name: 'DisplaySlotCard' }).find((c) => c.props('title') === '电 / 水 / 气 / 蒸汽');
++    expect(energyCard).toBeDefined();
++    expect(energyCard!.props('value')).toBeFalsy();
++    expect(energyCard!.text()).toContain('实时数据接入中');
++    wrapper.unmount();
++  });
++
++  it('metricValues 读口失败：console.error + 指标空态，不炸页面', async () => {
++    metricValues.mockRejectedValue(new Error('down'));
++    const wrapper = mount(FactoryPage, { ...mountOptions });
++    await flushPromises();
++    expect(consoleError).toHaveBeenCalled();
++    expect(wrapper.text()).toContain('指标数据接入中');
++    wrapper.unmount();
++  });
++});
+diff --git a/frontend/tests/unit/display/factory-summary-read-port.spec.ts b/frontend/tests/unit/display/factory-summary-read-port.spec.ts
+new file mode 100644
+index 00000000..65afe44c
+--- /dev/null
++++ b/frontend/tests/unit/display/factory-summary-read-port.spec.ts
+@@ -0,0 +1,87 @@
++/*
++ * TASK-0058 批次二 · display-api 新增工厂状态数聚合封装 + 安全红线
++ *
++ * 覆盖（D2 / D4）：
++ * - factoryStatusSummary URL/参数逐字对齐 D1 端点 /api/v1/iot/status/factory-summary；
++ * - 响应容错：null/缺字段 → available=false + 全 0（fail-soft 不把 0 冒充真 0）；
++ * - available=true 时真 0 原样保留（0 是 0 不是空态）；
++ * - 安全红线：display-api.ts 代码区零 appKey/secret/HMAC、零 /openapi/v1 直连、零自造代理。
++ */
++import { readFileSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const getRequest = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/lib/axios', () => ({ getRequest }));
++
++import { displayApi, type FactoryStatusSummaryVO } from '/@/api/display/display-api';
++
++const getMock = vi.mocked(getRequest);
++
++describe('displayApi.factoryStatusSummary（TASK-0058 批次二 D2）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('URL/参数逐字对齐 D1，available=true 的计数与接入标记原样返回', async () => {
++    const data: FactoryStatusSummaryVO = {
++      running: 3,
++      fault: 2,
++      offline: 1,
++      unknown: 4,
++      total: 10,
++      available: true,
++    };
++    getMock.mockResolvedValue({ code: 200, data });
++
++    const out = await displayApi.factoryStatusSummary(42);
++
++    expect(getMock).toHaveBeenCalledWith('/api/v1/iot/status/factory-summary', { factoryInstanceId: 42 });
++    expect(out).toEqual(data);
++    expect(out.available).toBe(true);
++  });
++
++  it('真 0 原样保留：available=true 且全 0 时不被当成空态', async () => {
++    getMock.mockResolvedValue({ code: 200, data: { running: 0, fault: 0, offline: 0, unknown: 0, total: 0, available: true } });
++
++    const out = await displayApi.factoryStatusSummary(42);
++
++    expect(out.available).toBe(true);
++    expect(out.total).toBe(0);
++  });
++
++  it('fail-soft 载荷原样透传：available=false + message 接入中', async () => {
++    getMock.mockResolvedValue({
++      code: 200,
++      data: { running: 0, fault: 0, offline: 0, unknown: 0, total: 0, available: false, message: '状态数据接入中' },
++    });
++
++    const out = await displayApi.factoryStatusSummary(42);
++
++    expect(out.available).toBe(false);
++    expect(out.message).toBe('状态数据接入中');
++  });
++
++  it('data=null/undefined/非对象 → available=false + 全 0（fail-closed，不静默当真 0）', async () => {
++    getMock.mockResolvedValueOnce({ code: 200, data: null });
++    getMock.mockResolvedValueOnce(undefined);
++    getMock.mockResolvedValueOnce({ code: 200, data: [] });
++
++    for (let i = 0; i < 3; i++) {
++      const out = await displayApi.factoryStatusSummary(42);
++      expect(out).toEqual({ running: 0, fault: 0, offline: 0, unknown: 0, total: 0, available: false, message: undefined });
++    }
++  });
++});
++
++describe('安全红线（批次二沿用）', () => {
++  it('display-api.ts 代码区零 appKey/secret/HMAC 直连、零 /openapi/v1、零自造代理', () => {
++    const source = readFileSync(resolve(process.cwd(), 'src/api/display/display-api.ts'), 'utf8');
++    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
++    expect(code).not.toMatch(/appKey|appSecret|createHmac|HMAC|secret/i);
++    expect(code).not.toMatch(/\/openapi\/v1/);
++    expect(code).not.toMatch(/\bfetch\s*\(/);
++    expect(code).toContain('getRequest(');
++  });
++});

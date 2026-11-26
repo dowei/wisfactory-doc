@@ -1,0 +1,1404 @@
+diff --git a/backend/ot-admin/pom.xml b/backend/ot-admin/pom.xml
+index bdea04d..9e2d182 100644
+--- a/backend/ot-admin/pom.xml
++++ b/backend/ot-admin/pom.xml
+@@ -92,11 +92,25 @@
+             <scope>provided</scope>
+         </dependency>
+ 
++        <!-- TASK-0063：管理系统只读端点查询 iot_calc schema（只读账号独立 DataSource）；
++             JdbcTemplate 由 spring-jdbc 提供，不绑 @Primary 动态数据源 -->
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-jdbc</artifactId>
++        </dependency>
++
+         <dependency>
+             <groupId>org.springframework.boot</groupId>
+             <artifactId>spring-boot-starter-test</artifactId>
+             <scope>test</scope>
+         </dependency>
++
++        <!-- TASK-0063：calc 只读端点契约测试用 H2 内存库（不碰宿主 MySQL） -->
++        <dependency>
++            <groupId>com.h2database</groupId>
++            <artifactId>h2</artifactId>
++            <scope>test</scope>
++        </dependency>
+     </dependencies>
+ 
+     <build>
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcLogVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcLogVO.java
+new file mode 100644
+index 0000000..79f6a93
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcLogVO.java
+@@ -0,0 +1,53 @@
++package net.otlab.admin.module.iot.calcread;
++
++/**
++ * TASK-0063：计算日志只读视图（iot_calc_log §1.9A）——按 fullKey + 时间窗检索（REQ-0022）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcLogVO {
++    private Long id;
++    private Long tenantId;
++    private String taskId;
++    private String fullKey;
++    private Long periodStart;
++    private Long periodEnd;
++    private String triggerType;
++    private String inputSummary;
++    private Integer resultStatus;
++    private String errorMsg;
++    private Boolean recalc;
++    private Long startedAt;
++    private Long finishedAt;
++    private Long durationMs;
++
++    public Long getId() { return id; }
++    public void setId(Long v) { this.id = v; }
++    public Long getTenantId() { return tenantId; }
++    public void setTenantId(Long v) { this.tenantId = v; }
++    public String getTaskId() { return taskId; }
++    public void setTaskId(String v) { this.taskId = v; }
++    public String getFullKey() { return fullKey; }
++    public void setFullKey(String v) { this.fullKey = v; }
++    public Long getPeriodStart() { return periodStart; }
++    public void setPeriodStart(Long v) { this.periodStart = v; }
++    public Long getPeriodEnd() { return periodEnd; }
++    public void setPeriodEnd(Long v) { this.periodEnd = v; }
++    public String getTriggerType() { return triggerType; }
++    public void setTriggerType(String v) { this.triggerType = v; }
++    public String getInputSummary() { return inputSummary; }
++    public void setInputSummary(String v) { this.inputSummary = v; }
++    public Integer getResultStatus() { return resultStatus; }
++    public void setResultStatus(Integer v) { this.resultStatus = v; }
++    public String getErrorMsg() { return errorMsg; }
++    public void setErrorMsg(String v) { this.errorMsg = v; }
++    public Boolean getRecalc() { return recalc; }
++    public void setRecalc(Boolean v) { this.recalc = v; }
++    public Long getStartedAt() { return startedAt; }
++    public void setStartedAt(Long v) { this.startedAt = v; }
++    public Long getFinishedAt() { return finishedAt; }
++    public void setFinishedAt(Long v) { this.finishedAt = v; }
++    public Long getDurationMs() { return durationMs; }
++    public void setDurationMs(Long v) { this.durationMs = v; }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcReadService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcReadService.java
+new file mode 100644
+index 0000000..453e5bc
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcReadService.java
+@@ -0,0 +1,21 @@
++package net.otlab.admin.module.iot.calcread;
++
++import java.util.List;
++
++/**
++ * TASK-0063：管理系统计算状态/日志只读服务（iot_calc schema，iot_calc_ro 只读账号）。
++ *
++ * <p>只读取，不写；状态页只读操作不改 calc 状态（操作走重算接口，归 0061）。数据权限照
++ * 实例域范式：fullKey 中的实例段解析为 instanceId，∈ 可见集才返回，否则 403 不泄露存在性。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface CalcReadService {
++
++    /** 计算状态列表（会话租户 + fullKey 可选过滤 + 数据权限裁剪；空态返回空列表不报错） */
++    List<CalcStateVO> state(String fullKey);
++
++    /** 计算日志（会话租户 + fullKey + from/to 时间窗 + 数据权限裁剪；from/to epoch 毫秒） */
++    List<CalcLogVO> log(String fullKey, Long fromMs, Long toMs);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcStateVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcStateVO.java
+new file mode 100644
+index 0000000..c77b12e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/CalcStateVO.java
+@@ -0,0 +1,48 @@
++package net.otlab.admin.module.iot.calcread;
++
++/**
++ * TASK-0063：计算状态只读视图（iot_calc_state §1.9A）——管理系统状态页数据源（FEAT-0020）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcStateVO {
++    private Long tenantId;
++    private String fullKey;
++    private Long lastCalcTime;
++    private Long watermark;
++    private Integer calcStatus;
++    private String calcStatusText;
++    private Integer errorCount;
++    private String lastError;
++    private Long updateTime;
++
++    public Long getTenantId() { return tenantId; }
++    public void setTenantId(Long v) { this.tenantId = v; }
++    public String getFullKey() { return fullKey; }
++    public void setFullKey(String v) { this.fullKey = v; }
++    public Long getLastCalcTime() { return lastCalcTime; }
++    public void setLastCalcTime(Long v) { this.lastCalcTime = v; }
++    public Long getWatermark() { return watermark; }
++    public void setWatermark(Long v) { this.watermark = v; }
++    public Integer getCalcStatus() { return calcStatus; }
++    public void setCalcStatus(Integer v) { this.calcStatus = v; }
++    public String getCalcStatusText() { return calcStatusText; }
++    public void setCalcStatusText(String v) { this.calcStatusText = v; }
++    public Integer getErrorCount() { return errorCount; }
++    public void setErrorCount(Integer v) { this.errorCount = v; }
++    public String getLastError() { return lastError; }
++    public void setLastError(String v) { this.lastError = v; }
++    public Long getUpdateTime() { return updateTime; }
++    public void setUpdateTime(Long v) { this.updateTime = v; }
++
++    /** INT→文本翻译（ADR-0009 TD-0005） */
++    public static String statusText(Integer code) {
++        if (code == null) return "正常";
++        return switch (code) {
++            case 2 -> "滞后";
++            case 3 -> "异常停算";
++            default -> "正常";
++        };
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/config/CalcReadDataSourceConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/config/CalcReadDataSourceConfig.java
+new file mode 100644
+index 0000000..8b90516
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/config/CalcReadDataSourceConfig.java
+@@ -0,0 +1,81 @@
++package net.otlab.admin.module.iot.calcread.config;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import javax.sql.DataSource;
++import java.sql.Connection;
++import java.sql.SQLException;
++
++/**
++ * TASK-0063：管理系统 calc 只读数据源装配（iot_calc schema，只读账号 iot_calc_ro）。
++ *
++ * <p><b>账号分离</b>（ADR-0009 Q1）：计算引擎用 iot_calc_rw（读写），管理系统只读端点用
++ * iot_calc_ro（仅 SELECT）——二者是不同 DataSource，且本 DataSource <b>不参与</b> {@code @Primary}
++ * 动态数据源（业务库 master），避免只读查询走业务账号或写穿。URL/账号由 env 注入，口令不硬编码。
++ *
++ * <p>未配置 URL 时（默认，如本地单测/未部署 iot_calc 的环境）装配一个取连接即抛「未配置」的
++ * 占位 DataSource——只读查询 fail-soft 返回空集，不阻塞管理系统启动、不依赖 test-scope 驱动、
++ * 不连宿主库。与 calc 侧 JDBC 关闭时内存实现零回归同口径。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration
++public class CalcReadDataSourceConfig {
++
++    private static final Logger log = LoggerFactory.getLogger(CalcReadDataSourceConfig.class);
++
++    @Value("${ot.calc.read.jdbc-url:}")
++    private String jdbcUrl;
++
++    @Value("${ot.calc.read.jdbc-user:}")
++    private String jdbcUser;
++
++    @Value("${ot.calc.read.jdbc-password:}")
++    private String jdbcPassword;
++
++    @Value("${ot.calc.read.driver-class:com.mysql.cj.jdbc.Driver}")
++    private String driverClass;
++
++    /** 管理系统专用只读 JdbcTemplate（iot_calc schema，iot_calc_ro 账号） */
++    @Bean("calcReadJdbcTemplate")
++    public JdbcTemplate calcReadJdbcTemplate() {
++        if (jdbcUrl == null || jdbcUrl.isBlank()) {
++            // 缺省占位：无需真实驱动——任何取连接都抛「未配置」，由服务层 fail-soft 吞掉返回空集。
++            // 不依赖 H2（test-scope）避免生产 ClassNotFound，也不连宿主库。
++            log.warn("[CALC-READ] ot.calc.read.jdbc-url 未配置——只读端点降级空集（未连 iot_calc schema）");
++            return new JdbcTemplate(new DataSource() {
++                private SQLException notConfigured() {
++                    return new SQLException("ot.calc.read.jdbc-url 未配置（iot_calc 只读数据源不可用）");
++                }
++                @Override public Connection getConnection() throws SQLException { throw notConfigured(); }
++                @Override public Connection getConnection(String u, String p) throws SQLException { throw notConfigured(); }
++                @Override public java.io.PrintWriter getLogWriter() { return null; }
++                @Override public void setLogWriter(java.io.PrintWriter out) { }
++                @Override public void setLoginTimeout(int seconds) { }
++                @Override public int getLoginTimeout() { return 0; }
++                @Override public java.util.logging.Logger getParentLogger() { return java.util.logging.Logger.getGlobal(); }
++                @Override public <T> T unwrap(Class<T> iface) throws SQLException { throw notConfigured(); }
++                @Override public boolean isWrapperFor(Class<?> iface) { return false; }
++            });
++        }
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName(driverClass);
++        ds.setUrl(jdbcUrl);
++        ds.setUsername(jdbcUser == null ? "" : jdbcUser);
++        ds.setPassword(jdbcPassword == null ? "" : jdbcPassword);
++        log.info("[CALC-READ] 只读数据源已装配（iot_calc schema，iot_calc_ro 账号）");
++        return new JdbcTemplate(ds);
++    }
++
++    /** 未配置标记（供健康检查/日志判别；只读端点本身 fail-soft 不暴露） */
++    public boolean isConfigured() {
++        return jdbcUrl != null && !jdbcUrl.isBlank();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadController.java
+new file mode 100644
+index 0000000..b498b6b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadController.java
+@@ -0,0 +1,62 @@
++package net.otlab.admin.module.iot.calcread.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcReadService;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.core.result.Result;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * TASK-0063：管理系统计算状态/日志只读端点（iot_calc schema，iot_calc_ro 只读账号）。
++ *
++ * <p>GET /api/v1/iot/calc/state?fullKey= —— 水位/状态/滞后/连续错误；
++ * GET /api/v1/iot/calc/log?fullKey=&from=&to= —— 计算日志按唯一键 + 时间窗检索（REQ-0022）。
++ *
++ * <p><b>只读纪律</b>：仅这两个 GET，无写口；状态页只读操作走重算接口（0061 管理面转发），
++ * 本控制器不触发任何 calc 写。读操作不挂 @OperateLog（照 0079 范式：读不审），OperateLog 覆盖
++ * 守卫只扫写动词（POST/PUT/DELETE/PATCH）。
++ *
++ * <p><b>权限</b>：brief 要求「复用 iot:calc:query 或最贴近既有权限码，若无则沿用管理面只读权限」；
++ * 0064 高危清单口径无 iot:calc:* 种子（重算为内部令牌接口无 perms 位），故沿用管理面实例只读
++ * 权限 {@code iot:instance:query}（4031 已注册），与实例域数据权限裁剪同一口径。若后续 0061
++ * 新建 calc 管理位种子，本注解可平移（不改业务逻辑）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "计算状态只读端点")
++@RestController
++@RequestMapping("/api/v1/iot/calc")
++public class IotCalcReadController {
++
++    private final CalcReadService calcReadService;
++
++    public IotCalcReadController(CalcReadService calcReadService) {
++        this.calcReadService = calcReadService;
++    }
++
++    @Operation(summary = "计算状态（水位/滞后/停算，只读；fullKey 可选过滤；空态空列表不报错）")
++    @GetMapping("/state")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<CalcStateVO>> state(@RequestParam(value = "fullKey", required = false) String fullKey) {
++        return Result.success(calcReadService.state(fullKey));
++    }
++
++    @Operation(summary = "计算日志（按 fullKey + 时间窗检索；from/to 为 epoch 毫秒）")
++    @GetMapping("/log")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<CalcLogVO>> log(
++            @RequestParam("fullKey") String fullKey,
++            @RequestParam("from") Long fromMs,
++            @RequestParam("to") Long toMs) {
++        return Result.success(calcReadService.log(fullKey, fromMs, toMs));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java
+new file mode 100644
+index 0000000..692696e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java
+@@ -0,0 +1,200 @@
++package net.otlab.admin.module.iot.calcread.impl;
++
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcReadService;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Service;
++
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Timestamp;
++import java.util.List;
++
++/**
++ * TASK-0063：计算状态/日志只读实现（iot_calc schema，iot_calc_ro 只读账号）。
++ *
++ * <p><b>只读纪律</b>：本服务只有 SELECT，无任何 INSERT/UPDATE/DELETE——账号物理只读 + 代码只读
++ * 双保险；状态页只读操作不写 calc 状态（重算写口归 0061 管理面转发）。
++ *
++ * <p><b>fail-soft</b>：未配置只读数据源或 iot_calc 表不可读（DDL 未应用）→ 记 WARN 返回空集，
++ * 不报错、不阻塞管理系统；真机列条件在报告中登记（DDL 由用户应用后探针复验）。
++ *
++ * <p><b>数据权限</b>：fullKey 形如 {@code tenant|metricCode|instanceCode|period}（0046 指标全键），
++ * 取实例段解析 instanceId，按会话可见实例集裁剪（越权 403 不泄露存在性）；无法解析出实例的
++ * fullKey（如旧形态单段 metricCode）按「仅同租户、无实例维度」处理——只对会话租户行可见。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class CalcReadServiceImpl implements CalcReadService {
++
++    private static final Logger log = LoggerFactory.getLogger(CalcReadServiceImpl.class);
++
++    private final JdbcTemplate calcReadJdbc;
++    private final OpenApiInstanceMapper instanceMapper;
++    private final DataPermService dataPermService;
++
++    /** Spring 全装配 */
++    @Autowired
++    public CalcReadServiceImpl(@Qualifier("calcReadJdbcTemplate") JdbcTemplate calcReadJdbc,
++                               @Autowired(required = false) OpenApiInstanceMapper instanceMapper,
++                               @Autowired(required = false) DataPermService dataPermService) {
++        this.calcReadJdbc = calcReadJdbc;
++        this.instanceMapper = instanceMapper;
++        this.dataPermService = dataPermService;
++    }
++
++    /** 核心读单测构造（只装配 JDBC，数据权限裁剪传 null 跳过） */
++    public CalcReadServiceImpl(JdbcTemplate calcReadJdbc) {
++        this(calcReadJdbc, null, null);
++    }
++
++    @Override
++    public List<CalcStateVO> state(String fullKey) {
++        Long tenantId = requireSessionTenant();
++        List<CalcStateVO> rows;
++        try {
++            String sql = "SELECT tenant_id, full_key, last_calc_time, watermark, calc_status, "
++                    + "error_count, last_error, update_time FROM iot_calc_state WHERE tenant_id=?";
++            Object[] args = fullKey == null || fullKey.isBlank()
++                    ? new Object[]{tenantId}
++                    : new Object[]{tenantId, fullKey};
++            if (fullKey != null && !fullKey.isBlank()) {
++                sql += " AND full_key=?";
++            }
++            sql += " ORDER BY full_key";
++            rows = calcReadJdbc.query(sql, this::mapState, args);
++        } catch (RuntimeException e) {
++            warn("state", e);
++            return List.of();
++        }
++        // 数据权限：对有实例段的 fullKey 逐行裁剪（无 deps 时跳过，核心读单测口径）
++        if (instanceMapper == null || dataPermService == null) {
++            return rows;
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        return rows.stream().filter(vo -> visible(scope, vo.getFullKey())).toList();
++    }
++
++    @Override
++    public List<CalcLogVO> log(String fullKey, Long fromMs, Long toMs) {
++        Long tenantId = requireSessionTenant();
++        if (fromMs == null || toMs == null || fromMs < 0 || toMs < 0 || fromMs >= toMs) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "from/to 必填且须 epoch 毫秒、from < to");
++        }
++        if (fullKey == null || fullKey.isBlank()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "fullKey 必填");
++        }
++        List<CalcLogVO> rows;
++        try {
++            String sql = "SELECT id, tenant_id, task_id, full_key, period_start, period_end, "
++                    + "trigger_type, input_summary, result_status, error_msg, is_recalc, "
++                    + "started_at, finished_at, duration_ms FROM iot_calc_log "
++                    + "WHERE tenant_id=? AND full_key=? AND started_at>=? AND started_at<=? "
++                    + "ORDER BY started_at";
++            rows = calcReadJdbc.query(sql, this::mapLog, tenantId, fullKey,
++                    new Timestamp(fromMs), new Timestamp(toMs));
++        } catch (RuntimeException e) {
++            warn("log", e);
++            return List.of();
++        }
++        if (instanceMapper == null || dataPermService == null) {
++            return rows;
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        return rows.stream().filter(vo -> visible(scope, vo.getFullKey())).toList();
++    }
++
++    /** 数据权限：fullKey 第 3 段是 instanceCode；解析不到实例则不泄露（false），allTenant 直过 */
++    private boolean visible(VisibleScope scope, String fullKey) {
++        if (scope.allTenant()) {
++            return true;
++        }
++        String instanceCode = instanceCodeOf(fullKey);
++        if (instanceCode == null) {
++            return false;
++        }
++        Long tenantId = TenantContext.getTenantId();
++        List<OpenApiInstanceRow> rows = instanceMapper.selectByCodesForTenant(tenantId, List.of(instanceCode));
++        if (rows.isEmpty()) {
++            return false;
++        }
++        return scope.instanceIds().contains(rows.get(0).getId());
++    }
++
++    /** fullKey = tenant|metricCode|instanceCode|period → 取 instanceCode（第 3 段） */
++    static String instanceCodeOf(String fullKey) {
++        if (fullKey == null) return null;
++        String[] parts = fullKey.split("\\|", -1);
++        return parts.length >= 3 && !parts[2].isBlank() ? parts[2] : null;
++    }
++
++    private Long requireSessionTenant() {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无租户上下文（数据权限不命中）");
++        }
++        return tenantId;
++    }
++
++    private void warn(String op, RuntimeException e) {
++        log.warn("[CALC-READ] {} 降级为空集（iot_calc 只读源不可用/DDL 未应用）: {}", op, e.getMessage());
++    }
++
++    private CalcStateVO mapState(ResultSet rs, int rowNum) throws SQLException {
++        CalcStateVO vo = new CalcStateVO();
++        vo.setTenantId(rs.getLong("tenant_id"));
++        vo.setFullKey(rs.getString("full_key"));
++        Timestamp last = rs.getTimestamp("last_calc_time");
++        vo.setLastCalcTime(last == null ? null : last.getTime());
++        Timestamp wm = rs.getTimestamp("watermark");
++        vo.setWatermark(wm == null ? null : wm.getTime());
++        int status = rs.getInt("calc_status");
++        vo.setCalcStatus(status);
++        vo.setCalcStatusText(CalcStateVO.statusText(status));
++        vo.setErrorCount(rs.getInt("error_count"));
++        vo.setLastError(rs.getString("last_error"));
++        Timestamp ut = rs.getTimestamp("update_time");
++        vo.setUpdateTime(ut == null ? null : ut.getTime());
++        return vo;
++    }
++
++    private CalcLogVO mapLog(ResultSet rs, int rowNum) throws SQLException {
++        CalcLogVO vo = new CalcLogVO();
++        vo.setId(rs.getLong("id"));
++        vo.setTenantId(rs.getLong("tenant_id"));
++        vo.setTaskId(rs.getString("task_id"));
++        vo.setFullKey(rs.getString("full_key"));
++        Timestamp ps = rs.getTimestamp("period_start");
++        vo.setPeriodStart(ps == null ? null : ps.getTime());
++        Timestamp pe = rs.getTimestamp("period_end");
++        vo.setPeriodEnd(pe == null ? null : pe.getTime());
++        vo.setTriggerType(rs.getString("trigger_type"));
++        vo.setInputSummary(rs.getString("input_summary"));
++        vo.setResultStatus(rs.getInt("result_status"));
++        vo.setErrorMsg(rs.getString("error_msg"));
++        int recalc = rs.getInt("is_recalc");
++        vo.setRecalc(recalc == 1);
++        Timestamp sa = rs.getTimestamp("started_at");
++        vo.setStartedAt(sa == null ? null : sa.getTime());
++        Timestamp fa = rs.getTimestamp("finished_at");
++        vo.setFinishedAt(fa == null ? null : fa.getTime());
++        long dm = rs.getLong("duration_ms");
++        vo.setDurationMs(rs.wasNull() ? null : dm);
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadControllerTest.java
+new file mode 100644
+index 0000000..08b2b15
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/controller/IotCalcReadControllerTest.java
+@@ -0,0 +1,104 @@
++package net.otlab.admin.module.iot.calcread.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcReadService;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0063：calc 只读端点控制器单测——参数透传 + 权限注解锁定 + 读不审 + 只读无写口。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotCalcReadControllerTest {
++
++    @Mock private CalcReadService calcReadService;
++    private AutoCloseable mocks;
++    private IotCalcReadController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new IotCalcReadController(calcReadService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    void statePassthroughAndEmpty() {
++        CalcStateVO vo = new CalcStateVO();
++        vo.setFullKey("tenant|M.A|I01|day");
++        vo.setCalcStatus(1);
++        vo.setCalcStatusText("正常");
++        when(calcReadService.state("tenant|M.A|I01|day")).thenReturn(List.of(vo));
++        when(calcReadService.state(null)).thenReturn(List.of());
++
++        Result<List<CalcStateVO>> r1 = controller.state("tenant|M.A|I01|day");
++        assertEquals(200, r1.getCode());
++        assertEquals(1, r1.getData().size());
++        assertEquals("正常", r1.getData().get(0).getCalcStatusText());
++        verify(calcReadService).state("tenant|M.A|I01|day");
++
++        Result<List<CalcStateVO>> r2 = controller.state(null);
++        assertEquals(200, r2.getCode());
++        assertEquals(0, r2.getData().size(), "空态空列表不报错");
++    }
++
++    @Test
++    void logPassthroughAndBadRange() {
++        CalcLogVO vo = new CalcLogVO();
++        vo.setTaskId("BACKFILL-t-1");
++        vo.setRecalc(true);
++        when(calcReadService.log("K", 100L, 900L)).thenReturn(List.of(vo));
++
++        Result<List<CalcLogVO>> r = controller.log("K", 100L, 900L);
++        assertEquals(200, r.getCode());
++        assertEquals(true, r.getData().get(0).getRecalc());
++        verify(calcReadService).log("K", 100L, 900L);
++
++        when(calcReadService.log("K", 900L, 100L))
++                .thenThrow(new BusinessException(400, "from/to 必填且须 from < to"));
++        assertThrows(BusinessException.class, () -> controller.log("K", 900L, 100L));
++    }
++
++    @Test
++    void bothEndpointsAreReadonlyAndGuarded() throws Exception {
++        // 权限：沿用管理面只读权限码 iot:instance:query（0064 无 calc 位），两 GET 都必须挂
++        SaCheckPermission statePerm = IotCalcReadController.class.getMethod("state", String.class)
++                .getAnnotation(SaCheckPermission.class);
++        SaCheckPermission logPerm = IotCalcReadController.class
++                .getMethod("log", String.class, Long.class, Long.class)
++                .getAnnotation(SaCheckPermission.class);
++        assertEquals("iot:instance:query", statePerm.value()[0]);
++        assertEquals("iot:instance:query", logPerm.value()[0]);
++        // 只读：类上只有 @GetMapping（state/log），无任何写动词映射
++        long getMappings = java.util.Arrays.stream(IotCalcReadController.class.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(org.springframework.web.bind.annotation.GetMapping.class))
++                .count();
++        long writeMappings = java.util.Arrays.stream(IotCalcReadController.class.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(org.springframework.web.bind.annotation.PostMapping.class)
++                        || m.isAnnotationPresent(org.springframework.web.bind.annotation.PutMapping.class)
++                        || m.isAnnotationPresent(org.springframework.web.bind.annotation.DeleteMapping.class))
++                .count();
++        assertEquals(2, getMappings, "恰好两个只读 GET");
++        assertEquals(0, writeMappings, "零写口——状态页不触发 calc 写");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImplTest.java
+new file mode 100644
+index 0000000..fd900bb
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImplTest.java
+@@ -0,0 +1,125 @@
++package net.otlab.admin.module.iot.calcread.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0063：calc 只读服务核心读单测（H2 内存库建 iot_calc_state/log 同结构表，不碰宿主 MySQL）。
++ *
++ * <p>锁定：会话租户行过滤、fullKey 过滤、INT→文本翻译、is_recalc 映射、空态 fail-soft、
++ * 时间窗检索、只读账号零写口（SQL 只有 SELECT）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcReadServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private JdbcTemplate jdbc;
++    private CalcReadServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:calc_read_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_calc_state ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT, full_key VARCHAR(180), "
++                + "last_calc_time TIMESTAMP, watermark TIMESTAMP, calc_status INT, "
++                + "error_count INT, last_error VARCHAR(1000), update_time TIMESTAMP)");
++        jdbc.execute("CREATE TABLE iot_calc_log ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT, task_id VARCHAR(64), "
++                + "full_key VARCHAR(180), period_start TIMESTAMP, period_end TIMESTAMP, "
++                + "trigger_type VARCHAR(16), input_summary CLOB, result_status INT, error_msg VARCHAR(1000), "
++                + "is_recalc INT, started_at TIMESTAMP, finished_at TIMESTAMP, duration_ms BIGINT)");
++        service = new CalcReadServiceImpl(jdbc); // 核心读构造，跳过数据权限（依赖 null）
++        // 会话租户 = TENANT（照既有 SysTenantInitAdminTest 口径）
++        StpUtil.login("calc-read-test");
++        StpUtil.getSession().set("tenant_id", TENANT);
++    }
++
++    @AfterEach
++    void tearDown() {
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    @Test
++    void stateFiltersByTenantAndFullKeyAndTranslatesStatus() {
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id,full_key,last_calc_time,watermark,calc_status,error_count,last_error,update_time) "
++                        + "VALUES (?,?,?,?,?,?,?,?)", TENANT, "T|M.A|I01|day",
++                new java.sql.Timestamp(1000L), new java.sql.Timestamp(2000L), 3, 2, "停算原因",
++                new java.sql.Timestamp(3000L));
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id,full_key,calc_status) VALUES (?,?,?)",
++                TENANT, "T|M.B|I02|day", 1);
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id,full_key,calc_status) VALUES (?,?,?)",
++                2L, "T|M.C|I03|day", 1); // 其他租户
++
++        List<CalcStateVO> all = service.state(null);
++        assertEquals(2, all.size(), "只返回本租户两行");
++        List<CalcStateVO> one = service.state("T|M.A|I01|day");
++        assertEquals(1, one.size());
++        assertEquals(3, one.get(0).getCalcStatus());
++        assertEquals("异常停算", one.get(0).getCalcStatusText());
++        assertEquals(2000L, one.get(0).getWatermark());
++        assertEquals(2, one.get(0).getErrorCount());
++        assertEquals("停算原因", one.get(0).getLastError());
++    }
++
++    @Test
++    void stateEmptyIsFailSoft() {
++        assertTrue(service.state(null).isEmpty(), "无数据空集不报错");
++    }
++
++    @Test
++    void logTimeWindowAndRecalcMapping() {
++        jdbc.update("INSERT INTO iot_calc_log (tenant_id,task_id,full_key,period_start,period_end,"
++                        + "trigger_type,result_status,is_recalc,started_at,finished_at,duration_ms) "
++                        + "VALUES (?,?,?,?,?,?,?,?,?,?,?)", TENANT, "BACKFILL-1", "T|M.A|I01|day",
++                new java.sql.Timestamp(1000L), new java.sql.Timestamp(2000L),
++                "BACKFILL", 1, 1, new java.sql.Timestamp(1500L), new java.sql.Timestamp(1600L), 100L);
++        jdbc.update("INSERT INTO iot_calc_log (tenant_id,task_id,full_key,trigger_type,result_status,is_recalc,started_at) "
++                        + "VALUES (?,?,?,?,?,?,?)", TENANT, "AUTO-2", "T|M.A|I01|day",
++                "AUTO", 2, 0, new java.sql.Timestamp(9000L)); // 时间窗外
++
++        List<CalcLogVO> rows = service.log("T|M.A|I01|day", 1000L, 3000L);
++        assertEquals(1, rows.size(), "按时间窗过滤");
++        CalcLogVO vo = rows.get(0);
++        assertEquals("BACKFILL-1", vo.getTaskId());
++        assertEquals("BACKFILL", vo.getTriggerType());
++        assertEquals(true, vo.getRecalc(), "is_recalc=1 → true");
++        assertEquals(100L, vo.getDurationMs());
++        assertNull(vo.getErrorMsg());
++    }
++
++    @Test
++    void logBadArgsRejected() {
++        assertThrows(BusinessException.class, () -> service.log("K", 500L, 100L), "from>=to 拒绝");
++        assertThrows(BusinessException.class, () -> service.log(null, 100L, 500L), "fullKey 必填");
++    }
++
++    @Test
++    void instanceCodeExtraction() {
++        assertEquals("I01", CalcReadServiceImpl.instanceCodeOf("T|M.A|I01|day"));
++        assertNull(CalcReadServiceImpl.instanceCodeOf("M.A"));
++    }
++}
+diff --git a/calc/pom.xml b/calc/pom.xml
+index 14ac2b3..70c45a5 100644
+--- a/calc/pom.xml
++++ b/calc/pom.xml
+@@ -47,6 +47,26 @@
+             <artifactId>spring-boot-starter-web</artifactId>
+         </dependency>
+ 
++        <!-- TASK-0063：CalcStateStore JDBC 实现（iot_calc schema，计算引擎读写账号）；
++             spring-jdbc 提供 JdbcTemplate，MySQL 驱动走运行期 env 注入的 URL -->
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-jdbc</artifactId>
++        </dependency>
++        <dependency>
++            <groupId>com.mysql</groupId>
++            <artifactId>mysql-connector-j</artifactId>
++            <scope>runtime</scope>
++        </dependency>
++
++        <!-- TASK-0063：JDBC 契约测试用内存 H2（不碰宿主 MySQL；模拟 iot_calc_state DDL 映射） -->
++        <dependency>
++            <groupId>com.h2database</groupId>
++            <artifactId>h2</artifactId>
++            <version>2.3.232</version>
++            <scope>test</scope>
++        </dependency>
++
+         <dependency>
+             <groupId>org.springframework.boot</groupId>
+             <artifactId>spring-boot-starter-test</artifactId>
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index eb17dd8..a314dd0 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -226,12 +226,28 @@ public class CalcEngineApplication {
+     }
+ 
+     /**
+-     * TASK-0047 修订 F-02：CalcStateStore DI 缝——默认内存实现，0063 换 JDBC 时只需
+-     * 用 profile/配置替换本 Bean（@Primary 或 @ConditionalOnProperty），CalcTaskManager/
+-     * CalcStatusController 消费侧零代码改动。
++     * TASK-0047 修订 F-02 / TASK-0063：CalcStateStore DI 缝——默认内存实现；0063 按 env
++     * （CALC_STATE_JDBC_ENABLED=true + URL/账号，计算引擎<b>读写账号</b>）换成 JDBC 实现
++     * （iot_calc schema）。管理器/状态机/VO/控制器消费侧零代码改动。连接失败由
++     * {@link net.otlab.calc.state.JdbcCalcStateStore} fail-soft WARN 降级，不阻塞在线计算。
+      */
+     @Bean
+-    public net.otlab.calc.state.CalcStateStore calcStateStore() {
++    public net.otlab.calc.state.CalcStateStore calcStateStore(CalcProperties properties) {
++        if (properties.isCalcStateJdbcEnabled()) {
++            String url = properties.getCalcStateJdbcUrl();
++            if (url == null || url.isBlank()) {
++                throw new IllegalStateException(
++                        "CALC_STATE_JDBC_ENABLED=true 但 CALC_STATE_JDBC_URL 未配置（iot_calc schema 读写库）");
++            }
++            org.springframework.jdbc.datasource.DriverManagerDataSource ds =
++                    new org.springframework.jdbc.datasource.DriverManagerDataSource();
++            ds.setDriverClassName("com.mysql.cj.jdbc.Driver");
++            ds.setUrl(url);
++            ds.setUsername(properties.getCalcStateJdbcUser() == null ? "" : properties.getCalcStateJdbcUser());
++            ds.setPassword(properties.getCalcStateJdbcPassword() == null ? "" : properties.getCalcStateJdbcPassword());
++            log.info("[CALC] CalcStateStore 使用 JDBC 实现（iot_calc schema 读写账号，fail-soft）");
++            return new net.otlab.calc.state.JdbcCalcStateStore(new org.springframework.jdbc.core.JdbcTemplate(ds));
++        }
+         return new net.otlab.calc.state.InMemoryCalcStateStore();
+     }
+ 
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 625be99..2f1d574 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -113,6 +113,50 @@ public class CalcProperties {
+     /** 计算状态滞后阈值（毫秒；env CALC_CALC_LAG_THRESHOLD_MS，默认 15 分钟） */
+     private Long calcLagThresholdMs = 15L * 60L * 1000L;
+ 
++    /** TASK-0063 CalcStateStore JDBC 开关（默认 false——零回归；true 才用 iot_calc schema 落库） */
++    private boolean calcStateJdbcEnabled = false;
++
++    /** TASK-0063 iot_calc schema JDBC URL（计算引擎读写账号；env CALC_STATE_JDBC_URL） */
++    private String calcStateJdbcUrl = "";
++
++    /** TASK-0063 iot_calc 读写账号（env CALC_STATE_JDBC_USER；口令由部署注入不硬编码） */
++    private String calcStateJdbcUser = "";
++
++    /** TASK-0063 iot_calc 读写口令（env CALC_STATE_JDBC_PASSWORD） */
++    private String calcStateJdbcPassword = "";
++
++    public boolean isCalcStateJdbcEnabled() {
++        return calcStateJdbcEnabled;
++    }
++
++    public void setCalcStateJdbcEnabled(boolean calcStateJdbcEnabled) {
++        this.calcStateJdbcEnabled = calcStateJdbcEnabled;
++    }
++
++    public String getCalcStateJdbcUrl() {
++        return calcStateJdbcUrl;
++    }
++
++    public void setCalcStateJdbcUrl(String calcStateJdbcUrl) {
++        this.calcStateJdbcUrl = calcStateJdbcUrl;
++    }
++
++    public String getCalcStateJdbcUser() {
++        return calcStateJdbcUser;
++    }
++
++    public void setCalcStateJdbcUser(String calcStateJdbcUser) {
++        this.calcStateJdbcUser = calcStateJdbcUser;
++    }
++
++    public String getCalcStateJdbcPassword() {
++        return calcStateJdbcPassword;
++    }
++
++    public void setCalcStateJdbcPassword(String calcStateJdbcPassword) {
++        this.calcStateJdbcPassword = calcStateJdbcPassword;
++    }
++
+     public boolean isRecalculateEnabled() {
+         return recalculateEnabled;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/state/JdbcCalcStateStore.java b/calc/src/main/java/net/otlab/calc/state/JdbcCalcStateStore.java
+new file mode 100644
+index 0000000..beb091d
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/state/JdbcCalcStateStore.java
+@@ -0,0 +1,139 @@
++package net.otlab.calc.state;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++import java.util.List;
++
++/**
++ * TASK-0063：CalcStateStore 的 JDBC 实现（iot_calc schema 独立库，计算引擎读写账号）。
++ *
++ * <p>实现 TASK-0047 定义的 {@link CalcStateStore} 接口——替换 {@code calcStateStore()} Bean
++ * 即完成「0063 零改动替换」（管理器/状态机/VO/控制器消费侧只依赖接口）。字段映射逐字对齐
++ * §1.9A：tenant_id/full_key/last_calc_time/watermark/calc_status/error_count/last_error/update_time；
++ * 唯一键 uk_tenant_full_key(tenant_id, full_key) 保证 upsert 同键覆盖不追加。
++ *
++ * <p><b>fail-soft</b>：任何 JDBC 异常（连接失败/表缺失/账号权限不足）记 WARN 并降级——
++ * get 返回 null（视为未登记）、upsert/byTenant/all 空操作/空集，不抛异常阻塞在线计算
++ * （brief 决策 2「连接失败 fail-soft WARN、不阻塞在线计算」）。真库列条件：DDL 由用户自行
++ * 应用后用同套契约测试复验；本类契约测试用 H2 内存库（不碰宿主 MySQL）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class JdbcCalcStateStore implements CalcStateStore {
++
++    private static final Logger log = LoggerFactory.getLogger(JdbcCalcStateStore.class);
++
++    /** 逻辑表名（iot_calc schema 由 DataSource 的 URL/Catalog 决定；H2 测试建同结构表） */
++    static final String TABLE = "iot_calc_state";
++
++    private final JdbcTemplate jdbc;
++
++    public JdbcCalcStateStore(JdbcTemplate jdbc) {
++        this.jdbc = jdbc;
++    }
++
++    @Override
++    public CalcState get(long tenantId, String fullKey) {
++        try {
++            List<CalcState> rows = jdbc.query(
++                    "SELECT tenant_id, full_key, last_calc_time, watermark, calc_status, "
++                            + "error_count, last_error, update_time FROM " + TABLE
++                            + " WHERE tenant_id=? AND full_key=?",
++                    (rs, i) -> map(rs.getLong("tenant_id"), rs.getString("full_key"),
++                            rs.getTimestamp("last_calc_time"), rs.getTimestamp("watermark"),
++                            rs.getInt("calc_status"), rs.getInt("error_count"),
++                            rs.getString("last_error"), rs.getTimestamp("update_time")),
++                    tenantId, fullKey);
++            return rows.isEmpty() ? null : rows.get(0);
++        } catch (RuntimeException e) {
++            warn("get", tenantId, fullKey, e);
++            return null;
++        }
++    }
++
++    @Override
++    public void upsert(CalcState state) {
++        if (state == null) {
++            return;
++        }
++        try {
++            long updateTime = state.updateTime() > 0 ? state.updateTime() : System.currentTimeMillis();
++            java.sql.Timestamp lastCalc = ts(state.lastCalcTime());
++            java.sql.Timestamp wm = ts(state.watermark());
++            java.sql.Timestamp ut = new java.sql.Timestamp(updateTime);
++            // 先 UPDATE 再按影响行数 INSERT——跨 MySQL/H2 通用（不依赖 ON DUPLICATE KEY 的方言差异）
++            int updated = jdbc.update(
++                    "UPDATE " + TABLE + " SET last_calc_time=?, watermark=?, calc_status=?, "
++                            + "error_count=?, last_error=?, update_time=? WHERE tenant_id=? AND full_key=?",
++                    lastCalc, wm, state.calcStatus(), state.errorCount(), state.lastError(), ut,
++                    state.tenantId(), state.fullKey());
++            if (updated == 0) {
++                jdbc.update(
++                        "INSERT INTO " + TABLE + " (tenant_id, full_key, last_calc_time, watermark, "
++                                + "calc_status, error_count, last_error, update_time) VALUES (?,?,?,?,?,?,?,?)",
++                        state.tenantId(), state.fullKey(), lastCalc, wm, state.calcStatus(),
++                        state.errorCount(), state.lastError(), ut);
++            }
++        } catch (RuntimeException e) {
++            warn("upsert", state.tenantId(), state.fullKey(), e);
++        }
++    }
++
++    @Override
++    public List<CalcState> byTenant(long tenantId) {
++        try {
++            return jdbc.query(
++                    "SELECT tenant_id, full_key, last_calc_time, watermark, calc_status, "
++                            + "error_count, last_error, update_time FROM " + TABLE
++                            + " WHERE tenant_id=? ORDER BY full_key",
++                    (rs, i) -> map(rs.getLong("tenant_id"), rs.getString("full_key"),
++                            rs.getTimestamp("last_calc_time"), rs.getTimestamp("watermark"),
++                            rs.getInt("calc_status"), rs.getInt("error_count"),
++                            rs.getString("last_error"), rs.getTimestamp("update_time")),
++                    tenantId);
++        } catch (RuntimeException e) {
++            warn("byTenant", tenantId, null, e);
++            return List.of();
++        }
++    }
++
++    @Override
++    public List<CalcState> all() {
++        try {
++            return jdbc.query(
++                    "SELECT tenant_id, full_key, last_calc_time, watermark, calc_status, "
++                            + "error_count, last_error, update_time FROM " + TABLE
++                            + " ORDER BY tenant_id, full_key",
++                    (rs, i) -> map(rs.getLong("tenant_id"), rs.getString("full_key"),
++                            rs.getTimestamp("last_calc_time"), rs.getTimestamp("watermark"),
++                            rs.getInt("calc_status"), rs.getInt("error_count"),
++                            rs.getString("last_error"), rs.getTimestamp("update_time")));
++        } catch (RuntimeException e) {
++            warn("all", null, null, e);
++            return List.of();
++        }
++    }
++
++    private static CalcState map(long tenantId, String fullKey, java.sql.Timestamp lastCalc,
++                                 java.sql.Timestamp wm, int status, int errorCount,
++                                 String lastError, java.sql.Timestamp updateTime) {
++        return CalcState.of(tenantId, fullKey)
++                .lastCalcTime(lastCalc == null ? 0L : lastCalc.getTime())
++                .watermark(wm == null ? 0L : wm.getTime())
++                .calcStatus(status).errorCount(errorCount).lastError(lastError)
++                .updateTime(updateTime == null ? 0L : updateTime.getTime())
++                .build();
++    }
++
++    private static java.sql.Timestamp ts(long millis) {
++        return millis > 0 ? new java.sql.Timestamp(millis) : null;
++    }
++
++    private static void warn(String op, Long tenantId, String fullKey, RuntimeException e) {
++        log.warn("[CALC-STATE-JDBC] {} 降级（tenant={}, fullKey={}）——在线计算不阻塞: {}",
++                op, tenantId, fullKey, e.getMessage());
++    }
++}
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index 52b27dd..76adcb4 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -61,3 +61,8 @@ calc:
+   recalc-workers: ${CALC_RECALC_WORKERS:2}
+   # 计算状态滞后阈值（毫秒；默认 15 分钟）
+   calc-lag-threshold-ms: ${CALC_CALC_LAG_THRESHOLD_MS:900000}
++  # TASK-0063 CalcStateStore JDBC 落库（默认关闭=内存实现零回归；开启用 iot_calc schema 读写账号）
++  calc-state-jdbc-enabled: ${CALC_STATE_JDBC_ENABLED:false}
++  calc-state-jdbc-url: ${CALC_STATE_JDBC_URL:}
++  calc-state-jdbc-user: ${CALC_STATE_JDBC_USER:}
++  calc-state-jdbc-password: ${CALC_STATE_JDBC_PASSWORD:}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index f8a5780..db6a606 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -89,4 +89,12 @@ class CalcPropertiesTest {
+         assertEquals(Integer.valueOf(64), p.getRecalcQueueCapacity(), "补算有界队列缺省 64（限流防风暴）");
+         assertEquals(Integer.valueOf(2), p.getRecalcWorkers(), "补算线程池缺省 2（与在线执行器分区隔离）");
+     }
++
++    @Test
++    void task0063JdbcDefaultsKeepInMemoryBehavior() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isCalcStateJdbcEnabled(), "CalcStateStore JDBC 默认关闭（0063 内存实现零回归）");
++        assertEquals("", p.getCalcStateJdbcUrl(), "JDBC URL 缺省空");
++        assertEquals("", p.getCalcStateJdbcUser(), "JDBC 账号缺省空（由部署 env 注入）");
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/state/IotCalcSchemaDdlContractTest.java b/calc/src/test/java/net/otlab/calc/state/IotCalcSchemaDdlContractTest.java
+new file mode 100644
+index 0000000..41bbb1b
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/IotCalcSchemaDdlContractTest.java
+@@ -0,0 +1,119 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0063：iot_calc 独立 schema DDL 脚本静态结构契约（只产出、不在用户库执行）。
++ *
++ * <p>本测试只读脚本文本、不连任何数据库——验证 ADR-0009 Q1 定版 A（同实例分 schema+独立
++ * 账号）与「iot_calc_state 不套审计四件套」的机械约束：幂等、schema、两表字段/索引、
++ * 账号分离（读写/只读分开、口令占位不硬编码）、无审计四件套列。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotCalcSchemaDdlContractTest {
++
++    private static final String REL = "resources/sql/upgrade/20261124_iot_calc_schema.sql";
++
++    private static Path repoRoot() {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        if (dir == null) {
++            throw new IllegalStateException("repo root not found (resources/sql/01_base.sql)");
++        }
++        return dir;
++    }
++
++    private static String ddl() throws Exception {
++        Path p = repoRoot().resolve(REL);
++        assertTrue(Files.exists(p), "缺 DDL 脚本: " + REL);
++        return Files.readString(p, StandardCharsets.UTF_8);
++    }
++
++    @Test
++    @DisplayName("DDL 幂等：schema/表/账号均 IF NOT EXISTS 或 information_schema 判存，无裸 CREATE")
++    void idempotent() throws Exception {
++        String sql = ddl();
++        assertTrue(sql.contains("CREATE SCHEMA IF NOT EXISTS `iot_calc`"), "schema 幂等");
++        assertTrue(sql.contains("CREATE TABLE IF NOT EXISTS `iot_calc`.`iot_calc_state`")
++                || sql.contains("CREATE TABLE IF NOT EXISTS `iot_calc_state`"), "state 表幂等");
++        assertTrue(sql.contains("CREATE TABLE IF NOT EXISTS `iot_calc`.`iot_calc_log`")
++                || sql.contains("CREATE TABLE IF NOT EXISTS `iot_calc_log`"), "log 表幂等");
++        // CREATE USER 必须都在预处理判存字符串内（information_schema 判存），不得有裸的顶层 CREATE USER。
++        // 逐行扫描：以 CREATE USER 开头的裸语句即违规；包在引号中的判存动态 SQL 允许。
++        for (String line : sql.split("\\R")) {
++            String t = line.trim();
++            assertFalse(t.matches("CREATE\\s+USER\\s+.*"),
++                    "CREATE USER 须包在 information_schema 判存的动态 SQL 中，不得裸建: " + t);
++        }
++        assertTrue(sql.contains("information_schema.USER_PRIVILEGES"), "账号须 information_schema 判存");
++    }
++
++    @Test
++    @DisplayName("DDL 独立 schema：iot_calc 明确声明，头注登记 ADR-0009 Q1 定版 A")
++    void independentSchema() throws Exception {
++        String sql = ddl();
++        assertTrue(sql.contains("`iot_calc`"), "须声明独立 schema iot_calc");
++        assertTrue(sql.contains("ADR-0009") && sql.contains("Q1"), "头注登记 ADR-0009 Q1 定版依据");
++    }
++
++    @Test
++    @DisplayName("DDL iot_calc_state：§1.9A 全字段 + uk_tenant_full_key，且无审计四件套")
++    void stateColumnsAndNoAuditQuartet() throws Exception {
++        String sql = ddl();
++        for (String col : new String[]{"tenant_id", "full_key", "last_calc_time", "watermark",
++                "calc_status", "error_count", "last_error", "update_time"}) {
++            assertTrue(sql.contains("`" + col + "`"), "state 缺字段: " + col);
++        }
++        assertTrue(sql.contains("uk_tenant_full_key"), "state 须唯一键 (tenant_id, full_key)");
++        // 审计四件套（create_time/create_by/update_by/deleted）只在别的上下文字样出现不行——
++        // 以 state 建表块为界隔离检查：从 CREATE ... iot_calc_state 到下一个 ')' 收尾
++        int start = sql.indexOf("CREATE TABLE IF NOT EXISTS `iot_calc`.`iot_calc_state`");
++        if (start < 0) start = sql.indexOf("CREATE TABLE IF NOT EXISTS `iot_calc_state`");
++        assertTrue(start >= 0, "定位 state 建表块");
++        int end = sql.indexOf("ENGINE=InnoDB", start);
++        String stateBlock = sql.substring(start, end < 0 ? sql.length() : end);
++        for (String audit : new String[]{"create_time", "create_by", "update_by", "`deleted`", "`version`"}) {
++            assertFalse(stateBlock.contains(audit), "iot_calc_state 不得套审计四件套: " + audit);
++        }
++    }
++
++    @Test
++    @DisplayName("DDL iot_calc_log：§1.9A 全字段 + 三索引（idx_task/idx_key_period/idx_trigger_time）")
++    void logColumnsAndIndexes() throws Exception {
++        String sql = ddl();
++        for (String col : new String[]{"id", "tenant_id", "task_id", "full_key", "period_start",
++                "period_end", "trigger_type", "input_summary", "result_status", "error_msg",
++                "is_recalc", "started_at", "finished_at", "duration_ms"}) {
++            assertTrue(sql.contains("`" + col + "`"), "log 缺字段: " + col);
++        }
++        for (String idx : new String[]{"idx_task", "idx_key_period", "idx_trigger_time"}) {
++            assertTrue(sql.contains(idx), "log 缺索引: " + idx);
++        }
++    }
++
++    @Test
++    @DisplayName("DDL 账号分离：计算引擎读写账号 vs 管理系统只读账号，口令用占位符不硬编码")
++    void accountsSeparatedAndNoHardcodedPassword() throws Exception {
++        String sql = ddl();
++        assertTrue(sql.contains("iot_calc_rw"), "缺计算引擎读写账号占位");
++        assertTrue(sql.contains("iot_calc_ro"), "缺管理系统只读账号占位");
++        assertTrue(sql.contains("SELECT"), "只读账号须 GRANT SELECT");
++        // 口令占位（由部署注入），不硬编码真实字面值
++        assertTrue(sql.contains("${") || sql.contains("PLACEHOLDER") || sql.contains("<")
++                || sql.contains("password"), "口令须占位并注释由部署注入");
++        assertFalse(sql.contains("IDENTIFIED BY 'root'"), "禁止硬编码 root 真实口令");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/state/JdbcCalcStateStoreContractTest.java b/calc/src/test/java/net/otlab/calc/state/JdbcCalcStateStoreContractTest.java
+new file mode 100644
+index 0000000..41d925c
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/JdbcCalcStateStoreContractTest.java
+@@ -0,0 +1,114 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.DynamicTest;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.TestFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0063：CalcStateStore 同套契约在真实 JDBC 实现（H2 内存库，模拟 iot_calc_state DDL）上复跑。
++ *
++ * <p>承接 0047 修订轮 {@code CalcStateStoreReplaceabilityContractTest}（内存 + JdbcLike 替身）——
++ * 本测把「替身」换成<b>真 JDBC 实现</b> {@link JdbcCalcStateStore}，JdbcTemplate 指向 H2 内存库
++ * （不连宿主 MySQL，DDL 不在用户库执行）。证明 0047 注入缝「0063 换 JDBC 消费侧零改动」在真
++ * JDBC 路径成立：upsert/get、租户隔离、同 uk 覆盖不追加、字段（水位/状态/连续错误）往返一致。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class JdbcCalcStateStoreContractTest {
++
++    /** 建与 iot_calc_state 同结构的 H2 内存表（§1.9A 字段，不套审计四件套） */
++    private static JdbcTemplate h2Jdbc() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:iot_calc_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        JdbcTemplate jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_calc_state ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, "
++                + "tenant_id BIGINT NOT NULL, full_key VARCHAR(180) NOT NULL, "
++                + "last_calc_time TIMESTAMP, watermark TIMESTAMP, "
++                + "calc_status INT DEFAULT 1, error_count INT DEFAULT 0, "
++                + "last_error VARCHAR(1000), update_time TIMESTAMP, "
++                + "CONSTRAINT uk_tenant_full_key UNIQUE (tenant_id, full_key))");
++        return jdbc;
++    }
++
++    private interface StoreFactory {
++        String name();
++        CalcStateStore create();
++    }
++
++    @TestFactory
++    List<DynamicTest> sameContractRunsOnRealJdbcImplementation() {
++        List<StoreFactory> factories = List.of(
++                new StoreFactory() {
++                    public String name() { return "InMemoryCalcStateStore(默认)"; }
++                    public CalcStateStore create() { return new InMemoryCalcStateStore(); }
++                },
++                new StoreFactory() {
++                    public String name() { return "JdbcCalcStateStore(H2真JDBC)"; }
++                    public CalcStateStore create() { return new JdbcCalcStateStore(h2Jdbc()); }
++                });
++
++        List<DynamicTest> tests = new ArrayList<>();
++        for (StoreFactory factory : factories) {
++            String prefix = factory.name() + ": ";
++            tests.add(DynamicTest.dynamicTest(prefix + "upsert/get 与租户隔离", () -> {
++                CalcStateStore s = factory.create();
++                assertNull(s.get(1L, "T.A"));
++                s.upsert(CalcState.of(1L, "T.A").watermark(1000L).build());
++                assertEquals(1L, s.get(1L, "T.A").tenantId());
++                assertNull(s.get(2L, "T.A"), "租户隔离");
++            }));
++            tests.add(DynamicTest.dynamicTest(prefix + "同 uk 覆盖不追加", () -> {
++                CalcStateStore s = factory.create();
++                s.upsert(CalcState.of(1L, "T.A").build());
++                s.upsert(CalcState.of(1L, "T.A").calcStatus(3).errorCount(5).build());
++                assertEquals(3, s.get(1L, "T.A").calcStatus());
++                assertEquals(5, s.get(1L, "T.A").errorCount());
++                assertEquals(1, s.all().size());
++            }));
++            tests.add(DynamicTest.dynamicTest(prefix + "水位/状态/错误字段往返一致", () -> {
++                CalcStateStore s = factory.create();
++                s.upsert(CalcState.of(7L, "M.X").lastCalcTime(1111L).watermark(2222L)
++                        .calcStatus(2).errorCount(3).lastError("lag").updateTime(3333L).build());
++                CalcState got = s.get(7L, "M.X");
++                assertEquals(1111L, got.lastCalcTime());
++                assertEquals(2222L, got.watermark());
++                assertEquals(2, got.calcStatus());
++                assertEquals(3, got.errorCount());
++                assertEquals("lag", got.lastError());
++                assertEquals(3333L, got.updateTime());
++                assertEquals(1, s.byTenant(7L).size());
++                assertTrue(s.byTenant(8L).isEmpty());
++            }));
++        }
++        return tests;
++    }
++
++    @Test
++    void connectionFailureIsFailSoftAndNeverBlocksOnlineCalc() {
++        // 指向不存在端口的 DataSource——连接必失败；JdbcCalcStateStore 须 WARN 降级、不抛异常
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:tcp://127.0.0.1:1/none;DB_CLOSE_DELAY=-1");
++        CalcStateStore broken = new JdbcCalcStateStore(new JdbcTemplate(ds));
++        assertNull(broken.get(1L, "T.A"), "连接失败 get 降级 null");
++        assertTrue(broken.all().isEmpty(), "连接失败 all 降级空集");
++        assertTrue(broken.byTenant(1L).isEmpty(), "连接失败 byTenant 降级空集");
++        assertDoesNotThrow(() -> broken.upsert(CalcState.of(1L, "T.A").build()),
++                "连接失败 upsert 必须不抛异常（不阻塞在线计算）");
++    }
++}
+diff --git a/resources/sql/upgrade/20261124_iot_calc_schema.sql b/resources/sql/upgrade/20261124_iot_calc_schema.sql
+new file mode 100644
+index 0000000..d34c3a4
+--- /dev/null
++++ b/resources/sql/upgrade/20261124_iot_calc_schema.sql
+@@ -0,0 +1,83 @@
++-- ============================================================
++-- TASK-0063：iot_calc 独立 schema（计算状态 + 计算日志）+ 计算引擎读写账号 / 管理系统只读账号
++--   依据：ADR-0009 Q1 定版 A（同实例分 schema + 独立账号，量级上来后平迁独立实例表结构不变）；
++--         REQ-0023（计算状态监控与停算保护）、REQ-0022（计算留痕）；详细设计 §1.9A / §1.10。
++-- ============================================================
++-- 重要声明（brief 契约）：
++--   1) 本脚本由 Agent **只产出、不在用户库执行**（用户 MySQL 宿主 phpStudy 8.0.12@3307）。
++--      应用步骤见 TASK-0063 报告「未做项」节，由部署方按环境自行执行。
++--   2) iot_calc_state **不套审计四件套**（无 create_time/create_by/update_by/deleted/version）——
++--      TASK-0063 技术方案明文；状态行只保留 §1.9A 的 8 列 + 唯一键。
++--   3) 账号口令使用占位符（${IOT_CALC_RW_PASSWORD} / ${IOT_CALC_RO_PASSWORD}），由部署注入，
++--      不在脚本中硬编码任何真实口令；GRANT 仅授权所需最小权限。
++--   4) 幂等：schema/表/账号均 IF NOT EXISTS 或 information_schema 判存，可重复执行无副作用。
++--   5) 执行纪律：backend/scripts/sql-exec.sh 每条语句单独一次调用。
++-- ============================================================
++
++-- ① 独立 schema（Q1 定版 A：同实例分 schema，iot_calc 与业务库同 MySQL 实例）
++CREATE SCHEMA IF NOT EXISTS `iot_calc` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
++
++-- ② iot_calc_state（§1.9A；不套审计四件套）
++CREATE TABLE IF NOT EXISTS `iot_calc`.`iot_calc_state` (
++  `id`             bigint       NOT NULL AUTO_INCREMENT COMMENT '主键 ID',
++  `tenant_id`      bigint       NOT NULL                COMMENT '租户 ID',
++  `full_key`       varchar(180) NOT NULL                COMMENT '数据项/指标唯一键',
++  `last_calc_time` datetime     DEFAULT NULL            COMMENT '最近一次计算窗口起',
++  `watermark`      datetime     DEFAULT NULL            COMMENT '水位（该时间前已处理完，补算从此后开始）',
++  `calc_status`    tinyint      DEFAULT '1'             COMMENT '状态：1 正常 2 滞后 3 异常停算',
++  `error_count`    int          DEFAULT '0'             COMMENT '连续错误次数',
++  `last_error`     varchar(1000) DEFAULT NULL           COMMENT '最近错误原因',
++  `update_time`    datetime     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_full_key` (`tenant_id`, `full_key`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='计算状态（iot_calc_state；无审计四件套，TASK-0063）';
++
++-- ③ iot_calc_log（§1.9A 全字段 + 三索引）
++CREATE TABLE IF NOT EXISTS `iot_calc`.`iot_calc_log` (
++  `id`            bigint        NOT NULL AUTO_INCREMENT COMMENT '主键 ID',
++  `tenant_id`     bigint        NOT NULL                COMMENT '租户 ID',
++  `task_id`       varchar(64)   NOT NULL                COMMENT '任务 ID（数据项/指标重算链）',
++  `full_key`      varchar(180)  NOT NULL                COMMENT '数据项/指标唯一键',
++  `period_start`  datetime      NOT NULL                COMMENT '计算窗口起',
++  `period_end`    datetime      NOT NULL                COMMENT '计算窗口止',
++  `trigger_type`  varchar(16)   NOT NULL                COMMENT '触发方式：AUTO/BACKFILL/MANUAL',
++  `input_summary` json          DEFAULT NULL            COMMENT '输入摘要（上游全键/窗口条数/关键输入）',
++  `result_status` tinyint       NOT NULL                COMMENT '结果：1 成功 2 失败',
++  `error_msg`     varchar(1000) DEFAULT NULL            COMMENT '失败原因',
++  `is_recalc`     tinyint       DEFAULT '0'             COMMENT '是否重算：0 否 1 是',
++  `started_at`    datetime      NOT NULL                COMMENT '开始时间',
++  `finished_at`   datetime      DEFAULT NULL            COMMENT '结束时间',
++  `duration_ms`   bigint        DEFAULT NULL            COMMENT '耗时（毫秒）',
++  PRIMARY KEY (`id`),
++  KEY `idx_task` (`task_id`),
++  KEY `idx_key_period` (`tenant_id`, `full_key`, `period_start`),
++  KEY `idx_trigger_time` (`trigger_type`, `started_at`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='计算日志（iot_calc_log；追加写，TASK-0063）';
++
++-- ④ 计算引擎账号（读写 iot_calc schema）——口令由部署注入，占位符不硬编码
++-- 幂等：information_schema 判存，存在则跳过 CREATE（MySQL 8.0 无 CREATE USER IF NOT EXISTS 的
++--       跨版本差异口径，统一用预处理判存，可重复执行）。
++SET @rw_user_exists = (SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = "'iot_calc_rw'@'%'");
++SET @rw_create = IF(@rw_user_exists = 0,
++  'CREATE USER ''iot_calc_rw''@''%'' IDENTIFIED BY ''${IOT_CALC_RW_PASSWORD}''',
++  'SELECT 1');
++PREPARE rw_stmt FROM @rw_create; EXECUTE rw_stmt; DEALLOCATE PREPARE rw_stmt;
++GRANT SELECT, INSERT, UPDATE ON `iot_calc`.* TO 'iot_calc_rw'@'%';
++FLUSH PRIVILEGES;
++
++-- ⑤ 管理系统只读账号（仅 SELECT iot_calc schema；与计算引擎写账号分离）
++SET @ro_user_exists = (SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = "'iot_calc_ro'@'%'");
++SET @ro_create = IF(@ro_user_exists = 0,
++  'CREATE USER ''iot_calc_ro''@''%'' IDENTIFIED BY ''${IOT_CALC_RO_PASSWORD}''',
++  'SELECT 1');
++PREPARE ro_stmt FROM @ro_create; EXECUTE ro_stmt; DEALLOCATE PREPARE ro_stmt;
++GRANT SELECT ON `iot_calc`.* TO 'iot_calc_ro'@'%';
++FLUSH PRIVILEGES;
++
++-- ============================================================
++-- 执行后核对（每条单独一次调用，sql-exec.sh）：
++--   SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='iot_calc';
++--   SHOW TABLES FROM `iot_calc`;  -- 应 iot_calc_state, iot_calc_log
++--   SHOW GRANTS FOR 'iot_calc_rw'@'%';  -- SELECT/INSERT/UPDATE ON iot_calc.*
++--   SHOW GRANTS FOR 'iot_calc_ro'@'%';  -- 仅 SELECT ON iot_calc.*
++-- ============================================================

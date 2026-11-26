@@ -1,0 +1,549 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+index 4b65dc3..ff5e521 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+@@ -118,7 +118,7 @@ public class OpenApiController {
+         }
+     }
+ 
+-    @Operation(summary = "模型与数据项字典同步（本期路由占位：全量字典空实现，增量语义归 TASK-0054）")
++    @Operation(summary = "模型与数据项字典增量同步（since 游标；新增/变更/禁用三态；appKey 有效即可）")
+     @GetMapping("/dict/sync")
+     public Result<OpenApiDictSyncVO> dictSync(
+             @RequestParam(value = "since", required = false) Long since,
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiDictSyncVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiDictSyncVO.java
+index 49a31df..3cb7092 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiDictSyncVO.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiDictSyncVO.java
+@@ -5,14 +5,24 @@ import lombok.AllArgsConstructor;
+ import lombok.Data;
+ import lombok.NoArgsConstructor;
+ 
++import java.time.LocalDateTime;
+ import java.util.List;
+ 
+ /**
+  * 字典同步 VO（/openapi/v1/dict/sync，§3.5：since 之后新增/变更/禁用的实例与数据项清单）。
+  *
+- * <p><b>本期路由占位</b>（brief 裁决）：返回全量字典空实现（两清单恒空）——增量语义
+- * （since 游标推进、新增/变更/禁用三态清单）归 TASK-0054 交付；appKey 有效即可调用
+- * （不走 scope 裁剪，§3.5 原文）。since 原样回显供调用方游标习惯保持。
++ * <p>占位兼容（TASK-0051 → TASK-0054）：既有字段 {@code since/instances/items} 保留，
++ * 行元素由 {@code Object} 具体化为 {@link InstanceRow} / {@link ItemRow}。since 缺省=0
++ * （全量），响应原样回显（调用方游标习惯）；增量口径为 {@code update_time > from_unixtime(since/1000)}
++ * （含逻辑删行——以 changeType=3「禁用」态返回，不因物理过滤丢失通知）。
++ *
++ * <p><b>命名差异</b>：中台称「资产（asset）」，平台称「模型实例（instance）」——
++ * 实例行的 instanceId/templateId/modelCode/deptId/status 即资产到平台模型的对应关系
++ * （modelCode = instanceCode 路径式编码；templateId = 模型模板，deptId = 数据权限锚点）。
++ * 数据项行以 instanceId/fullKey 回指所属实例；sourceType 1 绑定点位 / 2 公式 / 3 子级汇总。
++ *
++ * <p>changeType 三态：1 新增（行创建时间 ≥ since）/ 2 变更（status 由启用转停等状态变化）/
++ * 3 禁用（deleted=1 逻辑删或 status=0 停用）。appKey 有效即可调用（不走 scope 裁剪，§3.5 原文）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -20,15 +30,108 @@ import java.util.List;
+ @Data
+ @NoArgsConstructor
+ @AllArgsConstructor
+-@Schema(description = "字典同步（本期占位：全量字典空实现，增量语义归 TASK-0054）")
++@Schema(description = "字典同步增量清单（实例+数据项；资产=模型实例对应关系在载荷明确）")
+ public class OpenApiDictSyncVO {
+ 
+-    @Schema(description = "请求游标（epoch 毫秒，原样回显；本期不参与增量计算）")
++    @Schema(description = "请求游标（epoch 毫秒，原样回显；缺省 0 = 全量）")
+     private Long since;
+ 
+-    @Schema(description = "实例清单（新增/变更/禁用；本期恒空——增量语义归 TASK-0054）")
+-    private List<Object> instances;
++    @Schema(description = "实例清单（中台称资产）：新增/变更/禁用三态，含逻辑删禁用通知")
++    private List<InstanceRow> instances;
++
++    @Schema(description = "数据项清单：新增/变更/禁用三态，含逻辑删禁用通知")
++    private List<ItemRow> items;
++
++    /** 公共载荷三要素（brief：{id, code, name?, changeType, updateTime, assetModelRelation}） */
++    @Data
++    @NoArgsConstructor
++    @AllArgsConstructor
++    @Schema(description = "字典同步行公共字段：id + 编码 + 名称 + 变更类型 + 更新时间")
++    public abstract static class RowBase {
++        @Schema(description = "行 ID（实例 ID / 数据项 ID）")
++        private Long id;
++
++        @Schema(description = "编码（实例=instance_code 路径式模型编码；数据项=data_code）")
++        private String code;
++
++        @Schema(description = "名称（可空：实例名称 / 数据名称）")
++        private String name;
++
++        @Schema(description = "变更类型：1 新增 2 变更 3 禁用（含 deleted=1 逻辑删）")
++        private Integer changeType;
++
++        @Schema(description = "行更新时间（epoch 毫秒；增量游标比较基准）")
++        private LocalDateTime updateTime;
++    }
++
++    /**
++     * 实例行（中台资产 → 平台模型映射）。
++     *
++     * <p>instanceId = 平台模型实例 ID（中台资产 ID 的对应体）；templateId = 来源模型模板 ID；
++     * modelCode = 路径式实例编码（F01.WS01.EQ001）；deptId = 数据权限锚点；status 0 禁用 1 启用。
++     */
++    @Data
++    @NoArgsConstructor
++    @Schema(description = "模型实例行（中台资产=平台模型）：instanceId/templateId/modelCode/deptId/status")
++    public static class InstanceRow extends RowBase {
++        @Schema(description = "实例 ID（中台资产对应体）")
++        private Long instanceId;
++
++        @Schema(description = "来源模板 ID（模型定义）")
++        private Long templateId;
++
++        @Schema(description = "模型编码（路径式实例编码，中台资产编码对齐体）")
++        private String modelCode;
++
++        @Schema(description = "绑定部门 ID（数据权限锚点，中台可空）")
++        private Long deptId;
++
++        @Schema(description = "状态 0 禁用 1 启用（changeType=3 禁用行恒为 0）")
++        private Integer status;
++
++        public InstanceRow(Long instanceId, String code, String name, Integer changeType,
++                           LocalDateTime updateTime, Long templateId, Long deptId, Integer status) {
++            super(instanceId, code, name, changeType, updateTime);
++            this.instanceId = instanceId;
++            this.templateId = templateId;
++            this.modelCode = code;
++            this.deptId = deptId;
++            this.status = status;
++        }
++    }
++
++    /**
++     * 数据项行。{@code instanceId} 回指所属实例（资产模型对应；与 fullKey 前缀实例编码一致）；
++     * sourceType 1 绑定点位 / 2 公式 / 3 子级汇总；status 0 禁用 1 启用。
++     */
++    @Data
++    @NoArgsConstructor
++    @Schema(description = "数据项行：itemId/dataCode/instanceId/fullKey/sourceType/status")
++    public static class ItemRow extends RowBase {
++        @Schema(description = "数据项 ID")
++        private Long itemId;
++
++        @Schema(description = "所属实例 ID（中台资产对应体）")
++        private Long instanceId;
++
++        @Schema(description = "全键 = 实例编码.数据编码")
++        private String fullKey;
++
++        @Schema(description = "取值方式 1 绑定点位 2 公式 3 子级汇总")
++        private Integer sourceType;
++
++        @Schema(description = "状态 0 禁用 1 启用（changeType=3 禁用行恒为 0）")
++        private Integer status;
+ 
+-    @Schema(description = "数据项清单（新增/变更/禁用；本期恒空——增量语义归 TASK-0054）")
+-    private List<Object> items;
++        public ItemRow(Long itemId, String code, String name, Integer changeType,
++                       LocalDateTime updateTime, Long instanceId, String fullKey,
++                       Integer sourceType, Integer status) {
++            super(itemId, code, name, changeType, updateTime);
++            this.itemId = itemId;
++            this.instanceId = instanceId;
++            this.fullKey = fullKey;
++            this.sourceType = sourceType;
++            this.status = status;
++        }
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiInstanceMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiInstanceMapper.java
+index 0a77cd3..42234b7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiInstanceMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiInstanceMapper.java
+@@ -1,6 +1,7 @@
+ package net.otlab.admin.module.openapi.mapper;
+ 
+ import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
+ import org.apache.ibatis.annotations.Mapper;
+ import org.apache.ibatis.annotations.Param;
+ import org.apache.ibatis.annotations.Select;
+@@ -55,4 +56,29 @@ public interface OpenApiInstanceMapper {
+             + "</script>")
+     List<OpenApiInstanceRow> selectByIdsForTenant(@Param("tenantId") Long tenantId,
+                                                   @Param("ids") Collection<Long> ids);
++
++    /**
++     * dict/sync 增量查询（TASK-0054，§3.5）：本租户 update_time > from_unixtime(since/1000)
++     * 的实例行，含 deleted=1 逻辑删行（以禁用态返回，不物理过滤）。
++     *
++     * <p><b>changeType 三态派生</b>：deleted=1（逻辑删）→ 3 禁用；status=0 且未删
++     * （启用→停用状态变更）→ 2 变更；create_time ≥ since（行创建时间落在增量窗起点及之后）
++     * → 1 新增；其余 → 2 变更。since=0 时 create_time ≥ epoch 0 全量为新增，
++     * 停用行仍以 2 变更可见（三态在真实数据上可区分）。逻辑删行 status 强制 0，
++     * 不因 deleted=0 物理过滤丢失禁用通知。
++     * 时间比较用 SQL 侧 FROM_UNIXTIME，避免 JVM/DB 时区口径漂移。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT id, instance_code AS code, instance_name AS name, "
++            + "CASE WHEN deleted = 1 THEN 3 "
++            + "     WHEN status = 0 THEN 2 "
++            + "     WHEN create_time >= FROM_UNIXTIME(#{since}/1000) THEN 1 ELSE 2 END AS changeType, "
++            + "update_time AS updateTime, id AS instanceId, template_id AS templateId, "
++            + "instance_code AS modelCode, dept_id AS deptId, "
++            + "CASE WHEN deleted = 1 THEN 0 ELSE status END AS status "
++            + "FROM iot_model_instance "
++            + "WHERE tenant_id = #{tenantId} AND update_time > FROM_UNIXTIME(#{since}/1000) "
++            + "ORDER BY update_time ASC, id ASC")
++    List<OpenApiDictSyncVO.InstanceRow> selectChangedForTenant(@Param("tenantId") Long tenantId,
++                                                               @Param("since") Long since);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiItemMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiItemMapper.java
+index 902c058..8597cd2 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiItemMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiItemMapper.java
+@@ -1,6 +1,7 @@
+ package net.otlab.admin.module.openapi.mapper;
+ 
+ import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
+ import org.apache.ibatis.annotations.Mapper;
+ import org.apache.ibatis.annotations.Param;
+ import org.apache.ibatis.annotations.Select;
+@@ -30,4 +31,25 @@ public interface OpenApiItemMapper {
+             + "</script>")
+     List<OpenApiItemRow> selectByFullKeysForTenant(@Param("tenantId") Long tenantId,
+                                                    @Param("keys") Collection<String> keys);
++
++    /**
++     * dict/sync 增量查询（TASK-0054，§3.5）：本租户 update_time > from_unixtime(since/1000)
++     * 的数据项行，含 deleted=1 逻辑删行（禁用通知）；dataCode 即 code，dataName 即 name。
++     *
++     * <p>changeType 三态派生同实例行：deleted=1 → 3 禁用；status=0 未删 → 2 变更；
++     * create_time ≥ since → 1 新增；其余 → 2 变更；since=0 全量当新增（停用行以 2 可见）。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT id, data_code AS code, data_name AS name, "
++            + "CASE WHEN deleted = 1 THEN 3 "
++            + "     WHEN status = 0 THEN 2 "
++            + "     WHEN create_time >= FROM_UNIXTIME(#{since}/1000) THEN 1 ELSE 2 END AS changeType, "
++            + "update_time AS updateTime, id AS itemId, instance_id AS instanceId, "
++            + "full_key AS fullKey, source_type AS sourceType, "
++            + "CASE WHEN deleted = 1 THEN 0 ELSE status END AS status "
++            + "FROM iot_data_item "
++            + "WHERE tenant_id = #{tenantId} AND update_time > FROM_UNIXTIME(#{since}/1000) "
++            + "ORDER BY update_time ASC, id ASC")
++    List<OpenApiDictSyncVO.ItemRow> selectChangedForTenant(@Param("tenantId") Long tenantId,
++                                                           @Param("since") Long since);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+index f3e888b..7278114 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+@@ -69,8 +69,12 @@ public interface OpenApiQueryService {
+                                                      Long startMs, Long endMs);
+ 
+     /**
+-     * GET /openapi/v1/dict/sync：模型与数据项字典同步（appKey 有效即可——不走 scope）。
+-     * <b>本期路由占位</b>：返回全量字典空实现（增量语义归 TASK-0054）。
++     * GET /openapi/v1/dict/sync：模型与数据项字典增量同步（appKey 有效即可——不走 scope）。
++     *
++     * <p>TASK-0054 转正：查询 since 之后新增/变更/禁用的实例与数据项两类行（含 deleted=1
++     * 逻辑删行的禁用通知），since 缺省=0（全量）、响应原样回显；资产=模型实例对应关系在
++     * 载荷（instanceId/templateId/modelCode/deptId/status）明确（中台资产=平台模型）。
++     * 租户隔离由验签产物 tenantId 显式带参收敛，不消费 dataperm（§3.5 原文）。
+      */
+     OpenApiDictSyncVO dictSync(OpenApiClientIdentity identity, Long since);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+index f0ab57c..ef4cfb7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+@@ -295,9 +295,12 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+ 
+     @Override
+     public OpenApiDictSyncVO dictSync(OpenApiClientIdentity identity, Long since) {
+-        // appKey 有效即可（§3.5 原文——不走 scope 裁剪）；本期路由占位：全量字典空实现，
+-        // 增量语义（since 游标推进、新增/变更/禁用三态清单）归 TASK-0054
+-        return new OpenApiDictSyncVO(since, List.of(), List.of());
++        // appKey 有效即可（§3.5 原文——不走 scope 裁剪、不消费 dataperm）；租户取验签产物
++        // 调用方行（DB 权威），mapper 显式 tenant_id 收敛——跨租户行不进入清单。
++        long cursor = since == null ? 0L : since;
++        return new OpenApiDictSyncVO(cursor,
++                instanceMapper.selectChangedForTenant(identity.getTenantId(), cursor),
++                itemMapper.selectChangedForTenant(identity.getTenantId(), cursor));
+     }
+ 
+     // ---------- 内部 ----------
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/mapper/OpenApiDictSyncMapperSqlTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/mapper/OpenApiDictSyncMapperSqlTest.java
+new file mode 100644
+index 0000000..a7956e1
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/mapper/OpenApiDictSyncMapperSqlTest.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.openapi.mapper;
++
++import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
++import org.apache.ibatis.builder.annotation.MapperAnnotationBuilder;
++import org.apache.ibatis.mapping.BoundSql;
++import org.apache.ibatis.mapping.MappedStatement;
++import org.apache.ibatis.session.Configuration;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * dict/sync 增量 Mapper SQL 解析回归（TASK-0054）。
++ *
++ * <p>本仓库无 Spring 上下文集成测试，@Select 注解 SQL 写错只在运行时炸——此处用 MyBatis
++ * MapperAnnotationBuilder 真实解析注解并渲染 BoundSql，钉住增量三要素：显式 tenant_id、
++ * since 游标 FROM_UNIXTIME 边界、deleted=1 行以禁用态返回（不被 deleted=0 物理过滤）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class OpenApiDictSyncMapperSqlTest {
++
++    private Configuration parse(Class<?> mapper) {
++        Configuration configuration = new Configuration();
++        new MapperAnnotationBuilder(configuration, mapper).parse();
++        return configuration;
++    }
++
++    private String render(Class<?> mapper, String method, long tenantId, long since) {
++        Configuration cfg = parse(mapper);
++        MappedStatement ms = cfg.getMappedStatement(mapper.getName() + "." + method);
++        assertNotNull(ms, "注解 SQL 应已解析：" + method);
++        BoundSql bound = ms.getBoundSql(Map.of("tenantId", tenantId, "since", since));
++        return bound.getSql().replaceAll("\\s+", " ").trim();
++    }
++
++    @Test
++    @DisplayName("实例增量 SQL：显式租户 + FROM_UNIXTIME 严格大于 + 逻辑删禁用三态 CASE")
++    void instanceIncrementalSql() {
++        String sql = render(OpenApiInstanceMapper.class, "selectChangedForTenant", 1L, 1763968800000L);
++        assertTrue(sql.contains("tenant_id = ?"), "显式租户隔离：SQL 必须带 tenant_id 条件");
++        assertTrue(sql.contains("update_time > FROM_UNIXTIME(?/1000)"), "严格大于游标（精确边界不返回）");
++        assertTrue(sql.contains("deleted = 1 THEN 3"), "逻辑删 → changeType=3 禁用");
++        assertTrue(sql.contains("status = 0 THEN 2"), "启用→停用状态变更 → changeType=2 变更");
++        assertTrue(sql.contains("create_time >= FROM_UNIXTIME(?/1000) THEN 1"), "窗内新建 → changeType=1 新增");
++        assertTrue(sql.contains("WHEN deleted = 1 THEN 0 ELSE status END AS status"),
++                "逻辑删行禁用态 status=0 必须回显");
++        assertTrue(sql.contains("FROM iot_model_instance"), "取实例表");
++        assertTrue(!sql.contains("deleted = 0"), "不得物理过滤 deleted 行（禁用通知不能丢）");
++        assertEquals(3, sql.chars().filter(c -> c == '?').count(),
++                "三个绑定位：tenantId + since(CASE 新增判定) + since(WHERE 游标)");
++    }
++
++    @Test
++    @DisplayName("数据项增量 SQL：显式租户 + FROM_UNIXTIME + 逻辑删禁用三态 + fullKey/instanceId 载荷")
++    void itemIncrementalSql() {
++        String sql = render(OpenApiItemMapper.class, "selectChangedForTenant", 1L, 0L);
++        assertTrue(sql.contains("tenant_id = ?"), "显式租户隔离");
++        assertTrue(sql.contains("update_time > FROM_UNIXTIME(?/1000)"), "严格大于游标");
++        assertTrue(sql.contains("deleted = 1 THEN 3"), "逻辑删 → changeType=3");
++        assertTrue(sql.contains("status = 0 THEN 2"), "停用变更 → changeType=2");
++        assertTrue(sql.contains("instance_id AS instanceId"), "资产模型对应：instanceId 回指实例");
++        assertTrue(sql.contains("full_key AS fullKey"), "fullKey 回显");
++        assertTrue(sql.contains("source_type AS sourceType"), "sourceType 回显");
++        assertTrue(!sql.contains("deleted = 0"), "不得物理过滤 deleted 行");
++        assertEquals(3, sql.chars().filter(c -> c == '?').count(),
++                "三个绑定位：tenantId + since(CASE) + since(WHERE)");
++    }
++
++    @Test
++    @DisplayName("返回类型：具体化行 DTO（VO 内嵌）而非 Object，占位兼容字段保留")
++    void rowDtoTypes() {
++        Configuration instCfg = parse(OpenApiInstanceMapper.class);
++        MappedStatement inst = instCfg.getMappedStatement(
++                OpenApiInstanceMapper.class.getName() + ".selectChangedForTenant");
++        assertEquals(OpenApiDictSyncVO.InstanceRow.class, inst.getResultMaps().get(0).getType(),
++                "实例清单行类型为具体化 InstanceRow");
++
++        Configuration itemCfg = parse(OpenApiItemMapper.class);
++        MappedStatement item = itemCfg.getMappedStatement(
++                OpenApiItemMapper.class.getName() + ".selectChangedForTenant");
++        assertEquals(OpenApiDictSyncVO.ItemRow.class, item.getResultMaps().get(0).getType(),
++                "数据项清单行类型为具体化 ItemRow");
++
++        // 占位兼容：since/instances/items 三字段仍在（类型由 Object 具体化）
++        var vo = new OpenApiDictSyncVO(0L, java.util.List.of(), java.util.List.of());
++        assertEquals(0L, vo.getSince());
++        assertNotNull(vo.getInstances());
++        assertNotNull(vo.getItems());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
+index 4fba54c..d4eecb7 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
+@@ -4,6 +4,7 @@ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
+ import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
+ import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
+@@ -28,12 +29,14 @@ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.MockitoAnnotations;
+ 
++import java.time.LocalDateTime;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -521,17 +524,133 @@ class OpenApiQueryServiceImplTest {
+         verify(timeseriesClient).queryPointHistory(TENANT_ID, "default", "P1", "state", 0L, DAY);
+     }
+ 
+-    // ---------- 6) dict/sync ----------
++    // ---------- 6) dict/sync（TASK-0054 转正） ----------
++
++    private static final LocalDateTime DICT_T0 = LocalDateTime.of(2026, 11, 24, 10, 0, 0);
++    private static final long DICT_T0_MS = 1763968800000L; // 2026-11-24 10:00:00 +08:00
++
++    private OpenApiDictSyncVO.InstanceRow instanceRow(long instanceId, String code, Long templateId,
++                                                      Long deptId, int status, int changeType,
++                                                      LocalDateTime updateTime) {
++        return new OpenApiDictSyncVO.InstanceRow(instanceId, code, code + "-名", changeType,
++                updateTime, templateId, deptId, status);
++    }
++
++    private OpenApiDictSyncVO.ItemRow itemRow(long itemId, String dataCode, long instanceId,
++                                              String fullKey, int sourceType, int status,
++                                              int changeType, LocalDateTime updateTime) {
++        return new OpenApiDictSyncVO.ItemRow(itemId, dataCode, dataCode + "-名", changeType,
++                updateTime, instanceId, fullKey, sourceType, status);
++    }
++
++    @Test
++    @DisplayName("dict/sync：since=0 全量三类清单 + 具体化行 DTO + since 回显（VO 占位兼容）")
++    void dictSyncFullThreeStates() {
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of(
++                instanceRow(2L, "F01", 4L, 1L, 1, 1, DICT_T0),
++                instanceRow(3L, "F01.WS01", 4L, 4L, 1, 2, DICT_T0.plusSeconds(1)),
++                instanceRow(17L, "T06R2", null, 4L, 0, 3, DICT_T0.plusSeconds(2))));
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of(
++                itemRow(9L, "ELEC_METER", 12L, "F01.WS13.R2OKQ.ELEC_METER", 1, 1, 1, DICT_T0),
++                itemRow(10L, "ELEC_CONS", 12L, "F01.WS13.R2OKQ.ELEC_CONS", 2, 1, 2, DICT_T0.plusSeconds(1)),
++                itemRow(3L, "ELEC_CONS", 9L, "F01.WS13.EQ13.ELEC_CONS", 2, 0, 3, DICT_T0.plusSeconds(2))));
++
++        OpenApiDictSyncVO vo = service.dictSync(identity(null), 0L);
++
++        assertEquals(0L, vo.getSince());
++        assertEquals(3, vo.getInstances().size());
++        assertEquals(3, vo.getItems().size());
++        assertInstanceOf(OpenApiDictSyncVO.InstanceRow.class, vo.getInstances().get(0));
++        assertInstanceOf(OpenApiDictSyncVO.ItemRow.class, vo.getItems().get(0));
++        OpenApiDictSyncVO.InstanceRow inst = (OpenApiDictSyncVO.InstanceRow) vo.getInstances().get(2);
++        assertEquals("T06R2", inst.getCode());
++        assertEquals(3, inst.getChangeType());
++        assertEquals(0, inst.getStatus());
++        assertEquals(DICT_T0.plusSeconds(2), inst.getUpdateTime());
++        OpenApiDictSyncVO.ItemRow item = (OpenApiDictSyncVO.ItemRow) vo.getItems().get(2);
++        assertEquals(3, item.getChangeType());
++        assertEquals(0, item.getStatus());
++        assertEquals("F01.WS13.EQ13.ELEC_CONS", item.getFullKey());
++        assertEquals(9L, item.getInstanceId());
++        assertEquals(2, item.getSourceType());
++        assertEquals(DICT_T0.plusSeconds(2), item.getUpdateTime());
++        verifyNoInteractions(dataPermService);
++    }
++
++    @Test
++    @DisplayName("dict/sync：since 缺省=0（全量）+ since 原样回显")
++    void dictSyncDefaultSince() {
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of());
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of());
++
++        OpenApiDictSyncVO vo = service.dictSync(identity(null), null);
++
++        assertEquals(0L, vo.getSince());
++        assertTrue(vo.getInstances().isEmpty());
++        assertTrue(vo.getItems().isEmpty());
++        verify(instanceMapper).selectChangedForTenant(TENANT_ID, 0L);
++        verify(itemMapper).selectChangedForTenant(TENANT_ID, 0L);
++    }
+ 
+     @Test
+-    @DisplayName("dict/sync：appKey 有效即可（不走 scope——no dataperm 调用），占位空实现 + since 回显")
+-    void dictSyncPlaceholder() {
+-        var vo = service.dictSync(identity(null), 1763712000000L);
++    @DisplayName("dict/sync：since 游标推进只返回 update_time 之后的行；精确边界不返回（SQL >）")
++    void dictSyncIncrementalBoundary() {
++        long since = DICT_T0_MS;
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(since))).thenReturn(List.of(
++                instanceRow(6L, "F01.WS01.EQ001", 4L, null, 1, 2, DICT_T0.plusSeconds(1))));
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(since))).thenReturn(List.of());
++
++        OpenApiDictSyncVO vo = service.dictSync(identity(null), since);
++
++        assertEquals(since, vo.getSince());
++        assertEquals(1, vo.getInstances().size());
++        assertEquals("F01.WS01.EQ001", ((OpenApiDictSyncVO.InstanceRow) vo.getInstances().get(0)).getCode());
++        assertTrue(vo.getItems().isEmpty());
++        // 精确边界由 SQL 条件 update_time > FROM_UNIXTIME(#{since}/1000) 保证；本层原样传游标
++    }
++
++    @Test
++    @DisplayName("dict/sync：未来游标 → 两类清单均空（mapper 空集如实）")
++    void dictSyncFutureCursorEmpty() {
++        long since = 4102444800000L;
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(since))).thenReturn(List.of());
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(since))).thenReturn(List.of());
+ 
+-        assertEquals(1763712000000L, vo.getSince());
++        OpenApiDictSyncVO vo = service.dictSync(identity(null), since);
++
++        assertEquals(since, vo.getSince());
+         assertTrue(vo.getInstances().isEmpty());
+         assertTrue(vo.getItems().isEmpty());
+-        verifyNoInteractions(dataPermService, instanceMapper, itemMapper);
++    }
++
++    @Test
++    @DisplayName("dict/sync：deleted=1 行以 changeType=3 禁用态返回（mapper 三态派生 SQL）")
++    void dictSyncDeletedRowAsDisabled() {
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of(
++                instanceRow(17L, "T06R2", null, 4L, 0, 3, DICT_T0)));
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of(
++                itemRow(2L, "ELEC_METER", 9L, "F01.WS13.EQ13.ELEC_METER", 1, 1, 3, DICT_T0)));
++
++        OpenApiDictSyncVO vo = service.dictSync(identity(null), 0L);
++
++        OpenApiDictSyncVO.InstanceRow inst = (OpenApiDictSyncVO.InstanceRow) vo.getInstances().get(0);
++        assertEquals(3, inst.getChangeType());
++        OpenApiDictSyncVO.ItemRow item = (OpenApiDictSyncVO.ItemRow) vo.getItems().get(0);
++        assertEquals(3, item.getChangeType());
++    }
++
++    @Test
++    @DisplayName("dict/sync：跨租户隔离——查询显式带 identity.tenantId，不走 scope 不消费 dataperm")
++    void dictSyncTenantIsolationAndNoScope() {
++        when(instanceMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of());
++        when(itemMapper.selectChangedForTenant(eq(TENANT_ID), eq(0L))).thenReturn(List.of());
++
++        service.dictSync(identity("{\"instanceIds\":[999]}"), 0L);
++
++        verify(instanceMapper).selectChangedForTenant(eq(TENANT_ID), eq(0L));
++        verify(itemMapper).selectChangedForTenant(eq(TENANT_ID), eq(0L));
++        verify(instanceMapper, never()).selectChangedForTenant(eq(999L), anyLong());
++        verifyNoInteractions(dataPermService);
+     }
+ 
+     // ---------- 批量参数归一 ----------

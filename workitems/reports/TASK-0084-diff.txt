@@ -1,0 +1,1618 @@
+diff --git a/ingest/README.md b/ingest/README.md
+index 71d40f2..5b02e3f 100644
+--- a/ingest/README.md
++++ b/ingest/README.md
+@@ -21,6 +21,9 @@ ingest/
+ │   │                  #  写穿透/失败不阻塞/未命中回源——TASK-0029）+ 内存假实现（降级形态）
+ │   ├── event/         # 新值事件发射侧（Redis Pub/Sub，channel iot:newvalue:{tenant}）+
+ │   │                  #  网关状态事件（iot:gwstatus:{tenant}，ADR-0010 LWT——TASK-0029）
++│   ├── itembridge/    # 新值事件→MQTT 数据项主题桥接生产者（TASK-0084，opt-in）：
++│   │                  #  订阅 iot:newvalue:* → 4 字段映射 → QoS1 publish
++│   │                  #  iot/open/{tenant}/{instance}/item；ENV 默认关，映射失败丢弃+WARN
+ │   ├── gwtoken/       # 网关令牌链（凭据拉取/TTL 缓存/fail-closed 校验 + gatewayStatus，TASK-0076/0027）
+ │   ├── httpapi/       # HTTP 接入面（/ingest/v1/report、/ingest/v1/auth/mqtt，TASK-0076）
+ │   └── pipeline/      # 内核流水线组装：Consumer→Parser→四步校验→Batcher→Writer→Cache→Events
+@@ -66,6 +69,14 @@ ingest/
+ - 新值事件（发射侧，消费对接归 0040s）：写库成功后经 Redis Pub/Sub 发射
+   channel `iot:newvalue:{tenant}`、payload {tenant,pointCode,ts,value,quality} JSON；
+   发射失败 fail-soft 计 EventFailures。计算引擎按事件驱动触发下游计算/状态判定。
++- 新值事件→MQTT 桥接（TASK-0084，opt-in）：`INGEST_ITEM_BRIDGE_ENABLED=true|1` 才装配
++  （默认 false，避免消费侧未就绪时无效发布）；`INGEST_ITEM_BRIDGE_BROKER` 可切 MQTT broker
++  （空回退 `INGEST_MQTT_BROKER`）。独立 goroutine PSUBSCRIBE `iot:newvalue:*`，按 pointCode
++  映射 fullKey（=pointCode 原样）/instance（去末段数据码的设备段，如
++  `F01.WS01.EQ001.M01`→`F01.WS01.EQ001`），QoS1 publish 到 `iot/open/{tenant}/{instance}/item`，
++  载荷恰 4 字段 `{fullKey,ts,value,quality}`（camelCase/毫秒，tenant 只走主题段不进 payload）。
++  映射失败/tenant 不一致/坏 JSON → WARN+丢弃不造假主题；无订阅者不报错；桥接失败不动主流水线；
++  ctx 取消退出。live 冒烟 `INGEST_ITEM_BRIDGE_LIVE=1 ... go test -tags live ./internal/itembridge/`。
+ - ADR-0010 兑现（LWT 离线）：LWT/status 消息照既有分发进 EventStatusSink——
+   只发网关状态事件（channel `iot:gwstatus:{tenant}`，payload {tenant,gateway,graceful,
+   status,ts}），不直写状态 Redis（「按写入方划分」——最终状态由计算引擎按优先级链裁决）。
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index 558bc11..642b1c9 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -31,8 +31,10 @@
+ //	                            默认 30 天；now-该值 ≤ ts ≤ now 为补传豁免——§1.9A
+ //	                            原始 ts 落库不纠偏）
+ //	INGEST_DEADLETTER_WARN_EVERY 死信告警采样周期（首次 + 每 N 条各告警一次；默认 100）
++//	INGEST_ITEM_BRIDGE_ENABLED   TASK-0084 桥接生产者 opt-in 开关（仅 true/1 开启；默认 false）
++//	INGEST_ITEM_BRIDGE_BROKER    桥接 MQTT 发布 broker（空=回退 INGEST_MQTT_BROKER；env 可切）
+ //
+-// 组件口径（决策 3/4/6 + TASK-0028 + TASK-0029）：幂等=TTL 真实现（单实例形态）；
++// 组件口径（决策 3/4/6 + TASK-0028 + TASK-0029 + TASK-0084）：幂等=TTL 真实现（单实例形态）；
+ // 快照=InternalSnapshotClient 真客户端（哈希校验 + 0073 缓存原子替换）+ Reconciler 拉取
+ // 对账（config.changed 通知本期不消费）；质量判定挂点=RangeQualityJudge 真实现（网关
+ // 先填 + min/max 量程二次判定覆盖写，CONV-02 口径）；死信出口=DeadLetterCounter 统一
+@@ -46,6 +48,9 @@
+ // 写成功后发射——消费对接归 0040s）；网关状态（LWT）=EventStatusSink（ADR-0010 兑现：
+ // 只发 iot:gwstatus:{tenant} 事件，不直写状态 Redis；修订轮 I1——有界异步交接，
+ // broker 分发回调内零网络调用）。
++// TASK-0084 桥接生产者（opt-in）：INGEST_ITEM_BRIDGE_ENABLED=true 且 Redis/MQTT 配置就绪时，
++// 独立 goroutine 订阅 iot:newvalue:* → 4 字段映射 → QoS1 发布
++// iot/open/{tenant}/{instance}/item；映射/发布失败只 WARN，不影响 ingest 主流水线。
+ // 边界注记（ADR-0009 TD-0048）：人工补录/修正走管理面接口，ingest 不提供人工补录入口。
+ //
+ // 优雅停机：SIGTERM/SIGINT → HTTP Server 排空（Shutdown）→ 取消流水线/消费源/对账
+@@ -71,6 +76,7 @@ import (
+ 	"net.otlab/ingest/internal/event"
+ 	"net.otlab/ingest/internal/gwtoken"
+ 	"net.otlab/ingest/internal/httpapi"
++	"net.otlab/ingest/internal/itembridge"
+ 	"net.otlab/ingest/internal/message"
+ 	"net.otlab/ingest/internal/mqttsource"
+ 	"net.otlab/ingest/internal/pipeline"
+@@ -103,6 +109,9 @@ type Config struct {
+ 	TSMaxAge            time.Duration // INGEST_TS_MAX_AGE（默认 30 天）
+ 	DeadLetterWarnEvery int           // INGEST_DEADLETTER_WARN_EVERY（默认 100）
+ 
++	ItemBridgeEnabled bool   // TASK-0084 桥接生产者 opt-in（默认 false）
++	ItemBridgeBroker  string // 桥接 MQTT broker（空=回退 INGEST_MQTT_BROKER）
++
+ 	bound chan string // 绑定地址观测（测试/冒烟；nil = 不上报）
+ }
+ 
+@@ -127,6 +136,8 @@ func loadConfig(getenv func(string) string) Config {
+ 		TSFutureReject:      pipeline.DefaultTSFutureReject,
+ 		TSMaxAge:            pipeline.DefaultTSMaxAge,
+ 		DeadLetterWarnEvery: 100,
++		ItemBridgeEnabled:   itembridge.EnabledFromEnv(getenv),
++		ItemBridgeBroker:    getenv("INGEST_ITEM_BRIDGE_BROKER"),
+ 		GatewayMap:          map[string]gwtoken.ResolvedChannel{},
+ 	}
+ 	if cfg.HTTPAddr == "" {
+@@ -321,6 +332,16 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 		logger.Print("ingestd: MQTT 未配置（INGEST_MQTT_BROKER 空）——纯 HTTP 上报形态")
+ 	}
+ 
++	// ---- TASK-0084 新值事件→MQTT 桥接生产者（opt-in：默认关，不无效发布）----
++	// 独立 goroutine 订阅 Redis iot:newvalue:* → 4 字段映射 → QoS1 发布 iot/open/{t}/{i}/item。
++	// 装配失败（broker 不可达/参数不全）只 WARN，不阻断 ingest 主流水线；ctx 取消退出。
++	var bridgeStop func()
++	if cfg.ItemBridgeEnabled {
++		bridgeStop = startItemBridge(pctx, cfg, logger)
++	} else {
++		logger.Print("ingestd: 新值事件→MQTT 桥接未装配（INGEST_ITEM_BRIDGE_ENABLED 默认关）")
++	}
++
+ 	// ---- 快照对账（决策 4：真客户端哈希校验 + 原子替换；通知不消费，拉取兜底）----
+ 	if cfg.BackendBaseURL != "" && cfg.SnapshotScopeType != 0 {
+ 		reconciler := &snapshot.Reconciler{
+@@ -378,7 +399,10 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	if err := srv.Shutdown(shutCtx); err != nil {
+ 		logger.Printf("ingestd: HTTP 排空超时（强制返回）: %v", err)
+ 	}
+-	pcancel() // 停流水线消费循环/flusher/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
++	pcancel() // 停流水线消费循环/flusher/消费源/对账/桥接（各 goroutine ctx 取消即退）
++	if bridgeStop != nil {
++		bridgeStop()
++	}
+ 
+ 	// 停机排空（TASK-0029 承接 0027 遗留分流①）：攒批缓冲内合法数据写完再退；
+ 	// 超时兜底强制退出——排空失败 WARN 不阻塞停机（brief 决策 4①）。
+@@ -395,6 +419,43 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	return nil
+ }
+ 
++// startItemBridge 装配并启动桥接生产者（TASK-0084；opt-in 调用）。
++// 返回清理函数（关闭 MQTT 发布连接，幂等）；装配失败只 WARN 并降级不启动。
++func startItemBridge(ctx context.Context, cfg Config, logger *log.Logger) func() {
++	broker := cfg.ItemBridgeBroker
++	if broker == "" {
++		broker = cfg.MQTTBroker // env 未单列时回退消费侧 broker
++	}
++	if cfg.RedisAddr == "" || broker == "" {
++		logger.Printf("ingestd: 桥接开启但依赖缺失（INGEST_REDIS_ADDR=%q broker=%q）——不启动，主链不受影响", cfg.RedisAddr, broker)
++		return nil
++	}
++
++	pub := itembridge.NewPahoItemPublisher(itembridge.PahoPublisherOptions{
++		BrokerURL:      broker,
++		Username:       cfg.MQTTUsername,
++		Password:       cfg.MQTTPassword,
++		ClientIDPrefix: "ingest-item-bridge",
++	})
++	if err := pub.Connect(); err != nil {
++		logger.Printf("ingestd: 桥接 MQTT 发布器连接失败（fail-soft，不阻断主链）broker=%s err=%v", broker, err)
++		return nil
++	}
++	src := itembridge.NewRedisNewValueSource(itembridge.RedisSourceOptions{
++		Addr: cfg.RedisAddr,
++		DB:   cfg.RedisDB,
++	})
++	bridge := itembridge.NewBridge(src, pub, logger)
++	go func() {
++		if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
++			logger.Printf("ingestd: 桥接事件循环退出: %v", err)
++		}
++	}()
++	logger.Printf("ingestd: 新值事件→MQTT 桥接已装配 redis=%s db=%d broker=%s（iot:newvalue:* → iot/open/{tenant}/{instance}/item，opt-in）",
++		cfg.RedisAddr, cfg.RedisDB, broker)
++	return pub.Close
++}
++
+ // idleConsumer 纯 HTTP 面形态的空消费源（Run 消费循环不启动——StartFlusher 承担写库）。
+ type idleConsumer struct{}
+ 
+diff --git a/ingest/cmd/ingestd/wiring84_test.go b/ingest/cmd/ingestd/wiring84_test.go
+new file mode 100644
+index 0000000..4fc0761
+--- /dev/null
++++ b/ingest/cmd/ingestd/wiring84_test.go
+@@ -0,0 +1,40 @@
++package main
++
++import (
++	"testing"
++	"time"
++)
++
++// TASK-0084 接线契约：桥接 opt-in env（默认关）+ env 覆盖。
++func TestIngestdConfigItemBridgeOptInDefaultOff(t *testing.T) {
++	cfg := loadConfig(getenvOf(nil))
++	if cfg.ItemBridgeEnabled {
++		t.Fatalf("ItemBridgeEnabled 缺省 = %v，want false（opt-in）", cfg.ItemBridgeEnabled)
++	}
++	if cfg.ItemBridgeBroker != "" {
++		t.Fatalf("ItemBridgeBroker 缺省 = %q，want 空（回退 INGEST_MQTT_BROKER 或不装配）", cfg.ItemBridgeBroker)
++	}
++}
++
++func TestIngestdConfigItemBridgeFromEnv(t *testing.T) {
++	cfg := loadConfig(getenvOf(map[string]string{
++		"INGEST_ITEM_BRIDGE_ENABLED": "true",
++		"INGEST_ITEM_BRIDGE_BROKER":  "tcp://127.0.0.1:18888",
++	}))
++	if !cfg.ItemBridgeEnabled {
++		t.Fatal("INGEST_ITEM_BRIDGE_ENABLED=true 应开启桥接")
++	}
++	if cfg.ItemBridgeBroker != "tcp://127.0.0.1:18888" {
++		t.Fatalf("ItemBridgeBroker = %q", cfg.ItemBridgeBroker)
++	}
++}
++
++func TestIngestdConfigItemBridgeInvalidValueOff(t *testing.T) {
++	cfg := loadConfig(getenvOf(map[string]string{"INGEST_ITEM_BRIDGE_ENABLED": "yes"}))
++	if cfg.ItemBridgeEnabled {
++		t.Fatal("非法值 yes 不应开启桥接")
++	}
++}
++
++// ensure time import used (future timing assertions if extended)
++var _ = time.Second
+diff --git a/ingest/internal/itembridge/bridge.go b/ingest/internal/itembridge/bridge.go
+new file mode 100644
+index 0000000..6d815e4
+--- /dev/null
++++ b/ingest/internal/itembridge/bridge.go
+@@ -0,0 +1,220 @@
++// Package itembridge 承载 TASK-0084 桥接生产者：订阅 Redis 新值事件（iot:newvalue:{tenant}），
++// 按 pointCode 映射 fullKey/instanceCode，发布到 MQTT 数据项订阅主题
++// iot/open/{tenant_code}/{instance_code}/item（统一消息模型 4 字段 fullKey/ts/value/quality）。
++//
++// 契约纪律（brief 决策 1-6，冻结契约 v1.1.0 §3.5 推送行）：
++//   - payload 恰 4 字段、camelCase、ts 毫秒（0053 定版）——tenant 只走主题段，不注入 payload；
++//   - pointCode 即 fullKey 核心（「现场只认 pointCode 不认 id」字段纪律不改）：fullKey = pointCode
++//     原样；instanceCode 取 pointCode 去掉末段数据码后的设备段（与 snapshot.DataItem.FullKey
++//     的 instance_code + "." + data_code 定义互逆；F01.WS01.EQ001.M01 → F01.WS01.EQ001）；
++//   - 映射失败（无分隔符 / 空段 / channel 租户不可解析 / payload 非法 JSON / payload tenant
++//     与主题 tenant 不一致）→ WARN + 丢弃，不造假主题、不发空字段；
++//   - opt-in：INGEST_ITEM_BRIDGE_ENABLED 默认 false；开启后独立 goroutine，ctx 取消退出；
++//   - MQTT QoS1 fire-and-forget（无订阅者不报错）；桥接失败只 WARN，不影响 ingest 主流水线。
++package itembridge
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++	"strings"
++	"sync/atomic"
++	"time"
++)
++
++// NewValueSource Redis 新值事件订阅源薄接口（生产=RedisNewValueSource；测试=内存假源）。
++// Run 阻塞消费直至 ctx 取消；每条事件回调 (channel, payload)。重连/退避由源自身负责。
++type NewValueSource interface {
++	Run(ctx context.Context, onEvent func(channel, payload string)) error
++}
++
++// ItemPublisher MQTT 数据项主题发布薄接口（生产=PahoItemPublisher；测试=记录式假发布器）。
++type ItemPublisher interface {
++	Publish(ctx context.Context, topic string, payload []byte) error
++}
++
++// ItemChangeEvent 数据项变更事件载荷（契约 §3.5 推送行 4 字段逐字，字段序即线上序）。
++type ItemChangeEvent struct {
++	FullKey string  `json:"fullKey"`
++	Ts      int64   `json:"ts"`
++	Value   float64 `json:"value"`
++	Quality int     `json:"quality"`
++}
++
++// MarshalItemChange 有序序列化为契约 4 字段 JSON（camelCase / ts 毫秒原样 / quality 透传）。
++func MarshalItemChange(ev ItemChangeEvent) ([]byte, error) {
++	return json.Marshal(ev)
++}
++
++// MapPointCode pointCode → (fullKey, instanceCode)。fullKey 恒等于 pointCode 原样（字段纪律：
++// pointCode 即 fullKey 核心）；instanceCode = 去掉最后一段数据码后的前缀（设备段）。
++// 契约合法域要求至少两段且每段非空；否则映射失败（丢弃+WARN，不造假主题）。
++func MapPointCode(pointCode string) (string, string, error) {
++	idx := strings.LastIndex(pointCode, ".")
++	if idx <= 0 || idx == len(pointCode)-1 {
++		return "", "", fmt.Errorf("itembridge: pointCode %q 无法解析 instanceCode（须含非空实例段与数据码段）", pointCode)
++	}
++	instance := pointCode[:idx]
++	// 中间段不得为空（F01..M01 之类），避免造出含空段的实例路径。
++	for _, seg := range strings.Split(instance, ".") {
++		if seg == "" {
++			return "", "", fmt.Errorf("itembridge: pointCode %q 实例路径含空段", pointCode)
++		}
++	}
++	return pointCode, instance, nil
++}
++
++// NewValuePattern Redis PSUBSCRIBE 模式（brief 逐字频道前缀 + 通配租户段）。
++func NewValuePattern() string { return "iot:newvalue:*" }
++
++const newValuePrefix = "iot:newvalue:"
++
++// TenantFromNewValueChannel 从频道名取 tenant（仅 iot:newvalue:{tenant} 形态且 tenant 非空合法）。
++func TenantFromNewValueChannel(channel string) (string, bool) {
++	if !strings.HasPrefix(channel, newValuePrefix) {
++		return "", false
++	}
++	tenant := strings.TrimPrefix(channel, newValuePrefix)
++	if tenant == "" || strings.Contains(tenant, ":") || strings.ContainsAny(tenant, " \t\r\n") {
++		return "", false
++	}
++	return tenant, true
++}
++
++// ItemTopic 数据项订阅主题（契约逐字 iot/open/{tenant}/{instance}/item）。
++func ItemTopic(tenant, instance string) string {
++	return "iot/open/" + tenant + "/" + instance + "/item"
++}
++
++// EnabledFromEnv opt-in 解析：仅 true/1（忽略大小写与首尾空白）为真，其余（含空/假值/乱值）为 false。
++func EnabledFromEnv(getenv func(string) string) bool {
++	v := strings.ToLower(strings.TrimSpace(getenv("INGEST_ITEM_BRIDGE_ENABLED")))
++	return v == "true" || v == "1"
++}
++
++// BridgeStats 桥接观测计数（原子；生产扇出只 WARN 不影响主流水线）。
++type BridgeStats struct {
++	Published     uint64
++	Dropped       uint64
++	PublishFailed uint64
++}
++
++// Bridge 桥接主体（单 goroutine 事件循环；无内部缓冲——事件到即映射即发）。
++type Bridge struct {
++	src    NewValueSource
++	pub    ItemPublisher
++	logger *log.Logger
++
++	published     atomic.Uint64
++	dropped       atomic.Uint64
++	publishFailed atomic.Uint64
++}
++
++// NewBridge 构造（logger 可空——内部补默认 logger）。
++func NewBridge(src NewValueSource, pub ItemPublisher, logger *log.Logger) *Bridge {
++	if logger == nil {
++		logger = log.Default()
++	}
++	return &Bridge{src: src, pub: pub, logger: logger}
++}
++
++// Stats 观测快照（原子加载）。
++func (b *Bridge) Stats() BridgeStats {
++	return BridgeStats{
++		Published:     b.published.Load(),
++		Dropped:       b.dropped.Load(),
++		PublishFailed: b.publishFailed.Load(),
++	}
++}
++
++// Run 启动桥接事件循环（阻塞直至 ctx 取消）；源退出后按指数退避重连（fail-soft，0027 范式）。
++func (b *Bridge) Run(ctx context.Context) error {
++	backoff := 200 * time.Millisecond
++	const maxBackoff = 5 * time.Second
++	for {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		err := b.src.Run(ctx, b.onEvent)
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		b.logger.Printf("itembridge: 订阅源退出（%v），%v 后重连", err, backoff)
++		timer := time.NewTimer(backoff)
++		select {
++		case <-ctx.Done():
++			if !timer.Stop() {
++				<-timer.C
++			}
++			return ctx.Err()
++		case <-timer.C:
++		}
++		if backoff < maxBackoff {
++			backoff *= 2
++			if backoff > maxBackoff {
++				backoff = maxBackoff
++			}
++		}
++	}
++}
++
++// onEvent 单条事件处理：channel tenant 解析 → payload 解析 → 双一致性校验 → 映射 → 发布。
++// 任一失败只 WARN + 计数丢弃（fail-soft），不 panic、不影响 ingest 主流水线。
++func (b *Bridge) onEvent(channel, payload string) {
++	tenant, ok := TenantFromNewValueChannel(channel)
++	if !ok {
++		b.logger.Printf("itembridge: WARN 新值事件频道非法，丢弃 channel=%q", channel)
++		b.dropped.Add(1)
++		return
++	}
++	var src struct {
++		Tenant    string  `json:"tenant"`
++		PointCode string  `json:"pointCode"`
++		Ts        int64   `json:"ts"`
++		Value     float64 `json:"value"`
++		Quality   int     `json:"quality"`
++	}
++	if err := json.Unmarshal([]byte(payload), &src); err != nil {
++		b.logger.Printf("itembridge: WARN 新值事件 payload 非法 JSON，丢弃 channel=%q err=%v", channel, err)
++		b.dropped.Add(1)
++		return
++	}
++	if src.Tenant != tenant {
++		// 防跨租户注入：payload tenant 与主题 tenant 不一致一律丢弃（0053 消费侧同口径双校验）。
++		b.logger.Printf("itembridge: WARN 新值事件 tenant 不一致丢弃 channelTenant=%q payloadTenant=%q", tenant, src.Tenant)
++		b.dropped.Add(1)
++		return
++	}
++	fullKey, instance, err := MapPointCode(src.PointCode)
++	if err != nil {
++		b.logger.Printf("itembridge: WARN pointCode 映射失败，丢弃 channel=%q pointCode=%q err=%v", channel, src.PointCode, err)
++		b.dropped.Add(1)
++		return
++	}
++	body, err := MarshalItemChange(ItemChangeEvent{
++		FullKey: fullKey, Ts: src.Ts, Value: src.Value, Quality: src.Quality,
++	})
++	if err != nil {
++		b.logger.Printf("itembridge: WARN 数据项事件编码失败（fail-soft）channel=%q err=%v", channel, err)
++		b.dropped.Add(1)
++		return
++	}
++	topic := ItemTopic(tenant, instance)
++	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	err = b.pub.Publish(pubCtx, topic, body)
++	cancel()
++	if err != nil {
++		// QoS1 fire-and-forget：无订阅者/瞬时故障不报错、不影响后续事件（fail-soft）。
++		b.logger.Printf("itembridge: WARN MQTT 发布失败（fail-soft，不影响主链）topic=%q err=%v", topic, err)
++		b.publishFailed.Add(1)
++		return
++	}
++	b.published.Add(1)
++}
++
++// 编译期接口面锁定（生产/测试实现必须满足薄接口）。
++var (
++	_ NewValueSource = (*RedisNewValueSource)(nil)
++	_ ItemPublisher  = (*PahoItemPublisher)(nil)
++)
+diff --git a/ingest/internal/itembridge/bridge_contract_test.go b/ingest/internal/itembridge/bridge_contract_test.go
+new file mode 100644
+index 0000000..73f01c6
+--- /dev/null
++++ b/ingest/internal/itembridge/bridge_contract_test.go
+@@ -0,0 +1,333 @@
++// TASK-0084 契约测试：新值事件 → MQTT 数据项订阅主题桥接生产者。
++//
++// 覆盖 brief「测试口径」逐条：newvalue payload→4 字段映射精确 / ts 原样 / quality 透传 /
++// pointCode→fullKey·instance 映射正确 / 映射失败丢弃 / 主题逐字 / opt-in 默认关 /
++// 租户主题隔离 / 无订阅者不报错 / ctx 取消退出；既有契约测试零回归另有全套 go test 背书。
++package itembridge
++
++import (
++	"context"
++	"encoding/json"
++	"log"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// ---- 测试夹具：假 newvalue 源（实现 NewValueSource）----
++
++type fakeSource struct {
++	ch     chan srcMsg
++	exitCh chan struct{}
++	once   sync.Once
++}
++
++type srcMsg struct {
++	channel string
++	payload string
++}
++
++func newFakeSource(depth int) *fakeSource {
++	return &fakeSource{ch: make(chan srcMsg, depth), exitCh: make(chan struct{})}
++}
++
++func (f *fakeSource) emit(channel, payload string) { f.ch <- srcMsg{channel, payload} }
++
++func (f *fakeSource) Run(ctx context.Context, onEvent func(channel, payload string)) error {
++	defer f.once.Do(func() { close(f.exitCh) })
++	for {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case m := <-f.ch:
++			onEvent(m.channel, m.payload)
++		}
++	}
++}
++
++// ---- 测试夹具：假 MQTT 发布器（实现 ItemPublisher）----
++
++type recPub struct {
++	mu    sync.Mutex
++	calls []pubCall
++	err   error
++}
++
++type pubCall struct {
++	topic   string
++	payload []byte
++}
++
++func (p *recPub) Publish(_ context.Context, topic string, payload []byte) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.calls = append(p.calls, pubCall{topic, append([]byte(nil), payload...)})
++	return p.err
++}
++
++func (p *recPub) snapshot() []pubCall {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return append([]pubCall(nil), p.calls...)
++}
++
++func newvalue(tenant, pointCode string, ts int64, value float64, quality int) string {
++	b, _ := json.Marshal(struct {
++		Tenant    string  `json:"tenant"`
++		PointCode string  `json:"pointCode"`
++		Ts        int64   `json:"ts"`
++		Value     float64 `json:"value"`
++		Quality   int     `json:"quality"`
++	}{tenant, pointCode, ts, value, quality})
++	return string(b)
++}
++
++func silentLogger() *log.Logger { return log.New(&strings.Builder{}, "", 0) }
++
++func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", msg)
++}
++
++// ---- 1. 字段纪律 / 映射函数 ----
++
++func TestContractMapPointCodeFullKeyIdentityAndInstanceDeviceSegment(t *testing.T) {
++	// brief 决策 2：pointCode 即 fullKey 核心（identity）；instance 取到设备段（去掉数据码末段）。
++	cases := []struct{ point, full, inst string }{
++		{"F01.WS01.EQ001.M01", "F01.WS01.EQ001.M01", "F01.WS01.EQ001"},
++		{"F01.M01", "F01.M01", "F01"},
++		{"F01.WS02.EQ009.STATUS", "F01.WS02.EQ009.STATUS", "F01.WS02.EQ009"},
++	}
++	for _, c := range cases {
++		full, inst, err := MapPointCode(c.point)
++		if err != nil {
++			t.Fatalf("MapPointCode(%q) 不应失败: %v", c.point, err)
++		}
++		if full != c.full || inst != c.inst {
++			t.Fatalf("MapPointCode(%q) = (%q,%q)，期望 (%q,%q)", c.point, full, inst, c.full, c.inst)
++		}
++	}
++}
++
++func TestContractMapPointCodeFailureDrops(t *testing.T) {
++	// 无分隔符 / 空 / 尾点 / 首点 / 纯点：无法解析出数据码或实例 → 映射失败（不造假主题）。
++	for _, bad := range []string{"", "BADCODE", "F01.", ".M01", "."} {
++		if _, _, err := MapPointCode(bad); err == nil {
++			t.Fatalf("MapPointCode(%q) 应失败，实际成功", bad)
++		}
++	}
++}
++
++func TestContractNewValueChannelPatternVerbatim(t *testing.T) {
++	if got := NewValuePattern(); got != "iot:newvalue:*" {
++		t.Fatalf("NewValuePattern() = %q，期望 iot:newvalue:*", got)
++	}
++	if tenant, ok := TenantFromNewValueChannel("iot:newvalue:bridge29"); !ok || tenant != "bridge29" {
++		t.Fatalf("TenantFromNewValueChannel = (%q,%v)", tenant, ok)
++	}
++	if _, ok := TenantFromNewValueChannel("iot:other:bridge29"); ok {
++		t.Fatal("非法 channel 不应解析出 tenant")
++	}
++}
++
++func TestContractItemTopicVerbatim(t *testing.T) {
++	if got := ItemTopic("tA", "F01.WS01.EQ001"); got != "iot/open/tA/F01.WS01.EQ001/item" {
++		t.Fatalf("ItemTopic = %q", got)
++	}
++}
++
++func TestContractItemChangeEventFourFieldsOrderedCamelCaseMilliseconds(t *testing.T) {
++	ev := ItemChangeEvent{FullKey: "F01.WS01.EQ001.M01", Ts: 1790000000123, Value: 12.5, Quality: 7}
++	b, err := MarshalItemChange(ev)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := `{"fullKey":"F01.WS01.EQ001.M01","ts":1790000000123,"value":12.5,"quality":7}`
++	if string(b) != want {
++		t.Fatalf("载荷逐字不符\n got=%s\nwant=%s", b, want)
++	}
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatal(err)
++	}
++	if len(m) != 4 {
++		t.Fatalf("载荷字段数 = %d，期望恰 4", len(m))
++	}
++	for _, forbidden := range []string{"tenant", "pointCode", "gateway", "batchId"} {
++		if _, ok := m[forbidden]; ok {
++			t.Fatalf("载荷不得含 tenant 类字段 %q（契约 4 字段）", forbidden)
++		}
++	}
++}
++
++// ---- 2. 桥接行为（假源 + 假发布器）----
++
++func TestContractBridgeMapsPublishesFourFieldsToTenantTopic(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++	defer func() { cancel(); <-done }()
++
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "F01.WS01.EQ001.M01", 1790000000123, 12.5, 7))
++	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "1 条发布")
++
++	call := pub.snapshot()[0]
++	if call.topic != "iot/open/bridge29/F01.WS01.EQ001/item" {
++		t.Fatalf("主题不符: %q", call.topic)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(call.payload, &m); err != nil {
++		t.Fatal(err)
++	}
++	if m["fullKey"] != "F01.WS01.EQ001.M01" || m["ts"] != float64(1790000000123) || m["value"] != 12.5 || m["quality"] != float64(7) {
++		t.Fatalf("4 字段不符: %v", m)
++	}
++	if _, ok := m["tenant"]; ok {
++		t.Fatal("payload 不得含 tenant")
++	}
++}
++
++func TestContractBridgeDropsOnMappingFailureWarnNoPublish(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++
++	// 坏 pointCode（无点分隔符）+ 坏 channel（租户无法解析）各一条，均应丢弃不发布。
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "BADCODE", 1, 1, 0))
++	src.emit("iot:other:bridge29", newvalue("bridge29", "F01.M01", 2, 2, 0))
++	// 放行一条合法的作为「桥接仍存活」的栅栏（栅栏到达即前面坏样本已被处理）。
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "F01.M01", 3, 3, 0))
++	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "合法栅栏发布")
++	cancel()
++	<-done
++
++	calls := pub.snapshot()
++	if len(calls) != 1 {
++		t.Fatalf("应恰 1 条发布（坏样本丢弃），实际 %d", len(calls))
++	}
++	if calls[0].topic != "iot/open/bridge29/F01/item" {
++		t.Fatalf("栅栏主题不符: %q", calls[0].topic)
++	}
++	if b.Stats().Dropped < 2 {
++		t.Fatalf("丢弃计数应 ≥2（坏 pointCode + 坏 channel），实际 %d", b.Stats().Dropped)
++	}
++}
++
++func TestContractBridgeTenantIsolationTopicOnlyPayloadTenantFree(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++	defer func() { cancel(); <-done }()
++
++	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 11, 0))
++	src.emit("iot:newvalue:tB", newvalue("tB", "F01.M01", 2, 22, 0))
++	// payload tenant 与 channel tenant 不一致：fail-closed 丢弃（防跨租户注入）。
++	src.emit("iot:newvalue:tA", newvalue("tB", "F01.M02", 3, 33, 0))
++	waitFor(t, func() bool { return len(pub.snapshot()) == 2 }, time.Second, "2 条合法发布")
++
++	topics := map[string]bool{}
++	for _, c := range pub.snapshot() {
++		topics[c.topic] = true
++		if strings.Contains(string(c.payload), "tenant") {
++			t.Fatalf("payload 含 tenant 字样: %s", c.payload)
++		}
++	}
++	if !topics["iot/open/tA/F01/item"] || !topics["iot/open/tB/F01/item"] {
++		t.Fatalf("租户主题隔离失败: %v", topics)
++	}
++	if topics["iot/open/tA/F01/item"] && len(pub.snapshot()) != 2 {
++		t.Fatalf("跨租户 payload 不应发布，实际 %d 条", len(pub.snapshot()))
++	}
++}
++
++func TestContractBridgePublishFailureFailSoftKeepsDraining(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{err: context.DeadlineExceeded}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++
++	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 1, 0))
++	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M02", 2, 2, 0))
++	waitFor(t, func() bool { return b.Stats().PublishFailed >= 2 }, time.Second, "2 次发布失败计数")
++	cancel()
++	<-done
++	// 两次都尝试发布（失败不阻断后续事件消费）。
++	if len(pub.snapshot()) != 2 {
++		t.Fatalf("失败样本也应尝试发布，实际 %d", len(pub.snapshot()))
++	}
++}
++
++func TestContractBridgeBadJSONWarnNoPublish(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++
++	src.emit("iot:newvalue:tA", "{not json")
++	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 1, 0))
++	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "合法栅栏发布")
++	cancel()
++	<-done
++	if len(pub.snapshot()) != 1 {
++		t.Fatalf("坏 JSON 不应发布，实际 %d 条", len(pub.snapshot()))
++	}
++}
++
++func TestContractBridgeContextCancelExits(t *testing.T) {
++	src, pub := newFakeSource(4), &recPub{}
++	b := NewBridge(src, pub, silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("ctx 取消后桥接未退出")
++	}
++}
++
++// ---- 3. opt-in 默认关 ----
++
++func TestContractOptInDefaultOff(t *testing.T) {
++	getenv := func(string) string { return "" }
++	if EnabledFromEnv(getenv) {
++		t.Fatal("INGEST_ITEM_BRIDGE_ENABLED 缺省必须 false")
++	}
++	env := map[string]string{}
++	g2 := func(k string) string {
++		if v, ok := env[k]; ok {
++			return v
++		}
++		return ""
++	}
++	for _, v := range []string{"yes", "on", "TRUE!", "2", "false", "0", "off", "", "tru"} {
++		env["INGEST_ITEM_BRIDGE_ENABLED"] = v
++		if EnabledFromEnv(g2) {
++			t.Fatalf("非法/假值 %q 不应开启", v)
++		}
++	}
++	// 首尾空白按 ingest loadConfig 既有口径 TrimSpace 后判定（env 常见脏值宽容）。
++	for _, v := range []string{"true", "1", "TRUE", "True", " true", "1 "} {
++		env["INGEST_ITEM_BRIDGE_ENABLED"] = v
++		if !EnabledFromEnv(g2) {
++			t.Fatalf("真值 %q 应开启", v)
++		}
++	}
++}
+diff --git a/ingest/internal/itembridge/bridge_live_test.go b/ingest/internal/itembridge/bridge_live_test.go
+new file mode 100644
+index 0000000..64b317c
+--- /dev/null
++++ b/ingest/internal/itembridge/bridge_live_test.go
+@@ -0,0 +1,481 @@
++//go:build live
++
++// TASK-0084 live 桥接冒烟（env 门控：INGEST_ITEM_BRIDGE_LIVE=1）。
++// 真协议夹具 broker（内嵌 MQTT 3.1.1 最小实现：CONNECT/SUBSCRIBE/PUBLISH QoS1/PUBACK/
++// PINGREQ/DISCONNECT + 通配符转发）+ 真 Redis（INGEST_REDIS_TEST_ADDR，默认 127.0.0.1:6379）
++// + 真 Paho 发布器（itembridge.PahoItemPublisher）+ 真桥接主体（Bridge）。
++//
++// 全序列：opt-in 关→不发布 / 开启后 newvalue→4 字段真收（主题 tenant+instance 正确）/
++// 映射失败样本丢弃 / 无订阅者不报错 / ctx 取消退出 / 全停归零。
++package itembridge
++
++import (
++	"bufio"
++	"context"
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++)
++
++// ---- 内嵌 MQTT 3.1.1 夹具 broker ----
++
++type fixtureBroker struct {
++	ln      net.Listener
++	mu      sync.Mutex
++	subs    map[net.Conn][]string // 每连接订阅的 topic filter
++	stopped bool
++	wg      sync.WaitGroup
++}
++
++func startFixtureBroker(t *testing.T) *fixtureBroker {
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	b := &fixtureBroker{ln: ln, subs: map[net.Conn][]string{}}
++	b.wg.Add(1)
++	go b.accept(t)
++	return b
++}
++
++func (b *fixtureBroker) addr() string { return b.ln.Addr().String() }
++
++func (b *fixtureBroker) accept(t *testing.T) {
++	defer b.wg.Done()
++	for {
++		conn, err := b.ln.Accept()
++		if err != nil {
++			return
++		}
++		b.wg.Add(1)
++		go b.handle(conn)
++	}
++}
++
++func (b *fixtureBroker) handle(conn net.Conn) {
++	defer b.wg.Done()
++	defer conn.Close()
++	br := bufio.NewReader(conn)
++	for {
++		b0, err := br.ReadByte()
++		if err != nil {
++			return
++		}
++		rem, err := readMqttLen(br)
++		if err != nil {
++			return
++		}
++		body := make([]byte, rem)
++		if _, err := io.ReadFull(br, body); err != nil {
++			return
++		}
++		pktType := b0 >> 4
++		switch pktType {
++		case 1: // CONNECT → CONNACK
++			if _, err := conn.Write([]byte{0x20, 0x02, 0x00, 0x00}); err != nil {
++				return
++			}
++		case 8: // SUBSCRIBE → 记录 filter + SUBACK
++			if len(body) < 2 {
++				return
++			}
++			pid := body[:2]
++			rest := body[2:]
++			filters := []string{}
++			for len(rest) >= 3 {
++				n := int(binary.BigEndian.Uint16(rest[:2]))
++				if len(rest) < 2+n+1 {
++					break
++				}
++				filters = append(filters, string(rest[2:2+n]))
++				rest = rest[2+n+1:]
++			}
++			b.mu.Lock()
++			b.subs[conn] = filters
++			b.mu.Unlock()
++			ack := []byte{0x90, byte(2 + len(filters)), pid[0], pid[1]}
++			for range filters {
++				ack = append(ack, 0x01) // granted QoS1
++			}
++			if _, err := conn.Write(ack); err != nil {
++				return
++			}
++		case 3: // PUBLISH → PUBACK(QoS1) + 转发匹配订阅者
++			if len(body) < 2 {
++				return
++			}
++			tl := int(binary.BigEndian.Uint16(body[:2]))
++			if len(body) < 2+tl {
++				return
++			}
++			topic := string(body[2 : 2+tl])
++			idx := 2 + tl
++			var pid []byte
++			var payload []byte
++			if b0&0x06 == 0x02 { // QoS1（flags 位 1-2 值 1；b0&0x06>>1 == 1）
++				if len(body) < idx+2 {
++					return
++				}
++				pid = body[idx : idx+2]
++				idx += 2
++				_, _ = conn.Write([]byte{0x40, 0x02, pid[0], pid[1]}) // PUBACK
++			}
++			payload = body[idx:]
++			b.fanout(topic, payload)
++		case 12: // PINGREQ → PINGRESP
++			_, _ = conn.Write([]byte{0xD0, 0x00})
++		case 14: // DISCONNECT
++			return
++		}
++	}
++}
++
++func (b *fixtureBroker) fanout(topic string, payload []byte) {
++	b.mu.Lock()
++	type target struct{ c net.Conn }
++	targets := []target{}
++	for c, filters := range b.subs {
++		for _, f := range filters {
++			if mqttMatch(f, topic) {
++				targets = append(targets, target{c})
++				break
++			}
++		}
++	}
++	b.mu.Unlock()
++	// 构造 QoS0 PUBLISH 给订阅者（简化：无 packet-id）。
++	var body []byte
++	body = append(body, 0x00, byte(len(topic)))
++	body = append(body, topic...)
++	body = append(body, payload...)
++	remlen := mqttLen(len(body))
++	pkt := append([]byte{0x30}, remlen...)
++	pkt = append(pkt, body...)
++	for _, tg := range targets {
++		_, _ = tg.c.Write(pkt)
++	}
++}
++
++func (b *fixtureBroker) stop() {
++	b.mu.Lock()
++	b.stopped = true
++	b.mu.Unlock()
++	_ = b.ln.Close()
++	for c := range b.subs {
++		_ = c.Close()
++	}
++	b.wg.Wait()
++}
++
++func mqttMatch(filter, topic string) bool {
++	fs, ts := strings.Split(filter, "/"), strings.Split(topic, "/")
++	for i := range fs {
++		if i >= len(ts) {
++			return false
++		}
++		if fs[i] == "#" {
++			return true
++		}
++		if fs[i] != "+" && fs[i] != ts[i] {
++			return false
++		}
++	}
++	return len(fs) == len(ts)
++}
++
++func readMqttLen(br *bufio.Reader) (int, error) {
++	mult := 1
++	val := 0
++	for {
++		bb, err := br.ReadByte()
++		if err != nil {
++			return 0, err
++		}
++		val += int(bb&0x7f) * mult
++		if bb&0x80 == 0 {
++			return val, nil
++		}
++		mult *= 128
++	}
++}
++
++func mqttLen(n int) []byte {
++	var out []byte
++	for {
++		bb := byte(n % 128)
++		n /= 128
++		if n > 0 {
++			bb |= 0x80
++		}
++		out = append(out, bb)
++		if n == 0 {
++			return out
++		}
++	}
++}
++
++// ---- 裸协议 MQTT 订阅者（真协议栈收包）----
++
++type rawSubscriber struct {
++	conn net.Conn
++	br   *bufio.Reader
++}
++
++func dialSubscriber(t *testing.T, broker string, filter string) *rawSubscriber {
++	conn, err := net.DialTimeout("tcp", broker, 3*time.Second)
++	if err != nil {
++		t.Fatal(err)
++	}
++	br := bufio.NewReader(conn)
++	// CONNECT（clean session, keepalive 60, clientId=sub-live）
++	cid := "sub-live"
++	vh := append([]byte{0x00, 0x04}, []byte("MQTT")...)
++	vh = append(vh, 0x04, 0x02, 0x00, 0x3c)
++	vh = append(vh, 0x00, byte(len(cid)))
++	vh = append(vh, []byte(cid)...)
++	body := vh
++	pkt := append([]byte{0x10}, mqttLen(len(body))...)
++	pkt = append(pkt, body...)
++	_, _ = conn.Write(pkt)
++	if b0, err := br.ReadByte(); err != nil || b0 != 0x20 {
++		t.Fatalf("CONNACK 失败 b0=%v err=%v", b0, err)
++	}
++	if _, err := readMqttLen(br); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := br.ReadByte(); err != nil { // 会话存在标志/返回码（2 字节）
++		t.Fatal(err)
++	}
++	if _, err := br.ReadByte(); err != nil {
++		t.Fatal(err)
++	}
++	// SUBSCRIBE（packetId=1）
++	sb := []byte{0x00, 0x01, 0x00, byte(len(filter))}
++	sb = append(sb, []byte(filter)...)
++	sb = append(sb, 0x01)
++	pkt = append([]byte{0x82}, mqttLen(len(sb))...)
++	pkt = append(pkt, sb...)
++	_, _ = conn.Write(pkt)
++	b0, err := br.ReadByte()
++	if err != nil || b0 != 0x90 {
++		t.Fatalf("SUBACK 失败 b0=%v err=%v", b0, err)
++	}
++	rl, err := readMqttLen(br)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ack := make([]byte, rl)
++	if _, err := io.ReadFull(br, ack); err != nil {
++		t.Fatal(err)
++	}
++	return &rawSubscriber{conn: conn, br: br}
++}
++
++// readMsg 读一条 PUBLISH（QoS0 简化），返回 topic + payload；超时上返。
++func (s *rawSubscriber) readMsg(timeout time.Duration) (string, []byte, error) {
++	_ = s.conn.SetReadDeadline(time.Now().Add(timeout))
++	b0, err := s.br.ReadByte()
++	if err != nil {
++		return "", nil, err
++	}
++	if b0>>4 != 3 {
++		return "", nil, fmt.Errorf("非 PUBLISH 包 b0=%x", b0)
++	}
++	rem, err := readMqttLen(s.br)
++	if err != nil {
++		return "", nil, err
++	}
++	body := make([]byte, rem)
++	if _, err := io.ReadFull(s.br, body); err != nil {
++		return "", nil, err
++	}
++	tl := int(binary.BigEndian.Uint16(body[:2]))
++	return string(body[2 : 2+tl]), body[2+tl:], nil
++}
++
++// ---- live 全序列 ----
++
++func TestLiveBridgeEndToEnd(t *testing.T) {
++	if os.Getenv("INGEST_ITEM_BRIDGE_LIVE") != "1" {
++		t.Skip("live 冒烟需 INGEST_ITEM_BRIDGE_LIVE=1")
++	}
++	redisAddr := os.Getenv("INGEST_REDIS_TEST_ADDR")
++	if redisAddr == "" {
++		redisAddr = "127.0.0.1:6379"
++	}
++	// 真 Redis 存活探测。
++	pinger := cache.NewRedisClient(cache.RedisOptions{Addr: redisAddr, DB: 15})
++	if err := pinger.Ping(context.Background()); err != nil {
++		t.Fatalf("真 Redis 不可用 addr=%s: %v", redisAddr, err)
++	}
++
++	broker := startFixtureBroker(t)
++	defer broker.stop()
++	log.Printf("LIVE fixture broker=%s redis=%s", broker.addr(), redisAddr)
++
++	sub := dialSubscriber(t, broker.addr(), "iot/open/+/+/item")
++	defer sub.conn.Close()
++
++	tenant := fmt.Sprintf("bridge84%d", time.Now().Unix()%100000)
++	ch := "iot:newvalue:" + tenant
++	publish := func(payload string) {
++		rc := cache.NewRedisClient(cache.RedisOptions{Addr: redisAddr, DB: 15})
++		defer rc.Close()
++		if _, err := rc.Do(context.Background(), "PUBLISH", ch, payload); err != nil {
++			t.Fatalf("redis PUBLISH 失败: %v", err)
++		}
++	}
++	nv := func(point string, ts int64, value float64, q int) string {
++		b, _ := json.Marshal(struct {
++			Tenant    string  `json:"tenant"`
++			PointCode string  `json:"pointCode"`
++			Ts        int64   `json:"ts"`
++			Value     float64 `json:"value"`
++			Quality   int     `json:"quality"`
++		}{tenant, point, ts, value, q})
++		return string(b)
++	}
++
++	// 步骤 1：桥接未开启（opt-in 关）→ 发布 newvalue 不应有任何 MQTT 消息。
++	publish(nv("F01.WS01.EQ001.M01", 1790000001000, 12.5, 0))
++	if _, _, err := sub.readMsg(400 * time.Millisecond); err == nil {
++		t.Fatal("桥接未开启却收到 MQTT 发布（opt-in 默认关被违反）")
++	}
++	fmt.Println("LIVE-S1 opt-in 默认关：无发布（400ms 无消息）")
++
++	// 步骤 2：开启桥接（真 Paho 发布器 + 真 Redis 订阅源）。
++	pub := NewPahoItemPublisher(PahoPublisherOptions{BrokerURL: "tcp://" + broker.addr(), ClientIDPrefix: "live-bridge"})
++	if err := pub.Connect(); err != nil {
++		t.Fatalf("Paho 连接夹具 broker 失败: %v", err)
++	}
++	defer pub.Close()
++	src := NewRedisNewValueSource(RedisSourceOptions{Addr: redisAddr, DB: 15})
++	bridge := NewBridge(src, pub, log.New(os.Stdout, "LIVE-BRIDGE ", log.LstdFlags))
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- bridge.Run(ctx) }()
++	// 等 PSUBSCRIBE 建好（PUBSUB NUMPAT 观测）。
++	waitSubscribed(t, redisAddr)
++	fmt.Println("LIVE-S2 桥接已开启：PSUBSCRIBE iot:newvalue:* 建好")
++
++	// 步骤 3：发一条 newvalue → 真收 4 字段，主题 tenant/instance 正确。
++	ts := int64(1790000002000)
++	// 订阅就绪栅栏：重试发布直至真收（排除 PSUBSCRIBE 尚未生效的竞态）。
++	var topic string
++	var body []byte
++	var err error
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		publish(nv("F01.WS01.EQ001.M01", ts, 42.75, 6))
++		topic, body, err = sub.readMsg(600 * time.Millisecond)
++		if err == nil {
++			break
++		}
++		if time.Now().After(deadline) {
++			st := bridge.Stats()
++			t.Fatalf("未收到 MQTT 消息: %v（bridge stats=%+v）", err, st)
++		}
++	}
++	wantTopic := "iot/open/" + tenant + "/F01.WS01.EQ001/item"
++	if topic != wantTopic {
++		t.Fatalf("主题不符 got=%q want=%q", topic, wantTopic)
++	}
++	var m map[string]json.RawMessage
++	if err := json.Unmarshal(body, &m); err != nil {
++		t.Fatalf("载荷非法 JSON: %v (%s)", err, body)
++	}
++	if len(m) != 4 {
++		t.Fatalf("载荷字段数=%d want=4 (%s)", len(m), body)
++	}
++	var ev ItemChangeEvent
++	if err := json.Unmarshal(body, &ev); err != nil {
++		t.Fatal(err)
++	}
++	if ev.FullKey != "F01.WS01.EQ001.M01" || ev.Ts != ts || ev.Value != 42.75 || ev.Quality != 6 {
++		t.Fatalf("4 字段不符: %+v", ev)
++	}
++	if _, ok := m["tenant"]; ok {
++		t.Fatal("payload 含 tenant（契约 4 字段禁止）")
++	}
++	fmt.Printf("LIVE-S3 真收 4 字段: topic=%s payload=%s\n", topic, body)
++
++	// 步骤 4：映射失败样本（无分隔符）→ 丢弃，无 MQTT 发布。
++	publish(nv("BADCODE", ts, 1, 0))
++	if _, _, err := sub.readMsg(500 * time.Millisecond); err == nil {
++		t.Fatal("映射失败样本却发布了 MQTT 消息")
++	}
++	fmt.Println("LIVE-S4 映射失败样本丢弃（500ms 无消息）")
++
++	// 步骤 5：租户隔离——另一 tenant 的主题段正确、payload 无 tenant。
++	tenant2 := tenant + "B"
++	ch2 := "iot:newvalue:" + tenant2
++	rc2 := cache.NewRedisClient(cache.RedisOptions{Addr: redisAddr, DB: 15})
++	b2, _ := json.Marshal(map[string]any{"tenant": tenant2, "pointCode": "F02.M09", "ts": ts, "value": 9.5, "quality": 1})
++	_, _ = rc2.Do(context.Background(), "PUBLISH", ch2, string(b2))
++	rc2.Close()
++	topic2, body2, err := sub.readMsg(3 * time.Second)
++	if err != nil {
++		t.Fatalf("租户 B 未收到: %v", err)
++	}
++	if topic2 != "iot/open/"+tenant2+"/F02/item" {
++		t.Fatalf("租户 B 主题不符: %q", topic2)
++	}
++	if strings.Contains(string(body2), "tenant") {
++		t.Fatalf("租户 B payload 含 tenant: %s", body2)
++	}
++	fmt.Printf("LIVE-S5 租户隔离: topic=%s payload=%s\n", topic2, body2)
++
++	// 步骤 6：无订阅者不报错——关掉裸订阅者后发 newvalue，发布仍成功（publishFailed 不增）。
++	_ = sub.conn.Close()
++	before := bridge.Stats().PublishFailed
++	publish(nv("F01.WS01.EQ003.M02", ts, 7.5, 0))
++	deadline2 := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline2) {
++		if bridge.Stats().Published >= 3 {
++			break
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	if bridge.Stats().Published < 3 || bridge.Stats().PublishFailed > before {
++		t.Fatalf("无订阅者发布应成功: %+v", bridge.Stats())
++	}
++	fmt.Println("LIVE-S6 无订阅者不报错：QoS1 fire-and-forget 发布成功，publishFailed 不增")
++
++	// 步骤 7：ctx 取消退出 + 全停。
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("ctx 取消后桥接未退出")
++	}
++	st := bridge.Stats()
++	fmt.Printf("LIVE-S7 ctx 取消退出: published=%d dropped=%d publishFailed=%d\n", st.Published, st.Dropped, st.PublishFailed)
++	fmt.Println("LIVE-ALL-DONE")
++}
++
++func waitSubscribed(t *testing.T, redisAddr string) {
++	t.Helper()
++	rc := cache.NewRedisClient(cache.RedisOptions{Addr: redisAddr, DB: 15})
++	defer rc.Close()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		reply, err := rc.Do(context.Background(), "PUBSUB", "NUMPAT")
++		if err == nil {
++			if n, ok := reply.(int64); ok && n >= 1 {
++				return
++			}
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	t.Fatal("等待 PSUBSCRIBE 建立超时（PUBSUB NUMPAT 未 ≥1）")
++}
+diff --git a/ingest/internal/itembridge/paho_publisher.go b/ingest/internal/itembridge/paho_publisher.go
+new file mode 100644
+index 0000000..cc00425
+--- /dev/null
++++ b/ingest/internal/itembridge/paho_publisher.go
+@@ -0,0 +1,93 @@
++// MQTT 数据项发布器（TASK-0084）：Paho v1.5.1（go.mod 已钉，零新增依赖），topic 由契约
++// iot/open/{tenant}/{instance}/item 逐字构造（见 ItemTopic），QoS1 fire-and-forget——
++// 无订阅者不报错（broker 侧回执成功即算发布；PUBLISH 语义不保证有消费者）。
++// 连接由独立 Paho 客户端承载（clientID 随机后缀多实例隔离；不复用 mqttsource 消费连接，
++// 避免消费会话 CleanSession(false) 与发布主题范围互相牵连）；broker 地址 env 可切。
++package itembridge
++
++import (
++	"context"
++	"fmt"
++	"os"
++	"sync/atomic"
++	"time"
++
++	pahomqtt "github.com/eclipse/paho.mqtt.golang"
++)
++
++// PahoPublisherOptions 发布器配置。
++type PahoPublisherOptions struct {
++	BrokerURL      string // tcp://host:1883
++	Username       string // 空 = 匿名
++	Password       string
++	ClientIDPrefix string        // 空 = ingest-item-bridge
++	ConnectTimeout time.Duration // <=0 → 5s
++}
++
++// PahoItemPublisher Paho 适配（并发 Publish 安全——paho 客户端内部串行化 token）。
++type PahoItemPublisher struct {
++	opts   PahoPublisherOptions
++	client pahomqtt.Client
++	seq    atomic.Uint64
++}
++
++// NewPahoItemPublisher 构造（连接由 Connect 显式建立）。
++func NewPahoItemPublisher(opts PahoPublisherOptions) *PahoItemPublisher {
++	if opts.ClientIDPrefix == "" {
++		opts.ClientIDPrefix = "ingest-item-bridge"
++	}
++	return &PahoItemPublisher{opts: opts}
++}
++
++// Connect 初连（失败快速上返，由调用方决定是否重试；生产装配启动 WARN 不阻断 ingest）。
++func (p *PahoItemPublisher) Connect() error {
++	timeout := p.opts.ConnectTimeout
++	if timeout <= 0 {
++		timeout = 5 * time.Second
++	}
++	cid := fmt.Sprintf("%s-%d-%d", p.opts.ClientIDPrefix, os.Getpid(), p.seq.Add(1))
++	opts := pahomqtt.NewClientOptions().
++		AddBroker(p.opts.BrokerURL).
++		SetClientID(cid).
++		SetUsername(p.opts.Username).
++		SetPassword(p.opts.Password).
++		SetCleanSession(true). // 发布端无需持久会话（消息本体 QoS1 由 broker 承载）
++		SetConnectRetry(false).
++		SetConnectTimeout(timeout)
++	client := pahomqtt.NewClient(opts)
++	tok := client.Connect()
++	if !tok.WaitTimeout(timeout + 2*time.Second) {
++		return fmt.Errorf("itembridge: MQTT 连接超时（%v）", timeout)
++	}
++	if err := tok.Error(); err != nil {
++		return fmt.Errorf("itembridge: MQTT 连接失败: %w", err)
++	}
++	p.client = client
++	return nil
++}
++
++// Publish QoS1 发布（ctx 取消/超时上返；无订阅者由 broker 正常回执，不视为错误）。
++func (p *PahoItemPublisher) Publish(ctx context.Context, topic string, payload []byte) error {
++	if p.client == nil {
++		return fmt.Errorf("itembridge: MQTT 发布器未连接")
++	}
++	tok := p.client.Publish(topic, 1, false, payload)
++	done := make(chan struct{})
++	go func() {
++		tok.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++		return tok.Error()
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// Close 断开（幂等）。
++func (p *PahoItemPublisher) Close() {
++	if p.client != nil && p.client.IsConnectionOpen() {
++		p.client.Disconnect(250)
++	}
++}
+diff --git a/ingest/internal/itembridge/redis_source.go b/ingest/internal/itembridge/redis_source.go
+new file mode 100644
+index 0000000..b460e55
+--- /dev/null
++++ b/ingest/internal/itembridge/redis_source.go
+@@ -0,0 +1,260 @@
++// Redis 新值事件订阅源（TASK-0084）：复用 ingest 既有极简 RESP2 客户端的连线纪律
++// （纯标准库 net+bufio，零新增第三方依赖），对 broker 走 PSUBSCRIBE iot:newvalue:*
++// —— 一条连接承接所有租户的新值频道（tenant 从 channel 段解析，按前缀过滤）。
++//
++// 重连纪律（0027/0029 fail-soft 范式）：断线/读失败即关闭重连，指数退避（200ms→5s 封顶）；
++// 每条 push 消息严格按 RESP2 数组解析（[*3, "message"/"pmessage", channel, payload]），
++// 长度上限防御（复用与 cache 客户端同量级的保护），不巨量分配。ctx 取消即退出并断连。
++package itembridge
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"net"
++	"strconv"
++	"sync"
++	"time"
++)
++
++// RedisSourceOptions 订阅源配置。
++type RedisSourceOptions struct {
++	Addr        string        // host:port（INGEST_REDIS_ADDR）
++	Password    string        // 空 = 匿名
++	DB          int           // 逻辑库（Pub/Sub 与 DB 无关，握手沿用 SELECT 纪律）
++	DialTimeout time.Duration // <=0 → 3s
++	CmdTimeout  time.Duration // <=0 → 3s（不在订阅期使用，仅握手）
++}
++
++const (
++	sourceDefaultDialTimeout = 3 * time.Second
++	sourceDefaultCmdTimeout  = 3 * time.Second
++	sourceMaxLine            = 1 << 20 // 回复行上限（1 MiB）
++	sourceMaxBulk            = 1 << 20 // payload 上限（1 MiB）
++	sourceMaxArray           = 8       // push 数组元素上限（本源只消费 3/4 元素）
++	sourceMaxBackoff         = 5 * time.Second
++)
++
++// RedisNewValueSource 真订阅源（PSUBSCRIBE iot:newvalue:*）。
++type RedisNewValueSource struct {
++	opts RedisSourceOptions
++}
++
++// NewRedisNewValueSource 构造（惰性建连，Run 内循环）。
++func NewRedisNewValueSource(opts RedisSourceOptions) *RedisNewValueSource {
++	if opts.DialTimeout <= 0 {
++		opts.DialTimeout = sourceDefaultDialTimeout
++	}
++	if opts.CmdTimeout <= 0 {
++		opts.CmdTimeout = sourceDefaultCmdTimeout
++	}
++	return &RedisNewValueSource{opts: opts}
++}
++
++// Run 阻塞订阅直至 ctx 取消；断线指数退避重连。
++func (s *RedisNewValueSource) Run(ctx context.Context, onEvent func(channel, payload string)) error {
++	backoff := 200 * time.Millisecond
++	for {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		err := s.runOnce(ctx, onEvent)
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		timer := time.NewTimer(backoff)
++		select {
++		case <-ctx.Done():
++			if !timer.Stop() {
++				<-timer.C
++			}
++			return ctx.Err()
++		case <-timer.C:
++		}
++		_ = err // 退避重连（err 只用于内层日志；Break 由 ctx 决定）
++		if backoff < sourceMaxBackoff {
++			backoff *= 2
++			if backoff > sourceMaxBackoff {
++				backoff = sourceMaxBackoff
++			}
++		}
++	}
++}
++
++// runOnce 单次连接生命周期：拨号+握手+PSUBSCRIBE+逐条读 push。
++func (s *RedisNewValueSource) runOnce(ctx context.Context, onEvent func(channel, payload string)) error {
++	d := s.opts.DialTimeout
++	if dl, ok := ctx.Deadline(); ok {
++		if remain := time.Until(dl); remain < d {
++			d = remain
++		}
++	}
++	conn, err := net.DialTimeout("tcp", s.opts.Addr, d)
++	if err != nil {
++		return fmt.Errorf("itembridge: redis 连接失败 %s: %w", s.opts.Addr, err)
++	}
++	defer conn.Close()
++
++	br := bufio.NewReader(conn)
++	cmds := make([][]string, 0, 3)
++	if s.opts.Password != "" {
++		cmds = append(cmds, []string{"AUTH", s.opts.Password})
++	}
++	cmds = append(cmds, []string{"SELECT", strconv.Itoa(s.opts.DB)})
++	cmds = append(cmds, []string{"PSUBSCRIBE", NewValuePattern()})
++	for _, args := range cmds {
++		if err := writeRESP(conn, args); err != nil {
++			return fmt.Errorf("itembridge: 订阅握手写失败: %w", err)
++		}
++	}
++	for range cmds {
++		if _, err := sourceReadReply(br); err != nil {
++			return fmt.Errorf("itembridge: 订阅握手读失败: %w", err)
++		}
++	}
++
++	// 订阅期用独立 goroutine 监听 ctx 取消→关连接，使阻塞 Read 立即返回（不加锁，conn.Close 并发安全）。
++	done := make(chan struct{})
++	var once sync.Once
++	go func() {
++		select {
++		case <-ctx.Done():
++			_ = conn.Close()
++		case <-done:
++		}
++	}()
++	defer once.Do(func() { close(done) })
++
++	for {
++		reply, err := sourceReadReply(br)
++		if err != nil {
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			return fmt.Errorf("itembridge: 订阅读失败（将重连）: %w", err)
++		}
++		arr, ok := reply.([]any)
++		if !ok || len(arr) < 4 {
++			continue // 非 pmessage push（如 psubscribe 确认），忽略
++		}
++		kind := sourceAsText(arr[0])
++		channel := sourceAsText(arr[2])
++		payloadBytes, _ := arr[3].([]byte)
++		if kind != "pmessage" {
++			continue
++		}
++		if _, valid := TenantFromNewValueChannel(channel); !valid {
++			continue // 频道形态不符（异常 push）直接忽略，不进 onEvent
++		}
++		onEvent(channel, string(payloadBytes))
++	}
++}
++
++// sourceAsText bulk（[]byte）与简单串（string）统一取文本（RESP2 pmessage 的数组元素为 bulk）。
++func sourceAsText(v any) string {
++	switch t := v.(type) {
++	case string:
++		return t
++	case []byte:
++		return string(t)
++	default:
++		return ""
++	}
++}
++
++// writeRESP 编码一条 RESP2 命令数组（与 cache.appendRESPCommand 同形态）。
++func writeRESP(conn net.Conn, args []string) error {
++	var buf []byte
++	buf = append(buf, '*')
++	buf = append(buf, strconv.Itoa(len(args))...)
++	buf = append(buf, '\r', '\n')
++	for _, a := range args {
++		buf = append(buf, '$')
++		buf = append(buf, strconv.Itoa(len(a))...)
++		buf = append(buf, '\r', '\n')
++		buf = append(buf, a...)
++		buf = append(buf, '\r', '\n')
++	}
++	_, err := conn.Write(buf)
++	return err
++}
++
++// sourceReadReply RESP2 回复解析（行/数组有界，拒绝畸形长度）。
++func sourceReadReply(br *bufio.Reader) (any, error) {
++	line, err := sourceReadLine(br)
++	if err != nil {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, fmt.Errorf("itembridge: 空回复行")
++	}
++	switch line[0] {
++	case '+', '-':
++		return string(line[1:]), nil
++	case ':':
++		return strconv.ParseInt(string(line[1:]), 10, 64)
++	case '$':
++		n, err := strconv.Atoi(string(line[1:]))
++		if err != nil || n < -1 || n > sourceMaxBulk {
++			return nil, fmt.Errorf("itembridge: bulk 长度非法 %q", line)
++		}
++		if n == -1 {
++			return nil, nil
++		}
++		body := make([]byte, n+2)
++		if _, err := readFull(br, body); err != nil {
++			return nil, err
++		}
++		return body[:n], nil
++	case '*':
++		n, err := strconv.Atoi(string(line[1:]))
++		if err != nil || n < 0 || n > sourceMaxArray {
++			return nil, fmt.Errorf("itembridge: 数组长度非法 %q", line)
++		}
++		out := make([]any, 0, n)
++		for i := 0; i < n; i++ {
++			r, err := sourceReadReply(br)
++			if err != nil {
++				return nil, err
++			}
++			out = append(out, r)
++		}
++		return out, nil
++	default:
++		return nil, fmt.Errorf("itembridge: 回复类型未知 %q", line)
++	}
++}
++
++func sourceReadLine(br *bufio.Reader) ([]byte, error) {
++	var acc []byte
++	for {
++		chunk, err := br.ReadSlice('\n')
++		if len(acc)+len(chunk) > sourceMaxLine {
++			return nil, fmt.Errorf("itembridge: 回复行超上限")
++		}
++		acc = append(acc, chunk...)
++		if err == bufio.ErrBufferFull {
++			continue
++		}
++		if err != nil {
++			return nil, err
++		}
++		break
++	}
++	for len(acc) > 0 && (acc[len(acc)-1] == '\n' || acc[len(acc)-1] == '\r') {
++		acc = acc[:len(acc)-1]
++	}
++	return acc, nil
++}
++
++func readFull(br *bufio.Reader, buf []byte) (int, error) {
++	total := 0
++	for total < len(buf) {
++		n, err := br.Read(buf[total:])
++		total += n
++		if err != nil {
++			return total, err
++		}
++	}
++	return total, nil
++}

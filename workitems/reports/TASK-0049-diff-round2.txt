@@ -1,0 +1,259 @@
+diff --git a/calc/README.md b/calc/README.md
+index b6a5d88..373794f 100644
+--- a/calc/README.md
++++ b/calc/README.md
+@@ -37,7 +37,8 @@ calc/
+ │   │                               #  ValueStore/ValueSample/CalcResult/ArithmeticEvaluator、
+ │   │                               #  ExecutorRuntime（装配+生命周期+观测）
+ │   ├── status/                     # 状态判定（TASK-0049）：StatusEvaluator（priority 升序首命中/
+-│   │                               #   直绑短路/LWT 离线输入/UNKNOWN 质量标记/稳定序号）、
++│   │                               #   StatusEvaluator（LWT 离线优先/直绑短路/priority 升序首命中/
++│   │                               #   UNKNOWN 质量标记/稳定序号）、
+ │   │                               #   StatusEvaluatorRuntime（桥接 0041 ResultSink + LWT 事件通道）、
+ │   │                               #   RedisStateWriter（RESP2 写 iot:st:{tenant}:{instance}，未变不重写）、
+ │   │                               #   TdengineTraceWriter（STATUS 数据项写 st_item_value，逐语句 REST）、
+@@ -109,7 +110,7 @@ calc/
+ `status-enabled=true` 时按详细设计 V1.1 §1.5B 判定链路接入 0041 执行器输出：
+ 
+ - **触发**：`StatusEvaluatorRuntime` 以 `ResultSink` 装饰器接在执行器落地边界后——任一被引用数据项更新（到达/周期通道）即重判；另订阅 Redis LWT 事件通道 `iot:gwstatus:{tenant}`（ADR-0010，离线优先触发重判）。接入取向为独立组件桥接，不侵入 `DualTriggerExecutor` 主链（0041 的 140 测试零回归）。
+-- **求值**：`StatusEvaluator` 直绑短路（RUN_STATE 枚举命中）→ LWT 离线优先 → 规则 priority **升序逐条**求值首个命中（故障优先于运行）；全不命中 = UNKNOWN + 质量码 3，不硬套默认状态；单条规则求值失败隔离跳过。状态编码稳定序号取字典单一来源（ADR-0009）。
++- **求值**：`StatusEvaluator` LWT 离线优先（ADR-0010）→ 直绑短路（RUN_STATE 枚举命中）→ 规则 priority **升序逐条**求值首个命中（故障优先于运行）；全不命中 = UNKNOWN + 质量码 3，不硬套默认状态；单条规则求值失败隔离跳过。状态编码稳定序号取字典单一来源（ADR-0009）。
+ - **当前状态**：`RedisStateWriter` 以 RESP2 写 `iot:st:{tenant}:{instance}`（JSON statusCode/statusName/color/seq/quality/ts），**未变不重写**。
+ - **变化留痕**：`TdengineTraceWriter` 以 STATUS 数据项写 `st_item_value`（value=稳定序号、quality=0、UNKNOWN 写 -1+质量码），逐语句独立下发 taosAdapter REST、子表首写 `INSERT...USING...TAGS`（含 tenant_id），**未变不重写**；留痕写失败 WARN 不阻塞。
+ - **失败语义**：判定失败只影响该实例（不发假状态、不覆盖旧 Redis 值）；判定与留痕的"未变不重写"均以状态编码变化为唯一判据（质量码变化不算变位）。
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java b/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java
+index 0e94214..5781294 100644
+--- a/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java
++++ b/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java
+@@ -11,7 +11,7 @@ import org.slf4j.LoggerFactory;
+ 
+ /**
+  * 状态判定求值引擎（TASK-0049 / 详细设计 V1.1 §1.5B p12 + §5 T17）：
+- * 实例被引用数据项更新时触发——直绑短路 → LWT 离线输入 → 规则 priority 升序逐条求值，
++ * 实例被引用数据项更新时触发——LWT 离线优先（ADR-0010）→ 直绑短路 → 规则 priority 升序逐条求值，
+  * 首个命中即当前状态；全不命中 UNKNOWN + 质量标记（CONV-02 码 3，不硬套默认状态）。
+  *
+  * <p><b>接入取向</b>（brief 决策 1「最小改动 + javadoc 说明」）：求值引擎做纯函数式独立组件，
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java b/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java
+index fb1436c..73c1a1e 100644
+--- a/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java
+@@ -89,7 +89,27 @@ public final class StatusEvaluatorRuntime implements AutoCloseable {
+         void subscribe(String channel, java.util.function.Consumer<String> listener);
+     }
+ 
+-    /** 由 Runtime 内部订阅，收到任意 payload 视为离线事件（离线优先，ADR-0010） */
++    /**
++     * F-03（修订轮）：解析 LWT 事件 payload 的 online 字段——仅离线事件触发离线优先判定。
++     *
++     * <p>规则：{@code online:false}（布尔或字符串）/ 缺 online 字段 / 非 JSON 坏 payload → 离线
++     * （LWT 语义=离线事件；fail-safe）；{@code online:true} → 在线恢复事件 → 回到规则求值。
++     * 用轻量文本匹配零新增依赖（本工程 RESP2/REST 均为零依赖纪律）。
++     */
++    static boolean isOffline(String payload) {
++        if (payload == null || payload.isBlank()) {
++            return true;
++        }
++        java.util.regex.Matcher m = java.util.regex.Pattern
++                .compile("\"online\"\\s*:\\s*(true|false|\"true\"|\"false\")", java.util.regex.Pattern.CASE_INSENSITIVE)
++                .matcher(payload);
++        if (!m.find()) {
++            return true; // 缺 online=LWT 默认离线
++        }
++        return !m.group(1).toLowerCase().contains("true");
++    }
++
++    /** 由 Runtime 内部订阅，收到 payload 后按 online 字段决定离线优先还是恢复规则求值 */
+     public void start() {
+         lwtSubscriber.start();
+         log.info("[CALC-STATUS] 状态判定已装配 tenant={} instance={} redis=iot:st:{}:{} lwt={}",
+@@ -190,8 +210,10 @@ public final class StatusEvaluatorRuntime implements AutoCloseable {
+             }
+             started = true;
+             source.subscribe(channel, payload -> {
+-                log.info("[CALC-STATUS] LWT 离线事件触发重判 channel={} payload={}", channel, payload);
+-                evaluate(true, System.currentTimeMillis());
++                boolean offline = isOffline(payload);
++                log.info("[CALC-STATUS] LWT 事件触发重判 channel={} offline={} payload={}", channel, offline, payload);
++                // 离线→离线优先；在线恢复→回到规则求值（同一赋值链，无独立状态写口）
++                evaluate(offline, System.currentTimeMillis());
+             });
+         }
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java b/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java
+index 7baaf25..1e069a8 100644
+--- a/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java
++++ b/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java
+@@ -80,15 +80,42 @@ public final class TdengineTraceWriter implements StatusTraceSink {
+                 throw new TraceWriteException("TDengine REST HTTP " + resp.statusCode(), null);
+             }
+             String body = resp.body();
+-            if (body == null || !body.contains("\"code\":0")) {
+-                throw new TraceWriteException("TDengine 应答非 code=0: " +
+-                        (body == null ? "空应答" : body.substring(0, Math.min(200, body.length()))), null);
+-            }
++            requireTaosSuccess(body);
+             return body;
+         };
+         return new TdengineTraceWriter(runner, tenantCode);
+     }
+ 
++    /**
++     * F-01（修订轮）：taosAdapter REST 应答校验——从静默成功判定改为真解析 code 数值。
++     *
++     * <p>真 taosAdapter 3.x 应答形如 {@code {"code":0,"desc":"...","data":...}}，JSON 序列化
++     * 可能在冒号后带空格（{@code "code": 0}）——旧 {@code contains("\"code\":0")} 会把合法
++     * 应答误判为失败。改为从 JSON 抽取 code 字段转整数判定（0=成功），不可解析/非 0 一律失败。
++     * 供单测以捕获的应答样本离线验证（真机 REST 恢复前的替代证据）。
++     */
++    static void requireTaosSuccess(String body) {
++        if (body == null || body.isBlank()) {
++            throw new TraceWriteException("TDengine 应答为空", null);
++        }
++        Integer code = extractCode(body);
++        if (code == null) {
++            throw new TraceWriteException("TDengine 应答无 code 字段（不可解析）: "
++                    + body.substring(0, Math.min(200, body.length())), null);
++        }
++        if (code != 0) {
++            throw new TraceWriteException("TDengine 错误码 " + code + ": "
++                    + body.substring(0, Math.min(200, body.length())), null);
++        }
++    }
++
++    /** 从 JSON 文本提取 code 数值（容错冒号后空白；不引入 JSON 依赖——本类零新增依赖纪律） */
++    static Integer extractCode(String body) {
++        java.util.regex.Matcher m = java.util.regex.Pattern
++                .compile("\"code\"\\s*:\\s*(-?\\d+)").matcher(body);
++        return m.find() ? Integer.valueOf(m.group(1)) : null;
++    }
++
+     @Override
+     public synchronized boolean append(String tenantCode, String instanceCode, StatusDecision decision) {
+         String key = tenantCode + ":" + instanceCode;
+@@ -111,9 +138,13 @@ public final class TdengineTraceWriter implements StatusTraceSink {
+         String child = "D_" + instanceCode.replaceAll("[^A-Za-z0-9_]", "_") + "_STATUS";
+         long ts = d.ts();
+         double value = d.seq() == null ? -1 : d.seq(); // UNKNOWN 不写序号→-1 哨兵（quality>0 打标，不冒充已知状态）
++        // F-02（修订轮）：full_key 严格 = instance_code + "." + data_code（冻结契约
++        // config-snapshot-schema.md:165 / tdengine-super-tables.md:15,37）——读侧
++        // OpenApiTimeseriesClient WHERE full_key = ? 按规范 fullKey 查询，禁止任何前缀。
++        String fullKey = instanceCode + "." + STATUS_DATA_CODE;
+         return "INSERT INTO " + db + "." + child
+                 + " USING " + db + ".st_item_value"
+-                + " TAGS (" + 1L + ", '" + "full:" + instanceCode + "." + STATUS_DATA_CODE + "', '"
++                + " TAGS (" + 1L + ", '" + fullKey + "', '"
+                 + instanceCode + "', '" + STATUS_DATA_CODE + "', 'status', " + STATUS_SOURCE_TYPE + ")"
+                 + " VALUES (" + ts + ", " + value + ", " + d.quality() + ")";
+     }
+diff --git a/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java b/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java
+index 972bbb8..3481a96 100644
+--- a/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java
+@@ -100,6 +100,34 @@ class StatusRuntimeContractTest {
+         assertEquals(4, f.trace().rows().get(1).seq());
+     }
+ 
++    @Test
++    void lwtPayloadParsesOnlineField() {
++        // F-03（修订轮）：LWT 通道 online 字段解析——离线事件（online:false / 缺字段）才触发离线优先，
++        // 在线事件（online:true）不得误裁 OFFLINE，且回到规则求值（恢复路径闭合）。
++        assertTrue(StatusEvaluatorRuntime.isOffline("{\"gateway\":\"GW1\",\"online\":false}"));
++        assertTrue(StatusEvaluatorRuntime.isOffline("{\"gateway\":\"GW1\",\"online\":\"false\"}"));
++        assertTrue(StatusEvaluatorRuntime.isOffline("{\"gateway\":\"GW1\"}"), "缺 online=LWT 语义（离线）");
++        assertTrue(StatusEvaluatorRuntime.isOffline("not-json"), "坏 payload fail-safe 按离线");
++        assertFalse(StatusEvaluatorRuntime.isOffline("{\"gateway\":\"GW1\",\"online\":true}"));
++        assertFalse(StatusEvaluatorRuntime.isOffline("{\"gateway\":\"GW1\",\"online\":\"true\"}"));
++    }
++
++    @Test
++    void lwtOnlineEventReturnsToRuleEvaluationNotOffline() {
++        Fixture f = fixture();
++        f.runtime().start();
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        f.runtime().evaluate(false, 1000L);
++        assertEquals("RUNNING", f.runtime().current().statusCode());
++        // 先离线
++        f.lwtListener().get().accept("{\"gateway\":\"GW1\",\"online\":false}");
++        assertEquals("OFFLINE", f.runtime().current().statusCode());
++        // 网关恢复在线事件（online:true）→ 回到规则求值，CURRENT>0 命中 RUNNING
++        f.lwtListener().get().accept("{\"gateway\":\"GW1\",\"online\":true}");
++        assertEquals("RUNNING", f.runtime().current().statusCode(), "在线事件回到规则态，不误裁 OFFLINE");
++        assertEquals(StatusDecision.Source.RULE, f.runtime().current().source());
++    }
++
+     @Test
+     void evaluationFailureDoesNotOverwriteOldState() {
+         Fixture f = fixture();
+diff --git a/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java b/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java
+index 8b188e8..4870727 100644
+--- a/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java
+@@ -31,6 +31,39 @@ class TdengineTraceWriterContractTest {
+         assertFalse(sql.contains("USE "), "REST 无库上下文 USE");
+     }
+ 
++    @Test
++    void tagsSixTupleUsesContractFullKeyWithoutPrefix() {
++        // F-02（修订轮）：full_key 标签必须严格 = instance_code + "." + data_code（冻结契约
++        // config-snapshot-schema.md:165 + tdengine-super-tables.md:15/37），无 full: 前缀——
++        // 读侧 OpenApiTimeseriesClient WHERE full_key = ? 按规范 fullKey 查询，前缀将读不到。
++        // 逐值精确断言六元组（tenant_id / full_key / instance_code / data_code / category / source_type）
++        // ——对旧实现 'full:T49.EQ001.STATUS' 必红。
++        StatusDecision d = new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1795211995000L);
++        String sql = TdengineTraceWriter.insertSql("t49", "F01.WS01.EQ001", d);
++        String[] tags = tagsOf(sql);
++        assertEquals(6, tags.length, "六个 tag 齐全: " + sql);
++        assertEquals("1", tags[0], "tenant_id（TAGS 首值占位；真库标签值由租户库上下文/配置注入）");
++        assertEquals("F01.WS01.EQ001.STATUS", tags[1], "full_key = instance_code + '.' + data_code，无 full: 前缀");
++        assertEquals("F01.WS01.EQ001", tags[2], "instance_code");
++        assertEquals("STATUS", tags[3], "data_code");
++        assertEquals("status", tags[4], "category");
++        assertEquals("1", tags[5], "source_type=1（直绑语义）");
++        assertFalse(sql.contains("full:"), "SQL 全文无 full: 非契约前缀: " + sql);
++    }
++
++    /** 从 INSERT ... TAGS (...) 提取六个 tag 字面值（去单引号/空白） */
++    private static String[] tagsOf(String sql) {
++        int a = sql.indexOf("TAGS (");
++        int b = sql.indexOf(')', a);
++        String inside = sql.substring(a + "TAGS (".length(), b);
++        String[] raw = inside.split(",", -1);
++        String[] out = new String[raw.length];
++        for (int i = 0; i < raw.length; i++) {
++            out[i] = raw[i].trim().replaceAll("^'|'$", "");
++        }
++        return out;
++    }
++
+     @Test
+     void appendWritesOnlyOnceForSameStatusAndRunnerCapturesSingleSql() {
+         List<String> captured = new ArrayList<>();
+@@ -49,6 +82,27 @@ class TdengineTraceWriterContractTest {
+         assertTrue(captured.get(1).contains("VALUES (3000, 3.0, 0)"));
+     }
+ 
++    @Test
++    void restParsesCapturedTaosAdapterResponseSamples() {
++        // F-01（修订轮）：用 0029/0077 报告捕获的真 taosAdapter 应答样本离线验证 rest() 的
++        // code 解析——恢复真机前至少有"应答解析"这一层的实测替代证据（非只靠假 runner）。
++        // 成功样本（0077/0078 报告原样）
++        TdengineTraceWriter.requireTaosSuccess("{\"code\":0,\"column_meta\":[[\"ts\",\"TIMESTAMP\",8]],\"data\":[],\"rows\":0}");
++        TdengineTraceWriter.requireTaosSuccess("{\"code\":0}");
++        TdengineTraceWriter.requireTaosSuccess("{\"code\":0,\"desc\":\"OK\",\"data\":[[0]]}");
++        // 序列化变体：冒号后带空格（ Jackson / 部分网关渲染形态）——旧 contains 实现必误判
++        TdengineTraceWriter.requireTaosSuccess("{\"code\": 0, \"desc\": \"OK\"}");
++        // 真错误样本（0077/0078 报告 code 9728 原样）——必须失败
++        assertThrows(TdengineTraceWriter.TraceWriteException.class, () ->
++                TdengineTraceWriter.requireTaosSuccess(
++                        "{\"code\":9728,\"desc\":\"syntax error near ...\",\"timing\":4089500}"));
++        // 空/无 code 字段——fail-closed
++        assertThrows(TdengineTraceWriter.TraceWriteException.class, () ->
++                TdengineTraceWriter.requireTaosSuccess(""));
++        assertThrows(TdengineTraceWriter.TraceWriteException.class, () ->
++                TdengineTraceWriter.requireTaosSuccess("{\"desc\":\"no code\"}"));
++    }
++
+     @Test
+     void restFailurePropagatesTraceWriteExceptionForCallerWarn() {
+         TdengineTraceWriter w = new TdengineTraceWriter(sql -> { throw new Exception("不可达"); }, "t49");

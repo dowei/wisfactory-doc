@@ -1,0 +1,1934 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictEvent.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictEvent.java
+new file mode 100644
+index 0000000..2e84c89
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictEvent.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.dataperm;
++
++/**
++ * 可见集合缓存失效事件（TASK-0006）。
++ *
++ * <p>payload=userId 可空——<b>null 即全量失效</b>（brief 裁决 1 失效粒度按变更类型）：
++ * <ul>
++ * <li>①用户角色绑定变更 → 单用户失效（userId 非空）；</li>
++ * <li>②角色本身/授权变更、③部门变更、④实例绑部门变更 → 全量失效（userId=null）。</li>
++ * </ul>
++ *
++ * <p>发布时机由 {@link DataPermCacheEvictPublisher} 统一挂点（事务提交后 afterCommit，
++ * 照 TASK-0003 范式）；消费方 {@link DataPermCacheEvictListener} 执行 Redis SCAN+DEL。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record DataPermCacheEvictEvent(Long userId) {
++
++    /**
++     * 单用户失效事件（用户角色绑定变更）
++     */
++    public static DataPermCacheEvictEvent ofUser(Long userId) {
++        return new DataPermCacheEvictEvent(userId);
++    }
++
++    /**
++     * 全量失效事件（角色/部门/实例绑部门变更，低频操作全量失效简单正确）
++     */
++    public static DataPermCacheEvictEvent all() {
++        return new DataPermCacheEvictEvent(null);
++    }
++
++    /**
++     * 是否全量失效（userId 为 null 即全量）
++     */
++    public boolean evictAll() {
++        return userId == null;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListener.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListener.java
+new file mode 100644
+index 0000000..5e2b7b1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListener.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.context.event.EventListener;
++import org.springframework.stereotype.Component;
++
++/**
++ * 可见集合缓存失效事件监听器（TASK-0006）：消费 {@link DataPermCacheEvictEvent}，
++ * 委托 {@link VisibleScopeCache#evict(Long)} 执行 Redis SCAN+DEL（单机一期口径，
++ * Spring 应用事件进程内即达——不引 Redis pub/sub，多实例跨节点失效登记 TD 随集群形态任务裁决）。
++ *
++ * <p>失效动作绝不抛出中断业务（缓存实现契约：故障只能降级为重新计算/TTL 兜底），
++ * 监听器自身再兜一层 try/catch 防未来缓存实现违约。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class DataPermCacheEvictListener {
++
++    private final VisibleScopeCache cache;
++
++    public DataPermCacheEvictListener(VisibleScopeCache cache) {
++        this.cache = cache;
++    }
++
++    /**
++     * userId=null 即全量失效（brief 裁决 1：SCAN+DEL 按 userId 前缀或全量，生产安全不用 KEYS）
++     */
++    @EventListener
++    public void onCacheEvict(DataPermCacheEvictEvent event) {
++        try {
++            cache.evict(event.userId());
++            log.info("[DATAPERM] visible-scope cache evicted {}", event.evictAll() ? "ALL" : "userId=" + event.userId());
++        } catch (Exception e) {
++            log.warn("[DATAPERM] 缓存失效执行失败（TTL 兜底）userId={} 摘要：{}", event.userId(), e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisher.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisher.java
+new file mode 100644
+index 0000000..2e9459f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisher.java
+@@ -0,0 +1,75 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.stereotype.Component;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++/**
++ * 可见集合缓存失效事件发布助手（TASK-0006，失效点唯一入口）。
++ *
++ * <p>变更点（role/dept/user-role/实例绑部门）每处一行调用 {@link #evictAll()} 或
++ * {@link #evictUser(Long)}；本助手统一挂事务同步——<b>有事务时提交后（afterCommit）才发布</b>，
++ * 照 TASK-0003 SysTenantServiceImpl 挂点范式：未提交先失效会让并发事务重新回填脏数据，
++ * 失效必须在提交后发生。
++ *
++ * <p>与 0003 的差异（有理由的偏离）：无事务同步上下文时<b>立即发布</b>而非跳过——
++ * 0003 有开通扫描兜底，跳过无害；本组件的兜底只有 TTL（10 分钟内权限可能放大），
++ * 「改绑定/角色后权限即时生效」（REQ-0002 验收 4）不允许跳过。变更点中的
++ * updateRoleMenu/updateRoleDept/updateDataScope 等写方法本就无事务注解，立即发布即其正确路径。
++ *
++ * <p>发布动作本身绝不抛出（afterCommit 内异常收敛 WARN，不炸穿已提交的写事务；
++ * 无事务路径同样收敛——失效失败只留 TTL 兜底）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class DataPermCacheEvictPublisher {
++
++    private final ApplicationEventPublisher publisher;
++
++    public DataPermCacheEvictPublisher(ApplicationEventPublisher publisher) {
++        this.publisher = publisher;
++    }
++
++    /**
++     * 单用户失效（用户角色绑定/用户自身部门变更点调用）
++     */
++    public void evictUser(Long userId) {
++        publish(DataPermCacheEvictEvent.ofUser(userId));
++    }
++
++    /**
++     * 全量失效（角色本身/授权变更、部门变更、实例绑部门变更点调用）
++     */
++    public void evictAll() {
++        publish(DataPermCacheEvictEvent.all());
++    }
++
++    private void publish(DataPermCacheEvictEvent event) {
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                @Override
++                public void afterCommit() {
++                    try {
++                        publisher.publishEvent(event);
++                    } catch (Exception e) {
++                        log.warn("[DATAPERM] 缓存失效事件发布失败（不阻断主流程，TTL 兜底）userId={} 摘要：{}",
++                                event.userId(), e.getMessage());
++                    }
++                }
++            });
++        } else {
++            // 无事务上下文（非事务写方法/纯调用）：立即发布即失效——失效是安全语义，不允许跳过等 TTL
++            try {
++                publisher.publishEvent(event);
++            } catch (Exception e) {
++                log.warn("[DATAPERM] 缓存失效事件发布失败（TTL 兜底）userId={} 摘要：{}",
++                        event.userId(), e.getMessage());
++            }
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java
+index b3f022d..ed4cec3 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java
+@@ -23,4 +23,11 @@ public class DataPermProperties {
+      * {@code <=0} 视为关闭上限（误配 0 不得造成全量不可见）。
+      */
+     private int subtreeMax = 5000;
++
++    /**
++     * 可见集合缓存 TTL 秒数（TASK-0006，默认 600=10 分钟——FEAT-0002 业务规则：TTL 仅兜底，
++     * 主动失效由部门/角色/绑定变更点事件驱动）。{@code <=0} 为误配：Redis 实现回落默认
++     * 600 并 WARN——直写无 TTL 的 SET 会产生永不过期的永久键（漏失效即权限永久放大）。
++     */
++    private long cacheTtlSeconds = 600;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java
+index b01727a..a3d8eaa 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java
+@@ -1,9 +1,11 @@
+ package net.otlab.admin.module.iot.dataperm;
+ 
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+- * 可见集合缓存的 NoOp 实现（TASK-0005 本期直查）。
++ * 可见集合缓存的 NoOp 实现（TASK-0005 本期直查；TASK-0006 保留为 {@code ot.dataperm.cache-enabled=false}
++ * 时的测试与故障兜底——关闭开关即回直查，与默认（Redis 实现，matchIfMissing）互斥注册单 Bean）。
+  *
+  * <p>不缓存任何结果：get 恒未命中、put/evict 空操作。resolve 调用路径的
+  * 「先缓存后计算」接缝已按缓存语义写好，TASK-0006 交付 Redis 实现后无需改动
+@@ -13,6 +15,7 @@ import org.springframework.stereotype.Component;
+  * @date 2026-11-22
+  */
+ @Component
++@ConditionalOnProperty(name = "ot.dataperm.cache-enabled", havingValue = "false")
+ public class NoOpVisibleScopeCache implements VisibleScopeCache {
+ 
+     @Override
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCache.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCache.java
+new file mode 100644
+index 0000000..8bfdba7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCache.java
+@@ -0,0 +1,146 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import com.fasterxml.jackson.databind.DeserializationFeature;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.data.redis.core.Cursor;
++import org.springframework.data.redis.core.ScanOptions;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Component;
++
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * 可见集合缓存 Redis 实现（TASK-0006）：key={@code iot:dataperm:scope:{userId}:{roleVer}}，
++ * value=VisibleScope JSON（Jackson），TTL 默认 600s（{@code ot.dataperm.cache-ttl-seconds} 可配，
++ * FEAT-0002 业务规则 10 分钟——TTL 仅兜底，主动失效由变更点事件驱动）。
++ *
++ * <p><b>「角色版本」裁决（brief 裁决 1）</b>：sys_role 表无版本列，采用<b>失效即失效</b>模型
++ * 替代版本号——key 不含真实版本，roleVer 段保留为占位 {@code 0}（未来引入版本列时的演进位，
++ * 本期恒 0）；失效时按 userId 前缀 SCAN+DEL 或全量 SCAN+DEL（生产安全不用 KEYS）。
++ * 失效粒度按变更类型：①用户角色绑定变更→该 userId；②角色本身/授权变更、③部门变更、
++ * ④实例绑部门变更→全量（低频操作，全量失效简单正确）。
++ *
++ * <p><b>键空间</b>：专用 {@code rawStringRedisTemplate}（无 key-prefix，键由本组件自拼完整名，
++ * 与微信公众号票据同类使用方）——验收命令 {@code redis-cli --scan --pattern 'iot:dataperm:scope:*'}
++ * 直查物理键；跨系统隔离以 database 分库为准（ADR-1009）。
++ *
++ * <p>故障纪律（{@link VisibleScopeCache} 接口约束）：任何 Redis 异常只降级（get 降级为未命中
++ * 重新计算、put/evict 跳过留 TTL 兜底），绝不抛出阻断业务查询或已提交的写事务。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++@ConditionalOnProperty(name = "ot.dataperm.cache-enabled", havingValue = "true", matchIfMissing = true)
++public class RedisVisibleScopeCache implements VisibleScopeCache {
++
++    /** 键前缀（物理键，无 key-prefix 修饰）：iot:dataperm:scope:{userId}:{roleVer} */
++    public static final String KEY_PREFIX = "iot:dataperm:scope:";
++
++    /** roleVer 占位段：sys_role 无版本列，本期恒 0（失效即失效模型，brief 裁决 1） */
++    private static final String ROLE_VERSION_PLACEHOLDER = "0";
++
++    /** 误配 TTL 的回落默认（600s=10 分钟，与配置默认一致） */
++    private static final long DEFAULT_TTL_SECONDS = 600;
++
++    /** SCAN 每批提示数（性能提示非上限，Redis 按需返回） */
++    private static final int SCAN_COUNT_HINT = 200;
++
++    /** DEL 分批大小（防全量失效时单命令键数过大） */
++    private static final int DELETE_BATCH_SIZE = 1000;
++
++    /** VisibleScope JSON 解析器：宽容未知字段（向前兼容），与 DataPermServiceImpl.SCOPE_JSON 同范式 */
++    private static final ObjectMapper SCOPE_JSON = JsonMapper.builder()
++            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
++            .build();
++
++    private final StringRedisTemplate redisTemplate;
++    private final Duration ttl;
++
++    public RedisVisibleScopeCache(@Qualifier("rawStringRedisTemplate") StringRedisTemplate rawStringRedisTemplate,
++                                  DataPermProperties properties) {
++        this.redisTemplate = rawStringRedisTemplate;
++        long configured = properties.getCacheTtlSeconds();
++        if (configured <= 0) {
++            // 误配 <=0 若直写 SET 无 TTL 会产生永不过期的永久键（漏失效即权限永久放大），
++            // 回落默认值并 WARN 提示配置错误
++            log.warn("[DATAPERM] cache-ttl-seconds={} 误配（<=0），回落默认 {}s", configured, DEFAULT_TTL_SECONDS);
++            configured = DEFAULT_TTL_SECONDS;
++        }
++        this.ttl = Duration.ofSeconds(configured);
++    }
++
++    @Override
++    public VisibleScope get(Long userId) {
++        try {
++            String json = redisTemplate.opsForValue().get(key(userId));
++            if (json == null || json.isBlank()) {
++                return null;
++            }
++            return SCOPE_JSON.readValue(json, VisibleScope.class);
++        } catch (Exception e) {
++            // 缓存故障只能降级为「重新计算」，不得阻断业务查询（接口约束）
++            log.warn("[DATAPERM] cache get degraded to recompute userId={} 摘要：{}", userId, e.getMessage());
++            return null;
++        }
++    }
++
++    @Override
++    public void put(Long userId, VisibleScope scope) {
++        if (scope == null) {
++            return;
++        }
++        try {
++            redisTemplate.opsForValue().set(key(userId), SCOPE_JSON.writeValueAsString(scope), ttl);
++        } catch (Exception e) {
++            log.warn("[DATAPERM] cache put skipped userId={} 摘要：{}", userId, e.getMessage());
++        }
++    }
++
++    /**
++     * 主动失效：userId=null 全量（{@code iot:dataperm:scope:*}），否则该用户
++     * （{@code iot:dataperm:scope:{userId}:*}）——SCAN 游标分批 + DEL 分批，生产安全不用 KEYS
++     */
++    @Override
++    public void evict(Long userId) {
++        String pattern = KEY_PREFIX + (userId == null ? "*" : userId + ":*");
++        try {
++            long deleted = 0;
++            List<String> batch = new ArrayList<>();
++            try (Cursor<String> cursor = redisTemplate.scan(ScanOptions.scanOptions()
++                    .match(pattern).count(SCAN_COUNT_HINT).build())) {
++                while (cursor.hasNext()) {
++                    batch.add(cursor.next());
++                    if (batch.size() >= DELETE_BATCH_SIZE) {
++                        deleted += deleteBatch(batch);
++                    }
++                }
++            }
++            if (!batch.isEmpty()) {
++                deleted += deleteBatch(batch);
++            }
++            log.info("[DATAPERM] visible-scope cache evicted pattern={} keys={}", pattern, deleted);
++        } catch (Exception e) {
++            log.warn("[DATAPERM] cache evict failed（TTL 兜底）pattern={} 摘要：{}", pattern, e.getMessage());
++        }
++    }
++
++    private long deleteBatch(List<String> batch) {
++        // 快照后清空复用缓冲（批次列表不再作为删除入参被后续 clear 污染）
++        List<String> snapshot = List.copyOf(batch);
++        batch.clear();
++        Long deleted = redisTemplate.delete(snapshot);
++        return deleted == null ? 0L : deleted;
++    }
++
++    private static String key(Long userId) {
++        return KEY_PREFIX + userId + ":" + ROLE_VERSION_PLACEHOLDER;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+index 3039415..cf6bc5c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+@@ -6,6 +6,7 @@ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
+ import net.otlab.admin.module.iot.dataperm.DataPermAccessStrategy;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceCreateForm;
+@@ -116,6 +117,13 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+     @Autowired
+     private IotModelTemplateMapper modelTemplateMapper;
+ 
++    /**
++     * 可见集合缓存失效事件发布（TASK-0006）：实例绑部门变更发全量失效——实例可见集含
++     * dept 推导与 ancestors 子树展开，逐用户反查成本高且低频（brief 裁决 1 失效粒度④）
++     */
++    @Autowired
++    private DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     @Autowired
+     private IotInstanceCodeMapper instanceCodeMapper;
+ 
+@@ -337,7 +345,12 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         upd.setDeptId(form.getDeptId());
+         upd.setSort(form.getSort());
+         upd.setStatus(form.getStatus());
+-        return this.updateById(upd);
++        boolean updated = this.updateById(upd);
++        // 实例绑部门变更：可见集缓存全量失效（提交后发布，TASK-0006 brief 裁决 4，唯一实例侧挂点）
++        if (updated && form.getDeptId() != null && !form.getDeptId().equals(existing.getDeptId())) {
++            dataPermCacheEvictPublisher.evictAll();
++        }
++        return updated;
+     }
+ 
+     /**
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
+index 3711cdb..f07b9a1 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
+@@ -3,6 +3,7 @@ package net.otlab.admin.module.system.service.impl;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
+ import net.otlab.admin.module.system.entity.SysDept;
+ import net.otlab.admin.module.system.entity.SysUser;
+ import net.otlab.admin.module.system.mapper.SysDeptMapper;
+@@ -35,6 +36,14 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+     @Autowired
+     private SysUserMapper userMapper;
+ 
++    /**
++     * 可见集合缓存失效事件发布（TASK-0006）：部门增/改/删均发全量失效——scope=2 的
++     * 「本部门及下属」按 ancestors 匹配，部门树任何变更影响所有用过该树的可见集，
++     * 逐用户反查成本高且部门变更低频（brief 裁决 1：失效粒度按变更类型）
++     */
++    @Autowired
++    private DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     @Override
+     public Page<SysDept> selectDeptList(Page<SysDept> page, SysDept dept) {
+         LambdaQueryWrapper<SysDept> wrapper = new LambdaQueryWrapper<>();
+@@ -79,7 +88,11 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+         // 服务端维护祖级列表：数据权限「本部门及下属」按 ancestors 匹配（DataScopeServiceImpl.selectChildDeptIds），
+         // 前端传值不可信，漏传即静默失效（BUG-0059）
+         dept.setAncestors(resolveAncestors(dept.getParentId()));
+-        return this.save(dept);
++        boolean saved = this.save(dept);
++        if (saved) {
++            dataPermCacheEvictPublisher.evictAll(); // 部门树变更：可见集缓存全量失效（TASK-0006，裁决 3）
++        }
++        return saved;
+     }
+ 
+     @Override
+@@ -106,6 +119,9 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+         if (parentChanged && updated) {
+             cascadeUpdateChildAncestors(dept.getId());
+         }
++        if (updated) {
++            dataPermCacheEvictPublisher.evictAll(); // 部门变更（含移动级联重算）：可见集缓存全量失效（TASK-0006，裁决 3）
++        }
+         return updated;
+     }
+ 
+@@ -203,7 +219,11 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+         if (userMapper.selectCount(userWrapper) > 0) {
+             throw new BusinessException("system.dept.hasUsers");
+         }
+-        return this.removeById(deptId);
++        boolean removed = this.removeById(deptId);
++        if (removed) {
++            dataPermCacheEvictPublisher.evictAll(); // 部门删除：可见集缓存全量失效（TASK-0006，裁决 3）
++        }
++        return removed;
+     }
+ 
+     @Override
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
+index bb70381..2c9bf85 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
+@@ -3,6 +3,7 @@ package net.otlab.admin.module.system.service.impl;
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
+ import net.otlab.admin.module.system.entity.SysMenu;
+ import net.otlab.admin.module.system.entity.SysRole;
+ import net.otlab.admin.module.system.entity.SysRoleDept;
+@@ -67,6 +68,14 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+ 
+     @Autowired
+     private SysUserRoleMapper userRoleMapper;
++
++    /**
++     * 可见集合缓存失效事件发布（TASK-0006）：角色本身/授权变更发全量失效（低频操作简单正确），
++     * 用户角色绑定变更发单用户失效——失效即失效模型（sys_role 无版本列，brief 裁决 1）
++     */
++    @Autowired
++    private DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     @Override
+     public Page<SysRole> selectRoleList(Page<SysRole> page, SysRole role) {
+         LambdaQueryWrapper<SysRole> wrapper = new LambdaQueryWrapper<>();
+@@ -114,7 +123,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         if (role.getDataScope() != null && role.getDataScope() == 5 && deptIds != null && !deptIds.isEmpty()) {
+             batchInsertRoleDept(role.getId(), deptIds);
+         }
+-        
++        dataPermCacheEvictPublisher.evictAll(); // 角色集变更：可见集缓存全量失效（提交后发布，TASK-0006）
++
+         return true;
+     }
+ 
+@@ -151,11 +161,12 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         
+         // 删除旧的部门关联
+         deleteRoleDeptByRoleId(role.getId());
+-        
++
+         // 如果数据权限为自定义（dataScope=5），保存新的部门关联
+         if (role.getDataScope() != null && role.getDataScope() == 5 && deptIds != null && !deptIds.isEmpty()) {
+             batchInsertRoleDept(role.getId(), deptIds);
+         }
++        dataPermCacheEvictPublisher.evictAll(); // 角色本身/授权变更：可见集缓存全量失效（提交后发布，TASK-0006）
+ 
+         return true;
+     }
+@@ -181,7 +192,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         
+         // 删除角色部门关联
+         deleteRoleDeptByRoleId(roleId);
+-        
++        dataPermCacheEvictPublisher.evictAll(); // 角色删除：可见集缓存全量失效（提交后发布，TASK-0006）
++
+         return true;
+     }
+ 
+@@ -231,11 +243,12 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+     public void updateRoleMenu(RoleMenuUpdateForm updateDTO) {
+         // 删除旧的角色菜单关联
+         deleteRoleMenuByRoleId(updateDTO.getRoleId());
+-        
++
+         // 保存新的角色菜单关联
+         if (updateDTO.getMenuIds() != null && !updateDTO.getMenuIds().isEmpty()) {
+             batchInsertRoleMenu(updateDTO.getRoleId(), updateDTO.getMenuIds());
+         }
++        dataPermCacheEvictPublisher.evictAll(); // 角色授权变更：可见集缓存全量失效（TASK-0006，brief 指定挂点）
+     }
+ 
+     @Override
+@@ -270,11 +283,12 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+     public void updateRoleDept(RoleDeptUpdateForm updateDTO) {
+         // 删除旧的角色部门关联
+         deleteRoleDeptByRoleId(updateDTO.getRoleId());
+-        
++
+         // 保存新的角色部门关联
+         if (updateDTO.getDeptIds() != null && !updateDTO.getDeptIds().isEmpty()) {
+             batchInsertRoleDept(updateDTO.getRoleId(), updateDTO.getDeptIds());
+         }
++        dataPermCacheEvictPublisher.evictAll(); // 自定义范围授权变更：可见集缓存全量失效（TASK-0006，裁决 2）
+     }
+ 
+     @Override
+@@ -295,6 +309,7 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         if (updateDTO.getDeptIds() != null && !updateDTO.getDeptIds().isEmpty() && updateDTO.getDataScope() == DataScopeEnum.CUSTOM.getValue()) {
+             batchInsertRoleDept(updateDTO.getId(), updateDTO.getDeptIds());
+         }
++        dataPermCacheEvictPublisher.evictAll(); // data_scope 变更：可见集缓存全量失效（TASK-0006，裁决 2）
+     }
+ 
+     /**
+@@ -395,7 +410,7 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+             wrapper.eq(SysUserRole::getUserId, userId)
+                    .eq(SysUserRole::getRoleId, roleId);
+             long count = userRoleMapper.selectCount(wrapper);
+-            
++
+             // 如果不存在关联，则添加
+             if (count == 0) {
+                 SysUserRole userRole = new SysUserRole();
+@@ -406,6 +421,7 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+                 userRoleMapper.insert(userRole);
+             }
+         }
++        userIds.forEach(dataPermCacheEvictPublisher::evictUser); // 用户角色绑定变更：单用户失效（TASK-0006，裁决 1）
+     }
+ 
+     @Override
+@@ -421,6 +437,7 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         wrapper.eq(SysUserRole::getUserId, userId)
+                .eq(SysUserRole::getRoleId, roleId);
+         userRoleMapper.delete(wrapper);
++        dataPermCacheEvictPublisher.evictUser(userId); // 用户角色绑定变更：单用户失效（TASK-0006，裁决 1）
+     }
+ 
+     @Override
+@@ -443,5 +460,6 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+         wrapper.eq(SysUserRole::getRoleId, roleId)
+                .in(SysUserRole::getUserId, userIds);
+         userRoleMapper.delete(wrapper);
++        userIds.forEach(dataPermCacheEvictPublisher::evictUser); // 批量绑定变更：逐用户失效（TASK-0006，裁决 1）
+     }
+ }
+\ No newline at end of file
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
+index edcc3b7..b7be344 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
+@@ -14,6 +14,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
+ import net.otlab.admin.module.system.entity.SysFile;
+ import net.otlab.admin.module.system.entity.SysMenu;
+ import net.otlab.admin.module.system.entity.SysModule;
+@@ -88,6 +89,13 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+     @Autowired
+     private SysModuleService moduleService;
+ 
++    /**
++     * 可见集合缓存失效事件发布（TASK-0006）：用户角色绑定/用户自身部门变更发单用户失效
++     * （brief 裁决 1 失效粒度①——逐用户反查成本高的问题在绑定变更点天然不存在，事件方即 userId）
++     */
++    @Autowired
++    private DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     @Override
+     public Page<SysUser> selectUserList(Page<SysUser> page, SysUser user) {
+         return this.page(page, buildUserWrapper(user));
+@@ -364,6 +372,11 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+         if (updated && Constant.STATUS_DISABLE.equals(user.getStatus())) {
+             kickOut(user.getId());
+         }
++        // 用户自身部门变更影响 scope∈{2,3} 的可见集（dept_id 参与本部门/及下属求解）：
++        // 请求携带 deptId 即失效该用户（grep 核实补充变更点，同值失效为无害多余；TASK-0006）
++        if (updated && user.getDeptId() != null) {
++            dataPermCacheEvictPublisher.evictUser(user.getId());
++        }
+         return updated;
+     }
+ 
+@@ -483,6 +496,7 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+             userRole.setTenantId(TenantContext.getTenantId());
+             userRoleMapper.insert(userRole);
+         }
++        dataPermCacheEvictPublisher.evictUser(userId); // 用户角色绑定变更：该用户可见集缓存失效（提交后发布，TASK-0006）
+         log.info("用户角色分配完成，userId: {}, 保留: {}, 新增: {}, 移除: {}", userId, targetIds.size() - toAdd.size(), toAdd.size(), toRemove.size());
+     }
+ 
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index 5716280..b4df574 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -35,6 +35,8 @@ ot:
+     read-timeout-ms: ${OT_TDENGINE_READ_TIMEOUT_MS:5000}       # REST 读超时
+   dataperm:
+     subtree-max: ${OT_DATAPERM_SUBTREE_MAX:5000}   # 子树展开上限（TASK-0005 / ADR-0016 裁决 1）：步骤 4 ancestors 子树展开的实例数上限；超限截断并 WARN（[DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>），不报错不降级；<=0 视为关闭上限
++    cache-enabled: ${OT_DATAPERM_CACHE_ENABLED:true}        # 可见集合 Redis 缓存开关（TASK-0006，默认 true）：false 走 NoOpVisibleScopeCache 直查（测试与故障兜底）；缓存键 iot:dataperm:scope:{userId}:{roleVer}
++    cache-ttl-seconds: ${OT_DATAPERM_CACHE_TTL_SECONDS:600} # 可见集合缓存 TTL 秒数（TASK-0006，默认 600=10 分钟，FEAT-0002 业务规则）：TTL 仅兜底，主动失效由部门/角色/绑定变更点事件驱动；<=0 误配回落默认 600 并 WARN
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListenerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListenerTest.java
+new file mode 100644
+index 0000000..1cd1bff
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictListenerTest.java
+@@ -0,0 +1,64 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 缓存失效事件监听器单元测试（TASK-0006）：事件 payload 直通缓存 evict（null=全量），
++ * 缓存实现违约抛出时监听器兜住（失效动作绝不中断业务）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermCacheEvictListenerTest {
++
++    @Mock
++    private VisibleScopeCache cache;
++
++    private DataPermCacheEvictListener listener;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        listener = new DataPermCacheEvictListener(cache);
++    }
++
++    @org.junit.jupiter.api.AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("单用户失效事件 - 直通 cache.evict(userId)")
++    void singleUserEvent_delegatesToCacheEvict() {
++        listener.onCacheEvict(DataPermCacheEvictEvent.ofUser(7L));
++
++        verify(cache).evict(7L);
++    }
++
++    @Test
++    @DisplayName("全量失效事件 - 直通 cache.evict(null)（null 即全量 SCAN）")
++    void allEvent_delegatesToCacheEvictNull() {
++        listener.onCacheEvict(DataPermCacheEvictEvent.all());
++
++        verify(cache).evict(null);
++    }
++
++    @Test
++    @DisplayName("缓存实现违约抛出 - 监听器兜住不外溢（失效动作绝不中断业务）")
++    void cacheFailure_swallowed() {
++        org.mockito.Mockito.doThrow(new RuntimeException("redis down")).when(cache).evict(7L);
++
++        assertDoesNotThrow(() -> listener.onCacheEvict(DataPermCacheEvictEvent.ofUser(7L)));
++        assertThrows(RuntimeException.class, () -> cache.evict(7L), "前置：mock 本身确实违约");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisherTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisherTest.java
+new file mode 100644
+index 0000000..311d01d
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheEvictPublisherTest.java
+@@ -0,0 +1,114 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 缓存失效事件发布助手单元测试（TASK-0006）：事务提交后发布（照 0003 afterCommit 挂点范式）、
++ * 无事务上下文立即发布（不跳过——失效是安全语义）、发布异常收敛不炸穿写事务。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermCacheEvictPublisherTest {
++
++    private ApplicationEventPublisher publisher;
++    private DataPermCacheEvictPublisher helper;
++
++    @BeforeEach
++    void setUp() {
++        publisher = mock(ApplicationEventPublisher.class);
++        helper = new DataPermCacheEvictPublisher(publisher);
++    }
++
++    @AfterEach
++    void tearDown() {
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++    }
++
++    private DataPermCacheEvictEvent capturePublishedEvent() {
++        ArgumentCaptor<DataPermCacheEvictEvent> captor = ArgumentCaptor.forClass(DataPermCacheEvictEvent.class);
++        verify(publisher).publishEvent(captor.capture());
++        return captor.getValue();
++    }
++
++    @Test
++    @DisplayName("无事务上下文 - 立即发布（不跳过等 TTL）：updateRoleMenu 等非事务写方法的正确路径")
++    void noTransaction_publishesImmediately() {
++        helper.evictAll();
++
++        DataPermCacheEvictEvent event = capturePublishedEvent();
++        assertTrue(event.evictAll(), "userId=null 即全量失效");
++    }
++
++    @Test
++    @DisplayName("无事务上下文 - evictUser 发布单用户事件")
++    void noTransaction_evictUserPublishesUserId() {
++        helper.evictUser(7L);
++
++        DataPermCacheEvictEvent event = capturePublishedEvent();
++        assertEquals(7L, event.userId());
++    }
++
++    @Test
++    @DisplayName("有事务上下文 - 注册 afterCommit 同步，提交前不发布（未提交先失效会被并发事务回填脏数据）")
++    void withTransaction_notPublishedBeforeCommit() {
++        TransactionSynchronizationManager.initSynchronization();
++
++        helper.evictUser(7L);
++
++        verify(publisher, never()).publishEvent(any(DataPermCacheEvictEvent.class));
++        List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
++        assertEquals(1, syncs.size(), "必须注册事务同步挂点");
++    }
++
++    @Test
++    @DisplayName("有事务上下文 - afterCommit 时发布事件（transact 语义：提交后失效）")
++    void withTransaction_publishedAfterCommit() {
++        TransactionSynchronizationManager.initSynchronization();
++
++        helper.evictAll();
++        TransactionSynchronizationManager.getSynchronizations().get(0).afterCommit();
++
++        DataPermCacheEvictEvent event = capturePublishedEvent();
++        assertTrue(event.evictAll());
++    }
++
++    @Test
++    @DisplayName("afterCommit 内发布异常 - 收敛不炸穿已提交事务（照 0003 挂点范式）")
++    void afterCommit_publishFailure_swallowed() {
++        TransactionSynchronizationManager.initSynchronization();
++        doThrow(new RuntimeException("listener exploded")).when(publisher).publishEvent(any(DataPermCacheEvictEvent.class));
++
++        helper.evictUser(7L);
++
++        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
++                TransactionSynchronizationManager.getSynchronizations().get(0).afterCommit());
++    }
++
++    @Test
++    @DisplayName("无事务路径发布异常 - 同样收敛（失效失败只留 TTL 兜底，不得中断写路径）")
++    void immediatePublishFailure_swallowed() {
++        doThrow(new RuntimeException("listener exploded")).when(publisher).publishEvent(any(DataPermCacheEvictEvent.class));
++
++        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> helper.evictUser(7L));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheWiringTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheWiringTest.java
+new file mode 100644
+index 0000000..04ff0c3
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermCacheWiringTest.java
+@@ -0,0 +1,54 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.boot.test.context.runner.ApplicationContextRunner;
++import org.springframework.data.redis.core.StringRedisTemplate;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++/**
++ * 缓存实现条件装配单元测试（TASK-0006）：{@code ot.dataperm.cache-enabled} 开关裁决——
++ * 默认/true 注册 Redis 实现，false 注册 NoOp 直查（0005 保留的兜底），二者互斥单 Bean
++ * （DataPermServiceImpl 构造注入 VisibleScopeCache，双 Bean 即启动失败）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermCacheWiringTest {
++
++    private final ApplicationContextRunner runner = new ApplicationContextRunner()
++            .withBean(DataPermProperties.class)
++            .withBean("rawStringRedisTemplate", StringRedisTemplate.class, () -> mock(StringRedisTemplate.class))
++            .withBean(NoOpVisibleScopeCache.class)
++            .withBean(RedisVisibleScopeCache.class);
++
++    @Test
++    @DisplayName("默认（不配置开关）- Redis 实现注册，NoOp 不注册")
++    void defaultProperty_registersRedisImpl() {
++        runner.run(context -> {
++            assertThat(context).hasSingleBean(VisibleScopeCache.class);
++            assertThat(context.getBean(VisibleScopeCache.class)).isInstanceOf(RedisVisibleScopeCache.class);
++        });
++    }
++
++    @Test
++    @DisplayName("cache-enabled=true - Redis 实现注册")
++    void explicitTrue_registersRedisImpl() {
++        runner.withPropertyValues("ot.dataperm.cache-enabled=true").run(context -> {
++            assertThat(context).hasSingleBean(VisibleScopeCache.class);
++            assertThat(context.getBean(VisibleScopeCache.class)).isInstanceOf(RedisVisibleScopeCache.class);
++        });
++    }
++
++    @Test
++    @DisplayName("cache-enabled=false - 走 NoOp 直查（测试与故障兜底），Redis 实现不注册")
++    void disabled_registersNoOp() {
++        runner.withPropertyValues("ot.dataperm.cache-enabled=false").run(context -> {
++            assertThat(context).hasSingleBean(VisibleScopeCache.class);
++            assertThat(context.getBean(VisibleScopeCache.class)).isInstanceOf(NoOpVisibleScopeCache.class);
++            assertThat(context).doesNotHaveBean(RedisVisibleScopeCache.class);
++        });
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+index 483056e..5b3abf6 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+@@ -333,4 +333,42 @@ class DataPermResolveScopeTest {
+ 
+         verify(roleMapper, times(2)).selectEnabledRolesByUserId(7L);
+     }
++
++    @Test
++    @DisplayName("缓存接缝 - 未命中计算后回填：首次 resolve 计算+put，二次 resolve 直接命中不再触库（TASK-0006 Redis 语义）")
++    void testCacheMiss_ComputeThenBackfill_SecondResolveHits() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1)));
++        java.util.Map<Long, VisibleScope> store = new java.util.HashMap<>();
++        java.util.concurrent.atomic.AtomicInteger putCount = new java.util.concurrent.atomic.AtomicInteger();
++        VisibleScopeCache fakeCache = new VisibleScopeCache() {
++            @Override
++            public VisibleScope get(Long userId) {
++                return store.get(userId);
++            }
++
++            @Override
++            public void put(Long userId, VisibleScope scope) {
++                store.put(userId, scope);
++                putCount.incrementAndGet();
++            }
++
++            @Override
++            public void evict(Long userId) {
++                store.remove(userId);
++            }
++        };
++        DataPermServiceImpl cached = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, fakeCache, properties);
++
++        VisibleScope first = cached.resolve(7L);
++
++        assertTrue(first.allTenant(), "首次未命中按计算路径返回");
++        assertEquals(1, putCount.get(), "计算完成必须回填缓存");
++        verify(roleMapper, times(1)).selectEnabledRolesByUserId(7L);
++
++        VisibleScope second = cached.resolve(7L);
++
++        assertSame(first, second, "第二次命中缓存返回同一对象");
++        verify(roleMapper, times(1)).selectEnabledRolesByUserId(7L);
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCacheTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCacheTest.java
+new file mode 100644
+index 0000000..f6305fc
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/RedisVisibleScopeCacheTest.java
+@@ -0,0 +1,213 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.data.redis.core.Cursor;
++import org.springframework.data.redis.core.ScanOptions;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.ValueOperations;
++
++import java.time.Duration;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 可见集合缓存 Redis 实现单元测试（TASK-0006，brief 测试口径）。
++ *
++ * <p>覆盖：命中/未命中/损坏 JSON 降级/Redis 异常降级；put 回填（含 TTL 配置传递——
++ * 短 TTL 配置模拟过期口径）；失效单用户与全量（SCAN 语义：pattern 精确 + SCAN+DEL 不用 KEYS）；
++ * 误配 TTL 回落默认。standalone Mockito 范式（照 SurveyFormEditLockServiceImplTest），
++ * RedisTemplate/Cursor 全 mock 不触真实 Redis（真实 TTL 过期与键可见性归 dev 冒烟验收）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class RedisVisibleScopeCacheTest {
++
++    @Mock
++    private StringRedisTemplate redisTemplate;
++
++    @Mock
++    private ValueOperations<String, String> valueOps;
++
++    private DataPermProperties properties;
++    private RedisVisibleScopeCache cache;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        when(redisTemplate.opsForValue()).thenReturn(valueOps);
++        properties = new DataPermProperties();
++        cache = new RedisVisibleScopeCache(redisTemplate, properties);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private VisibleScope scope() {
++        return new VisibleScope(false, java.util.Set.of(10L, 11L), java.util.Set.of(1L, 2L), true);
++    }
++
++    // ---------- get：命中 / 未命中 / 降级 ----------
++
++    @Test
++    @DisplayName("get 未命中 - 返回 null（resolve 侧触发重新计算）")
++    void get_miss_returnsNull() {
++        when(valueOps.get(RedisVisibleScopeCache.KEY_PREFIX + "7:0")).thenReturn(null);
++
++        assertNull(cache.get(7L));
++    }
++
++    @Test
++    @DisplayName("get 命中 - JSON 反序列化还原 VisibleScope（部门/实例/标记三组字段一致）")
++    void get_hit_deserializesScope() {
++        VisibleScope source = scope();
++        String json = "{\"allTenant\":false,\"deptIds\":[10,11],\"instanceIds\":[1,2],\"createByOnly\":true}";
++        when(valueOps.get(RedisVisibleScopeCache.KEY_PREFIX + "7:0")).thenReturn(json);
++
++        VisibleScope restored = cache.get(7L);
++
++        assertEquals(source.allTenant(), restored.allTenant());
++        assertEquals(source.deptIds(), restored.deptIds());
++        assertEquals(source.instanceIds(), restored.instanceIds());
++        assertEquals(source.createByOnly(), restored.createByOnly());
++    }
++
++    @Test
++    @DisplayName("get 损坏 JSON - 降级为未命中（重新计算），绝不抛出阻断业务")
++    void get_corruptedJson_degradesToNull() {
++        when(valueOps.get(RedisVisibleScopeCache.KEY_PREFIX + "7:0")).thenReturn("{not-json");
++
++        assertNull(cache.get(7L), "损坏缓存值必须降级为未命中而非抛出");
++    }
++
++    @Test
++    @DisplayName("get Redis 故障 - 降级为未命中，缓存故障不得阻断业务查询（接口契约）")
++    void get_redisFailure_degradesToNull() {
++        when(valueOps.get(any())).thenThrow(new RuntimeException("connection refused"));
++
++        assertNull(cache.get(7L));
++    }
++
++    // ---------- put：回填与 TTL ----------
++
++    @Test
++    @DisplayName("put 回填 - 默认 TTL 600s（FEAT-0002 业务规则 10 分钟）")
++    void put_writesJsonWithDefaultTtl() {
++        cache.put(7L, scope());
++
++        verify(valueOps).set(eq(RedisVisibleScopeCache.KEY_PREFIX + "7:0"), any(String.class), eq(Duration.ofSeconds(600)));
++    }
++
++    @Test
++    @DisplayName("put 回填 - 短 TTL 配置传递（测试口径：可用短 TTL 配置模拟过期）")
++    void put_shortTtlConfigFlowsThrough() {
++        properties.setCacheTtlSeconds(1);
++        RedisVisibleScopeCache shortTtl = new RedisVisibleScopeCache(redisTemplate, properties);
++
++        shortTtl.put(7L, scope());
++
++        verify(valueOps).set(eq(RedisVisibleScopeCache.KEY_PREFIX + "7:0"), any(String.class), eq(Duration.ofSeconds(1)));
++    }
++
++    @Test
++    @DisplayName("put 误配 TTL<=0 - 回落默认 600s（防无 TTL 永久键导致权限永久放大）")
++    void put_invalidTtlFallsBackToDefault() {
++        properties.setCacheTtlSeconds(0);
++        RedisVisibleScopeCache badTtl = new RedisVisibleScopeCache(redisTemplate, properties);
++
++        badTtl.put(7L, scope());
++
++        verify(valueOps).set(eq(RedisVisibleScopeCache.KEY_PREFIX + "7:0"), any(String.class), eq(Duration.ofSeconds(600)));
++    }
++
++    @Test
++    @DisplayName("put Redis 故障 - 静默跳过（下次 resolve 重新计算），绝不抛出")
++    void put_redisFailure_doesNotThrow() {
++        org.mockito.Mockito.doThrow(new RuntimeException("connection refused"))
++                .when(valueOps).set(any(String.class), any(String.class), any(Duration.class));
++
++        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> cache.put(7L, scope()));
++    }
++
++    // ---------- evict：单用户 / 全量（SCAN 语义） ----------
++
++    private Cursor<String> cursorOf(String... keys) {
++        Cursor<String> cursor = mock(Cursor.class);
++        java.util.Iterator<String> it = java.util.Arrays.asList(keys).iterator();
++        when(cursor.hasNext()).thenAnswer(inv -> it.hasNext());
++        when(cursor.next()).thenAnswer(inv -> it.next());
++        return cursor;
++    }
++
++    @Test
++    @DisplayName("evict 单用户 - SCAN pattern=iot:dataperm:scope:{userId}:*，扫到的键 DEL")
++    void evictUser_scansUserPrefixAndDeletes() {
++        Cursor<String> cursor = cursorOf(RedisVisibleScopeCache.KEY_PREFIX + "7:0");
++        when(redisTemplate.scan(any(ScanOptions.class))).thenReturn(cursor);
++        when(redisTemplate.delete(anyCollection())).thenReturn(1L);
++
++        cache.evict(7L);
++
++        org.mockito.ArgumentCaptor<ScanOptions> captor = org.mockito.ArgumentCaptor.forClass(ScanOptions.class);
++        verify(redisTemplate).scan(captor.capture());
++        assertEquals("iot:dataperm:scope:7:*", captor.getValue().getPattern(), "失效即失效模型：按 userId 前缀 SCAN（roleVer 占位段任配）");
++        verify(redisTemplate).delete(List.of(RedisVisibleScopeCache.KEY_PREFIX + "7:0"));
++    }
++
++    @Test
++    @DisplayName("evict 全量（userId=null）- SCAN pattern=iot:dataperm:scope:*（角色/部门/实例绑部门变更口径）")
++    void evictAll_scansAllAndDeletes() {
++        Cursor<String> cursor = cursorOf(
++                RedisVisibleScopeCache.KEY_PREFIX + "7:0",
++                RedisVisibleScopeCache.KEY_PREFIX + "8:0");
++        when(redisTemplate.scan(any(ScanOptions.class))).thenReturn(cursor);
++        when(redisTemplate.delete(anyCollection())).thenReturn(2L);
++
++        cache.evict(null);
++
++        org.mockito.ArgumentCaptor<ScanOptions> captor = org.mockito.ArgumentCaptor.forClass(ScanOptions.class);
++        verify(redisTemplate).scan(captor.capture());
++        assertEquals("iot:dataperm:scope:*", captor.getValue().getPattern());
++        verify(redisTemplate).delete(List.of(
++                RedisVisibleScopeCache.KEY_PREFIX + "7:0",
++                RedisVisibleScopeCache.KEY_PREFIX + "8:0"));
++    }
++
++    @Test
++    @DisplayName("evict SCAN 无命中 - 不调 DEL（空批不发多余命令）")
++    void evict_noMatch_skipsDelete() {
++        Cursor<String> cursor = cursorOf();
++        when(redisTemplate.scan(any(ScanOptions.class))).thenReturn(cursor);
++
++        cache.evict(7L);
++
++        verify(redisTemplate, org.mockito.Mockito.never()).delete(anyCollection());
++    }
++
++    @Test
++    @DisplayName("evict Redis 故障 - 静默（TTL 兜底），绝不抛出阻断已提交的写事务")
++    void evict_redisFailure_doesNotThrow() {
++        when(redisTemplate.scan(any(ScanOptions.class))).thenThrow(new RuntimeException("timeout"));
++
++        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> cache.evict(7L));
++        assertTrue(true);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+index 32eb18a..81842d3 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+@@ -53,6 +53,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mockStatic;
+ import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+@@ -92,6 +93,9 @@ class IotModelInstanceServiceImplTest {
+     @Mock
+     private DataPermService dataPermService;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     @Mock
+     private IotDataItemService dataItemService;
+ 
+@@ -125,6 +129,7 @@ class IotModelInstanceServiceImplTest {
+         ReflectionTestUtils.setField(instanceService, "instanceCodeMapper", instanceCodeMapper);
+         ReflectionTestUtils.setField(instanceService, "deptMapper", deptMapper);
+         ReflectionTestUtils.setField(instanceService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(instanceService, "dataPermCacheEvictPublisher", dataPermCacheEvictPublisher);
+         ReflectionTestUtils.setField(instanceService, "dataItemService", dataItemService);
+         // 修订轮 I-1：写路径（编辑/删除/带父创建）新增数据权限防线——默认注入全租户可见域
+         // 使既有写路径用例维持原语义；受限场景在各用例内显式覆盖 resolve(1L)
+@@ -1180,4 +1185,58 @@ class IotModelInstanceServiceImplTest {
+         assertTrue(e.getMessage().contains("7 项"), e.getMessage());
+         verify(baseMapper, never()).deleteByIds(any());
+     }
++
++    // ---------- TASK-0006：实例绑部门变更 → 可见集缓存全量失效（brief 裁决 4，唯一实例侧挂点） ----------
++
++    @Test
++    @DisplayName("编辑改绑部门 - 全量失效事件发布一次（实例可见集含 dept 推导）")
++    void testUpdateDeptChanged_publishesEvictAll() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++        when(deptMapper.selectById(12L)).thenReturn(dept(12L, "二车间", 1));
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setDeptId(12L);
++
++        assertTrue(instanceService.updateInstance(form));
++
++        verify(dataPermCacheEvictPublisher, times(1)).evictAll();
++        verify(dataPermCacheEvictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("编辑未改部门（只改名称）- 不发布失效事件")
++    void testUpdateDeptUnchanged_noEvent() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setInstanceName("只改名");
++
++        assertTrue(instanceService.updateInstance(form));
++
++        verify(dataPermCacheEvictPublisher, never()).evictAll();
++        verify(dataPermCacheEvictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("编辑携带同值 deptId（no-op）- 不发布失效事件（与库中现值一致未变更）")
++    void testUpdateDeptSameValue_noEvent() {
++        IotModelInstance existing = instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1);
++        when(baseMapper.selectById(2L)).thenReturn(existing);
++        when(deptMapper.selectById(11L)).thenReturn(dept(11L, "一车间", 1));
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setDeptId(11L);
++
++        assertTrue(instanceService.updateInstance(form));
++
++        verify(dataPermCacheEvictPublisher, never()).evictAll();
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java
+index 9e6b401..f60fdc4 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java
+@@ -66,6 +66,9 @@ class SysDeptRoleTenantInjectionTest {
+     @Mock
+     private SysUserRoleMapper userRoleMapper;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     private SysDeptServiceImpl deptService;
+     private SysRoleServiceImpl roleService;
+ 
+@@ -88,11 +91,13 @@ class SysDeptRoleTenantInjectionTest {
+         deptService = new SysDeptServiceImpl();
+         ReflectionTestUtils.setField(deptService, "baseMapper", deptBaseMapper);
+         ReflectionTestUtils.setField(deptService, "userMapper", userMapper);
++        ReflectionTestUtils.setField(deptService, "dataPermCacheEvictPublisher", dataPermCacheEvictPublisher);
+         roleService = new SysRoleServiceImpl();
+         ReflectionTestUtils.setField(roleService, "baseMapper", roleBaseMapper);
+         ReflectionTestUtils.setField(roleService, "roleMenuMapper", roleMenuMapper);
+         ReflectionTestUtils.setField(roleService, "roleDeptMapper", roleDeptMapper);
+         ReflectionTestUtils.setField(roleService, "userRoleMapper", userRoleMapper);
++        ReflectionTestUtils.setField(roleService, "dataPermCacheEvictPublisher", dataPermCacheEvictPublisher);
+         SaTokenContextMockUtil.setMockContext();
+         StpUtil.login(1L);
+         StpUtil.getSession().set("tenant_id", 5L);
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImplTest.java
+index f279613..92f6200 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImplTest.java
+@@ -2,15 +2,19 @@ package net.otlab.admin.module.system.service.impl;
+ 
+ import com.baomidou.mybatisplus.core.MybatisConfiguration;
+ import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
+ import net.otlab.admin.module.system.entity.SysDept;
+ import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
+ import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
+ import org.apache.ibatis.builder.MapperBuilderAssistant;
+ import org.junit.jupiter.api.BeforeAll;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.Mock;
++import org.mockito.MockedStatic;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.test.util.ReflectionTestUtils;
+ 
+@@ -23,8 +27,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyList;
+ import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.mockStatic;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+@@ -32,6 +38,7 @@ import static org.mockito.Mockito.when;
+  * 部门服务单元测试（TC-0296 / BUG-0062）
+  * 重点：移动部门时新父级不得落在自身子树内；正常移动重算 ancestors；
+  * 存量脏数据成环时级联重算必须能终止（不无限下探）。
++ * TASK-0006 追加：部门增/改/删 → 可见集缓存全量失效事件（brief 裁决 3）。
+  *
+  * @author dowei
+  * @date 2026-11-02
+@@ -41,24 +48,41 @@ class SysDeptServiceImplTest {
+     @Mock
+     private SysDeptMapper baseMapper;
+ 
++    @Mock
++    private SysUserMapper userMapper;
++
++    @Mock
++    private DataPermCacheEvictPublisher evictPublisher;
++
+     private SysDeptServiceImpl deptService;
+ 
++    private AutoCloseable mocks;
++
+     @BeforeAll
+     static void initEntityMeta() {
+         // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
+-        MybatisConfiguration configuration = new MybatisConfiguration();
+-        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(configuration, ""), SysDept.class);
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysDept.class);
++        // TASK-0006 删除用例：部门下用户计数 wrapper 需要 SysUser lambda 缓存
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.system.entity.SysUser.class);
+     }
+ 
+     @BeforeEach
+     void setUp() {
+-        MockitoAnnotations.openMocks(this);
++        mocks = MockitoAnnotations.openMocks(this);
+         deptService = spy(new SysDeptServiceImpl());
+         ReflectionTestUtils.setField(deptService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(deptService, "userMapper", userMapper);
++        ReflectionTestUtils.setField(deptService, "dataPermCacheEvictPublisher", evictPublisher);
+         // 级联批量更新在 standalone 下无 mapper 代理，直接桩掉（本类只关注防环与重算判定）
+         doReturn(true).when(deptService).updateBatchById(anyList());
+     }
+ 
++    @org.junit.jupiter.api.AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
+     private SysDept dept(Long id, Long parentId, String ancestors) {
+         SysDept dept = new SysDept();
+         dept.setId(id);
+@@ -130,4 +154,57 @@ class SysDeptServiceImplTest {
+         // 环上的 A 不再被重算覆盖
+         assertEquals("0,2", a.getAncestors());
+     }
++
++    // ---------- TASK-0006：部门变更 → 可见集缓存全量失效 ----------
++
++    @Test
++    @DisplayName("新建部门 - 全量失效事件发布一次（scope=2 ancestors 匹配依赖部门树）")
++    void insertDept_publishesEvictAll() {
++        try (MockedStatic<TenantContext> tenantContext = mockStatic(TenantContext.class)) {
++            tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++            when(baseMapper.insert(any(SysDept.class))).thenReturn(1);
++
++            SysDept newDept = dept(null, 0L, null);
++            assertTrue(deptService.insertDept(newDept));
++
++            verify(evictPublisher, times(1)).evictAll();
++            verify(evictPublisher, never()).evictUser(any());
++        }
++    }
++
++    @Test
++    @DisplayName("编辑部门（移动级联重算）- 全量失效事件发布一次")
++    void updateDept_publishesEvictAll() {
++        SysDept current = dept(2L, 1L, "0,1");
++        when(baseMapper.selectById(2L)).thenReturn(current);
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++        when(baseMapper.updateById(any(SysDept.class))).thenReturn(1);
++
++        assertTrue(deptService.updateDept(dept(2L, 0L, null)));
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    @Test
++    @DisplayName("部门删除被拒（存在下级）- 不发布失效事件")
++    void deleteDept_rejected_noEvent() {
++        when(baseMapper.selectCount(any())).thenReturn(1L);
++
++        assertThrows(BusinessException.class, () -> deptService.deleteDeptById(1L));
++
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("删除部门 - 全量失效事件发布一次")
++    void deleteDept_publishesEvictAll() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(userMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.deleteById(any(Long.class))).thenReturn(1);
++
++        assertTrue(deptService.deleteDeptById(1L));
++
++        verify(evictPublisher, times(1)).evictAll();
++        verify(evictPublisher, never()).evictUser(any());
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImplTest.java
+new file mode 100644
+index 0000000..599b734
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImplTest.java
+@@ -0,0 +1,297 @@
++package net.otlab.admin.module.system.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.entity.dto.RoleDataScopeUpdateForm;
++import net.otlab.admin.module.system.entity.dto.RoleDeptUpdateForm;
++import net.otlab.admin.module.system.entity.dto.RoleMenuUpdateForm;
++import net.otlab.admin.module.system.entity.dto.RoleUserUpdateForm;
++import net.otlab.admin.module.system.mapper.SysRoleDeptMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMenuMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import net.otlab.core.constant.DataScopeEnum;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 角色服务——可见集缓存失效事件发布单元测试（TASK-0006）。
++ *
++ * <p>失效粒度断言（brief 裁决 1）：角色本身/授权变更（insert/update/delete/updateRoleMenu/
++ * updateRoleDept/updateDataScope）→ 全量失效；用户角色绑定变更（addUsersToRole/
++ * removeUserFromRole/removeUsersFromRole）→ 单用户失效。写失败（校验拒绝/查重冲突）不发布。
++ *
++ * <p>standalone Mockito 范式（照 SysDeptServiceImplTest）：baseMapper 注入 ServiceImpl，
++ * publisher 全 mock 断言事件，不触真实库。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class SysRoleServiceImplTest {
++
++    @Mock
++    private SysRoleMapper baseMapper;
++
++    @Mock
++    private SysRoleMenuMapper roleMenuMapper;
++
++    @Mock
++    private SysRoleDeptMapper roleDeptMapper;
++
++    @Mock
++    private SysUserRoleMapper userRoleMapper;
++
++    @Mock
++    private DataPermCacheEvictPublisher evictPublisher;
++
++    private SysRoleServiceImpl roleService;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysUserRole.class);
++        // 角色-菜单/角色-部门关联删除走 LambdaQueryWrapper，需要实体 lambda 缓存
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.system.entity.SysRoleMenu.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.system.entity.SysRoleDept.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        roleService = new SysRoleServiceImpl();
++        ReflectionTestUtils.setField(roleService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(roleService, "roleMenuMapper", roleMenuMapper);
++        ReflectionTestUtils.setField(roleService, "roleDeptMapper", roleDeptMapper);
++        ReflectionTestUtils.setField(roleService, "userRoleMapper", userRoleMapper);
++        ReflectionTestUtils.setField(roleService, "dataPermCacheEvictPublisher", evictPublisher);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    private SysRole role(Long id, Integer dataScope) {
++        SysRole role = new SysRole();
++        role.setId(id);
++        role.setRoleCode("R" + id);
++        role.setRoleName("角色" + id);
++        role.setDataScope(dataScope);
++        role.setStatus(1);
++        return role;
++    }
++
++    // ---------- 角色本身/授权变更 → 全量失效（裁决 2） ----------
++
++    @Test
++    @DisplayName("新建角色 - 全量失效事件发布一次")
++    void insertRole_publishesEvictAll() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysRole.class))).thenReturn(1);
++
++        assertTrue(roleService.insertRole(role(9L, 5), null, null));
++
++        verify(evictPublisher, times(1)).evictAll();
++        verify(evictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("新建角色查重冲突 - 写失败不发布失效事件")
++    void insertRole_duplicateCode_noEvent() {
++        when(baseMapper.selectCount(any())).thenReturn(1L);
++
++        assertThrows(BusinessException.class, () -> roleService.insertRole(role(9L, 5), null, null));
++
++        verify(evictPublisher, never()).evictAll();
++        verify(evictPublisher, never()).evictUser(any());
++    }
++
++    @Test
++    @DisplayName("编辑角色（含 data_scope/授权重建）- 全量失效事件发布一次")
++    void updateRole_publishesEvictAll() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.updateById(any(SysRole.class))).thenReturn(1);
++        when(roleMenuMapper.delete(any())).thenReturn(1);
++        when(roleDeptMapper.delete(any())).thenReturn(1);
++
++        assertTrue(roleService.updateRole(role(9L, 2), null, null));
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    @Test
++    @DisplayName("删除角色 - 全量失效事件发布一次")
++    void deleteRoleById_publishesEvictAll() {
++        when(userRoleMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.deleteById(any(Long.class))).thenReturn(1);
++        when(roleMenuMapper.delete(any())).thenReturn(1);
++        when(roleDeptMapper.delete(any())).thenReturn(1);
++
++        assertTrue(roleService.deleteRoleById(9L));
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    @Test
++    @DisplayName("改角色菜单授权 - 全量失效事件发布一次（brief 指定挂点）")
++    void updateRoleMenu_publishesEvictAll() {
++        when(roleMenuMapper.delete(any())).thenReturn(1);
++
++        RoleMenuUpdateForm form = new RoleMenuUpdateForm();
++        form.setRoleId(9L);
++        form.setMenuIds(List.of(1L, 2L));
++        roleService.updateRoleMenu(form);
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    @Test
++    @DisplayName("改角色自定义范围 - 全量失效事件发布一次（自定义 scope 直接进可见集）")
++    void updateRoleDept_publishesEvictAll() {
++        when(roleDeptMapper.delete(any())).thenReturn(1);
++
++        RoleDeptUpdateForm form = new RoleDeptUpdateForm();
++        form.setRoleId(9L);
++        form.setDeptIds(List.of(10L, 11L));
++        roleService.updateRoleDept(form);
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    @Test
++    @DisplayName("改 data_scope - 全量失效事件发布一次")
++    void updateDataScope_publishesEvictAll() {
++        when(baseMapper.selectById(9L)).thenReturn(role(9L, 1));
++        when(baseMapper.updateById(any(SysRole.class))).thenReturn(1);
++        when(roleDeptMapper.delete(any())).thenReturn(1);
++
++        RoleDataScopeUpdateForm form = new RoleDataScopeUpdateForm();
++        form.setId(9L);
++        form.setDataScope(DataScopeEnum.CUSTOM.getValue());
++        form.setDeptIds(List.of(10L));
++        roleService.updateDataScope(form);
++
++        verify(evictPublisher, times(1)).evictAll();
++    }
++
++    // ---------- 用户角色绑定变更 → 单用户失效（裁决 1） ----------
++
++    @Test
++    @DisplayName("角色批量加用户 - 逐用户失效（不做全量）")
++    void addUsersToRole_publishesEvictPerUser() {
++        when(baseMapper.selectById(9L)).thenReturn(role(9L, 1));
++        when(userRoleMapper.selectCount(any())).thenReturn(0L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        RoleUserUpdateForm form = new RoleUserUpdateForm();
++        form.setRoleId(9L);
++        form.setUserIds(List.of(101L, 102L));
++        roleService.addUsersToRole(form);
++
++        verify(evictPublisher, times(2)).evictUser(any());
++        verify(evictPublisher).evictUser(101L);
++        verify(evictPublisher).evictUser(102L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("角色移除单用户 - 单用户失效")
++    void removeUserFromRole_publishesEvictUser() {
++        when(baseMapper.selectById(9L)).thenReturn(role(9L, 1));
++        when(userRoleMapper.delete(any())).thenReturn(1);
++
++        roleService.removeUserFromRole(9L, 101L);
++
++        verify(evictPublisher, times(1)).evictUser(101L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("角色批量移除用户 - 逐用户失效")
++    void removeUsersFromRole_publishesEvictPerUser() {
++        when(baseMapper.selectById(9L)).thenReturn(role(9L, 1));
++        when(userRoleMapper.delete(any())).thenReturn(2);
++
++        RoleUserUpdateForm form = new RoleUserUpdateForm();
++        form.setRoleId(9L);
++        form.setUserIds(List.of(101L, 102L));
++        roleService.removeUsersFromRole(form);
++
++        verify(evictPublisher).evictUser(101L);
++        verify(evictPublisher).evictUser(102L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("角色不存在（查 id 未命中）- 业务拒绝不发布失效事件")
++    void removeUserFromRole_missingRole_noEvent() {
++        when(baseMapper.selectById(9L)).thenReturn(null);
++
++        assertThrows(BusinessException.class, () -> roleService.removeUserFromRole(9L, 101L));
++
++        verify(evictPublisher, never()).evictUser(any());
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("批量加用户入参为空 - 早退不发布失效事件")
++    void addUsersToRole_emptyUserIds_noEvent() {
++        RoleUserUpdateForm form = new RoleUserUpdateForm();
++        form.setRoleId(9L);
++        form.setUserIds(java.util.Collections.emptyList());
++
++        roleService.addUsersToRole(form);
++
++        verify(evictPublisher, never()).evictUser(any());
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("insertRole 全链路 - 角色菜单/部门关联也落库（防桩过深漏真实路径）")
++    void insertRole_fullPath_persistsRelations() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysRole.class))).thenReturn(1);
++        when(roleMenuMapper.insert(any(net.otlab.admin.module.system.entity.SysRoleMenu.class))).thenReturn(1);
++        when(roleDeptMapper.insert(any(net.otlab.admin.module.system.entity.SysRoleDept.class))).thenReturn(1);
++
++        assertTrue(roleService.insertRole(role(9L, 5), List.of(1L), List.of(10L)));
++
++        verify(roleMenuMapper, times(1)).insert(any(net.otlab.admin.module.system.entity.SysRoleMenu.class));
++        verify(roleDeptMapper, times(1)).insert(any(net.otlab.admin.module.system.entity.SysRoleDept.class));
++        verify(evictPublisher, times(1)).evictAll();
++        verify(evictPublisher, never()).evictUser(any(Long.class));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserDataPermEvictTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserDataPermEvictTest.java
+new file mode 100644
+index 0000000..70af010
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserDataPermEvictTest.java
+@@ -0,0 +1,166 @@
++package net.otlab.admin.module.system.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import net.otlab.core.security.CryptoIndex;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 用户服务——可见集缓存失效事件发布单元测试（TASK-0006，brief 裁决 1 失效粒度①）。
++ *
++ * <p>覆盖：updateUserRoles 绑定变更 → 单用户失效；updateUser 携带 deptId（用户自身部门变更，
++ * scope∈{2,3} 求解输入）→ 单用户失效；不携带 deptId → 不失效。standalone Mockito 范式
++ * （照 SysUserServiceImplKickOutTest：spy 桩掉持久化，保留被测分支逻辑）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class SysUserDataPermEvictTest {
++
++    @Mock
++    private SysUserMapper baseMapper;
++
++    @Mock
++    private SysUserRoleMapper userRoleMapper;
++
++    @Mock
++    private SysRoleMapper roleMapper;
++
++    @Mock
++    private DataPermCacheEvictPublisher evictPublisher;
++
++    private SysUserServiceImpl userService;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysUser.class);
++        TableInfoHelper.initTableInfo(assistant, SysRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysUserRole.class);
++        // fillCryptoIndex 需要索引密钥（16 字节，同 PhoneCodeServiceImplTest 口径）
++        CryptoIndex.init("1234567890abcdef");
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        userService = new SysUserServiceImpl();
++        ReflectionTestUtils.setField(userService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(userService, "userRoleMapper", userRoleMapper);
++        ReflectionTestUtils.setField(userService, "roleMapper", roleMapper);
++        ReflectionTestUtils.setField(userService, "dataPermCacheEvictPublisher", evictPublisher);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- updateUserRoles：绑定变更 → 单用户失效 ----------
++
++    @Test
++    @DisplayName("用户角色绑定变更（含新增关联）- 单用户失效一次，不做全量")
++    void updateUserRoles_publishesEvictUserOnce() {
++        when(baseMapper.selectById(7L)).thenReturn(new SysUser());
++        when(roleMapper.selectCount(any())).thenReturn(2L);
++        when(userRoleMapper.selectList(any())).thenReturn(List.of());
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        userService.updateUserRoles(7L, List.of(1L, 2L));
++
++        verify(evictPublisher, times(1)).evictUser(7L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("用户角色绑定变更（无实际增删）- 仍单用户失效（幂等无害）")
++    void updateUserRoles_noDiff_stillEvictsUser() {
++        when(baseMapper.selectById(7L)).thenReturn(new SysUser());
++        when(roleMapper.selectCount(any())).thenReturn(1L);
++        SysUserRole existing = new SysUserRole();
++        existing.setUserId(7L);
++        existing.setRoleId(1L);
++        when(userRoleMapper.selectList(any())).thenReturn(List.of(existing));
++
++        userService.updateUserRoles(7L, List.of(1L));
++
++        verify(evictPublisher, times(1)).evictUser(7L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("用户不存在 - 业务拒绝不发布失效事件")
++    void updateUserRoles_missingUser_noEvent() {
++        when(baseMapper.selectById(7L)).thenReturn(null);
++
++        org.junit.jupiter.api.Assertions.assertThrows(net.otlab.core.exception.BusinessException.class,
++                () -> userService.updateUserRoles(7L, List.of(1L)));
++
++        verify(evictPublisher, never()).evictUser(any());
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    // ---------- updateUser：用户自身部门变更 → 单用户失效 ----------
++
++    @Test
++    @DisplayName("updateUser 携带 deptId - 单用户失效（scope∈{2,3} 可见集随用户部门变化）")
++    void updateUser_withDeptId_publishesEvictUser() {
++        when(baseMapper.updateById(any(SysUser.class))).thenReturn(1);
++
++        SysUser form = new SysUser();
++        form.setId(7L);
++        form.setDeptId(12L);
++        assertTrue(userService.updateUser(form));
++
++        verify(evictPublisher, times(1)).evictUser(7L);
++        verify(evictPublisher, never()).evictAll();
++    }
++
++    @Test
++    @DisplayName("updateUser 不携带 deptId（仅改昵称）- 不发布失效事件")
++    void updateUser_withoutDeptId_noEvent() {
++        when(baseMapper.updateById(any(SysUser.class))).thenReturn(1);
++
++        SysUser form = new SysUser();
++        form.setId(7L);
++        form.setNickname("新昵称");
++        assertTrue(userService.updateUser(form));
++
++        verify(evictPublisher, never()).evictUser(any());
++        verify(evictPublisher, never()).evictAll();
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java
+index 72aee87..988ac4a 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java
+@@ -66,6 +66,9 @@ class SysUserTenantInjectionTest {
+     @Mock
+     private SysRoleMapper roleMapper;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.dataperm.DataPermCacheEvictPublisher dataPermCacheEvictPublisher;
++
+     private SysUserServiceImpl userService;
+ 
+     private AutoCloseable mocks;
+@@ -87,6 +90,7 @@ class SysUserTenantInjectionTest {
+         ReflectionTestUtils.setField(userService, "userRoleMapper", userRoleMapper);
+         ReflectionTestUtils.setField(userService, "roleMapper", roleMapper);
+         ReflectionTestUtils.setField(userService, "sm4Key", SM4_KEY);
++        ReflectionTestUtils.setField(userService, "dataPermCacheEvictPublisher", dataPermCacheEvictPublisher);
+         SaTokenContextMockUtil.setMockContext();
+     }
+ 

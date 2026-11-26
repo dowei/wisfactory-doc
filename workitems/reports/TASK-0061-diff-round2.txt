@@ -1,0 +1,357 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java
+index 192e026..f8143f7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunner.java
+@@ -1,28 +1,36 @@
+ package net.otlab.admin.module.iot.inspect.scheduler;
+ 
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.calcread.CalcLogVO;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
+ import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
+ import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
+ import net.otlab.admin.module.iot.inspect.vo.InspectItemVO;
+ import net.otlab.admin.module.iot.inspect.vo.InspectPayloads;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.jdbc.core.JdbcTemplate;
+ import org.springframework.stereotype.Component;
+ 
+ import java.sql.Timestamp;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * TASK-0061 D2/D3：巡检任务体——产出三类清单 + 标签租户比对 + 在线率快照并落库归档。
+  *
+- * <p>数据源全部只读复用：calc state/log（0063 CalcReadService）、status current（0050，
+- * iot:st Redis 键，fail-soft）、metric list（0045，iot_metric 表）、租户表（sys_tenant）。
+- * 任务只写 iot_inspect_result，不改任何业务数据；禁逐点扫 TDengine。
++ * <p><b>系统级跨租户直查</b>（修订轮 I-1）：调度线程无会话（TenantContext=null），但已注入
++ * JdbcTemplate，按 sys_tenant 活跃租户循环，直接用 tenant_id 显式查 iot_calc.iot_calc_log /
++ * iot_calc_state（两表均有 tenant_id 列，20261124_iot_calc_schema.sql :39/:24），映射成 CalcLogVO /
++ * CalcStateVO 后调用现成聚合纯函数产出真实清单——<b>不依赖 CalcReadService 会话租户</b>。
+  *
+- * <p><b>系统级跨租户</b>：调度线程无会话（TenantContext null），JdbcTemplate 原生 SQL 显式
+- * 遍历 sys_tenant 活跃租户；calc 只读服务需会话租户，本任务用其显式重载不可得时按 fail-soft
+- * 产出空清单（报告登记：巡检任务的 calc 明细需 0063 显式租户重载支撑，当前以 fail-soft 占位）。
++ * <p>在线率按 iot_point 表 status 聚合（status=1 视为在线，status=0 离线；SQL 聚合，禁逐点扫 TDengine）；
++ * 无点位 total=0 → 看板 N/A（REQ-0031 验收 6）。
++ *
++ * <p>仅 TENANT_DB_MISMATCH 因 TDengine REST 故障保持「待核验」占位（brief D2.4）；其余清单查询
++ * 异常才 fail-soft 空集 + WARN（真实降级，不是无条件空集）。只写 iot_inspect_result，不改业务数据。
+  *
+  * @author dowei
+  * @date 2026-11-24
+@@ -32,10 +40,15 @@ public class InspectTaskRunner {
+ 
+     private static final Logger log = LoggerFactory.getLogger(InspectTaskRunner.class);
+     private static final ObjectMapper JSON = new ObjectMapper();
++    private static final String TYPE_ONLINE_RATE = "ONLINE_RATE";
+ 
+     private final InspectResultStore store;
+     private final JdbcTemplate jdbc;
+ 
++    /** CALC_ERR 取数窗口（小时，可配）；缺省 24h（修订轮 I-1：系统级直查，非会话端点） */
++    @Value("${ot.inspect.calc-error-window-hours:24}")
++    private int calcErrorWindowHours = 24;
++
+     public InspectTaskRunner(InspectResultStore store, JdbcTemplate jdbc) {
+         this.store = store;
+         this.jdbc = jdbc;
+@@ -53,41 +66,88 @@ public class InspectTaskRunner {
+     }
+ 
+     private void inspectTenant(TenantRow tenant, Timestamp now) {
+-        // ① CALC_ERR 统计（按原因聚合）；系统级任务无会话租户 → calc 只读端点 fail-soft 空集
++        // ① CALC_ERR 统计：iot_calc.iot_calc_log 直查（result_status=2 + 时间窗）→ 按原因聚合
+         List<InspectItemVO> calcErr = safeCalcErr(tenant.id());
+ 
+-        // ② 完整度低清单（calc 状态近似，无物理完整度列）
++        // ② 完整度低清单：iot_calc.iot_calc_state 直查 → 滞后/停算近似（页面注明口径）
+         List<InspectItemVO> completeness = safeCompleteness(tenant.id());
+ 
+-        // ③ 标签租户 vs 库名 iot_<tenant_code> 比对：TDengine REST 故障 → 待核验占位（fail-soft）
++        // ③ 标签租户 vs 库名 iot_<tenant_code> 比对：TDengine REST 故障 → 待核验占位（D2.4）
+         List<InspectItemVO> mismatch = List.of(InspectPayloads.pendingVerification(
+                 tenant.code(), InspectPayloads.expectedDbName(tenant.code())));
+ 
+-        // ④ 在线率聚合快照：从 status current Redis 计数或巡检快照；本任务不做逐点 TDengine 扫描，
+-        //    无快照产出 total=0（看板 N/A）而非造假 100%。
+-        List<InspectItemVO> onlineSnap = List.of();
++        // ④ 在线率聚合快照：iot_point status 聚合（真实分子/分母，禁逐点扫 TDengine）
++        InspectPayloads.OnlineSnapshot online = safeOnlineSnapshot(tenant.id());
+ 
+         save(tenant.id(), IotInspectResult.TYPE_CALC_ERR, now, calcErr);
+         save(tenant.id(), IotInspectResult.TYPE_COMPLETENESS, now, completeness);
+         save(tenant.id(), IotInspectResult.TYPE_TENANT_DB_MISMATCH, now, mismatch);
+-        if (!onlineSnap.isEmpty()) {
+-            save(tenant.id(), "ONLINE_RATE", now, onlineSnap);
+-        }
++        saveOnlineRate(tenant.id(), now, online);
+     }
+ 
++    /** ① CALC_ERR：系统级按 tenant_id 直查 iot_calc_log（绕开会话），映射后调现成聚合函数 */
+     private List<InspectItemVO> safeCalcErr(Long tenantId) {
+         try {
+-            // 巡检任务为系统级定时线程（无会话租户）——calc 只读服务按会话裁剪，此处 fail-soft
+-            // 空集；真机接入 0063 显式租户重载后仅替换取数处（聚合纯函数不变）。
+-            return List.of();
++            long from = System.currentTimeMillis() - Math.max(1, calcErrorWindowHours) * 3600L * 1000;
++            List<CalcLogVO> logs = jdbc.query(
++                    "SELECT full_key, result_status, error_msg FROM iot_calc.iot_calc_log "
++                            + "WHERE tenant_id=? AND result_status=2 AND started_at>=?",
++                    (rs, n) -> {
++                        CalcLogVO vo = new CalcLogVO();
++                        vo.setTenantId(tenantId);
++                        vo.setFullKey(rs.getString("full_key"));
++                        vo.setResultStatus(rs.getInt("result_status"));
++                        vo.setErrorMsg(rs.getString("error_msg"));
++                        return vo;
++                    }, tenantId, new Timestamp(from));
++            List<InspectItemVO> items = InspectPayloads.groupCalcErrors(logs);
++            log.info("[INSPECT] CALC_ERR tenant={}: {} log row(s) -> {} reason group(s)",
++                    tenantId, logs.size(), items.size());
++            return items;
+         } catch (RuntimeException e) {
++            // 真实降级：仅查询异常（表不可读/字段缺失等）才空集，非无条件空集
+             log.warn("[INSPECT] CALC_ERR 降级空集 tenant={}: {}", tenantId, e.getMessage());
+             return List.of();
+         }
+     }
+ 
++    /** ② 完整度低清单：系统级按 tenant_id 直查 iot_calc_state，映射后调现成近似函数 */
+     private List<InspectItemVO> safeCompleteness(Long tenantId) {
+-        return List.of(); // 无物理完整度列 + 无会话 calc 状态 → fail-soft 空集，页面注明口径
++        try {
++            List<CalcStateVO> states = jdbc.query(
++                    "SELECT full_key, calc_status FROM iot_calc.iot_calc_state WHERE tenant_id=?",
++                    (rs, n) -> {
++                        CalcStateVO vo = new CalcStateVO();
++                        vo.setTenantId(tenantId);
++                        vo.setFullKey(rs.getString("full_key"));
++                        vo.setCalcStatus(rs.getInt("calc_status"));
++                        return vo;
++                    }, tenantId);
++            List<InspectItemVO> items = InspectPayloads.approximateLowCompleteness(states);
++            log.info("[INSPECT] COMPLETENESS tenant={}: {} state row(s) -> {} low item(s)",
++                    tenantId, states.size(), items.size());
++            return items;
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] COMPLETENESS 降级空集 tenant={}: {}", tenantId, e.getMessage());
++            return List.of();
++        }
++    }
++
++    /** ④ 在线率：iot_point 表 status 聚合（一条 SQL，不逐点查 TDengine）；无点位 total=0 → 看板 N/A */
++    private InspectPayloads.OnlineSnapshot safeOnlineSnapshot(Long tenantId) {
++        try {
++            List<long[]> rows = jdbc.query(
++                    "SELECT SUM(CASE WHEN status=1 THEN 1 ELSE 0 END) AS online, COUNT(*) AS total "
++                            + "FROM iot_point WHERE tenant_id=? AND deleted=0",
++                    (rs, n) -> new long[]{rs.getLong("online"), rs.getLong("total")}, tenantId);
++            long online = rows.isEmpty() || rows.get(0)[0] == 0 ? 0 : rows.get(0)[0];
++            long total = rows.isEmpty() || rows.get(0)[1] == 0 ? 0 : rows.get(0)[1];
++            String basis = "iot_point status 聚合（status=1 视为在线；非 TDengine 逐点扫描）";
++            return new InspectPayloads.OnlineSnapshot(online, total, basis);
++        } catch (RuntimeException e) {
++            log.warn("[INSPECT] ONLINE_RATE 降级 total=0 tenant={}: {}", tenantId, e.getMessage());
++            return new InspectPayloads.OnlineSnapshot(0, 0, "点位源不可读（降级 N/A）");
++        }
+     }
+ 
+     private List<TenantRow> activeTenants() {
+@@ -109,5 +169,19 @@ public class InspectTaskRunner {
+         }
+     }
+ 
++    /** 在线率快照落库：payload 为 [{online,total,basis}]，供 dashboard 源 JdbcInspectSources 读取 */
++    private void saveOnlineRate(Long tenantId, Timestamp now, InspectPayloads.OnlineSnapshot snap) {
++        try {
++            Map<String, Object> row = new LinkedHashMap<>();
++            row.put("online", snap.online());
++            row.put("total", snap.total());
++            row.put("basis", snap.basis());
++            String payload = JSON.writeValueAsString(List.of(row));
++            store.save(tenantId, TYPE_ONLINE_RATE, now, payload, 1);
++        } catch (Exception e) {
++            log.warn("[INSPECT] ONLINE_RATE 落库失败（fail-soft）tenant={}: {}", tenantId, e.getMessage());
++        }
++    }
++
+     private record TenantRow(Long id, String code) {}
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunnerContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunnerContractTest.java
+new file mode 100644
+index 0000000..b5c6502
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/inspect/scheduler/InspectTaskRunnerContractTest.java
+@@ -0,0 +1,166 @@
++package net.otlab.admin.module.iot.inspect.scheduler;
++
++import net.otlab.admin.module.iot.inspect.entity.IotInspectResult;
++import net.otlab.admin.module.iot.inspect.store.InspectResultStore;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0061 修订轮 I-1：巡检任务真实产出三类清单 + ONLINE_RATE 快照契约（旧恒空集必红）。
++ *
++ * <p>给定租户 1 的 iot_calc 失败日志（两类 error_msg）+ 滞后/停算状态 + 点位样本，
++ * {@code InspectTaskRunner.run()} 必须经真实查询 + 现成聚合函数产出**非空**清单并落库：
++ * CALC_ERR 按原因分组、COMPLETENESS 滞后/停算条目、ONLINE_RATE 真实分子/分母。
++ * 旧版 safeCalcErr()/safeCompleteness()/onlineSnap 恒 List.of() 时这些断言全红。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class InspectTaskRunnerContractTest {
++
++    private static final long TENANT = 1L;
++    private JdbcTemplate jdbc;
++    private InspectResultStore store;
++    private InspectTaskRunner runner;
++
++    @BeforeEach
++    void setUp() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:inspect_runner_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++
++        jdbc.execute("CREATE SCHEMA IF NOT EXISTS iot_calc");
++        jdbc.execute("CREATE TABLE iot_calc.iot_calc_log ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, task_id VARCHAR(64), "
++                + "full_key VARCHAR(180), period_start TIMESTAMP, period_end TIMESTAMP, "
++                + "trigger_type VARCHAR(16), input_summary CLOB, result_status INT NOT NULL, "
++                + "error_msg VARCHAR(1000), is_recalc INT, started_at TIMESTAMP, finished_at TIMESTAMP, duration_ms BIGINT)");
++        jdbc.execute("CREATE TABLE iot_calc.iot_calc_state ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, full_key VARCHAR(180), "
++                + "last_calc_time TIMESTAMP, watermark TIMESTAMP, calc_status INT, error_count INT, "
++                + "last_error VARCHAR(1000), update_time TIMESTAMP)");
++        jdbc.execute("CREATE TABLE iot_point ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, point_code VARCHAR(96), "
++                + "status INT, deleted INT DEFAULT 0)");
++        jdbc.execute("CREATE TABLE sys_tenant (id BIGINT PRIMARY KEY, tenant_code VARCHAR(32), status INT, deleted INT DEFAULT 0)");
++        jdbc.execute("CREATE TABLE iot_inspect_result ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "inspect_time TIMESTAMP NOT NULL, inspect_type VARCHAR(32) NOT NULL, "
++                + "payload_json CLOB, item_count INT NOT NULL DEFAULT 0, "
++                + "created_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
++
++        store = new InspectResultStore(jdbc, 90);
++        runner = new InspectTaskRunner(store, jdbc);
++    }
++
++    @AfterEach
++    void tearDown() {
++        jdbc.execute("DROP ALL OBJECTS");
++    }
++
++    private void seedTenant(long tenant, String code) {
++        jdbc.update("INSERT INTO sys_tenant (id, tenant_code, status, deleted) VALUES (?,?,1,0)", tenant, code);
++    }
++
++    private void seedCalcLog(long tenant, String fullKey, int resultStatus, String errorMsg) {
++        jdbc.update("INSERT INTO iot_calc.iot_calc_log "
++                        + "(tenant_id, task_id, full_key, period_start, period_end, trigger_type, result_status, error_msg, started_at) "
++                        + "VALUES (?,?,?,?,?,'AUTO',?,?,CURRENT_TIMESTAMP)",
++                tenant, "t", fullKey, new java.sql.Timestamp(System.currentTimeMillis()),
++                new java.sql.Timestamp(System.currentTimeMillis()), resultStatus, errorMsg);
++    }
++
++    private void seedCalcState(long tenant, String fullKey, int calcStatus) {
++        jdbc.update("INSERT INTO iot_calc.iot_calc_state (tenant_id, full_key, calc_status) VALUES (?,?,?)",
++                tenant, fullKey, calcStatus);
++    }
++
++    private void seedPoint(long tenant, int status) {
++        jdbc.update("INSERT INTO iot_point (tenant_id, point_code, status, deleted) VALUES (?,'P',?,0)",
++                tenant, status);
++    }
++
++    @Test
++    @DisplayName("I-1: run() 真实产出 CALC_ERR 非空清单——按 error_msg 原因分组计数")
++    void calcErrProducesNonEmptyGroupedList() {
++        seedTenant(TENANT, "T01");
++        // 2 个 fullKey、两类失败原因：超时×2、除零×1；再加一条成功（不应计入）
++        seedCalcLog(TENANT, "T|M.A|I01|day", 2, "超时");
++        seedCalcLog(TENANT, "T|M.B|I01|day", 2, "超时");
++        seedCalcLog(TENANT, "T|M.C|I02|day", 2, "除零");
++        seedCalcLog(TENANT, "T|M.D|I03|day", 1, null);
++
++        runner.run();
++
++        IotInspectResult row = store.latest(TENANT, IotInspectResult.TYPE_CALC_ERR);
++        assertNotNull(row, "CALC_ERR 必须落库");
++        assertTrue(row.getItemCount() > 0, "CALC_ERR 非空（旧版恒空集必红）");
++        String payload = row.getPayloadJson();
++        assertTrue(payload.contains("超时") && payload.contains("除零"), "按原因分组两类");
++        assertTrue(payload.contains("\"count\":2"), "超时计数=2");
++    }
++
++    @Test
++    @DisplayName("I-1: run() 真实产出 COMPLETENESS 非空清单——滞后/停算按 calc 状态近似")
++    void completenessProducesNonEmptyList() {
++        seedTenant(TENANT, "T01");
++        seedCalcState(TENANT, "T|M.A|I01|day", 2); // 滞后
++        seedCalcState(TENANT, "T|M.B|I02|day", 3); // 异常停算
++        seedCalcState(TENANT, "T|M.C|I03|day", 1); // 正常（不计入）
++
++        runner.run();
++
++        IotInspectResult row = store.latest(TENANT, IotInspectResult.TYPE_COMPLETENESS);
++        assertNotNull(row, "COMPLETENESS 必须落库");
++        assertEquals(2, row.getItemCount(), "滞后+停算两条（旧版恒空集必红）");
++        assertTrue(row.getPayloadJson().contains("calc 状态近似"), "口径标注保留");
++    }
++
++    @Test
++    @DisplayName("I-1: run() 落 ONLINE_RATE 真实分子/分母（点位 status 聚合，禁逐点扫 TDengine）")
++    void onlineRateProducesRealCounts() {
++        seedTenant(TENANT, "T01");
++        seedPoint(TENANT, 1); // 在线
++        seedPoint(TENANT, 1); // 在线
++        seedPoint(TENANT, 0); // 离线
++
++        runner.run();
++
++        IotInspectResult row = store.latest(TENANT, "ONLINE_RATE");
++        assertNotNull(row, "ONLINE_RATE 快照必须落库（旧版写死空集不落库必红）");
++        assertTrue(row.getPayloadJson().contains("\"online\":2"), "真实分子=2");
++        assertTrue(row.getPayloadJson().contains("\"total\":3"), "真实分母=3");
++    }
++
++    @Test
++    @DisplayName("I-1: fail-soft 真实降级——calc 表缺列/不可读时降级空集 + WARN，不是无条件空集")
++    void calcQueryFailureDegradesToEmpty() {
++        seedTenant(TENANT, "T01");
++        // 不建 iot_calc 表（drop 掉）→ 查询异常 → fail-soft 空集，但其它清单照常
++        jdbc.execute("DROP TABLE iot_calc.iot_calc_log");
++        jdbc.execute("DROP TABLE iot_calc.iot_calc_state");
++
++        runner.run(); // 不抛异常
++
++        IotInspectResult calcErr = store.latest(TENANT, IotInspectResult.TYPE_CALC_ERR);
++        assertNotNull(calcErr);
++        assertEquals(0, calcErr.getItemCount(), "真实降级才空集");
++        // 标签租户比对仍按 brief D2.4 保留待核验占位
++        IotInspectResult mismatch = store.latest(TENANT, IotInspectResult.TYPE_TENANT_DB_MISMATCH);
++        assertNotNull(mismatch);
++        assertTrue(mismatch.getPayloadJson().contains("待核验"));
++    }
++}

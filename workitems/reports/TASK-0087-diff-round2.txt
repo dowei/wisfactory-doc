@@ -1,0 +1,209 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+index b9fc6bb..0d37453 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+@@ -179,7 +179,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         for (String key : keys) {
+             OpenApiItemRow item = byKey.get(key);
+             // scope 外/未登记键裁剪（集合形态授权裁剪语义——不回显键存在性，不给枚举探测面）
+-            if (item == null || !scope.instanceIds().contains(item.getInstanceId())) {
++            // allTenant=true 时 instanceIds 恒空集：视为全租户可见，不做集合裁剪（与 :118 同范式）
++            if (item == null || (!scope.allTenant() && !scope.instanceIds().contains(item.getInstanceId()))) {
+                 continue;
+             }
+             OpenApiRealtimeItemVO value = realtimeStore.read(tenantId, tenantCode, key);
+@@ -272,7 +273,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         Set<Long> instanceIds = new LinkedHashSet<>();
+         for (OpenApiMetricRow row : rows) {
+             byCode.put(row.getMetricCode(), row);
+-            if (scope.instanceIds().contains(row.getInstanceId())) {
++            // allTenant=true 视为可见（instanceIds 恒空集）；受限 scope 只收可见实例
++            if (scope.allTenant() || scope.instanceIds().contains(row.getInstanceId())) {
+                 instanceIds.add(row.getInstanceId());
+             }
+         }
+@@ -282,7 +284,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         boolean truncated = false;
+         for (String code : codes) {
+             OpenApiMetricRow metric = byCode.get(code);
+-            if (metric == null || !scope.instanceIds().contains(metric.getInstanceId())) {
++            // allTenant=true 视为可见（instanceIds 恒空集，与 :118 同范式）
++            if (metric == null || (!scope.allTenant() && !scope.instanceIds().contains(metric.getInstanceId()))) {
+                 continue;
+             }
+             OpenApiPage<OpenApiMetricVO> page = timeseriesClient.queryMetrics(tenantId, tenantCode,
+@@ -390,9 +393,10 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         requireInstanceVisible(identity.getTenantId(), instanceId, resolveScope(identity), targetKind);
+     }
+ 
+-    /** 单目标接口 scope 判定（共享核心用；scope 显式传入） */
++    /** 单目标接口 scope 判定（共享核心用；scope 显式传入；allTenant=true 视为可见） */
+     private void requireInstanceVisible(Long tenantId, Long instanceId, VisibleScope scope, String targetKind) {
+-        if (instanceId == null || !scope.instanceIds().contains(instanceId)) {
++        // instanceId==null 始终拒绝；allTenant 跳过 instanceIds 集合检查（instanceIds 恒空集）
++        if (instanceId == null || (!scope.allTenant() && !scope.instanceIds().contains(instanceId))) {
+             throw new BusinessException(OpenApiCodes.SCOPE_DENIED,
+                     targetKind + " 不属于调用方授权范围（scope 外 6003）");
+         }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadAllTenantContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadAllTenantContractTest.java
+new file mode 100644
+index 0000000..fb92a54
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadAllTenantContractTest.java
+@@ -0,0 +1,156 @@
++package net.otlab.admin.module.iot.displayread.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.displayread.MetricValueVO;
++import net.otlab.admin.module.openapi.dto.OpenApiMetricVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiItemMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiItemRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiMetricMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiMetricRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiPointMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.service.impl.OpenApiQueryServiceImpl;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.admin.module.openapi.support.OpenApiRealtimeStore;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.nullable;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0087 修订轮 I-1：管理面 allTenant=true 会话 scope 的读口契约。
++ *
++ * <p>超管/运营方经 {@code DataPermService.resolve(userId)} 得到 {@code VisibleScope.allTenant}
++ * （instanceIds 恒空集），管理面四端点与 HMAC 共用同一份查询核心；核心 scope 判定必须
++ * allTenant 感知，否则这些用户经管理面取不到任何数据。此测用真实核心 + 假 mapper/store
++ * 端到端验证「allTenant → 非空 realtime/metric values」，旧版核心必红。HMAC 侧 scope 恒
++ * resolveClientScope（allTenant=false），既有 2576 基线零回归由全量测试佐证。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotDisplayReadAllTenantContractTest {
++
++    private static final long USER_ID = 7L;
++    private static final long TENANT_ID = 1L;
++    private static final long INSTANCE_ID = 101L;
++    private static final String FULL_KEY = "F01.WS01.EQ01.TEMP";
++    private static final String METRIC_CODE = "F01_WATER_AVG_DAY";
++
++    private DataPermService dataPermService;
++    private OpenApiItemMapper itemMapper;
++    private OpenApiMetricMapper metricMapper;
++    private OpenApiInstanceMapper instanceMapper;
++    private OpenApiTenantMapper tenantMapper;
++    private OpenApiRealtimeStore realtimeStore;
++    private OpenApiTimeseriesClient timeseriesClient;
++    private IotDisplayReadService service;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login(String.valueOf(USER_ID));
++        StpUtil.getSession().set("tenant_id", TENANT_ID);
++
++        dataPermService = mock(DataPermService.class);
++        itemMapper = mock(OpenApiItemMapper.class);
++        metricMapper = mock(OpenApiMetricMapper.class);
++        instanceMapper = mock(OpenApiInstanceMapper.class);
++        tenantMapper = mock(OpenApiTenantMapper.class);
++        realtimeStore = mock(OpenApiRealtimeStore.class);
++        timeseriesClient = mock(OpenApiTimeseriesClient.class);
++
++        // 管理面会话：超管/运营方 resolve(userId) → allTenant=true（instanceIds 恒空集）
++        when(dataPermService.resolve(eq(USER_ID))).thenReturn(VisibleScope.allTenant(false));
++
++        OpenApiQueryServiceImpl queryService = new OpenApiQueryServiceImpl(
++                dataPermService, instanceMapper, itemMapper, mock(OpenApiPointMapper.class),
++                metricMapper, tenantMapper, realtimeStore, timeseriesClient);
++        service = new IotDisplayReadServiceImpl(queryService, dataPermService);
++
++        when(tenantMapper.selectTenantCodeById(TENANT_ID)).thenReturn("default");
++    }
++
++    @AfterEach
++    void tearDown() {
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    @Test
++    @DisplayName("I-1 管理面 allTenant=true：会话 resolve → 共享核心可见 → realtime/metric values 非空（旧版必红）")
++    void allTenantManagementReadsReturnData() {
++        OpenApiItemRow itemRow = new OpenApiItemRow();
++        itemRow.setId(1L);
++        itemRow.setTenantId(TENANT_ID);
++        itemRow.setInstanceId(INSTANCE_ID);
++        itemRow.setFullKey(FULL_KEY);
++        itemRow.setUnit("degC");
++        itemRow.setStatus(1);
++        when(itemMapper.selectByFullKeysForTenant(eq(TENANT_ID), anyCollection()))
++                .thenReturn(List.of(itemRow));
++        when(realtimeStore.read(eq(TENANT_ID), eq("default"), eq(FULL_KEY)))
++                .thenReturn(new OpenApiRealtimeItemVO(23.5, 0, 1700000000000L));
++
++        OpenApiInstanceRow instanceRow = new OpenApiInstanceRow();
++        instanceRow.setId(INSTANCE_ID);
++        instanceRow.setTenantId(TENANT_ID);
++        instanceRow.setInstanceCode("F01");
++        when(instanceMapper.selectByIdsForTenant(eq(TENANT_ID), anyCollection()))
++                .thenReturn(List.of(instanceRow));
++
++        OpenApiMetricRow metricRow = new OpenApiMetricRow();
++        metricRow.setId(2L);
++        metricRow.setTenantId(TENANT_ID);
++        metricRow.setMetricCode(METRIC_CODE);
++        metricRow.setInstanceId(INSTANCE_ID);
++        metricRow.setPeriod("DAY");
++        metricRow.setStatus(1);
++        when(metricMapper.selectByCodesForTenant(eq(TENANT_ID), anyCollection()))
++                .thenReturn(List.of(metricRow));
++        OpenApiMetricVO metricVo = new OpenApiMetricVO();
++        metricVo.setMetricCode(METRIC_CODE);
++        metricVo.setInstanceCode("F01");
++        metricVo.setWindowStart("2026-11-20 00:00:00");
++        metricVo.setValue(412.6);
++        metricVo.setYoy(0.083);
++        metricVo.setUnit("m3");
++        when(timeseriesClient.queryMetrics(eq(TENANT_ID), eq("default"), eq(METRIC_CODE),
++                eq("F01"), eq("DAY"), anyLong(), anyLong(), any()))
++                .thenReturn(new OpenApiPage<>(List.of(metricVo), false));
++
++        Map<String, OpenApiRealtimeItemVO> realtime = service.itemsRealtime(INSTANCE_ID, List.of(FULL_KEY));
++        List<MetricValueVO> metrics = service.metricValues(List.of(METRIC_CODE), "DAY", 100L, 900L);
++
++        assertFalse(realtime.isEmpty(), "allTenant 超管经管理面实时读口必须取到数据（旧版 instanceIds 空集裁剪会返回空集）");
++        assertNotNull(realtime.get(FULL_KEY));
++        assertEquals(23.5, realtime.get(FULL_KEY).getV());
++        assertEquals(1, metrics.size(), "allTenant 超管经管理面指标读口必须取到数据");
++        assertEquals(412.6, metrics.get(0).getValue());
++        assertEquals(0.083, metrics.get(0).getYoy());
++        assertNotNull(metrics.get(0).getTs());
++    }
++}

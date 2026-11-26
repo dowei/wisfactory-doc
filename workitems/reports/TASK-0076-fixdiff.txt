@@ -1,0 +1,725 @@
+diff --git a/ingest/internal/gwtoken/gwtoken.go b/ingest/internal/gwtoken/gwtoken.go
+index 3e3767e..210b43d 100644
+--- a/ingest/internal/gwtoken/gwtoken.go
++++ b/ingest/internal/gwtoken/gwtoken.go
+@@ -35,6 +35,12 @@ const DefaultCacheTTL = 30 * time.Second
+ 
+ // GatewayIdentity 令牌链校验产物：租户选库（iot_<tenant_code>）与处理顺序第 1 步
+ // 的租户来源，只信任此结构（令牌侧），不信任消息自带 tenant。
++//
++// 扩展位（修订轮 I3 登记）：契约 §3.2 续认证回调须「校验 gateway_code 与设备令牌、
++// 租户与网关 status」——网关 status 数据源在后端 MySQL，Go 侧无 DB 访问，需后端
++// credential/pull 响应扩 gateway status 字段（归 0027 后端接线）后在此承载，并在
++// auth/mqtt 回调实校验；本期 status 不校验（通道/凭据禁用经后端 403 覆盖，网关级
++// 禁用会被 allow——缺口登记见 TASK-0076 报告修订轮）。
+ type GatewayIdentity struct {
+ 	GatewayCode string
+ 	TenantCode  string
+@@ -93,8 +99,11 @@ type TokenChainValidator struct {
+ 
+ 	now func() time.Time // 可替换时钟（测试用；非导出）
+ 
+-	mu    sync.Mutex
+-	cache map[cacheKey]cacheEntry
++	// mu 只护 cache/inflight 元数据短临界区（修订轮 I1：不横跨网络回源——
++	// 全局锁持锁拉取会让一次后端慢拉取冻结所有键的缓存命中，fail-closed 变成自伤 DoS）。
++	mu       sync.Mutex
++	cache    map[cacheKey]cacheEntry
++	inflight map[cacheKey]*inflightCall
+ }
+ 
+ type cacheKey struct {
+@@ -107,6 +116,13 @@ type cacheEntry struct {
+ 	expires time.Time
+ }
+ 
++// inflightCall 一次进行中的回源（per-key singleflight）：同键并发等待复用其结果。
++type inflightCall struct {
++	done chan struct{}
++	cred Credential
++	err  error
++}
++
+ // NewTokenChainValidator 构造令牌链校验器。resolver/puller 为 nil 时返回 nil
+ // （装配方自查依赖），与 0073 组件「接口注入」口径一致。
+ func NewTokenChainValidator(resolver GatewayChannelResolver, puller CredentialPuller, ttl time.Duration) *TokenChainValidator {
+@@ -122,6 +138,7 @@ func NewTokenChainValidator(resolver GatewayChannelResolver, puller CredentialPu
+ 		TTL:      ttl,
+ 		now:      time.Now,
+ 		cache:    make(map[cacheKey]cacheEntry),
++		inflight: make(map[cacheKey]*inflightCall),
+ 	}
+ }
+ 
+@@ -148,19 +165,39 @@ func (v *TokenChainValidator) Validate(ctx context.Context, credType, gatewayCod
+ 	return GatewayIdentity{GatewayCode: gatewayCode, TenantCode: rc.TenantCode, ChannelID: rc.ChannelID}, nil
+ }
+ 
+-// credential 带本地缓存的凭据拉取（TTL 配置化）。持锁拉取（串行化同一键的并发回源，
+-// 防后端惊群）；拉取失败不缓存（fail-closed：下次校验重新回源）。
++// credential 带本地缓存的凭据拉取（TTL 配置化）。per-key 串行化（singleflight 语义，
++// 修订轮 I1）：同键并发回源收敛为一次 Pull（等待者复用结果，防后端惊群），异键互不
++// 阻塞——后端慢拉取/不可达不冻结其他网关的缓存命中；Pull 在元数据锁外执行。
++// 拉取失败不缓存（fail-closed：下次校验重新回源）。
++// 已知取舍：等待者复用发起者的结果（含发起者 ctx 取消产生的错误）——singleflight 惯例。
+ func (v *TokenChainValidator) credential(ctx context.Context, channelID int64, credType string) (Credential, error) {
+ 	key := cacheKey{channelID: channelID, credType: credType}
++
+ 	v.mu.Lock()
+-	defer v.mu.Unlock()
+ 	if entry, ok := v.cache[key]; ok && v.now().Before(entry.expires) {
++		v.mu.Unlock()
+ 		return entry.cred, nil
+ 	}
++	if call, ok := v.inflight[key]; ok {
++		v.mu.Unlock()
++		<-call.done
++		return call.cred, call.err
++	}
++	call := &inflightCall{done: make(chan struct{})}
++	v.inflight[key] = call
++	v.mu.Unlock()
++
++	// 锁外回源（网络 I/O 不持元数据锁——异键并行互不受阻）。
+ 	cred, err := v.Puller.Pull(ctx, channelID, credType)
+-	if err != nil {
+-		return Credential{}, err
++
++	v.mu.Lock()
++	if err == nil {
++		v.cache[key] = cacheEntry{cred: cred, expires: v.now().Add(v.TTL)}
+ 	}
+-	v.cache[key] = cacheEntry{cred: cred, expires: v.now().Add(v.TTL)}
+-	return cred, nil
++	call.cred, call.err = cred, err
++	close(call.done)
++	delete(v.inflight, key)
++	v.mu.Unlock()
++
++	return cred, err
+ }
+diff --git a/ingest/internal/gwtoken/gwtoken_contract_test.go b/ingest/internal/gwtoken/gwtoken_contract_test.go
+index 03bc6e0..74f7b6b 100644
+--- a/ingest/internal/gwtoken/gwtoken_contract_test.go
++++ b/ingest/internal/gwtoken/gwtoken_contract_test.go
+@@ -3,6 +3,8 @@ package gwtoken_test
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -142,9 +144,9 @@ func TestContractTokenChainFailClosedOnMismatchAndEmpty(t *testing.T) {
+ 	ctx := context.Background()
+ 
+ 	cases := []struct {
+-		name       string
+-		gateway    string
+-		token      string
++		name      string
++		gateway   string
++		token     string
+ 		wantPulls int
+ 	}{
+ 		{"令牌不匹配", "GW_F01_01", "forged-token", 1},
+@@ -163,3 +165,133 @@ func TestContractTokenChainFailClosedOnMismatchAndEmpty(t *testing.T) {
+ 		pulls = puller.calls
+ 	}
+ }
++
++// ---- 修订轮 I1：per-key 串行化（singleflight）——同键回源串行收敛、异键并行 ----
++
++// gatedPuller 按通道注入悬挂的假拉取器：channelID==hangChannel 时阻塞至 release
++// 关闭，其余立即返回固定凭据；记录调用次数。
++type gatedPuller struct {
++	hangChannel int64
++	release     chan struct{}
++	calls       int
++	credText    string
++}
++
++func (p *gatedPuller) Pull(_ context.Context, channelID int64, credType string) (gwtoken.Credential, error) {
++	p.calls++
++	if channelID == p.hangChannel {
++		<-p.release // 悬挂（模拟后端慢拉取/不可达）
++		return gwtoken.Credential{}, fmt.Errorf("pull aborted")
++	}
++	return gwtoken.Credential{ChannelID: channelID, CredType: credType, Ciphertext: p.credText}, nil
++}
++
++// 契约依据：修订轮 I1——后端单键慢拉取不得冻结其他键的缓存命中（修复前全局锁横跨
++// 网络回源，一次悬挂拉取使所有 Validate 全部串行，fail-closed 变成自伤 DoS）。
++// A 键缓存空且回源悬挂期间，B 键（缓存已预热）必须在时限内命中返回。
++func TestContractTokenChainPerKeyParallelism(t *testing.T) {
++	release := make(chan struct{})
++	puller := &gatedPuller{hangChannel: 1, release: release, credText: "tok"}
++	resolver := gwtoken.StaticResolver{
++		"GW_A": {ChannelID: 1, TenantCode: "tenant_a"},
++		"GW_B": {ChannelID: 2, TenantCode: "tenant_b"},
++	}
++	v := gwtoken.NewTokenChainValidator(resolver, puller, 10*time.Second)
++	ctx := context.Background()
++
++	// 预热 B 键缓存（TTL 内）。
++	if _, err := v.Validate(ctx, gwtoken.CredTypeHTTPSecret, "GW_B", "tok"); err != nil {
++		t.Fatalf("预热 Validate(GW_B) error: %v", err)
++	}
++
++	// A 键回源悬挂（异步）。
++	validateADone := make(chan error, 1)
++	go func() {
++		_, err := v.Validate(ctx, gwtoken.CredTypeHTTPSecret, "GW_A", "tok")
++		validateADone <- err
++	}()
++	deadline := time.Now().Add(300 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		if puller.calls >= 2 {
++			break
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	if puller.calls < 2 {
++		t.Fatalf("A 键拉取未发起（calls=%d）", puller.calls)
++	}
++
++	// A 悬挂期间，B 键缓存命中必须不被阻塞（全局锁实现下此处必然超时失败）。
++	bDone := make(chan error, 1)
++	go func() {
++		_, err := v.Validate(ctx, gwtoken.CredTypeHTTPSecret, "GW_B", "tok")
++		bDone <- err
++	}()
++	select {
++	case err := <-bDone:
++		if err != nil {
++			t.Fatalf("B 键缓存命中被 A 键回源阻塞（I1 修复未生效）: %v", err)
++		}
++	case <-time.After(300 * time.Millisecond):
++		t.Fatal("B 键缓存命中超时——A 键回源冻结了异键访问（I1 修复未生效）")
++	}
++
++	// 释放 A：悬挂拉取结束，Validate(A) 返回（拉取失败 fail-closed 语义不变）。
++	close(release)
++	select {
++	case err := <-validateADone:
++		if err == nil {
++			t.Errorf("Validate(A) error = nil, want 拉取中止错误（fail-closed 不变）")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("Validate(A) 未在释放后返回")
++	}
++}
++
++// 契约依据：修订轮 I1——同键并发回源收敛为一次 Pull（singleflight）：N 个并发校验
++// 同（网关, 凭据类型）只触发一次后端拉取，全部得到同一结果。
++func TestContractTokenChainSameKeySingleflight(t *testing.T) {
++	inner := &countingPuller{cred: chainCredential()}
++	puller := &slowCountingPuller{inner: inner, delay: 20 * time.Millisecond}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, 10*time.Second)
++	ctx := context.Background()
++
++	const n = 8
++	errs := make(chan error, n)
++	var wg sync.WaitGroup
++	start := make(chan struct{})
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			<-start
++			_, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++			errs <- err
++		}()
++	}
++	close(start)
++	wg.Wait()
++	close(errs)
++
++	for err := range errs {
++		if err != nil {
++			t.Fatalf("并发 Validate error: %v", err)
++		}
++	}
++	if got := puller.calls(); got != 1 {
++		t.Errorf("Pull calls = %d, want 1（同键并发回源收敛为一次）", got)
++	}
++}
++
++// slowCountingPuller 带 backpressure 延迟的计数拉取器（放大并发窗口）。
++type slowCountingPuller struct {
++	inner *countingPuller
++	delay time.Duration
++}
++
++func (p *slowCountingPuller) Pull(ctx context.Context, channelID int64, credType string) (gwtoken.Credential, error) {
++	time.Sleep(p.delay)
++	return p.inner.Pull(ctx, channelID, credType)
++}
++
++func (p *slowCountingPuller) calls() int { return p.inner.calls }
+diff --git a/ingest/internal/httpapi/authmqtt.go b/ingest/internal/httpapi/authmqtt.go
+index f78e769..47fb6d7 100644
+--- a/ingest/internal/httpapi/authmqtt.go
++++ b/ingest/internal/httpapi/authmqtt.go
+@@ -12,9 +12,16 @@ import (
+ // MQTTAuthHandler POST /ingest/v1/auth/mqtt——EMQX HTTP 认证回调（契约 §3.2（续）：
+ // 「EMQX 认证回调；内部令牌」）。
+ //
+-// 流程：端点自身鉴权（内部令牌，常量时间比较）→ 校验网关编码与设备令牌、租户与网关
+-// status（令牌链，fail-closed）→ 返回 allow/deny 及该连接允许订阅/发布的主题范围
+-// （只能收自己的 config、只能发自己的 data/status，REQ-0013）。
++// 流程：端点自身鉴权（内部令牌，常量时间比较）→ 校验网关编码与设备令牌（令牌链，
++// fail-closed；租户来自令牌链解析产物）→ 返回 allow/deny 及该连接允许订阅/发布的
++// 主题范围（只能收自己的 config、只能发自己的 data/status，REQ-0013）。
++//
++// 已登记缺口（修订轮 I3，契约 §3.2 续「校验 gateway_code 与设备令牌、租户与网关
++// status」）：网关 status 本期未校验——通道/凭据禁用经后端 403 覆盖（REQ-0011 验收 5），
++// 但网关级禁用（凭据仍有效）会被 allow。网关 status 数据源在后端 MySQL，Go 侧无 DB
++// 访问：需后端 credential/pull 响应扩 gateway status 字段（登记归 0027 后端接线），
++// 届时在 gwtoken.GatewayIdentity 扩展位承载并在本回调实校验（GatewayIdentity seam
++// 已留扩展位，见 gwtoken 包注释）。
+ //
+ // 响应形状按 EMQX HTTP 认证文档惯例（{result: "allow"|"deny"}），主题范围为自定契约
+ // 扩展（topics.publish/subscribe）；形状由测试锁定，真 EMQX 联调归 0068。
+diff --git a/ingest/internal/httpapi/report.go b/ingest/internal/httpapi/report.go
+index ba8816c..d68ebe4 100644
+--- a/ingest/internal/httpapi/report.go
++++ b/ingest/internal/httpapi/report.go
+@@ -20,6 +20,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"log"
+ 	"net/http"
+ 
+ 	"net.otlab/ingest/internal/gwtoken"
+@@ -38,6 +39,14 @@ const (
+ // 2 MiB 覆盖余量并挡无界请求体）。超限请求按 400 处理，不进流水线。
+ const MaxRequestBodyBytes int64 = 2 << 20
+ 
++// 对外固定错误文案（修订轮 I2）：401/503 不回显内部错误细节——gwtoken 拉取失败错误串
++// 含后端 status/业务 message/响应体原文（Result<CredentialPullVO> 含 ciphertext，mock
++// 口径下 ciphertext 即期望网关令牌），sink 错误含内部拓扑；err 细节只进服务端日志。
++const (
++	msgTokenRejected   = "网关令牌校验失败"
++	msgSinkUnavailable = "服务暂不可用"
++)
++
+ // ReportSink 统一流水线入口抽象（0073 pipeline 的 HTTP 面）。测试以假实现断言
+ // 调用形态（brief 测试口径：mock pipeline）；生产接线用 PipelineSink。
+ type ReportSink interface {
+@@ -89,6 +98,15 @@ type ReportHandler struct {
+ 	Sink ReportSink
+ 	// CredType 上报通道凭据类型；空 → HTTP_SECRET（REQ-0011 凭据类型口径）。
+ 	CredType string
++	// Logger 服务端日志（修订轮 I2：err 细节只进日志不回显客户端）；nil → log.Default()。
++	Logger *log.Logger
++}
++
++func (h *ReportHandler) logger() *log.Logger {
++	if h.Logger != nil {
++		return h.Logger
++	}
++	return log.Default()
+ }
+ 
+ func (h *ReportHandler) credType() string {
+@@ -134,14 +152,18 @@ func (h *ReportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	identity, err := h.Validator.Validate(r.Context(), h.credType(), env.Gateway, token)
+ 	if err != nil {
+-		writeJSON(w, http.StatusUnauthorized, errorResponse{Message: "网关令牌校验失败（fail-closed）: " + err.Error()})
++		// 修订轮 I2：对外固定文案，err 细节（后端拓扑/响应内容/潜在密文材料）只进服务端日志。
++		h.logger().Printf("httpapi: 网关令牌校验失败（fail-closed）gateway=%q credType=%s: %v",
++			env.Gateway, h.credType(), err)
++		writeJSON(w, http.StatusUnauthorized, errorResponse{Message: msgTokenRejected})
+ 		return
+ 	}
+ 
+ 	// 统一流水线入口（0073 pipeline；租户 = 令牌侧解析产物）。
+ 	out, err := h.Sink.Report(r.Context(), identity.TenantCode, body)
+ 	if err != nil {
+-		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Message: "流水线入口暂不可用: " + err.Error()})
++		h.logger().Printf("httpapi: 流水线入口暂不可用 tenant=%q: %v", identity.TenantCode, err)
++		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Message: msgSinkUnavailable})
+ 		return
+ 	}
+ 	rejections := out.Rejections
+diff --git a/ingest/internal/httpapi/report_contract_test.go b/ingest/internal/httpapi/report_contract_test.go
+index 79141dd..5305dd6 100644
+--- a/ingest/internal/httpapi/report_contract_test.go
++++ b/ingest/internal/httpapi/report_contract_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"log"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -371,6 +372,71 @@ func TestContractReportEndpointSinkError503(t *testing.T) {
+ 	}
+ }
+ 
++// ---- 修订轮 I2：对外固定文案（err 细节只进服务端日志）----
++
++// 契约依据：修订轮 I2——401/503 响应固定文案，不回显内部错误细节（gwtoken 拉取失败
++// 错误串含后端 status/业务 message/响应体原文，响应体即 Result<CredentialPullVO> 含
++// ciphertext——mock 口径下 ciphertext 就是期望网关令牌）；err 细节只进服务端日志。
++func TestContractReportEndpointFixedExternalErrorMessages(t *testing.T) {
++	// 401：校验失败细节（含潜在密文材料）不回显。
++	var logBuf bytes.Buffer
++	mv := &mockValidator{err: fmt.Errorf(
++		`gwtoken: 凭据拉取失败 status=500 body={"data":{"ciphertext":"{v1}SECRET-MATERIAL"}}`)}
++	h := &httpapi.ReportHandler{Validator: mv, Sink: &mockSink{}, Logger: log.New(&logBuf, "", 0)}
++
++	resp := postReport(t, h, "gw-token-secret", contractUpstreamJSON)
++	if resp.StatusCode != http.StatusUnauthorized {
++		t.Fatalf("status = %d, want 401", resp.StatusCode)
++	}
++	raw := rawBody(t, resp)
++	var body map[string]any
++	if err := json.Unmarshal(raw, &body); err != nil {
++		t.Fatalf("401 响应 JSON 解析失败: %v body=%s", err, raw)
++	}
++	if body["message"] != "网关令牌校验失败" {
++		t.Errorf("401 message = %v, want 固定文案「网关令牌校验失败」（不回显 err 细节）", body["message"])
++	}
++	if strings.Contains(string(raw), "SECRET-MATERIAL") {
++		t.Errorf("401 响应体泄露内部错误细节（含潜在密文材料）: %s", raw)
++	}
++	if !strings.Contains(logBuf.String(), "SECRET-MATERIAL") {
++		t.Errorf("err 细节未进服务端日志: %q", logBuf.String())
++	}
++
++	// 503：sink 错误细节不回显。
++	var logBuf2 bytes.Buffer
++	ms := &mockSink{err: fmt.Errorf("pipeline internal-detail-X down")}
++	h2 := &httpapi.ReportHandler{Validator: &mockValidator{id: identity()}, Sink: ms, Logger: log.New(&logBuf2, "", 0)}
++	resp2 := postReport(t, h2, "gw-token-secret", contractUpstreamJSON)
++	if resp2.StatusCode != http.StatusServiceUnavailable {
++		t.Fatalf("status = %d, want 503", resp2.StatusCode)
++	}
++	raw2 := rawBody(t, resp2)
++	var body2 map[string]any
++	if err := json.Unmarshal(raw2, &body2); err != nil {
++		t.Fatalf("503 响应 JSON 解析失败: %v body=%s", err, raw2)
++	}
++	if body2["message"] != "服务暂不可用" {
++		t.Errorf("503 message = %v, want 固定文案「服务暂不可用」（不回显 err 细节）", body2["message"])
++	}
++	if strings.Contains(string(raw2), "internal-detail-X") {
++		t.Errorf("503 响应体泄露内部错误细节: %s", raw2)
++	}
++	if !strings.Contains(logBuf2.String(), "internal-detail-X") {
++		t.Errorf("err 细节未进服务端日志: %q", logBuf2.String())
++	}
++}
++
++func rawBody(t *testing.T, resp *http.Response) []byte {
++	t.Helper()
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("读响应失败: %v", err)
++	}
++	return b
++}
++
+ // ---- 真流水线接线 fixture ----
+ 
+ // realPipelineFixture 真流水线 + PipelineSink + ReportHandler 的端到端接线。
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+index 31a1c45..2bde895 100644
+--- a/ingest/internal/pipeline/pipeline.go
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -24,8 +24,9 @@
+ // 按 data_type 分发写 st_point_num / st_point_state + 更新 Redis 点位缓存。
+ //
+ // 内核简化口径（0027/0028 接线时收紧）：
+-//   - batchId / (pointCode, ts) 幂等去重为内存假实现（标记即接受）；真实去重（崩溃安全）
+-//     归 TASK-0028 经存储实现；
++//   - batchId / (pointCode, ts) 幂等去重为内存假实现（原子 MarkIfSeen——修订轮 C1，
++//     并发同键重报恰一处理）；真实去重（崩溃安全）归 TASK-0028 经存储实现，
++//     且必须保持 MarkIfSeen 原子语义；
+ //   - 整批标记在逐点校验前完成（接受即标记）；写失败重排后的重试不再过点级去重
+ //     （同一批已在接受时标记），避免自吞重排行。
+ package pipeline
+@@ -72,15 +73,18 @@ type SnapshotLookup interface {
+ }
+ 
+ // BatchDeduper batchId 整批幂等挂点（真实存储实现归 TASK-0028）。
++// MarkIfSeen 原子标记并报告是否首见：check+mark 在单锁内一次完成（TASK-0076 修订轮
++// C1——分离的 Seen/Mark 复合操作在 Submit 并发面构成 check-then-act 竞态，同 batchId
++// 并发重报可双双通过检查各自全批处理，QoS1 整批幂等被打破）；真实存储实现必须保持
++// 同一原子语义，不得降级为先查后写两段式。
+ type BatchDeduper interface {
+-	SeenBatch(batchID string) bool
+-	MarkBatch(batchID string)
++	MarkIfSeen(batchID string) bool
+ }
+ 
+ // PointDeduper (pointCode, ts) 幂等键挂点（真实存储实现归 TASK-0028）。
++// 原子语义同 BatchDeduper：同 (pointCode, ts) 跨批并发重报恰一处理。
+ type PointDeduper interface {
+-	SeenPoint(pointCode string, ts int64) bool
+-	MarkPoint(pointCode string, ts int64)
++	MarkIfSeen(pointCode string, ts int64) bool
+ }
+ 
+ // QualityJudge 质量判定挂点（处理顺序第 4 步）。完整判定逻辑（量程二次判定覆盖、
+@@ -290,8 +294,12 @@ type SubmitResult struct {
+ // 循环完全一致（同一 processOne 五步冻结顺序），仅并发模型不同——不经消息通道，
+ // 在调用方 goroutine 内执行；攒批缓冲、flusher、去重表与 Run 路径共享。
+ //
+-// 并发纪律：可与 Run（及多个 Submit）并发调用——流水线组件均并发安全；
+-// DeadLetterSink 由调用方保证并发安全（Run 消费循环与 HTTP handler 双入口写）。
++// 并发承诺（修订轮 C1 修正为真实语义）：可与 Run（及多个 Submit）并发调用，前提是
++// 各组件原子性成立——batchId / (pointCode, ts) 去重挂点必须为 MarkIfSeen 单锁原子
++// （内存假实现已原子；TASK-0028 真实存储实现必须保持同语义，不得降级为先查后写），
++// 攒批缓冲与统计为锁内原子，SnapshotLookup 读原子快照；DeadLetterSink 由调用方保证
++// 并发安全（Run 消费循环与 HTTP handler 双入口写）。并发同键重报恰一处理的竞态
++// 回归见 pipeline_submit_race_contract_test.go。
+ // flusher 由 Run 启动；纯 HTTP 面接线（无 MQTT 消费源）时用 StartFlusher 单独启动。
+ func (p *Pipeline) Submit(ctx context.Context, in Inbound) SubmitResult {
+ 	return p.processOne(ctx, in)
+@@ -325,14 +333,14 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 		return res
+ 	}
+ 
+-	// batchId 整批幂等（标记即接受，内核简化口径；崩溃安全归 TASK-0028）。
+-	if p.deps.Batches.SeenBatch(env.BatchID) {
++	// batchId 整批幂等（原子 MarkIfSeen：首见判定与标记单锁内完成——修订轮 C1 收敛
++	// check-then-act；内核简化口径，崩溃安全归 TASK-0028）。
++	if !p.deps.Batches.MarkIfSeen(env.BatchID) {
+ 		p.stats.DuplicateBatches.Add(1)
+ 		res.Duplicate = true
+ 		res.Accepted = len(env.Points) // 重报按成功无操作报全部点数（首次接收时已受理）
+ 		return res
+ 	}
+-	p.deps.Batches.MarkBatch(env.BatchID)
+ 
+ 	judge := p.currentJudge()
+ 	rows := make([]tdengine.PointRow, 0, len(env.Points))
+@@ -356,13 +364,12 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 			continue
+ 		}
+ 
+-		// (pointCode, ts) 幂等键（内核简化口径同 batchId）。
+-		if p.deps.Points.SeenPoint(pt.PointCode, pt.Ts) {
++		// (pointCode, ts) 幂等键（原子 MarkIfSeen，修订轮 C1 同 batchId 口径）。
++		if !p.deps.Points.MarkIfSeen(pt.PointCode, pt.Ts) {
+ 			p.stats.DuplicatePoints.Add(1)
+ 			res.Accepted++ // QoS1 重报：幂等无操作，按受理计（不是拒绝）
+ 			continue
+ 		}
+-		p.deps.Points.MarkPoint(pt.PointCode, pt.Ts)
+ 
+ 		// 第 4 步：质量判定（挂点；CONV-02 质量码口径见 internal/quality）。
+ 		q := judge(cfgPt, pt)
+@@ -605,20 +612,13 @@ func NewMemoryBatchDeduper(cap int) *MemoryBatchDeduper {
+ 	return &MemoryBatchDeduper{cap: cap, seen: make(map[string]struct{}, cap)}
+ }
+ 
+-// SeenBatch 报告 batchId 是否已标记。
+-func (d *MemoryBatchDeduper) SeenBatch(batchID string) bool {
+-	d.mu.Lock()
+-	defer d.mu.Unlock()
+-	_, ok := d.seen[batchID]
+-	return ok
+-}
+-
+-// MarkBatch 标记 batchId（FIFO 淘汰最早项）。
+-func (d *MemoryBatchDeduper) MarkBatch(batchID string) {
++// MarkIfSeen 原子标记并报告是否首见（修订轮 C1）：首见判定、标记与 FIFO 淘汰在单锁内
++// 一次完成，check-then-act 竞态不可达——同 batchId 并发重报恰一处理。
++func (d *MemoryBatchDeduper) MarkIfSeen(batchID string) bool {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 	if _, ok := d.seen[batchID]; ok {
+-		return
++		return false
+ 	}
+ 	if len(d.order) >= d.cap {
+ 		old := d.order[0]
+@@ -627,6 +627,7 @@ func (d *MemoryBatchDeduper) MarkBatch(batchID string) {
+ 	}
+ 	d.seen[batchID] = struct{}{}
+ 	d.order = append(d.order, batchID)
++	return true
+ }
+ 
+ // MemoryPointDeduper (pointCode, ts) 幂等假实现：有界 FIFO。
+@@ -649,21 +650,14 @@ func pointDedupKey(pointCode string, ts int64) string {
+ 	return fmt.Sprintf("%s\x00%d", pointCode, ts)
+ }
+ 
+-// SeenPoint 报告 (pointCode, ts) 是否已标记。
+-func (d *MemoryPointDeduper) SeenPoint(pointCode string, ts int64) bool {
+-	d.mu.Lock()
+-	defer d.mu.Unlock()
+-	_, ok := d.seen[pointDedupKey(pointCode, ts)]
+-	return ok
+-}
+-
+-// MarkPoint 标记 (pointCode, ts)（FIFO 淘汰最早项）。
+-func (d *MemoryPointDeduper) MarkPoint(pointCode string, ts int64) {
++// MarkIfSeen 原子标记并报告是否首见（修订轮 C1）：同 (pointCode, ts) 跨批并发重报
++// 恰一处理；首见判定、标记与 FIFO 淘汰单锁内一次完成。
++func (d *MemoryPointDeduper) MarkIfSeen(pointCode string, ts int64) bool {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
+ 	k := pointDedupKey(pointCode, ts)
+ 	if _, ok := d.seen[k]; ok {
+-		return
++		return false
+ 	}
+ 	if len(d.order) >= d.cap {
+ 		old := d.order[0]
+@@ -672,4 +666,5 @@ func (d *MemoryPointDeduper) MarkPoint(pointCode string, ts int64) {
+ 	}
+ 	d.seen[k] = struct{}{}
+ 	d.order = append(d.order, k)
++	return true
+ }
+diff --git a/ingest/internal/pipeline/pipeline_submit_race_contract_test.go b/ingest/internal/pipeline/pipeline_submit_race_contract_test.go
+new file mode 100644
+index 0000000..79aac99
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_submit_race_contract_test.go
+@@ -0,0 +1,134 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0076 修订轮 C1 竞态回归：QoS1 幂等在 Submit 并发面恰一处理。
++//
++// 背景（评审 C1 实证）：修复前 Seen/Mark 分离的 check-then-act 在并发 Submit 下，
++// 800 轮 × 24 goroutine 实验中同 batchId 被当新批处理 8-11 次、唯一 (pointCode, ts)
++// 键重复写出 5-7 行。修复后（原子 MarkIfSeen）本测试多轮迭代断言零复现——探针思路
++// 转正为正式回归测试。
++
++// 契约依据：REQ-0013 验收 3「同 batchId 重发 → 整批只落一次」的并发面——
++// 同 batchId 并发双 Submit 恰一处理：多轮迭代断言零重复。
++func TestContractSubmitRaceSameBatchIdExactlyOnce(t *testing.T) {
++	const rounds = 30
++	const goroutines = 12
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	for round := 0; round < rounds; round++ {
++		payload := fmt.Sprintf(
++			`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-RACE-%03d","sentAt":1795212000000,"points":[%s]}`,
++			round, pointJSON("F01_WS01_EQ001_M01", 1795211995000+int64(round), 132.5, 0))
++
++		results := make([]pipeline.SubmitResult, goroutines)
++		var wg sync.WaitGroup
++		start := make(chan struct{})
++		for i := 0; i < goroutines; i++ {
++			wg.Add(1)
++			go func(i int) {
++				defer wg.Done()
++				<-start // 同一刻齐发（放大竞态窗口；原子 MarkIfSeen 后仍须恰一处理）
++				results[i] = h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++			}(i)
++		}
++		close(start)
++		wg.Wait()
++
++		var nonDup, dup int
++		for _, r := range results {
++			if r.RejectedWhole {
++				t.Fatalf("round %d: RejectedWhole 异常: %+v", round, r)
++			}
++			if r.Duplicate {
++				dup++
++				if r.Rejected != 0 || len(r.Rejections) != 0 || r.Accepted != 1 {
++					t.Fatalf("round %d: 重复批次结果异常: %+v（重报按成功无操作报全部点数）", round, r)
++				}
++			} else {
++				nonDup++
++				if r.Accepted != 1 || r.Rejected != 0 {
++					t.Fatalf("round %d: 首见批次结果异常: %+v", round, r)
++				}
++			}
++		}
++		if nonDup != 1 || dup != goroutines-1 {
++			t.Fatalf("round %d: 同 batchId 并发恰一处理被破坏——nonDup=%d dup=%d, want 1/%d",
++				round, nonDup, dup, goroutines-1)
++		}
++	}
++
++	// 累计账面（同步计数）：每轮恰一行入攒批、恰 goroutines-1 次整批去重命中。
++	st := h.pipe.Stats()
++	if st.ReceivedBatches != rounds*goroutines {
++		t.Errorf("ReceivedBatches = %d, want %d", st.ReceivedBatches, rounds*goroutines)
++	}
++	if st.DuplicateBatches != rounds*(goroutines-1) {
++		t.Errorf("DuplicateBatches = %d, want %d（修订轮 C1：并发整批重报零重复处理）",
++			st.DuplicateBatches, rounds*(goroutines-1))
++	}
++	if st.AcceptedPoints != rounds {
++		t.Errorf("AcceptedPoints = %d, want %d（每轮恰一行，零重复入攒批）", st.AcceptedPoints, rounds)
++	}
++}
++
++// 契约依据：REQ-0013 验收 3「同点位同时间戳并发两条只入库一条」的并发面——
++// (pointCode, ts) 跨批并发重报恰一行写出：多轮迭代断言零重复写行。
++func TestContractSubmitRaceSamePointTsExactlyOnce(t *testing.T) {
++	const rounds = 30
++	const goroutines = 12
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	for round := 0; round < rounds; round++ {
++		ts := 1795211995000 + int64(round)
++		var wg sync.WaitGroup
++		start := make(chan struct{})
++		for i := 0; i < goroutines; i++ {
++			wg.Add(1)
++			go func(i int) {
++				defer wg.Done()
++				<-start
++				// 同 (pointCode, ts)、互异 batchId（跨批并发重报——幂等键粒度考核）。
++				payload := fmt.Sprintf(
++					`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-PRACE-%03d-%02d","sentAt":1795212000000,"points":[%s]}`,
++					round, i, pointJSON("F01_WS01_EQ001_M01", ts, 132.5, 0))
++				h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++			}(i)
++		}
++		close(start)
++		wg.Wait()
++	}
++
++	// 累计账面（同步计数）：每轮恰一行入攒批、恰 goroutines-1 次点级去重命中。
++	st := h.pipe.Stats()
++	if st.AcceptedPoints != rounds {
++		t.Errorf("AcceptedPoints = %d, want %d（每轮恰一行，零重复入攒批）", st.AcceptedPoints, rounds)
++	}
++	if st.DuplicatePoints != rounds*(goroutines-1) {
++		t.Errorf("DuplicatePoints = %d, want %d（修订轮 C1：并发同键重报零重复处理）",
++			st.DuplicatePoints, rounds*(goroutines-1))
++	}
++	// 落库账面收敛：写出行数恰为 rounds（每行唯一 ts，同子表单条 INSERT 多 VALUES）。
++	eventually(t, 2*time.Second, "写出行数恰为 rounds", func() bool {
++		return h.pipe.Stats().WrittenPoints == rounds
++	})
++	// 重复写行零容忍：唯一键数 == 写出行数（AcceptedPoints 已证零重复入攒批，
++	// WrittenPoints 收敛同值则无重复行到达写出口）。
++	if st.WrittenPoints != rounds {
++		t.Fatalf("写出后 WrittenPoints = %d, want %d（唯一 (pointCode, ts) 键恰一次写出）", st.WrittenPoints, rounds)
++	}
++}

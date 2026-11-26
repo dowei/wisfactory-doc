@@ -1,0 +1,3369 @@
+commit fb574cf3c3018c196c91f1df0f503c8e72914b4c
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 17:31:26 2026 +0800
+
+    feat(iot): 指标域——iot_metric 表与七端点（list/detail/add/generate/edit/changeStatus/remove）+ 口径强制标注与比值型约束 + 按请求清单批量生成 + 数据权限裁剪与写路径防线（TASK-0043）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/controller/IotMetricController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/controller/IotMetricController.java
+new file mode 100644
+index 0000000..e858424
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/controller/IotMetricController.java
+@@ -0,0 +1,137 @@
++package net.otlab.admin.module.iot.metric.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricStatusForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricUpdateForm;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.service.IotMetricService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * 指标控制器（TASK-0043，管理面——详细设计 §3.1 p22 指标段全行交付）
++ *
++ * <p>路径命名空间 /iot/metric（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
++ * iot:metric:*（sys_menu 4058-4062，指标管理页 4014 之下）。§3.1 p22 指标段共三行接口
++ * （list / CRUD / changeStatus）——本控制器按 brief 五权限码扩展为六端点（list/detail/
++ * add/generate/edit/changeStatus/remove）：detail 端点照 0021 点位域形态（brief 五权限码
++ * 含 query；批量 generate 共用 iot:metric:add——生成是新增的批量形态）。
++ *
++ * <p>列表接数据权限裁剪（详细设计 §1.7「指标查询按 dept_id 与实例双重过滤」+ ADR-0016
++ * 裁决 6 同型：dept_id IN 部门集 OR instance_id IN 可见集，NULL 不特判 fail-closed；
++ * create_by 分支不适用资产类——照 0021 口径）；详情越权 403（SCOPE_FORBIDDEN，服务层
++ * 同一闸）。删除为软删且编码归档不复用（uk_tenant_metric_code 不含 deleted，逻辑删行
++ * 永久占用编码）。
++ *
++ * <p>批量生成（POST /iot/metric/generate?instanceId=）：按请求传入指标清单批量生成
++ * （0011 批量保存范式——「模板自动生成」占位口径：指标模板载体未定义，留待 REQ-0024
++ * 后续裁决 / 0024 发布链）；逐项校验同 add、整批事务（任一项校验失败整批拒绝不半落库）。
++ *
++ * <p>启停（PUT /iot/metric/changeStatus，§3.1 p22 独立行）：停用=停止调度、已算结果保留
++ * （REQ-0024 口径）；置 0/置 1 逐指标发 MetricStatusChangedEvent 占位（只发布不建监听——
++ * 调度消费方归 FEAT-0013/0045，照 0013 范式）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "指标定义")
++@RestController
++@RequestMapping("/iot/metric")
++public class IotMetricController {
++
++    @Autowired
++    private IotMetricService metricService;
++
++    @Operation(summary = "指标分页列表（过滤 metricCode/metricName/instanceId/period/status；"
++            + "数据权限裁剪——dept_id IN 部门集 OR instance_id IN 可见集，未绑部门行 fail-closed；"
++            + "create_by 分支不适用资产类——照 0021 口径）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:metric:list")
++    public Result<Page<IotMetric>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                        @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                        IotMetric query) {
++        Page<IotMetric> page = new Page<>(pageNum, pageSize);
++        return Result.success(metricService.selectMetricList(page, query));
++    }
++
++    @Operation(summary = "指标详情（越权 403——SCOPE_FORBIDDEN）")
++    @GetMapping("/{id}")
++    @SaCheckPermission("iot:metric:query")
++    public Result<IotMetric> detail(@PathVariable("id") Long id) {
++        return Result.success(metricService.getMetricDetail(id));
++    }
++
++    @OperateLog(title = "指标定义", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增指标（口径强制标注——agg_type/period 必填合法，未标注不可保存；"
++            + "比值型 agg_type=5 分子分母齐备且同实例存在启用，缺一拒；非比值型 ratio_* 置 NULL；"
++            + "calendar_type 锁 1 自然（班次 2 拒创建）；编码租户内唯一双道闸 4002、字符集 "
++            + "[A-Za-z0-9_]、不入业务字典——ADR-0014；来源引用不存在 4001 拒存）")
++    @PostMapping
++    @SaCheckPermission("iot:metric:add")
++    public Result<Void> add(@Valid @RequestBody IotMetricCreateForm form) {
++        metricService.createMetric(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "指标定义", businessType = BusinessType.INSERT)
++    @Operation(summary = "批量生成指标（按请求传入指标清单批量生成——0011 批量保存范式；逐项校验"
++            + "同 add、整批事务，任一项失败整批拒绝；单批 ≤500 项；instanceId 以 query 入参覆盖"
++            + "项内值。「模板自动生成」占位口径——指标模板载体未定义，留待 REQ-0024 后续裁决/"
++            + "0024 发布链；权限复用 iot:metric:add）")
++    @PostMapping("/generate")
++    @SaCheckPermission("iot:metric:add")
++    public Result<Integer> generate(@RequestParam("instanceId") Long instanceId,
++                                    @Valid @RequestBody IotMetricGenerateForm form) {
++        return Result.success(metricService.generateMetrics(instanceId, form));
++    }
++
++    @OperateLog(title = "指标定义", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改指标（metric_code 不可改；白名单 metricName/instanceId/sourceItemId/"
++            + "aggType/period/calendarType/ratioNumItemId/ratioDenItemId/yoyFlag/momFlag/deptId；"
++            + "生效组合重跑口径/比值/归属校验，切非比值型时 ratio_* 显式清 NULL；启停走 changeStatus）")
++    @PutMapping
++    @SaCheckPermission("iot:metric:edit")
++    public Result<Void> edit(@Valid @RequestBody IotMetricUpdateForm form) {
++        metricService.updateMetric(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "指标定义", businessType = BusinessType.UPDATE)
++    @Operation(summary = "批量启停指标（§3.1 p22 独立行 changeStatus；整批 fail-closed；停用=停止"
++            + "调度、已算结果保留——REQ-0024 口径；置 0/置 1 逐指标发 MetricStatusChangedEvent 占位，"
++            + "调度消费方归 FEAT-0013/0045）")
++    @PutMapping("/changeStatus")
++    @SaCheckPermission("iot:metric:edit")
++    public Result<Void> changeStatus(@Valid @RequestBody IotMetricStatusForm form) {
++        metricService.changeMetricStatus(form.getIds(), form.getStatus());
++        return Result.success();
++    }
++
++    @OperateLog(title = "指标定义", businessType = BusinessType.DELETE)
++    @Operation(summary = "批量删除指标（软删除；编码删除归档不复用）")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:metric:remove")
++    public Result<Void> remove(@PathVariable("ids") List<Long> ids) {
++        metricService.deleteMetrics(ids);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricCreateForm.java
+new file mode 100644
+index 0000000..4302cab
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricCreateForm.java
+@@ -0,0 +1,90 @@
++package net.otlab.admin.module.iot.metric.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 指标创建请求表单（TASK-0043，REQ-0024 业务能力 / §3.1 p22 指标段）
++ *
++ * <p><b>口径强制标注</b>（REQ-0024 验收 3 应用层承载）：aggType/period 必填合法
++ * （agg_type ∈ 1-5、period ∈ HOUR/DAY/MONTH/YEAR），未标注不可保存；calendarType
++ * 一期锁 1 自然日历（班次 2 拒创建——REQ-0024 非目标「一期不做班次口径聚合」）。
++ * <b>比值型</b>（agg_type=5）：ratioNumItemId/ratioDenItemId 必填齐备（缺一拒），
++ * 且分子分母数据项必须同实例/同租户存在且启用（服务层校验，引用不存在 4001 拒存）；
++ * <b>非比值型</b>：ratio_* 请求值忽略、强制置 NULL。sourceItemId 携带时校验存在/
++ * 同实例/启用（TC-0014 步骤 6：来源引用不存在 4001 拒存）。instanceId 必填（统计对象
++ * 范围，DDL NOT NULL）；deptId 可空（数据权限锚点）。
++ *
++ * <p>表单不携带 tenantId（服务层会话覆盖）/id/审计字段。metricCode 字符集
++ * [A-Za-z0-9_]（周期后缀编码惯例，防路径分隔符/空白注入编码体系；ADR-0014——编码
++ * 不入业务字典，无字典校验）。本表单同时复用为批量生成（POST /iot/metric/generate）
++ * 的清单项——批量场景 instanceId 以 query 入参覆盖项内携带值（0011 templateId 同款
++ * 「入参为准」口径，项内值不信任）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "指标创建表单（TASK-0043）")
++public class IotMetricCreateForm {
++
++    @NotBlank(message = "指标编码不能为空")
++    @Size(max = 96, message = "指标编码长度不能超过 96")
++    @Pattern(regexp = "[A-Za-z0-9_]+", message = "指标编码仅允许字母/数字/下划线")
++    @Schema(description = "指标编码（租户内唯一，创建后不可改；不入业务字典——ADR-0014）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String metricCode;
++
++    @NotBlank(message = "指标名称不能为空")
++    @Size(max = 100, message = "指标名称长度不能超过 100")
++    @Schema(description = "指标名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String metricName;
++
++    @Schema(description = "归属实例 ID（统计对象范围，单点新增必填——服务层校验缺失 400；"
++            + "批量生成场景以 query 入参覆盖项内携带值，项内可不携带）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long instanceId;
++
++    @Schema(description = "来源数据项 ID（携带时校验存在/同实例/启用——引用不存在 4001 拒存；比值型可空）")
++    private Long sourceItemId;
++
++    @NotNull(message = "聚合方式不能为空（口径强制标注——未标注不可保存）")
++    @Min(value = 1, message = "聚合方式仅允许 1 平均 2 累计 3 最大 4 最小 5 比值")
++    @Max(value = 5, message = "聚合方式仅允许 1 平均 2 累计 3 最大 4 最小 5 比值")
++    @Schema(description = "聚合方式 1 平均 2 累计 3 最大 4 最小 5 比值（口径强制标注）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer aggType;
++
++    @NotBlank(message = "统计周期不能为空（口径强制标注——未标注不可保存）")
++    @Pattern(regexp = "HOUR|DAY|MONTH|YEAR", message = "统计周期仅允许 HOUR/DAY/MONTH/YEAR")
++    @Schema(description = "统计周期 HOUR/DAY/MONTH/YEAR（口径强制标注）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String period;
++
++    @Schema(description = "日历口径 1 自然 2 班次（一期锁 1——班次 2 拒创建，REQ-0024 非目标；未携带落 1）")
++    private Integer calendarType;
++
++    @Schema(description = "比值分子数据项 ID（agg_type=5 必填；非比值型忽略强制置 NULL）")
++    private Long ratioNumItemId;
++
++    @Schema(description = "比值分母数据项 ID（agg_type=5 必填；非比值型忽略强制置 NULL）")
++    private Long ratioDenItemId;
++
++    @Schema(description = "是否算同比 0 否 1 是（未携带落 0 = DDL DEFAULT）")
++    private Integer yoyFlag;
++
++    @Schema(description = "是否算环比 0 否 1 是（未携带落 0 = DDL DEFAULT）")
++    private Integer momFlag;
++
++    @Schema(description = "绑定部门 ID（携带时校验存在/同租户；数据权限锚点，未绑部门行 fail-closed）")
++    private Long deptId;
++
++    @Schema(description = "状态 0 禁用 1 启用（未携带落 1 = DDL DEFAULT '1' 同值）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricGenerateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricGenerateForm.java
+new file mode 100644
+index 0000000..84a3e86
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricGenerateForm.java
+@@ -0,0 +1,36 @@
++package net.otlab.admin.module.iot.metric.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.NotEmpty;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 指标批量生成表单（TASK-0043，POST /iot/metric/generate?instanceId= 请求体）
++ *
++ * <p><b>占位口径</b>（brief 裁决）：本期批量生成实现为「按请求传入指标清单批量生成」
++ * （同 0011 模板数据项批量保存范式——{@code IotTemplateItemBatchForm} 同款形态）；
++ * 「按实例已绑定模板的指标清单自动生成」留待指标模板载体定义（模板域只有数据项模板，
++ * 指标模板载体未定义——REQ-0024 后续裁决 / 0024 发布链），报告登记占位口径。
++ *
++ * <p>instanceId 为目标实例（query 入参，服务层以入参覆盖项内携带值——0011 templateId
++ * 「入参为准」口径）；metrics 级联 {@code @Valid} 逐项 bean 校验；单批上限
++ * {@link net.otlab.admin.module.iot.metric.service.IotMetricService#GENERATE_BATCH_MAX}
++ * 在服务层强制。逐项校验同 add（口径标注/比值约束/唯一性/归属），<b>整批事务</b>——
++ * 任一项校验失败整批拒绝不半落库（@Transactional rollbackFor）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "指标批量生成表单（TASK-0043，按请求清单——模板自动生成为占位口径）")
++public class IotMetricGenerateForm {
++
++    @NotEmpty(message = "指标清单不能为空")
++    @Valid
++    @Schema(description = "指标定义清单（单批 ≤500 项；instanceId 以 query 入参覆盖项内值）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<IotMetricCreateForm> metrics;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricStatusForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricStatusForm.java
+new file mode 100644
+index 0000000..d2ea5f1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricStatusForm.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.metric.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 指标批量启停表单（TASK-0043，§3.1 p22 指标段独立行 PUT /iot/metric/changeStatus）
++ *
++ * <p>形态照 0021 点位域批量启停（IotPointStatusForm 同款）：整批 fail-closed——批内全部
++ * id 必须存在且活跃、任一不可见即整批拒绝（不半批落库）。停用=停止调度、已算结果保留
++ * （REQ-0024 口径）；置 0/置 1 逐指标发 {@code MetricStatusChangedEvent}（占位只发布——
++ * 调度消费方归 FEAT-0013/0045，照 0013 范式）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "指标批量启停表单（TASK-0043）")
++public class IotMetricStatusForm {
++
++    @NotEmpty(message = "请选择要启停的指标")
++    @Schema(description = "指标 id 清单", requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<Long> ids;
++
++    @NotNull(message = "指标状态不能为空")
++    @Schema(description = "目标状态 0 禁用（停止调度结果保留） / 1 启用", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricUpdateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricUpdateForm.java
+new file mode 100644
+index 0000000..b656319
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/dto/IotMetricUpdateForm.java
+@@ -0,0 +1,70 @@
++package net.otlab.admin.module.iot.metric.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 指标修改请求表单（TASK-0043，§3.1 p22 指标段 PUT /iot/metric）
++ *
++ * <p>metric_code 不可改（编码即指标锚点与看板取数标识，改码即断口径——携带不一致一律
++ * 拒，携带同值为 no-op 不拦）；其余字段按白名单可变（null 不进更新集，MP 自动跳过保持
++ * 库内原值）：metricName/instanceId/sourceItemId/aggType/period/calendarType/
++ * ratioNumItemId/ratioDenItemId/yoyFlag/momFlag/deptId。启停不进编辑集（走 changeStatus
++ * 独立接口——§3.1 p22 独立行）。口径/比值/归属校验按「携带值与库内值的生效组合」重跑：
++ * 改实例时来源与比值数据项须属新实例；生效聚合方式切为非比值型时 ratio_* 强制清 NULL
++ * （UpdateWrapper 显式置 NULL，实体 updateById 的 null 跳过语义清不掉旧值）。
++ *
++ * <p>表单不携带 tenantId/status/deleted/id 之外的主键与审计字段（status 走启停接口、
++ * tenantId 服务层会话覆盖、审计字段 MetaObjectHandler 回填），杜绝 mass assignment。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "指标修改表单（TASK-0043）")
++public class IotMetricUpdateForm {
++
++    @NotNull(message = "指标ID不能为空")
++    @Schema(description = "指标ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long id;
++
++    @Size(max = 96, message = "指标编码长度不能超过 96")
++    @Schema(description = "指标编码（不可改——携带不一致拒绝，携带同值为 no-op）")
++    private String metricCode;
++
++    @Size(max = 100, message = "指标名称长度不能超过 100")
++    @Schema(description = "指标名称")
++    private String metricName;
++
++    @Schema(description = "归属实例 ID（携带时校验存在/同租户；来源与比值数据项须属生效实例）")
++    private Long instanceId;
++
++    @Schema(description = "来源数据项 ID（携带时校验存在/同实例/启用——引用不存在 4001 拒存）")
++    private Long sourceItemId;
++
++    @Schema(description = "聚合方式 1 平均 2 累计 3 最大 4 最小 5 比值（携带时校验值域）")
++    private Integer aggType;
++
++    @Schema(description = "统计周期 HOUR/DAY/MONTH/YEAR（携带时校验值域）")
++    private String period;
++
++    @Schema(description = "日历口径（一期锁 1——携带 2 班次拒绝，REQ-0024 非目标）")
++    private Integer calendarType;
++
++    @Schema(description = "比值分子数据项 ID（生效聚合方式=5 时校验齐备/存在/同实例/启用）")
++    private Long ratioNumItemId;
++
++    @Schema(description = "比值分母数据项 ID（生效聚合方式=5 时校验齐备/存在/同实例/启用）")
++    private Long ratioDenItemId;
++
++    @Schema(description = "是否算同比 0 否 1 是（携带时校验值域）")
++    private Integer yoyFlag;
++
++    @Schema(description = "是否算环比 0 否 1 是（携带时校验值域）")
++    private Integer momFlag;
++
++    @Schema(description = "绑定部门 ID（携带时校验存在/同租户）")
++    private Long deptId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/entity/IotMetric.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/entity/IotMetric.java
+new file mode 100644
+index 0000000..b6cde7a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/entity/IotMetric.java
+@@ -0,0 +1,95 @@
++package net.otlab.admin.module.iot.metric.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 指标定义实体类（TASK-0043，详细设计 §1.7 p15 / 附录 A p33 逐字 DDL）
++ *
++ * <p>iot_metric 表随本任务升级脚本（20261122_iot_metric_domain.sql）建立，DDL 逐字照
++ * 附录 A p33。metric_code 租户内唯一（uk_tenant_metric_code 物理唯一索引、不含 deleted
++ * 列）且创建后不可改——编码即指标锚点与看板取数标识（改码即断口径）；删除为逻辑删且
++ * 编码归档不复用（REQ-0024「指标编码租户内唯一停用不复用」）；metric_code 不纳入
++ * iot_data_dict 业务数据字典（TD-0036/ADR-0014——字典只管业务数据编码 data_code）。
++ *
++ * <p>指标四要素：来源数据项（source_item_id）、聚合方式（agg_type 1 平均 2 累计 3 最大
++ * 4 最小 5 比值）、统计周期（period HOUR/DAY/MONTH/YEAR）、统计对象范围（instance_id）。
++ * <b>口径强制标注</b>（REQ-0024 验收 3 应用层承载）：agg_type/period 必填合法，未标注
++ * 不可保存；calendar_type 一期锁 1 自然日历（班次 2 拒创建——REQ-0024 非目标）。
++ * 比值型指标（agg_type=5）：ratio_num_item_id/ratio_den_item_id 必填齐备且同实例/同租户
++ * 存在启用（分子分母分别聚合再相除的计算语义归 FEAT-0012/REQ-0025）；非比值型 ratio_*
++ * 强制置 NULL。
++ *
++ * <p>dept_id 绑定部门（数据权限锚点）+ instance_id 归属实例：指标查询数据权限按 dept_id
++ * 与实例双重过滤（详细设计 §1.7 p15，ADR-0016 裁决 6 同型 NULL 不特判 fail-closed）。
++ * status 列即启停（0 禁用 1 启用）：停用=停止调度、已算结果保留（REQ-0024 口径）；
++ * 启停发 {@code MetricStatusChangedEvent}（占位只发布——调度消费方归 FEAT-0013/0045）。
++ *
++ * <p>两处「与上游差异」占位（20261122_iot_metric_domain.sql 头注登记）：上看板标记
++ * （TD-0039/ADR-0011）与 src_type 级联标记（TD-0027/ADR-0009）逐字 DDL 均无对应列——
++ * 上看板标记随展示端任务（REQ-0029）落、src_type 级联随月年逐级聚合链（FEAT-0012）与
++ * 上游 DDL 修订落，本期不落列不校验。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_metric")
++@Schema(description = "指标定义（TASK-0043）")
++public class IotMetric extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "指标ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "指标编码（租户内唯一，创建后不可改；不入业务字典——ADR-0014）")
++    private String metricCode;
++
++    @Schema(description = "指标名称")
++    private String metricName;
++
++    @Schema(description = "归属实例ID（统计对象范围）")
++    private Long instanceId;
++
++    @Schema(description = "来源数据项ID（比值型可空）")
++    private Long sourceItemId;
++
++    @Schema(description = "聚合方式 1 平均 2 累计 3 最大 4 最小 5 比值")
++    private Integer aggType;
++
++    @Schema(description = "统计周期 HOUR/DAY/MONTH/YEAR")
++    private String period;
++
++    @Schema(description = "日历口径 1 自然 2 班次（预留，一期锁 1——REQ-0024）")
++    private Integer calendarType;
++
++    @Schema(description = "比值分子数据项ID（agg_type=5 必填；非比值型恒 NULL）")
++    private Long ratioNumItemId;
++
++    @Schema(description = "比值分母数据项ID（agg_type=5 必填；非比值型恒 NULL）")
++    private Long ratioDenItemId;
++
++    @Schema(description = "是否算同比 0 否 1 是")
++    private Integer yoyFlag;
++
++    @Schema(description = "是否算环比 0 否 1 是")
++    private Integer momFlag;
++
++    @Schema(description = "绑定部门ID（数据权限锚点，可空）")
++    private Long deptId;
++
++    @Schema(description = "状态 0 禁用 1 启用（停用=停止调度结果保留；启停发 MetricStatusChangedEvent）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/event/MetricStatusChangedEvent.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/event/MetricStatusChangedEvent.java
+new file mode 100644
+index 0000000..026a3e1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/event/MetricStatusChangedEvent.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.metric.event;
++
++/**
++ * 指标启停领域事件（TASK-0043）
++ *
++ * <p>指标启停（changeStatus 置 0 或置 1）后经 Spring {@code ApplicationEventPublisher}
++ * 发布的应用事件——调度消费方（停用=停止调度、启用=恢复调度；已算结果保留，
++ * REQ-0024 口径）归 <b>FEAT-0013 / TASK-0045</b>。<b>本期只发布不建监听器</b>（brief
++ * 裁决，照 0013 {@code InstanceItemsGeneratedEvent} / 0021 {@code PointEnabledEvent}
++ * 范式——无消费方注册，监听器随调度链路接线时交付）。
++ *
++ * <p>payload：metricId / tenantId / metricCode / newStatus（0 停 1 启）/ period（调度
++ * 周期口径）/ aggType（聚合方式）——调度消费方据此重排该指标的周期任务。发布时机：
++ * 主链事务内、状态更新成功之后——监听方须自行决定是否等事务提交（如需提交后语义，
++ * 接线时可用 @TransactionalEventListener 调整）。新增指标建档（add/generate 落 1）
++ * <b>不发布本事件</b>——新指标纳入调度走配置发布链路（ADR-0011 TD-0028「生成走配置
++ * 发布链路」同口径），本事件仅承载「启停操作」。
++ *
++ * @param metricId   启停指标 id（iot_metric.id）
++ * @param tenantId   会话租户 id
++ * @param metricCode 指标编码（调度注册锚点）
++ * @param newStatus  目标状态 0 禁用 1 启用
++ * @param period     统计周期 HOUR/DAY/MONTH/YEAR（调度周期口径）
++ * @param aggType    聚合方式 1 平均 2 累计 3 最大 4 最小 5 比值
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record MetricStatusChangedEvent(Long metricId,
++                                       Long tenantId,
++                                       String metricCode,
++                                       Integer newStatus,
++                                       String period,
++                                       Integer aggType) {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeMapper.java
+new file mode 100644
+index 0000000..bc53bff
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeMapper.java
+@@ -0,0 +1,46 @@
++package net.otlab.admin.module.iot.metric.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 指标编码占用旁路 Mapper（TASK-0043，uk_tenant_metric_code 双道闸第一道预检专用）。
++ *
++ * <p><b>含已删行</b>：uk_tenant_metric_code 为 (tenant_id, metric_code) 物理唯一索引、不含
++ * deleted 列，逻辑删行仍占用编码且编码不复用（REQ-0024 核心规则「指标编码租户内唯一
++ * 停用不复用」+ REQ-0008 同款「删除归档不复用」纪律）——预检若只看活跃行（@TableLogic
++ * 过滤），重存同码必撞物理索引且被误报为瞬态并发冲突。故本方法绕过 @TableLogic（原生
++ * @Select 不过逻辑删注入）返回占用行的 deleted 标记，由调用方区分文案（「已存在」/
++ * 「已被删除记录占用，不可复用」）。
++ *
++ * <p>旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}，照 TASK-0021
++ * IotPointCodeMapper 显式条件范式）：显式条件为 (tenant_id, metric_code)——tenant_id
++ * 显式取会话租户（调用方传入，禁请求携带），预检语义与物理唯一索引的作用域
++ * (tenant_id, metric_code) 精确一致。调用方保证 codes 非空。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotMetricCodeMapper {
++
++    /**
++     * 按 (tenant_id, metric_code) 显式查占用行（含已删行，携带 deleted 标记）
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param codes    待预检编码集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, metric_code, deleted FROM iot_metric "
++            + "WHERE tenant_id = #{tenantId} AND metric_code IN "
++            + "<foreach collection='codes' item='code' open='(' separator=',' close=')'>#{code}</foreach>"
++            + "</script>")
++    List<IotMetricCodeRow> selectOccupiedByCodes(@Param("tenantId") Long tenantId,
++                                                 @Param("codes") Collection<String> codes);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeRow.java
+new file mode 100644
+index 0000000..3212a4d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricCodeRow.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.metric.mapper;
++
++import lombok.Data;
++
++/**
++ * 指标编码占用行（uk_tenant_metric_code 双道闸预检的旁路查询结果行，TASK-0043）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、编码、deleted 标记——deleted=1 为逻辑删行
++ * （uk_tenant_metric_code 物理唯一索引不含 deleted 列，逻辑删行永久占用编码——编码
++ * 删除归档不复用，REQ-0024 核心规则），调用方据此区分「已存在」/「已被删除记录占用，
++ * 不可复用」文案（0011/0012/0017/0018/0021 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotMetricCodeRow {
++
++    private Long id;
++
++    private String metricCode;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricMapper.java
+new file mode 100644
+index 0000000..120365f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/mapper/IotMetricMapper.java
+@@ -0,0 +1,19 @@
++package net.otlab.admin.module.iot.metric.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 指标定义 Mapper（TASK-0043）
++ *
++ * <p>iot_metric 属 iot_ 前缀表：多租户条件由 TenantLineInnerInterceptor 注入会话租户、
++ * 逻辑删由 {@code @TableLogic} 运行时过滤；编码占用旁路预检走
++ * {@link IotMetricCodeMapper}（含已删行，双道闸第一道专用）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotMetricMapper extends BaseMapper<IotMetric> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/IotMetricService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/IotMetricService.java
+new file mode 100644
+index 0000000..06f54e3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/IotMetricService.java
+@@ -0,0 +1,75 @@
++package net.otlab.admin.module.iot.metric.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricUpdateForm;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++
++import java.util.List;
++
++/**
++ * 指标定义服务（TASK-0043，REQ-0024 / FEAT-0014 / §3.1 p22 指标段）
++ *
++ * <p>业务纪律（brief 裁决逐条）：
++ * <ul>
++ * <li><b>口径强制标注</b>：agg_type/period 必填合法（period ∈ HOUR/DAY/MONTH/YEAR），
++ *     未标注不可保存（REQ-0024 验收 3 应用层承载）；calendar_type 一期锁 1 自然日历
++ *     （班次 2 拒创建——REQ-0024 非目标）；</li>
++ * <li><b>比值型约束</b>（agg_type=5）：ratio_num_item_id/ratio_den_item_id 必填齐备
++ *     （缺一拒），且分子分母数据项同实例/同租户存在且启用；非比值型 ratio_* 请求值
++ *     忽略、强制置 NULL；</li>
++ * <li><b>编码唯一双道闸 4002</b>：uk_tenant_metric_code（tenant_id, metric_code）物理
++ *     唯一索引不含 deleted——含已删行旁路预检（删除归档不复用，REQ-0024「停用不复用」）
++ *     + DuplicateKey 兜底并发窗口；metric_code 创建后不可改；编码不入业务字典
++ *     （ADR-0014，无字典校验）；</li>
++ * <li><b>来源引用校验 4001</b>：source_item_id / 比值分子分母引用不存在（含跨实例、
++ *     未启用）→ 4001 拒存（TC-0014 步骤 6，FEAT-0014「空数据=来源引用不存在 4001」）；</li>
++ * <li><b>数据权限</b>：列表 dept_id IN 部门集 OR instance_id IN 可见集（ADR-0016 裁决 6
++ *     同型 NULL 不特判 fail-closed；create_by 分支不适用资产类——照 0021 口径）；详情
++ *     越权 403；写路径防线（update/changeStatus/remove 照 0021 修订轮范式 + 创建目标
++ *     实例须可见——照 0012 修订轮 I-1）；</li>
++ * <li><b>批量生成</b>：按请求传入指标清单批量生成（0011 批量保存范式——「模板自动生成」
++ *     占位：指标模板载体未定义，留待 REQ-0024 后续裁决/0024 发布链），逐项校验同 add、
++ *     整批事务；</li>
++ * <li><b>启停</b>：停用=停止调度、已算结果保留（REQ-0024 口径）；置 0/置 1 发
++ *     MetricStatusChangedEvent 占位（只发布不建监听——调度消费方归 FEAT-0013/0045）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotMetricService {
++
++    /** 指标批量生成单批上限（照 0011 ITEM_BATCH_MAX=500 范式） */
++    int GENERATE_BATCH_MAX = 500;
++
++    /**
++     * 指标分页列表（过滤 metricCode/metricName/instanceId/period/status；数据权限裁剪
++     * dept_id IN 部门集 OR instance_id IN 可见集）
++     */
++    Page<IotMetric> selectMetricList(Page<IotMetric> page, IotMetric query);
++
++    /** 指标详情（越权 403——SCOPE_FORBIDDEN 单对象形态） */
++    IotMetric getMetricDetail(Long id);
++
++    /** 新增指标（口径强制标注/比值约束/编码双道闸 4002/归属校验；目标实例须可见） */
++    boolean createMetric(IotMetricCreateForm form);
++
++    /**
++     * 批量生成指标（按请求清单，instanceId 以 query 入参覆盖项内值；逐项校验同 add、
++     * 整批事务；单批 ≤{@link #GENERATE_BATCH_MAX} 项）
++     *
++     * @return 实际生成条数
++     */
++    int generateMetrics(Long instanceId, IotMetricGenerateForm form);
++
++    /** 修改指标（metric_code 不可改；白名单；生效组合重跑口径/比值/归属校验） */
++    boolean updateMetric(IotMetricUpdateForm form);
++
++    /** 批量启停（整批 fail-closed；停用停调度结果保留；逐指标发 MetricStatusChangedEvent） */
++    boolean changeMetricStatus(List<Long> ids, Integer status);
++
++    /** 批量删除（软删；编码删除归档不复用） */
++    boolean deleteMetrics(List<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImpl.java
+new file mode 100644
+index 0000000..01d0893
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImpl.java
+@@ -0,0 +1,839 @@
++package net.otlab.admin.module.iot.metric.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermConditionAssembler;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricUpdateForm;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.event.MetricStatusChangedEvent;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricCodeMapper;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricCodeRow;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.metric.service.IotMetricService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++/**
++ * 指标定义服务实现类（TASK-0043）
++ *
++ * <p><b>口径强制标注</b>（REQ-0024 验收 3 应用层承载，brief 硬验收「未标注不可保存」）：
++ * agg_type 必填 ∈ {1..5}、period 必填 ∈ {HOUR, DAY, MONTH, YEAR}——缺一或非法即 400
++ * 拒存（表单 @NotNull/@NotBlank/@Pattern + 服务层双保险）；calendar_type 一期锁 1 自然
++ * 日历（未携带落 1 = DDL DEFAULT 同值；携带 2 班次拒创建——REQ-0024 非目标「一期不做
++ * 班次口径聚合」，同指标不混用两种日历口径随列级单值 + 禁班次结构性成立）。
++ *
++ * <p><b>比值型约束</b>（agg_type=5，brief 硬验收「分子分母齐备」）：ratio_num_item_id /
++ * ratio_den_item_id 必填齐备（缺一 400 拒），且分子分母数据项必须同实例（item.instance_id
++ * = metric.instance_id）/同租户（多租户插件注入）存在且启用（iot_data_item.enabled=1）
++ * ——REQ-0024 验收 2「分子分母分别聚合再相除」的定义侧齐备性约束（分别聚合的计算语义归
++ * FEAT-0012/REQ-0025）；<b>非比值型 ratio_* 请求值忽略、强制置 NULL</b>（编辑场景切换为
++ * 非比值型时经 UpdateWrapper 显式清 NULL——实体 updateById 的 null 跳过语义清不掉旧值）。
++ *
++ * <p><b>唯一性双道闸 4002</b>（0011/0012/0017/0018/0021 同款口径）：uk_tenant_metric_code
++ * 为 (tenant_id, metric_code) 物理唯一索引、不含 deleted 列——逻辑删行永久占用编码且编码
++ * 归档不复用（REQ-0024「指标编码租户内唯一停用不复用」）；第一道含已删行旁路预检
++ * （{@link IotMetricCodeMapper} 区分「已存在」/「已被删除记录占用，不可复用」文案）+
++ * 第二道 DuplicateKey 兜底（预检与落库之间的真实并发插入窗口）。metric_code 创建后不可改
++ * （编码即指标锚点与看板取数标识）；<b>编码不入业务字典</b>（ADR-0014——metric_code 无
++ * 字典校验，与数据项 data_code 的字典来源校验刻意区分）。
++ *
++ * <p><b>来源引用校验 4001</b>（TC-0014 步骤 6 / FEAT-0014「空数据=来源引用不存在 4001」）：
++ * source_item_id 与比值分子分母引用携带时必须命中本租户活跃数据项（多租户插件注入会话
++ * 租户条件即同租户保证）且 instance_id 与指标生效实例一致且 enabled=1——引用不存在/
++ * 跨实例/未启用 → 4001 拒存（ot-core ResultCode 未设 4001 枚举，照 0013 数据项域常量
++ * 直用原始码口径）。
++ *
++ * <p><b>数据权限裁剪</b>（ADR-0016 裁决 6 同型 + 详细设计 §1.7 p15「指标查询按 dept_id
++ * 与实例双重过滤」）：指标 list 接组件——{@code dept_id IN 部门集 OR instance_id IN 可见集}
++ * （NULL 不特判：scope=1 全租户不过滤、其余 scope 下未绑部门行两条件皆不命中=不可见
++ * fail-closed）；详情 403（SCOPE_FORBIDDEN 单对象形态）。<b>create_by 分支不适用</b>
++ * （brief 口径留痕：指标为资产类非个人创建物，归属以 dept/instance 锚定——与 REQ-0002
++ * 裁决 3 对齐，故 createByColumn 传 null）。
++ *
++ * <p><b>写路径数据权限防线</b>（brief 口径「update/remove/status 照 0021 修订轮范式——
++ * resolve+可见判定，指标可见=dept_id IN 部门集 OR instance_id IN 可见集（资产类无
++ * create_by 分支）」）：updateMetric/changeMetricStatus/deleteMetrics 三写原语经
++ * {@link #requireWritePerm} 判定目标指标可见性（与列表裁剪同条件），不可见 403 且文案不
++ * 泄露指标标识；批量原语批内任一不可见即整批拒绝（fail-closed 不半批变更）。<b>创建侧
++ * 防线</b>（add/generate 目标实例须 ∈ 可见集，照 0012 修订轮 I-1「子级创建的父实例必须
++ * ∈ 可见集」同型——向不可见实例写指标是同类写原语穿透 TC-0002 红线，创建锚点为必填
++ * instance_id 故防线确定性成立）。
++ *
++ * <p><b>批量生成</b>（brief 裁决占位口径）：本期实现为「按请求传入指标清单批量生成」
++ * （同 0011 批量保存范式）；「按实例已绑定模板的指标清单自动生成」留待指标模板载体定义
++ * （模板域只有数据项模板，指标模板载体未定义——REQ-0024 后续裁决 / 0024 发布链）。
++ * 逐项校验同 add（口径标注/比值约束/唯一性/归属），<b>整批事务</b>——任一项校验失败整批
++ * 拒绝不半落库（@Transactional rollbackFor）；单批 ≤{@link #GENERATE_BATCH_MAX} 项；
++ * instanceId 以 query 入参覆盖项内携带值（0011 templateId「入参为准」口径）。
++ *
++ * <p><b>启停语义</b>（REQ-0024「停用停止调度已算结果保留」）：changeStatus 置 0=停调度
++ * 结果保留（无删除动作、结果表归计算侧）；置 0/置 1 逐指标发
++ * {@link MetricStatusChangedEvent} 占位（只发布不建监听——调度消费方归 FEAT-0013/0045，
++ * 照 0013 范式）；新增建档（add/generate 落 1）不发本事件——新指标纳入调度走配置发布
++ * 链路（ADR-0011 TD-0028「生成走配置发布链路」同口径）。
++ *
++ * <p><b>字段白名单</b>：新增/更新均不直接落请求实体——status 创建时解析（未携带落 1 =
++ * DDL DEFAULT '1' 同值，编辑不承载启停）、tenant_id 会话覆盖、审计字段由 MetaObjectHandler
++ * 回填、deleted 不可经 API 注入，杜绝 mass assignment。
++ *
++ * <p><b>占位登记</b>（brief 裁决，不落列不校验）：上看板标记（TD-0039/ADR-0011）本期
++ * DDL 无该列——随展示端任务（REQ-0029）落；src_type 级联标记（TD-0027/ADR-0009）同口径
++ * ——本期来源仅数据项（source_item_id），上游指标级联随月年逐级聚合链（FEAT-0012）与
++ * 上游 DDL 修订落。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotMetricServiceImpl extends ServiceImpl<IotMetricMapper, IotMetric> implements IotMetricService {
++
++    /** varchar 限长口径（与 iot_metric DDL 一致；表无 remark 列） */
++    private static final int MAX_LEN_METRIC_CODE = 96;
++    private static final int MAX_LEN_METRIC_NAME = 100;
++
++    /** metric_code 字符集（防路径分隔符/空白注入编码体系；与创建表单 @Pattern 一致） */
++    private static final Pattern METRIC_CODE_PATTERN = Pattern.compile("[A-Za-z0-9_]+");
++
++    /** agg_type 值域（1 平均 2 累计 3 最大 4 最小 5 比值） */
++    private static final Set<Integer> AGG_TYPE_VALUES = Set.of(1, 2, 3, 4, 5);
++    /** 比值型聚合方式 */
++    private static final int AGG_TYPE_RATIO = 5;
++
++    /** period 值域（HOUR/DAY/MONTH/YEAR——口径强制标注） */
++    private static final Set<String> PERIOD_VALUES = Set.of("HOUR", "DAY", "MONTH", "YEAR");
++
++    /** calendar_type 值域（1 自然 2 班次预留——一期锁 1，班次 2 拒创建） */
++    private static final Set<Integer> CALENDAR_TYPE_VALUES = Set.of(1, 2);
++    /** calendar_type 自然日历（DDL DEFAULT '1' 同值；一期唯一放行值） */
++    private static final int CALENDAR_TYPE_NATURAL = 1;
++    /** calendar_type 班次（REQ-0024 一期非目标，拒创建） */
++    private static final int CALENDAR_TYPE_SHIFT = 2;
++
++    /** 启停开关值域（yoy_flag/mom_flag/status） */
++    private static final Set<Integer> FLAG_VALUES = Set.of(0, 1);
++
++    /** 创建未携带 status/calendar_type/yoy/mom 时落库默认（DDL DEFAULT 同值） */
++    private static final int DEFAULT_STATUS = 1;
++    private static final int DEFAULT_CALENDAR_TYPE = 1;
++    private static final int DEFAULT_FLAG = 0;
++
++    /** 引用不存在拒存码（4001——TC-0014 步骤 6；ot-core ResultCode 未设枚举，常量直用） */
++    private static final int CODE_REFERENCE_NOT_FOUND = 4001;
++
++    @Autowired
++    private IotMetricCodeMapper metricCodeMapper;
++
++    @Autowired
++    private IotModelInstanceMapper instanceMapper;
++
++    @Autowired
++    private IotDataItemMapper dataItemMapper;
++
++    @Autowired
++    private SysDeptMapper deptMapper;
++
++    @Autowired
++    private DataPermService dataPermService;
++
++    @Autowired
++    private DataPermConditionAssembler dataPermConditionAssembler;
++
++    @Autowired
++    private ApplicationEventPublisher eventPublisher;
++
++    // ---------- 列表 / 详情 ----------
++
++    @Override
++    public Page<IotMetric> selectMetricList(Page<IotMetric> page, IotMetric query) {
++        // 多租户条件由插件注入（会话链路）；deleted 由 @TableLogic 运行时过滤
++        LambdaQueryWrapper<IotMetric> wrapper = buildListWrapper(query);
++        wrapper.orderByAsc(IotMetric::getId);
++        return this.page(page, wrapper);
++    }
++
++    /**
++     * 列表查询装配：过滤条件（metricCode/metricName LIKE + instanceId/period/status/deptId
++     * eq）+ 数据权限裁剪条件（ADR-0016 裁决 6 同型——dept_id IN 部门集 OR instance_id IN
++     * 可见集；NULL 不特判 fail-closed；create_by 分支不适用资产类，createByColumn 传 null）。
++     */
++    private LambdaQueryWrapper<IotMetric> buildListWrapper(IotMetric query) {
++        LambdaQueryWrapper<IotMetric> wrapper = new LambdaQueryWrapper<>();
++        if (query != null) {
++            if (query.getMetricCode() != null) {
++                wrapper.like(IotMetric::getMetricCode, SqlLikeUtils.escape(query.getMetricCode()));
++            }
++            if (query.getMetricName() != null) {
++                wrapper.like(IotMetric::getMetricName, SqlLikeUtils.escape(query.getMetricName()));
++            }
++            if (query.getInstanceId() != null) {
++                wrapper.eq(IotMetric::getInstanceId, query.getInstanceId());
++            }
++            if (query.getPeriod() != null) {
++                wrapper.eq(IotMetric::getPeriod, query.getPeriod());
++            }
++            if (query.getStatus() != null) {
++                wrapper.eq(IotMetric::getStatus, query.getStatus());
++            }
++            if (query.getDeptId() != null) {
++                wrapper.eq(IotMetric::getDeptId, query.getDeptId());
++            }
++        }
++        // 数据权限裁剪（详细设计 §1.7 p15「指标查询按 dept_id 与实例双重过滤」+ ADR-0016
++        // 裁决 6 同型）：resolve(当前用户) → allTenant 直过（null=不追加条件）；否则
++        // dept_id IN 部门集 OR instance_id IN 可见集——NULL 不特判（未绑部门行对非 scope=1
++        // 结构性不可见 fail-closed）；可见集空 → 组件 FAIL_CLOSED（1=0 空列表）。
++        // create_by 分支不适用（资产类非个人创建物，brief 口径留痕——createByColumn 传 null）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        String condition = dataPermConditionAssembler.pointCondition(scope, null, "dept_id", "instance_id", null);
++        if (condition != null) {
++            wrapper.apply(condition);
++        }
++        return wrapper;
++    }
++
++    @Override
++    public IotMetric getMetricDetail(Long id) {
++        return requireReadableMetric(id);
++    }
++
++    /**
++     * 单对象读公共闸（详情读路径）：存在性 → 数据权限 403（SCOPE_FORBIDDEN——单对象形态，
++     * ADR-0016 裁决 2；文案不泄露指标标识）。可见性判定与列表条件同源同口径（双条件 OR，
++     * NULL 不特判 fail-closed；create_by 分支不适用）
++     */
++    private IotMetric requireReadableMetric(Long id) {
++        if (id == null) {
++            throw paramError("请选择要查询的指标");
++        }
++        IotMetric existing = this.getById(id);
++        if (existing == null) {
++            throw paramError("指标不存在或已删除");
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !isMetricReadableByUser(scope, existing)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该指标（数据权限不命中）");
++        }
++        return existing;
++    }
++
++    /** 指标单对象可见性判定（列表 SQL 条件的内存等价形态；NULL 行 fail-closed） */
++    private boolean isMetricReadableByUser(VisibleScope scope, IotMetric metric) {
++        return (metric.getDeptId() != null && scope.deptIds().contains(metric.getDeptId()))
++                || (metric.getInstanceId() != null && scope.instanceIds().contains(metric.getInstanceId()));
++    }
++
++    /**
++     * 写路径数据权限防线（update/changeStatus/deleteMetrics 三写原语共用，照 0021 修订轮
++     * 范式——brief 口径「指标可见=dept_id IN 部门集 OR instance_id IN 可见集（资产类无
++     * create_by 分支）」）：resolve(当前用户) → 目标指标可见性判定——可见口径与列表裁剪
++     * 同条件（allTenant，或 dept_id ∈ 部门集，或 instance_id ∈ 可见集；NULL 双条件行
++     * fail-closed）。不可见 → 403 且文案不泄露指标标识；批量原语批内任一不可见即整批拒绝
++     * （fail-closed 不半批变更）。
++     */
++    private void requireWritePerm(IotMetric target) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !isMetricReadableByUser(scope, target)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该指标（数据权限不命中）");
++        }
++    }
++
++    /** 批量写原语防线入口（逐目标判定，任一不可见即整批拒绝） */
++    private void requireWritePerm(List<IotMetric> targets) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (scope.allTenant()) {
++            return;
++        }
++        for (IotMetric target : targets) {
++            if (!isMetricReadableByUser(scope, target)) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该指标（数据权限不命中）");
++            }
++        }
++    }
++
++    /**
++     * 创建侧防线（add/generate 共用，照 0012 修订轮 I-1「子级创建的父实例必须 ∈ 可见集」
++     * 同型）：创建锚点为必填 instance_id，向不可见实例写指标是写原语穿透 TC-0002 红线的
++     * 同类路径——目标实例必须 ∈ 可见集（allTenant 直过），不可见 403 且文案不泄露实例标识。
++     */
++    private void requireCreatePerm(Long instanceId) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(instanceId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权在该实例下创建指标（数据权限不命中）");
++        }
++    }
++
++    // ---------- 创建 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createMetric(IotMetricCreateForm form) {
++        Long tenantId = TenantContext.getTenantId();
++        // instance_id 必填（统计对象范围，DDL NOT NULL）+ 归属校验 + 创建侧防线（目标实例须可见）
++        IotModelInstance instance = resolveInstance(form.getInstanceId());
++        requireCreatePerm(instance.getId());
++        validateDept(form.getDeptId());
++
++        // 逐项校验 + 白名单构建（与批量生成共用同一校验链——「生成校验同 add」brief 口径）
++        IotMetric entity = validateAndBuild(tenantId, instance.getId(), form, new LinkedHashSet<>(), null);
++
++        // 双道闸第一道：含已删行占用预检（uk_tenant_metric_code 不含 deleted 列，逻辑删行
++        // 永久占用编码——编码删除归档不复用、停用不复用；文案区分活跃行「已存在」/已删行
++        // 「已被删除记录占用，不可复用」）
++        List<IotMetricCodeRow> occupied = metricCodeMapper.selectOccupiedByCodes(tenantId,
++                List.of(entity.getMetricCode()));
++        if (!occupied.isEmpty()) {
++            throw duplicateMetricCode(occupied.get(0));
++        }
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的真实并发插入窗口（物理唯一索引）
++            throw duplicateCode4002("指标编码已存在: " + entity.getMetricCode());
++        }
++        return true;
++    }
++
++    // ---------- 批量生成（按请求清单——「模板自动生成」占位口径） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public int generateMetrics(Long instanceId, IotMetricGenerateForm form) {
++        if (instanceId == null) {
++            throw paramError("目标实例不能为空");
++        }
++        Long tenantId = TenantContext.getTenantId();
++        // 目标实例归属校验 + 创建侧防线在前（照 0012/0021 修订轮范式「存在性 → 数据权限 →
++        // 业务校验」——写原语先过数据权限闸再碰表单内容；instanceId 以 query 入参为准——
++        // 项内携带值不信任，0011 templateId 同款口径）
++        IotModelInstance instance = resolveInstance(instanceId);
++        requireCreatePerm(instance.getId());
++        List<IotMetricCreateForm> items = form == null ? null : form.getMetrics();
++        if (items == null || items.isEmpty()) {
++            throw paramError("指标清单不能为空");
++        }
++        if (items.size() > GENERATE_BATCH_MAX) {
++            throw paramError("单批生成上限 " + GENERATE_BATCH_MAX + " 项，当前 " + items.size() + " 项");
++        }
++
++        // 第一遍：逐项字段校验（编码/名称/口径标注/日历锁/开关值域/比值齐备性——与 add 共用
++        // 同一校验链）+ 批内撞码判定（先于库内预检——撞码批连库内核对都无需消耗，0011 范式）；
++        // 字段级违规在本遍收敛（任一项失败即抛出，未落库任何行）
++        Set<String> seenCodes = new LinkedHashSet<>(items.size());
++        for (IotMetricCreateForm item : items) {
++            if (item.getMetricCode() == null || !seenCodes.add(item.getMetricCode())) {
++                throw duplicateCode4002("指标编码批内重复: " + item.getMetricCode());
++            }
++            validateMetricCode(item.getMetricCode());
++            if (item.getMetricName() == null || item.getMetricName().length() > MAX_LEN_METRIC_NAME) {
++                throw paramError("指标名称必填且长度不能超过 " + MAX_LEN_METRIC_NAME);
++            }
++            resolveAggType(item.getAggType());
++            resolvePeriod(item.getPeriod());
++            resolveCalendarType(item.getCalendarType());
++            resolveFlag(item.getYoyFlag(), "同比开关仅允许 0 否 / 1 是");
++            resolveFlag(item.getMomFlag(), "环比开关仅允许 0 否 / 1 是");
++            resolveCreateStatus(item.getStatus());
++            if (item.getAggType() != null && item.getAggType() == AGG_TYPE_RATIO
++                    && (item.getRatioNumItemId() == null || item.getRatioDenItemId() == null)) {
++                throw paramError("比值型指标必须同时提供分子与分母数据项（ratioNumItemId/ratioDenItemId 缺一不可）");
++            }
++        }
++
++        // 第二遍：库内级校验（批内一次 IN，避免逐行往返放大，照 0021 导入范式）——
++        // ① 绑定部门存在性（去重后一次 selectByIds）；② 引用数据项存在性/同实例/启用
++        // （比值分子分母 + source_item_id，批内一次 selectByIds）；③ 编码占用旁路预检
++        // （含已删行——编码删除归档不复用）
++        Set<Long> deptIds = items.stream().map(IotMetricCreateForm::getDeptId)
++                .filter(java.util.Objects::nonNull)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        if (!deptIds.isEmpty()) {
++            Set<Long> existingDeptIds = deptMapper.selectByIds(deptIds).stream()
++                    .map(SysDept::getId)
++                    .collect(Collectors.toSet());
++            for (IotMetricCreateForm item : items) {
++                if (item.getDeptId() != null && !existingDeptIds.contains(item.getDeptId())) {
++                    throw paramError("绑定部门不存在或已删除: " + item.getDeptId());
++                }
++            }
++        }
++        Map<Long, IotDataItem> itemById = loadItemsByIds(collectReferencedItemIds(items, instance.getId()));
++        for (IotMetricCreateForm item : items) {
++            validateReferences(itemById, instance.getId(), item.getSourceItemId(),
++                    item.getRatioNumItemId(), item.getRatioDenItemId(), item.getAggType());
++        }
++        Set<String> codes = items.stream().map(IotMetricCreateForm::getMetricCode).collect(Collectors.toSet());
++        Map<String, IotMetricCodeRow> occupiedByCode = new LinkedHashMap<>();
++        for (IotMetricCodeRow row : metricCodeMapper.selectOccupiedByCodes(tenantId, codes)) {
++            occupiedByCode.putIfAbsent(row.getMetricCode(), row);
++        }
++        for (IotMetricCreateForm item : items) {
++            IotMetricCodeRow occupied = occupiedByCode.get(item.getMetricCode());
++            if (occupied != null) {
++                throw duplicateMetricCode(occupied);
++            }
++        }
++
++        // 全部通过：白名单构建实体逐项落库（instanceId 以入参覆盖；status/tenant_id/审计字段
++        // 口径同 add）。任一异常 rollbackFor 整批回滚——「逐项校验整批事务」brief 口径
++        try {
++            int count = 0;
++            for (IotMetricCreateForm item : items) {
++                this.save(validateAndBuild(tenantId, instance.getId(), item, seenCodes, itemById));
++                count++;
++            }
++            return count;
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的并发撞码窗口（物理唯一索引），rollbackFor 整批回滚
++            throw duplicateCode4002("指标编码并发冲突，整批未入库，请重试");
++        }
++    }
++
++    /** 批内引用数据项 id 收集（比值分子分母按生效聚合方式 + source_item_id，一次 IN 预检用） */
++    private Set<Long> collectReferencedItemIds(List<IotMetricCreateForm> items, Long instanceId) {
++        Set<Long> ids = new LinkedHashSet<>();
++        for (IotMetricCreateForm item : items) {
++            collectItemIds(ids, item.getAggType(), item.getSourceItemId(),
++                    item.getRatioNumItemId(), item.getRatioDenItemId());
++        }
++        return ids;
++    }
++
++    // ---------- 编辑 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateMetric(IotMetricUpdateForm form) {
++        IotMetric existing = this.getById(form.getId());
++        if (existing == null) {
++            throw paramError("指标不存在或已删除");
++        }
++        // 写路径数据权限防线（brief 口径照 0021 修订轮范式）：存在性 → 数据权限 → 业务校验。
++        // 可见口径与列表裁剪同条件（dept_id ∈ 部门集 OR instance_id ∈ 可见集，NULL 行
++        // fail-closed；无 create_by 分支——资产类非个人创建物）；不可见 403 且文案不泄露指标标识
++        requireWritePerm(existing);
++        // metric_code 不可改（编码即指标锚点与看板取数标识）：携带不一致一律拒（携带同值为 no-op 不拦）
++        if (form.getMetricCode() != null && !form.getMetricCode().equals(existing.getMetricCode())) {
++            throw paramError("指标编码不允许修改: " + existing.getMetricCode());
++        }
++
++        // 生效组合（携带值优先，未携带取库内值——单边改也须不破坏口径/比值/归属约束）
++        Integer effAggType = resolveAggType(form.getAggType() != null ? form.getAggType() : existing.getAggType());
++        String effPeriod = resolvePeriod(form.getPeriod() != null ? form.getPeriod() : existing.getPeriod());
++        Integer effCalendar = resolveCalendarType(
++                form.getCalendarType() != null ? form.getCalendarType() : existing.getCalendarType());
++        resolveFlag(form.getYoyFlag(), "同比开关仅允许 0 否 / 1 是");
++        resolveFlag(form.getMomFlag(), "环比开关仅允许 0 否 / 1 是");
++        if (form.getMetricName() != null && form.getMetricName().length() > MAX_LEN_METRIC_NAME) {
++            throw paramError("指标名称超长（上限 " + MAX_LEN_METRIC_NAME + " 字符）");
++        }
++        // 生效实例归属校验（携带时先过存在性；创建侧防线不适用编辑——目标行可见性已防线，
++        // 挪实例不扩大调用者可见面，照 0021 编辑 boundInstanceId 同口径）
++        Long effInstanceId = form.getInstanceId() != null ? form.getInstanceId() : existing.getInstanceId();
++        if (form.getInstanceId() != null) {
++            resolveInstance(form.getInstanceId());
++        }
++        validateDept(form.getDeptId());
++
++        // 来源/比值引用按生效组合重跑（改实例时引用须属新实例；生效聚合方式切非比值型时
++        // ratio_* 强制清 NULL——「非比值型 ratio_* 置 NULL」对编辑同口径）
++        Long effSource = form.getSourceItemId() != null ? form.getSourceItemId() : existing.getSourceItemId();
++        Long effRatioNum = form.getRatioNumItemId() != null ? form.getRatioNumItemId() : existing.getRatioNumItemId();
++        Long effRatioDen = form.getRatioDenItemId() != null ? form.getRatioDenItemId() : existing.getRatioDenItemId();
++        if (effAggType == AGG_TYPE_RATIO && (effRatioNum == null || effRatioDen == null)) {
++            // 比值型齐备性对编辑同口径（生效组合为比值型而分子分母缺一 → 400 拒）
++            throw paramError("比值型指标必须同时提供分子与分母数据项（ratioNumItemId/ratioDenItemId 缺一不可）");
++        }
++        Map<Long, IotDataItem> itemById = loadItemsByIds(
++                collectItemIds(new LinkedHashSet<>(), effAggType, effSource, effRatioNum, effRatioDen));
++        validateReferences(itemById, effInstanceId, effSource, effRatioNum, effRatioDen, effAggType);
++
++        // 字段白名单构建更新（null 不进更新集，MP 自动跳过保持库内原值；不可变字段不回写、
++        // 连 no-op 都不进 SET）：仅 metricName/instanceId/sourceItemId/aggType/period/
++        // calendarType/yoyFlag/momFlag/deptId 可变——status 不进编辑集（启停走 changeStatus
++        // 独立接口，§3.1 p22 独立行）、metricCode/tenantId/审计字段/deleted 永不进管理面
++        // 更新集（杜绝 mass assignment）。比值型携带比值字段（生效=5 且请求携带）进 SET；
++        // 非比值型 ratio_* 一律强制清 NULL（UpdateWrapper 显式 set null——实体 updateById
++        // 的 null 跳过语义清不掉旧值）
++        IotMetric upd = new IotMetric();
++        upd.setId(existing.getId());
++        upd.setMetricName(form.getMetricName());
++        upd.setInstanceId(form.getInstanceId());
++        upd.setSourceItemId(form.getSourceItemId());
++        upd.setAggType(form.getAggType());
++        upd.setPeriod(form.getPeriod());
++        upd.setCalendarType(form.getCalendarType());
++        if (effAggType == AGG_TYPE_RATIO) {
++            upd.setRatioNumItemId(form.getRatioNumItemId());
++            upd.setRatioDenItemId(form.getRatioDenItemId());
++        }
++        upd.setYoyFlag(form.getYoyFlag());
++        upd.setMomFlag(form.getMomFlag());
++        upd.setDeptId(form.getDeptId());
++        this.updateById(upd);
++        if (effAggType != AGG_TYPE_RATIO) {
++            // 非比值型：显式清 ratio_*（「非比值型 ratio_* 置 NULL」——切换类型/误携带都收敛为 NULL）
++            this.update(new LambdaUpdateWrapper<IotMetric>()
++                    .eq(IotMetric::getId, existing.getId())
++                    .set(IotMetric::getRatioNumItemId, null)
++                    .set(IotMetric::getRatioDenItemId, null));
++        }
++        return true;
++    }
++
++    // ---------- 批量启停（§3.1 p22 独立行 changeStatus） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean changeMetricStatus(List<Long> ids, Integer status) {
++        if (status == null || !FLAG_VALUES.contains(status)) {
++            throw paramError("指标状态仅允许 0 禁用 / 1 启用");
++        }
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要启停的指标");
++        }
++        // fail-closed：批内全部 id 必须存在且活跃（@TableLogic 过滤已删行），缺失即整批拒绝（不半批落库）
++        List<IotMetric> existingList = this.listByIds(ids);
++        if (existingList.size() < ids.size()) {
++            Map<Long, IotMetric> found = existingList.stream()
++                    .collect(Collectors.toMap(IotMetric::getId, Function.identity(), (a, b) -> a, LinkedHashMap::new));
++            List<Long> missing = ids.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("指标不存在或已删除: " + missing);
++        }
++
++        // 写路径数据权限防线（brief 口径照 0021 修订轮范式）：批内任一不可见即整批拒绝
++        // （fail-closed 不半批落库，403 文案不泄露指标标识）；可见口径与列表裁剪同条件
++        requireWritePerm(existingList);
++
++        // 批量启停：只更新状态字段（不夹带其他业务字段）。停用（置 0）=停止调度、已算结果
++        // 保留（REQ-0024 口径——无删除动作，结果表归计算侧）；置 0/置 1 逐指标发
++        // MetricStatusChangedEvent（启停事件占位——调度消费方归 FEAT-0013/0045，照 0013
++        // 范式只发布不建监听；同态 no-op 的重复事件由消费方幂等承接）
++        IotMetric upd = new IotMetric();
++        upd.setStatus(status);
++        for (Long id : ids) {
++            upd.setId(id);
++            this.updateById(upd);
++        }
++        for (IotMetric metric : existingList) {
++            publishStatusChangedEvent(metric, status);
++        }
++        return true;
++    }
++
++    // ---------- 批量删除 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteMetrics(List<Long> ids) {
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要删除的指标");
++        }
++        // fail-closed：批内全部 id 必须存在且活跃，缺失即整批拒绝（不半删）
++        List<IotMetric> existingList = this.listByIds(ids);
++        if (existingList.size() < ids.size()) {
++            Map<Long, IotMetric> found = existingList.stream()
++                    .collect(Collectors.toMap(IotMetric::getId, Function.identity(), (a, b) -> a, LinkedHashMap::new));
++            List<Long> missing = ids.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("指标不存在或已删除: " + missing);
++        }
++
++        // 写路径数据权限防线（brief 口径照 0021 修订轮范式）：批内任一不可见即整批拒绝
++        requireWritePerm(existingList);
++
++        // 无引用保护需求（本期 iot_metric 无入向引用表——看板取数/计算引擎链路未建，
++        // REQ-0029 上看板标记占位同源）：逻辑删（@TableLogic，deleted=1）；编码不复用
++        // （删除即归档——预检含已删行，REQ-0024「指标编码租户内唯一停用不复用」）
++        return this.removeByIds(ids);
++    }
++
++    // ---------- 校验链（add 与批量生成共用——「生成校验同 add」brief 口径） ----------
++
++    /**
++     * 单项校验 + 白名单构建（createMetric/generateMetrics 共用）：编码（非空/限长/字符集）
++     * → 名称（非空/限长）→ 口径强制标注（agg_type/period 必填合法）→ 日历锁 1 → 开关值域
++     * → ratio 齐备性（比值型缺一拒/非比值型置 NULL）→ 引用存在性/同实例/启用（4001）→
++     * 部门归属 → status 解析 → tenant 会话覆盖。批内撞码由调用方先判（generateMetrics
++     * 第一遍），此处不再重复。
++     *
++     * @param prefetchedItems 批内预载引用数据项（generateMetrics 第二遍产物；单条创建传 null
++     *                        ——引用校验按本次引用集逐项 selectById 补载）
++     */
++    private IotMetric validateAndBuild(Long tenantId, Long instanceId, IotMetricCreateForm item,
++                                       Set<String> seenCodes, Map<Long, IotDataItem> prefetchedItems) {
++        String metricCode = validateMetricCode(item.getMetricCode());
++        if (seenCodes != null) {
++            seenCodes.add(metricCode);
++        }
++        if (item.getMetricName() == null || item.getMetricName().length() > MAX_LEN_METRIC_NAME) {
++            throw paramError("指标名称必填且长度不能超过 " + MAX_LEN_METRIC_NAME);
++        }
++        Integer aggType = resolveAggType(item.getAggType());
++        String period = resolvePeriod(item.getPeriod());
++        Integer calendarType = resolveCalendarType(item.getCalendarType());
++        resolveFlag(item.getYoyFlag(), "同比开关仅允许 0 否 / 1 是");
++        resolveFlag(item.getMomFlag(), "环比开关仅允许 0 否 / 1 是");
++        Integer status = resolveCreateStatus(item.getStatus());
++        validateDept(item.getDeptId());
++
++        // 比值齐备性（比值型缺一 400 拒；非比值型 ratio_* 忽略请求值置 NULL）+ 引用校验（4001）
++        Long ratioNum = aggType == AGG_TYPE_RATIO ? item.getRatioNumItemId() : null;
++        Long ratioDen = aggType == AGG_TYPE_RATIO ? item.getRatioDenItemId() : null;
++        if (aggType == AGG_TYPE_RATIO && (ratioNum == null || ratioDen == null)) {
++            throw paramError("比值型指标必须同时提供分子与分母数据项（ratioNumItemId/ratioDenItemId 缺一不可）");
++        }
++        Map<Long, IotDataItem> itemById = resolveReferenceItems(prefetchedItems, aggType,
++                item.getSourceItemId(), ratioNum, ratioDen);
++        validateReferences(itemById, instanceId, item.getSourceItemId(), ratioNum, ratioDen, aggType);
++
++        // 字段白名单构建新增实体：id/审计字段不复制（框架自增 + MetaObjectHandler 回填）；
++        // tenant_id 服务层从会话覆盖（插件对 iot_ 前缀表 INSERT 自动补列与会话租户同值，
++        // 双保险口径同模板/实例/点位域）
++        IotMetric entity = new IotMetric();
++        entity.setTenantId(tenantId);
++        entity.setMetricCode(metricCode);
++        entity.setMetricName(item.getMetricName());
++        entity.setInstanceId(instanceId);
++        entity.setSourceItemId(item.getSourceItemId());
++        entity.setAggType(aggType);
++        entity.setPeriod(period);
++        entity.setCalendarType(calendarType);
++        entity.setRatioNumItemId(ratioNum);
++        entity.setRatioDenItemId(ratioDen);
++        entity.setYoyFlag(item.getYoyFlag() == null ? DEFAULT_FLAG : item.getYoyFlag());
++        entity.setMomFlag(item.getMomFlag() == null ? DEFAULT_FLAG : item.getMomFlag());
++        entity.setDeptId(item.getDeptId());
++        entity.setStatus(status);
++        return entity;
++    }
++
++    /**
++     * 引用数据项校验（4001 拒存，TC-0014 步骤 6）：引用携带时必须命中本租户活跃数据项
++     * （多租户插件注入会话租户条件即同租户保证）、instance_id 与指标生效实例一致（同实例）
++     * 且 enabled=1（启用）——引用不存在/跨实例/未启用 → 4001「来源引用不存在」拒存。
++     * source_item_id 与比值分子分母同口径；比值分子分母由齐备性校验保证非空（agg_type=5）。
++     */
++    private void validateReferences(Map<Long, IotDataItem> itemById, Long instanceId,
++                                    Long sourceItemId, Long ratioNumItemId, Long ratioDenItemId,
++                                    Integer aggType) {
++        for (Long itemId : collectItemIds(new LinkedHashSet<>(), aggType, sourceItemId, ratioNumItemId, ratioDenItemId)) {
++            IotDataItem item = itemById.get(itemId);
++            if (item == null) {
++                throw referenceNotFound("来源引用不存在或已删除: 数据项 " + itemId);
++            }
++            if (!instanceId.equals(item.getInstanceId())) {
++                throw referenceNotFound("来源引用与指标归属实例不一致: 数据项 " + itemId
++                        + "（须与指标同实例）");
++            }
++            if (item.getEnabled() == null || item.getEnabled() != 1) {
++                throw referenceNotFound("来源引用的数据项未启用: 数据项 " + itemId);
++            }
++        }
++    }
++
++    /** 引用 id 收集（source_item_id + 比值分子分母按生效聚合方式；比值型齐备性由调用方先保证） */
++    private Set<Long> collectItemIds(Set<Long> sink, Integer aggType,
++                                     Long sourceItemId, Long ratioNumItemId, Long ratioDenItemId) {
++        if (sourceItemId != null) {
++            sink.add(sourceItemId);
++        }
++        if (aggType != null && aggType == AGG_TYPE_RATIO) {
++            if (ratioNumItemId != null) {
++                sink.add(ratioNumItemId);
++            }
++            if (ratioDenItemId != null) {
++                sink.add(ratioDenItemId);
++            }
++        }
++        return sink;
++    }
++
++    /** 引用数据项批内预载（一次 selectByIds——多租户插件注入会话租户条件即同租户保证） */
++    private Map<Long, IotDataItem> loadItemsByIds(Set<Long> itemIds) {
++        if (itemIds.isEmpty()) {
++            return Map.of();
++        }
++        return dataItemMapper.selectByIds(itemIds).stream()
++                .collect(Collectors.toMap(IotDataItem::getId, Function.identity(), (a, b) -> a));
++    }
++
++    /**
++     * 引用校验数据集解析：批内预载（generateMetrics 传入）时合并缺失引用补载结果——预载命中
++     * 直接复用、未命中（如单条路径 / 预载遗漏）按本次引用集 selectById 补载；单条创建（传 null）
++     * 退化为按本次引用集一次 selectById。
++     */
++    private Map<Long, IotDataItem> resolveReferenceItems(Map<Long, IotDataItem> prefetchedItems, Integer aggType,
++                                                         Long sourceItemId, Long ratioNumItemId,
++                                                         Long ratioDenItemId) {
++        Set<Long> refIds = collectItemIds(new LinkedHashSet<>(), aggType, sourceItemId, ratioNumItemId, ratioDenItemId);
++        if (prefetchedItems == null || prefetchedItems.isEmpty()) {
++            return loadItemsByIds(refIds);
++        }
++        Set<Long> missing = refIds.stream()
++                .filter(id -> !prefetchedItems.containsKey(id))
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        if (missing.isEmpty()) {
++            return prefetchedItems;
++        }
++        Map<Long, IotDataItem> merged = new LinkedHashMap<>(prefetchedItems);
++        merged.putAll(loadItemsByIds(missing));
++        return merged;
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 编码校验：非空、长度 ≤96、字符集 [A-Za-z0-9_]（表单 @Size/@Pattern 之外的服务层双保险） */
++    private String validateMetricCode(String metricCode) {
++        if (metricCode == null || metricCode.isBlank()) {
++            throw paramError("指标编码不能为空");
++        }
++        if (metricCode.length() > MAX_LEN_METRIC_CODE) {
++            throw paramError("指标编码超长（上限 " + MAX_LEN_METRIC_CODE + " 字符）");
++        }
++        if (!METRIC_CODE_PATTERN.matcher(metricCode).matches()) {
++            throw paramError("指标编码仅允许字母/数字/下划线: " + metricCode);
++        }
++        return metricCode;
++    }
++
++    /**
++     * 聚合方式解析（口径强制标注——未标注不可保存）：null/值域外 → 400 拒存
++     */
++    private Integer resolveAggType(Integer aggType) {
++        if (aggType == null || !AGG_TYPE_VALUES.contains(aggType)) {
++            throw paramError("聚合方式未标注或非法（口径强制标注——仅允许 1 平均 2 累计 3 最大 4 最小 5 比值）: " + aggType);
++        }
++        return aggType;
++    }
++
++    /**
++     * 统计周期解析（口径强制标注——未标注不可保存）：null/值域外 → 400 拒存
++     * （period ∈ HOUR/DAY/MONTH/YEAR）
++     */
++    private String resolvePeriod(String period) {
++        if (period == null || !PERIOD_VALUES.contains(period)) {
++            throw paramError("统计周期未标注或非法（口径强制标注——仅允许 HOUR/DAY/MONTH/YEAR）: " + period);
++        }
++        return period;
++    }
++
++    /**
++     * 日历口径解析（一期锁 1 自然日历）：未携带落 1（DDL DEFAULT '1' 同值）；携带 2 班次
++     * 拒创建（REQ-0024 非目标「一期不做班次口径聚合」）；其余值域外拒。同一指标不混用
++     * 两种日历口径随「列级单值 + 禁班次」结构性成立（REQ-0024 验收 4）
++     */
++    private Integer resolveCalendarType(Integer calendarType) {
++        if (calendarType == null) {
++            return DEFAULT_CALENDAR_TYPE;
++        }
++        if (!CALENDAR_TYPE_VALUES.contains(calendarType)) {
++            throw paramError("日历口径仅允许 1 自然 / 2 班次: " + calendarType);
++        }
++        if (calendarType == CALENDAR_TYPE_SHIFT) {
++            throw paramError("班次日历口径一期不开放（REQ-0024 一期不做班次口径聚合，calendar_type 锁 1 自然日历）");
++        }
++        return calendarType;
++    }
++
++    /** 启停开关值域解析（yoy_flag/mom_flag/status——0/1） */
++    private void resolveFlag(Integer flag, String message) {
++        if (flag != null && !FLAG_VALUES.contains(flag)) {
++            throw paramError(message + ": " + flag);
++        }
++    }
++
++    /** 创建期 status 解析：未携带落 1（DDL DEFAULT '1' 同值）；携带时值域 0/1 */
++    private Integer resolveCreateStatus(Integer requested) {
++        if (requested == null) {
++            return DEFAULT_STATUS;
++        }
++        if (!FLAG_VALUES.contains(requested)) {
++            throw paramError("指标状态仅允许 0 禁用 / 1 启用");
++        }
++        return requested;
++    }
++
++    /** 实例归属校验：必填 + 存在（iot_ 前缀表多租户插件注入会话租户条件即同租户保证） */
++    private IotModelInstance resolveInstance(Long instanceId) {
++        if (instanceId == null) {
++            throw paramError("归属实例不能为空（统计对象范围必填）");
++        }
++        IotModelInstance instance = instanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("归属实例不存在或已删除: " + instanceId);
++        }
++        return instance;
++    }
++
++    /** 部门校验：携带时存在（sys_dept 在插件覆盖表清单内，selectById 注入会话租户条件即同租户保证） */
++    private void validateDept(Long deptId) {
++        if (deptId == null) {
++            return;
++        }
++        SysDept dept = deptMapper.selectById(deptId);
++        if (dept == null) {
++            throw paramError("绑定部门不存在或已删除: " + deptId);
++        }
++    }
++
++    /** 启停事件发布（占位只发布不建监听，0013 范式——调度消费方归 FEAT-0013/0045） */
++    private void publishStatusChangedEvent(IotMetric metric, Integer newStatus) {
++        eventPublisher.publishEvent(new MetricStatusChangedEvent(metric.getId(), metric.getTenantId(),
++                metric.getMetricCode(), newStatus, metric.getPeriod(), metric.getAggType()));
++        log.info("指标启停事件已发布（停用停调度结果保留，调度消费方 FEAT-0013/0045）: metricId={}, tenantId={}, "
++                        + "metricCode={}, newStatus={}, period={}, aggType={}",
++                metric.getId(), metric.getTenantId(), metric.getMetricCode(), newStatus,
++                metric.getPeriod(), metric.getAggType());
++    }
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011-0021 口径） */
++    private BusinessException duplicateMetricCode(IotMetricCodeRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return duplicateCode4002("指标编码已被删除记录占用，不可复用: " + row.getMetricCode());
++        }
++        return duplicateCode4002("指标编码已存在: " + row.getMetricCode());
++    }
++
++    private BusinessException duplicateCode4002(String message) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), message);
++    }
++
++    /** 来源引用不存在拒存（4001，TC-0014 步骤 6——照 0013 数据项域 validation4001 口径） */
++    private BusinessException referenceNotFound(String message) {
++        return new BusinessException(CODE_REFERENCE_NOT_FOUND, message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/config/IotMetricMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/config/IotMetricMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..ab9a658
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/config/IotMetricMenuPermissionGuardTest.java
+@@ -0,0 +1,138 @@
++package net.otlab.admin.module.iot.metric.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.metric.controller.IotMetricController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0043 守卫测试：指标域菜单权限（sys_menu 4058-4062 五行）与控制器接口清单核对。
++ *
++ * <p>brief 硬要求「权限与接口一一对应」；指标域的形态：§3.1 p22 指标段三行接口
++ * （list / CRUD / changeStatus）本批交付<b>七端点</b>（list/detail/add/generate/edit/
++ * changeStatus/remove——detail 照 0021 点位域形态补详情端点（brief 五权限码含 query），
++ * generate 共用 iot:metric:add（生成是新增的批量形态）、changeStatus 共用 iot:metric:edit
++ * ——§3.1 权限列口径）+ 菜单<b>五行种子</b>（brief 明文：list/query/add/edit/remove 挂
++ * 4014 指标管理页下，id 4058-4062，4057 已被 TASK-0021 点位域占用）。本测试锁定
++ * （照 IotPointMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_metric_domain.sql 的 sys_menu 五行种子（id 4058-4062，
++ *     parent_id=4014）权限码必须恰好等于预期的五值映射——删行/换码/挪 parent 即红；</li>
++ * <li>代码侧：指标管理面 @SaCheckPermission 权限码并集必须恰好等于五值集合（多注解/
++ *     漏注解/写错码即红）；</li>
++ * <li>双向核对（七端点全部被 SQL 登记）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotMetricMenuPermissionGuardTest {
++
++    /** 五行菜单种子的预期映射（id → perms），与升级脚本 4058-4062 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4058L, "iot:metric:list",
++            4059L, "iot:metric:query",
++            4060L, "iot:metric:add",
++            4061L, "iot:metric:edit",
++            4062L, "iot:metric:remove");
++
++    /** 管理面控制器预期权限码（七端点共用五码——generate 共用 add、changeStatus 共用 edit） */
++    private static final Set<String> EXPECTED_CONTROLLER_PERMS = Set.of(
++            "iot:metric:list", "iot:metric:query", "iot:metric:add", "iot:metric:edit", "iot:metric:remove");
++
++    /** 升级脚本路径（从模块目录或仓库根目录向上定位 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_metric_domain.sql";
++
++    /** 菜单种子行形如 (4058, 4014, 4, '指标查询', 3, NULL, NULL, NULL, 'iot:metric:list', ...） */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[56]\\d),\\s*4014,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的指标菜单行恰好等于预期五值映射（4058-4062，parent 4014）")
++    void scriptRegistersExactlyTheFiveMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4058-4062 五行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 指标管理面控制器权限码并集恰好等于五值集合（generate 共用 add、changeStatus 共用 edit）")
++    void controllerPermissionsAreExactlyTheFivePerms() {
++        Set<String> annotated = collectControllerPerms();
++        assertEquals(EXPECTED_CONTROLLER_PERMS, annotated,
++                "指标管理面 @SaCheckPermission 权限码并集必须恰好等于五值集合（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向核对 - 七端点权限码全部被 SQL 登记（BUG-0046 口径：未登记即任何角色都无法持有）")
++    void controllerPermsAllRegisteredInSql() throws Exception {
++        Set<String> fromSql = new TreeSet<>(parseMenuRows(readScript()).values());
++        Set<String> fromCode = collectControllerPerms();
++        assertTrue(fromSql.containsAll(fromCode),
++                "管理面权限码必须全部在 sys_menu SQL 登记（BUG-0046 口径）——否则任何角色（含超管）都无法持有");
++    }
++
++    /** 收集指标管理面控制器的全部 @SaCheckPermission 权限码（方法级 + 类级） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = IotMetricController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（指标管理页 4014 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript() throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(SCRIPT_RELATIVE);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImplTest.java
+new file mode 100644
+index 0000000..f5242c6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/metric/service/impl/IotMetricServiceImplTest.java
+@@ -0,0 +1,981 @@
++package net.otlab.admin.module.iot.metric.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.AbstractWrapper;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermConditionAssembler;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm;
++import net.otlab.admin.module.iot.metric.dto.IotMetricUpdateForm;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.event.MetricStatusChangedEvent;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricCodeMapper;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricCodeRow;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.Collection;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 指标服务单元测试（TASK-0043）
++ *
++ * <p>核心业务纪律（REQ-0024 / §3.1 p22 指标段 / brief）：口径强制标注（agg_type/period
++ * 必填合法——未标注不可保存）、比值型分子分母齐备约束（缺一拒）+ 同实例存在启用（引用
++ * 不存在 4001）、非比值型 ratio_* 置 NULL、calendar_type 锁 1（班次 2 拒创建）、编码租户
++ * 内唯一双道闸 4002（含已删行预检「已被删除记录占用，不可复用」+ DuplicateKey 兜底）、
++ * 编码不入字典（ADR-0014——无字典校验路径）、metric_code 不可改、启停停调度结果保留语义
++ * （status 落库断言 + MetricStatusChangedEvent 发布，调度侧归 FEAT-0013）、批量生成逐项
++ * 校验整批事务（批内撞码/库内占用/比值齐备/instanceId 入参覆盖）、列表/详情数据权限裁剪
++ * （dept_id IN 部门集 OR instance_id IN 可见集——NULL 不特判 fail-closed、create_by 分支
++ * 不适用资产类）、写路径防线（编辑/启停/删除越权 403）。
++ *
++ * <p>standalone Mockito 范式（照 IotPointServiceImplTest）：Mapper 全 mock 不触真实库；
++ * TenantContext/SecurityUtils 静态 mock 供会话租户与登录用户取值；DataPermConditionAssembler
++ * 用真实实例（裁剪条件形态断言的真实渲染器）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotMetricServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long USER = 10L;
++
++    private static final long INSTANCE_ID = 8L;
++    private static final long DEPT_ID = 4L;
++    private static final long SOURCE_ITEM_ID = 300L;
++    private static final long RATIO_NUM_ITEM_ID = 301L;
++    private static final long RATIO_DEN_ITEM_ID = 302L;
++
++    @Mock
++    private IotMetricMapper baseMapper;
++
++    @Mock
++    private IotMetricCodeMapper metricCodeMapper;
++
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private IotDataItemMapper dataItemMapper;
++
++    @Mock
++    private SysDeptMapper deptMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private ApplicationEventPublisher eventPublisher;
++
++    private final DataPermConditionAssembler dataPermConditionAssembler = new DataPermConditionAssembler();
++
++    private IotMetricServiceImpl metricService;
++
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++    private org.mockito.MockedStatic<SecurityUtils> securityUtils;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotMetric.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, SysDept.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = org.mockito.Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(USER);
++
++        metricService = new IotMetricServiceImpl();
++        ReflectionTestUtils.setField(metricService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(metricService, "metricCodeMapper", metricCodeMapper);
++        ReflectionTestUtils.setField(metricService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(metricService, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(metricService, "deptMapper", deptMapper);
++        ReflectionTestUtils.setField(metricService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(metricService, "dataPermConditionAssembler", dataPermConditionAssembler);
++        ReflectionTestUtils.setField(metricService, "eventPublisher", eventPublisher);
++
++        // 默认全租户（scope=1）；裁剪用例逐用例覆盖
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        // 默认引用数据项齐备启用（比值分子/分母/来源同实例）；引用异常用例逐用例覆盖
++        when(dataItemMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return ids.stream().map(this::itemRow).collect(Collectors.toList());
++        });
++        // 默认编码未占用/实例与部门存在/落库成功（异常用例逐用例覆盖）
++        when(metricCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++        when(instanceMapper.selectById(anyLong())).thenAnswer(inv -> instanceRow(inv.getArgument(0, Long.class)));
++        when(deptMapper.selectById(anyLong())).thenAnswer(inv -> deptRow(inv.getArgument(0, Long.class)));
++        when(deptMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return ids.stream().map(this::deptRow).collect(Collectors.toList());
++        });
++        when(baseMapper.insert(any(IotMetric.class))).thenReturn(1);
++        when(baseMapper.updateById(any(IotMetric.class))).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具构建 ----------
++
++    private IotModelInstance instanceRow(Long id) {
++        IotModelInstance row = new IotModelInstance();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setInstanceCode("FA.WS01.EQ00" + id);
++        row.setInstanceName("实例-" + id);
++        row.setNodeType(4);
++        row.setStatus(1);
++        return row;
++    }
++
++    private SysDept deptRow(Long id) {
++        SysDept row = new SysDept();
++        row.setId(id);
++        row.setDeptName("部门-" + id);
++        row.setStatus(1);
++        return row;
++    }
++
++    /** 引用数据项行（默认同实例 8 且启用；跨实例/未启用用例按需覆盖） */
++    private IotDataItem itemRow(Long id) {
++        IotDataItem row = new IotDataItem();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setInstanceId(INSTANCE_ID);
++        row.setDataCode("ITEM_" + id);
++        row.setSourceType(1);
++        row.setEnabled(1);
++        row.setStatus(1);
++        return row;
++    }
++
++    private IotMetricCreateForm createForm(String code) {
++        IotMetricCreateForm form = new IotMetricCreateForm();
++        form.setMetricCode(code);
++        form.setMetricName("吨产气耗");
++        form.setInstanceId(INSTANCE_ID);
++        form.setAggType(1);
++        form.setPeriod("DAY");
++        form.setSourceItemId(SOURCE_ITEM_ID);
++        form.setDeptId(DEPT_ID);
++        return form;
++    }
++
++    private IotMetricCreateForm ratioForm(String code) {
++        IotMetricCreateForm form = createForm(code);
++        form.setAggType(5);
++        form.setSourceItemId(null);
++        form.setRatioNumItemId(RATIO_NUM_ITEM_ID);
++        form.setRatioDenItemId(RATIO_DEN_ITEM_ID);
++        return form;
++    }
++
++    private IotMetric metricRow(Long id) {
++        IotMetric row = new IotMetric();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setMetricCode("GAS_PER_TON");
++        row.setMetricName("吨产气耗");
++        row.setInstanceId(INSTANCE_ID);
++        row.setAggType(1);
++        row.setPeriod("DAY");
++        row.setCalendarType(1);
++        row.setYoyFlag(0);
++        row.setMomFlag(0);
++        row.setStatus(1);
++        return row;
++    }
++
++    private static int codeOf(BusinessException e) {
++        return e.getCode();
++    }
++
++    // ---------- 新增：口径强制标注（未标注不可保存） ----------
++
++    @Test
++    @DisplayName("新增 - 聚合型指标建档成功：白名单落库/status 默认 1/calendar 默认 1/yoy/mom 默认 0/租户会话覆盖")
++    void testCreate_AggregationMetric_Success() {
++        IotMetricCreateForm form = createForm("GAS_PER_TON_DAY");
++        form.setYoyFlag(null);
++        form.setStatus(null);
++
++        assertTrue(metricService.createMetric(form));
++
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).insert(captor.capture());
++        IotMetric entity = captor.getValue();
++        assertEquals("GAS_PER_TON_DAY", entity.getMetricCode());
++        assertEquals("吨产气耗", entity.getMetricName());
++        assertEquals(INSTANCE_ID, entity.getInstanceId());
++        assertEquals(SOURCE_ITEM_ID, entity.getSourceItemId());
++        assertEquals(1, entity.getAggType());
++        assertEquals("DAY", entity.getPeriod());
++        assertEquals(1, entity.getCalendarType(), "未携带 calendar_type 落 1（DDL DEFAULT 同值）");
++        assertEquals(0, entity.getYoyFlag(), "未携带 yoy_flag 落 0（DDL DEFAULT 同值）");
++        assertEquals(0, entity.getMomFlag());
++        assertEquals(DEPT_ID, entity.getDeptId());
++        assertEquals(1, entity.getStatus(), "未携带 status 落 1（DDL DEFAULT '1' 同值）");
++        assertEquals(TENANT, entity.getTenantId(), "tenant_id 会话覆盖");
++        assertNull(entity.getRatioNumItemId(), "非比值型 ratio_num 置 NULL");
++        assertNull(entity.getRatioDenItemId(), "非比值型 ratio_den 置 NULL");
++        assertNull(entity.getId(), "id 不落请求值（框架自增）");
++    }
++
++    @Test
++    @DisplayName("新增 - 口径未标注：agg_type 缺失不可保存（400，口径强制标注）")
++    void testCreate_MissingAggType_Rejected() {
++        IotMetricCreateForm form = createForm("M_NO_AGG");
++        form.setAggType(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("口径强制标注"), "文案明示口径强制标注: " + e.getDefaultMessage());
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 口径未标注：period 缺失不可保存（400）")
++    void testCreate_MissingPeriod_Rejected() {
++        IotMetricCreateForm form = createForm("M_NO_PERIOD");
++        form.setPeriod(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("口径强制标注"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 口径非法：period=WEEK 值域外拒（400，仅 HOUR/DAY/MONTH/YEAR）")
++    void testCreate_InvalidPeriod_Rejected() {
++        IotMetricCreateForm form = createForm("M_WEEK");
++        form.setPeriod("WEEK");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    // ---------- 新增：编码双道闸 4002 / 字符集 / 不入字典（ADR-0014） ----------
++
++    @Test
++    @DisplayName("新增 - 编码撞活跃行：4002「已存在」（双道闸第一道预检）")
++    void testCreate_CodeOccupied_ActiveRow() {
++        IotMetricCodeRow row = new IotMetricCodeRow();
++        row.setId(99L);
++        row.setMetricCode("GAS_PER_TON_DAY");
++        row.setDeleted(0);
++        when(metricCodeMapper.selectOccupiedByCodes(TENANT, List.of("GAS_PER_TON_DAY"))).thenReturn(List.of(row));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(createForm("GAS_PER_TON_DAY")));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("已存在"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 编码撞已删行：4002「已被删除记录占用，不可复用」（删除归档不复用）")
++    void testCreate_CodeOccupied_DeletedRow() {
++        IotMetricCodeRow row = new IotMetricCodeRow();
++        row.setId(99L);
++        row.setMetricCode("GAS_PER_TON_DAY");
++        row.setDeleted(1);
++        when(metricCodeMapper.selectOccupiedByCodes(TENANT, List.of("GAS_PER_TON_DAY"))).thenReturn(List.of(row));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(createForm("GAS_PER_TON_DAY")));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("已被删除记录占用，不可复用"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 并发窗口 DuplicateKey 兜底：4002（物理唯一索引）")
++    void testCreate_DuplicateKeyFallback() {
++        when(baseMapper.insert(any(IotMetric.class))).thenThrow(new DuplicateKeyException("uk_tenant_metric_code"));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(createForm("GAS_PER_TON_DAY")));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), codeOf(e));
++    }
++
++    @Test
++    @DisplayName("新增 - 编码字符集 [A-Za-z0-9_]：含点/横杠拒（400）")
++    void testCreate_CodeCharsetRejected() {
++        IotMetricCreateForm form = createForm("GAS.PER-TON");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("字母/数字/下划线"));
++    }
++
++    @Test
++    @DisplayName("新增 - 编码超长（>96）拒（400）；编码不入业务字典（ADR-0014）——全链路无字典校验交互")
++    void testCreate_CodeTooLong_And_NoDictValidation() {
++        IotMetricCreateForm form = createForm("G".repeat(97));
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++
++        // ADR-0014 口径的服务层形态：metric_code 无字典校验路径——建档全链路不触任何字典 Mapper
++        // （指标域服务依赖清单无 SysDictMapper；此处以「合法编码建档成功且无字典类校验调用」作
++        // 行为留痕，字典 Mapper 不在本测试夹具装配清单内即是断言）
++        assertTrue(metricService.createMetric(createForm("GAS_PER_TON_DAY")));
++        verify(baseMapper).insert(any(IotMetric.class));
++    }
++
++    // ---------- 新增：比值型约束（缺一拒 / 同实例存在启用 4001 / 非比值型置 NULL） ----------
++
++    @Test
++    @DisplayName("新增 - 比值型缺分母：400 拒（REQ-0024 验收 2——分子分母齐备，缺一拒）")
++    void testCreate_RatioMissingDenominator_Rejected() {
++        IotMetricCreateForm form = ratioForm("EFF_PER_TON");
++        form.setRatioDenItemId(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("分子与分母"), "文案明示分子分母齐备: " + e.getDefaultMessage());
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 比值型缺分子：400 拒（缺一不可）")
++    void testCreate_RatioMissingNumerator_Rejected() {
++        IotMetricCreateForm form = ratioForm("EFF_PER_TON");
++        form.setRatioNumItemId(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 比值型分子不存在：4001 拒存（引用不存在——TC-0014 步骤 6）")
++    void testCreate_RatioReferenceNotExists_4001() {
++        when(dataItemMapper.selectByIds(anyCollection())).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(ratioForm("EFF_PER_TON")));
++        assertEquals(4001, codeOf(e), "来源引用不存在 4001（ot-core 未设枚举，数据项域同款常量）");
++        assertTrue(e.getDefaultMessage().contains("来源引用不存在"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 比值型分母跨实例：4001 拒存（同实例约束——REQ-0024 验收 2）")
++    void testCreate_RatioReferenceCrossInstance_4001() {
++        when(dataItemMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return ids.stream().map(id -> {
++                IotDataItem row = itemRow(id);
++                // 分母 302 挂到另一实例（同租户不同实例——比值型须同实例）
++                if (id == RATIO_DEN_ITEM_ID) {
++                    row.setInstanceId(9L);
++                }
++                return row;
++            }).collect(Collectors.toList());
++        });
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(ratioForm("EFF_PER_TON")));
++        assertEquals(4001, codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("同实例"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 比值型分子未启用：4001 拒存（存在启用约束）")
++    void testCreate_RatioReferenceDisabled_4001() {
++        when(dataItemMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return ids.stream().map(id -> {
++                IotDataItem row = itemRow(id);
++                if (id == RATIO_NUM_ITEM_ID) {
++                    row.setEnabled(0);
++                }
++                return row;
++            }).collect(Collectors.toList());
++        });
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(ratioForm("EFF_PER_TON")));
++        assertEquals(4001, codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("未启用"));
++    }
++
++    @Test
++    @DisplayName("新增 - 比值型齐备且同实例启用：建档成功（ratio 字段落库）")
++    void testCreate_RatioComplete_Success() {
++        assertTrue(metricService.createMetric(ratioForm("EFF_PER_TON")));
++
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(5, captor.getValue().getAggType());
++        assertEquals(RATIO_NUM_ITEM_ID, captor.getValue().getRatioNumItemId());
++        assertEquals(RATIO_DEN_ITEM_ID, captor.getValue().getRatioDenItemId());
++    }
++
++    @Test
++    @DisplayName("新增 - 非比值型误携带 ratio_*：请求值忽略、强制置 NULL")
++    void testCreate_NonRatio_RatioFieldsNulled() {
++        IotMetricCreateForm form = createForm("GAS_PER_TON_DAY");
++        form.setRatioNumItemId(RATIO_NUM_ITEM_ID);
++        form.setRatioDenItemId(RATIO_DEN_ITEM_ID);
++
++        assertTrue(metricService.createMetric(form));
++
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).insert(captor.capture());
++        assertNull(captor.getValue().getRatioNumItemId(), "非比值型 ratio_num 忽略请求值置 NULL");
++        assertNull(captor.getValue().getRatioDenItemId(), "非比值型 ratio_den 忽略请求值置 NULL");
++    }
++
++    @Test
++    @DisplayName("新增 - 来源数据项引用不存在：4001 拒存（TC-0014 步骤 6——来源引用不存在编码拒存）")
++    void testCreate_SourceReferenceNotExists_4001() {
++        when(dataItemMapper.selectByIds(anyCollection())).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.createMetric(createForm("GAS_PER_TON_DAY")));
++        assertEquals(4001, codeOf(e));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    // ---------- 新增：calendar_type 锁 1（班次拒） / 归属校验 / 开关值域 ----------
++
++    @Test
++    @DisplayName("新增 - calendar_type=2 班次拒创建（REQ-0024 一期不做班次口径）")
++    void testCreate_CalendarShiftRejected() {
++        IotMetricCreateForm form = createForm("M_SHIFT");
++        form.setCalendarType(2);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("班次"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - calendar_type=3 值域外拒（400）")
++    void testCreate_CalendarOutOfRangeRejected() {
++        IotMetricCreateForm form = createForm("M_CAL3");
++        form.setCalendarType(3);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.createMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++    }
++
++    @Test
++    @DisplayName("新增 - 归属校验：instance_id 缺失 400 / 实例不存在 400")
++    void testCreate_InstanceValidation() {
++        IotMetricCreateForm noInstance = createForm("M_NO_INST");
++        noInstance.setInstanceId(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> metricService.createMetric(noInstance));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e1));
++
++        when(instanceMapper.selectById(88L)).thenReturn(null);
++        IotMetricCreateForm ghostInstance = createForm("M_GHOST_INST");
++        ghostInstance.setInstanceId(88L);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> metricService.createMetric(ghostInstance));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++        assertTrue(e2.getDefaultMessage().contains("归属实例不存在"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 部门校验：dept_id 不存在拒（400）；yoy_flag/mom_flag 值域外拒（400）")
++    void testCreate_DeptAndFlagValidation() {
++        when(deptMapper.selectById(77L)).thenReturn(null);
++        IotMetricCreateForm ghostDept = createForm("M_GHOST_DEPT");
++        ghostDept.setDeptId(77L);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> metricService.createMetric(ghostDept));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e1));
++        assertTrue(e1.getDefaultMessage().contains("绑定部门不存在"));
++
++        IotMetricCreateForm badYoy = createForm("M_BAD_YOY");
++        badYoy.setYoyFlag(2);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> metricService.createMetric(badYoy));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    // ---------- 编辑 ----------
++
++    @Test
++    @DisplayName("编辑 - metric_code 不可改：携带不一致拒（400，编码即锚点）")
++    void testEdit_CodeImmutable() {
++        when(baseMapper.selectById(5L)).thenReturn(metricRow(5L));
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(5L);
++        form.setMetricCode("NEW_CODE");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.updateMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("不允许修改"));
++        verify(baseMapper, never()).updateById(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 白名单更新：name/instance/source/agg/period/calendar/yoy/mom/dept 进 SET，"
++            + "status/metricCode 不进编辑集（启停独立接口）")
++    void testEdit_WhitelistUpdate() {
++        IotMetric existing = metricRow(5L);
++        existing.setAggType(5);
++        existing.setRatioNumItemId(RATIO_NUM_ITEM_ID);
++        existing.setRatioDenItemId(RATIO_DEN_ITEM_ID);
++        when(baseMapper.selectById(5L)).thenReturn(existing);
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(5L);
++        form.setMetricName("吨产气耗（改）");
++        form.setPeriod("MONTH");
++        form.setYoyFlag(1);
++        form.setMomFlag(1);
++        form.setDeptId(5L);
++
++        assertTrue(metricService.updateMetric(form));
++
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotMetric upd = captor.getValue();
++        assertEquals("吨产气耗（改）", upd.getMetricName());
++        assertEquals("MONTH", upd.getPeriod());
++        assertEquals(1, upd.getYoyFlag());
++        assertEquals(1, upd.getMomFlag());
++        assertEquals(5L, upd.getDeptId());
++        assertNull(upd.getStatus(), "status 不进编辑集（启停走 changeStatus 独立接口）");
++        assertNull(upd.getMetricCode(), "metricCode 永不进管理面更新集（mass assignment 防线）");
++        assertNull(upd.getAggType(), "未携带不进 SET（MP null 跳过保持库内原值）");
++    }
++
++    @Test
++    @DisplayName("编辑 - 生效聚合切非比值型：ratio_* 显式清 NULL（UpdateWrapper——实体 null 跳过清不掉旧值）")
++    void testEdit_SwitchToNonRatio_ClearsRatioFields() {
++        IotMetric existing = metricRow(5L);
++        existing.setAggType(5);
++        existing.setRatioNumItemId(RATIO_NUM_ITEM_ID);
++        existing.setRatioDenItemId(RATIO_DEN_ITEM_ID);
++        when(baseMapper.selectById(5L)).thenReturn(existing);
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(5L);
++        form.setAggType(1);
++        form.setSourceItemId(SOURCE_ITEM_ID);
++
++        assertTrue(metricService.updateMetric(form));
++
++        // 非比值型：ratio_* 显式清 NULL（UpdateWrapper update 调用——entity=null + wrapper 两参形态）
++        verify(baseMapper).update(any(), any(Wrapper.class));
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertNull(captor.getValue().getRatioNumItemId(), "非比值型比值字段不进实体 SET");
++    }
++
++    @Test
++    @DisplayName("编辑 - 生效组合为比值型而分子分母缺一：400 拒（齐备性对编辑同口径）")
++    void testEdit_RatioIncomplete_Rejected() {
++        IotMetric existing = metricRow(5L);
++        when(baseMapper.selectById(5L)).thenReturn(existing);
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(5L);
++        form.setAggType(5);
++        form.setRatioNumItemId(RATIO_NUM_ITEM_ID);
++        // 未携带分母、库内原值亦无 → 生效组合缺分母
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.updateMetric(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("分子与分母"));
++        verify(baseMapper, never()).updateById(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 越权 403：不可见目标拒且 updateById 不触达（写路径防线——brief 口径照 0021）")
++    void testEdit_InvisibleForbidden() {
++        when(baseMapper.selectById(5L)).thenReturn(metricRow(5L));
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(9L), false));
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(5L);
++        form.setMetricName("越权改名");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> metricService.updateMetric(form));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), codeOf(e));
++        assertTrue(!e.getDefaultMessage().contains("GAS"), "403 文案不泄露指标编码");
++        verify(baseMapper, never()).updateById(any(IotMetric.class));
++    }
++
++    // ---------- 启停（停用停调度结果保留——status 落库断言 + 事件发布） ----------
++
++    @Test
++    @DisplayName("启停 - 停用：status=0 落库（停止调度、已算结果保留——无删除动作）+ 事件 newStatus=0")
++    void testChangeStatus_Disable_PersistedAndEvent() {
++        IotMetric existing = metricRow(5L);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(existing));
++
++        assertTrue(metricService.changeMetricStatus(List.of(5L), 0));
++
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(0, captor.getValue().getStatus(), "停用 status=0 落库（停调度结果保留）");
++        assertEquals(5L, captor.getValue().getId());
++        ArgumentCaptor<MetricStatusChangedEvent> evt = ArgumentCaptor.forClass(MetricStatusChangedEvent.class);
++        verify(eventPublisher).publishEvent(evt.capture());
++        assertEquals(0, evt.getValue().newStatus());
++        assertEquals("GAS_PER_TON", evt.getValue().metricCode());
++    }
++
++    @Test
++    @DisplayName("启停 - 启用：status=1 落库 + 事件 newStatus=1（恢复调度归 FEAT-0013 消费）")
++    void testChangeStatus_Enable_Event() {
++        IotMetric existing = metricRow(5L);
++        existing.setStatus(0);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(existing));
++
++        assertTrue(metricService.changeMetricStatus(List.of(5L), 1));
++
++        ArgumentCaptor<MetricStatusChangedEvent> evt = ArgumentCaptor.forClass(MetricStatusChangedEvent.class);
++        verify(eventPublisher).publishEvent(evt.capture());
++        assertEquals(1, evt.getValue().newStatus());
++        assertEquals("DAY", evt.getValue().period(), "事件 payload 携带调度周期口径");
++    }
++
++    @Test
++    @DisplayName("启停 - 状态值域外 400；ids 缺失 400；批内不存在整批拒绝 400")
++    void testChangeStatus_Validations() {
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> metricService.changeMetricStatus(List.of(5L), 2));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e1));
++
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> metricService.changeMetricStatus(List.of(), 0));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(metricRow(5L)));
++        BusinessException e3 = assertThrows(BusinessException.class,
++                () -> metricService.changeMetricStatus(List.of(5L, 6L), 0));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e3));
++        assertTrue(e3.getDefaultMessage().contains("6"), "缺失 id 明示: " + e3.getDefaultMessage());
++        verify(baseMapper, never()).updateById(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("启停 - 越权 403：批内任一不可见整批拒绝（fail-closed 不半批启停）")
++    void testChangeStatus_InvisibleForbidden() {
++        IotMetric visible = metricRow(5L);
++        visible.setDeptId(101L);
++        IotMetric invisible = metricRow(6L);
++        invisible.setMetricCode("OTHER_METRIC");
++        invisible.setInstanceId(9L);
++        invisible.setDeptId(null);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(visible, invisible));
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(8L), false));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.changeMetricStatus(List.of(5L, 6L), 0));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), codeOf(e));
++        verify(baseMapper, never()).updateById(any(IotMetric.class));
++        verify(eventPublisher, never()).publishEvent(any(MetricStatusChangedEvent.class));
++    }
++
++    // ---------- 批量删除 ----------
++
++    @Test
++    @DisplayName("删除 - 软删成功（removeByIds；编码归档不复用——预检含已删行口径）")
++    void testDelete_Success() {
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(metricRow(5L)));
++        when(baseMapper.deleteByIds(anyCollection())).thenReturn(1);
++
++        assertTrue(metricService.deleteMetrics(List.of(5L)));
++        verify(baseMapper).deleteByIds(anyCollection());
++    }
++
++    @Test
++    @DisplayName("删除 - 越权 403（整批 fail-closed）；ids 缺失/批内不存在 400")
++    void testDelete_Guards() {
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(9L), false));
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(metricRow(5L)));
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> metricService.deleteMetrics(List.of(5L)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), codeOf(e1));
++        verify(baseMapper, never()).deleteByIds(anyCollection());
++
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.allTenant(false));
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> metricService.deleteMetrics(List.of()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(metricRow(5L)));
++        BusinessException e3 = assertThrows(BusinessException.class,
++                () -> metricService.deleteMetrics(List.of(5L, 6L)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e3));
++    }
++
++    // ---------- 列表 / 详情：数据权限裁剪（ADR-0016 裁决 6 同型） ----------
++
++    @Test
++    @DisplayName("列表裁剪 - 受限用户：dept_id IN 部门集 OR instance_id IN 可见集字面条件；"
++            + "无 create_by 分支（资产类——brief 口径）；NULL 不特判（无 IS NULL 分支）")
++    void testList_Restricted_DualCondition() {
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(8L, 9L), false));
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(new Page<>(1, 10));
++
++        metricService.selectMetricList(new Page<>(1, 10), new IotMetric());
++
++        ArgumentCaptor<Wrapper<IotMetric>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        String segment = ((AbstractWrapper<?, ?, ?>) captor.getValue()).getSqlSegment();
++        assertTrue(segment.contains("dept_id IN"), "部门分支条件: " + segment);
++        assertTrue(segment.contains("instance_id IN"), "实例分支条件: " + segment);
++        assertTrue(segment.contains(" OR "), "双条件 OR 合并: " + segment);
++        assertTrue(!segment.contains("create_by"), "create_by 分支不适用（资产类非个人创建物）: " + segment);
++        assertTrue(!segment.contains("IS NULL"), "NULL 不特判（ADR-0016 裁决 6）: " + segment);
++    }
++
++    @Test
++    @DisplayName("列表裁剪 - 可见集空 fail-closed：1=0 空列表；scope=1 全租户不追加条件")
++    void testList_FailClosedAndAllTenant() {
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.denied());
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(new Page<>(1, 10));
++        metricService.selectMetricList(new Page<>(1, 10), new IotMetric());
++        ArgumentCaptor<Wrapper<IotMetric>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        assertTrue(((AbstractWrapper<?, ?, ?>) captor.getValue()).getSqlSegment().contains("1 = 0"));
++
++        org.mockito.Mockito.reset(baseMapper);
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(new Page<>(1, 10));
++        metricService.selectMetricList(new Page<>(1, 10), new IotMetric());
++        ArgumentCaptor<Wrapper<IotMetric>> captor2 = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor2.capture());
++        assertTrue(!((AbstractWrapper<?, ?, ?>) captor2.getValue()).getSqlSegment().contains("dept_id IN"),
++                "allTenant 不过滤（未绑部门行对租户管理员可见）");
++    }
++
++    @Test
++    @DisplayName("详情 - 越权 403（SCOPE_FORBIDDEN 单对象形态）；可见放行；不存在 400")
++    void testDetail_Guards() {
++        when(baseMapper.selectById(5L)).thenReturn(metricRow(5L));
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(9L), false));
++        BusinessException e1 = assertThrows(BusinessException.class, () -> metricService.getMetricDetail(5L));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), codeOf(e1));
++        assertTrue(!e1.getDefaultMessage().contains("GAS"), "403 文案不泄露指标编码");
++
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.allTenant(false));
++        assertNotNull(metricService.getMetricDetail(5L));
++
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(8L), Set.of(8L), false));
++        IotMetric deptVisible = metricRow(6L);
++        deptVisible.setInstanceId(9L);
++        deptVisible.setDeptId(8L);
++        when(baseMapper.selectById(6L)).thenReturn(deptVisible);
++        assertNotNull(metricService.getMetricDetail(6L), "dept 分支命中亦放行（双条件 OR）");
++
++        when(baseMapper.selectById(7L)).thenReturn(null);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> metricService.getMetricDetail(7L));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++    }
++
++    // ---------- 批量生成（按请求清单——「模板自动生成」占位口径） ----------
++
++    @Test
++    @DisplayName("批量生成 - 两项清单成功：逐项落库、instanceId 以 query 入参覆盖项内值、"
++            + "返回生成条数（0011 批量保存范式——「模板自动生成」占位口径）")
++    void testGenerate_BatchSuccess() {
++        IotMetricCreateForm m1 = createForm("GEN_M1");
++        m1.setInstanceId(99L);
++        IotMetricCreateForm m2 = ratioForm("GEN_M2");
++        m2.setInstanceId(99L);
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(m1, m2));
++
++        int count = metricService.generateMetrics(INSTANCE_ID, form);
++
++        assertEquals(2, count);
++        ArgumentCaptor<IotMetric> captor = ArgumentCaptor.forClass(IotMetric.class);
++        verify(baseMapper, org.mockito.Mockito.times(2)).insert(captor.capture());
++        List<IotMetric> inserted = captor.getAllValues();
++        assertEquals("GEN_M1", inserted.get(0).getMetricCode());
++        assertEquals(INSTANCE_ID, inserted.get(0).getInstanceId(), "instanceId 以 query 入参覆盖项内携带值（0011 templateId 同款）");
++        assertEquals(INSTANCE_ID, inserted.get(1).getInstanceId());
++        assertEquals(5, inserted.get(1).getAggType());
++        assertEquals(RATIO_NUM_ITEM_ID, inserted.get(1).getRatioNumItemId());
++        assertEquals(1, inserted.get(0).getStatus(), "生成项 status 默认 1（DDL DEFAULT 同值）");
++    }
++
++    @Test
++    @DisplayName("批量生成 - 批内撞码：4002 整批拒绝（第一道判定，未触库内核对）")
++    void testGenerate_BatchInternalCollision() {
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1"), createForm("GEN_M1")));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("批内重复"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 库内编码占用：4002 整批拒绝（含已删行旁路预检）")
++    void testGenerate_OccupiedCode() {
++        IotMetricCodeRow row = new IotMetricCodeRow();
++        row.setId(99L);
++        row.setMetricCode("GEN_M1");
++        row.setDeleted(0);
++        when(metricCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of(row));
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1"), createForm("GEN_M2")));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), codeOf(e));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 清单项比值型缺分母：400 整批拒绝（逐项校验，未落库任何行）")
++    void testGenerate_ItemMissingRatio_WholeBatchRejected() {
++        IotMetricCreateForm bad = ratioForm("GEN_BAD");
++        bad.setRatioDenItemId(null);
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1"), bad));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("分子与分母"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 清单项口径未标注（agg_type 缺失）：400 整批拒绝")
++    void testGenerate_ItemMissingAggType() {
++        IotMetricCreateForm bad = createForm("GEN_NO_AGG");
++        bad.setAggType(null);
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1"), bad));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("口径强制标注"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 目标实例不可见：403 整批拒绝（创建侧防线——照 0012 修订轮 I-1 同型）")
++    void testGenerate_InstanceInvisible() {
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(9L), false));
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1")));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), codeOf(e));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 超单批上限 400；清单空 400；instanceId 缺失 400")
++    void testGenerate_BatchGuards() {
++        List<IotMetricCreateForm> tooMany = new java.util.ArrayList<>();
++        for (int i = 0; i < 501; i++) {
++            tooMany.add(createForm("GEN_M" + i));
++        }
++        IotMetricGenerateForm over = new IotMetricGenerateForm();
++        over.setMetrics(tooMany);
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, over));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e1));
++
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, new IotMetricGenerateForm()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e2));
++
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1")));
++        BusinessException e3 = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(null, form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e3));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("批量生成 - 清单项绑定部门不存在：400 整批拒绝（批内一次 selectByIds）")
++    void testGenerate_DeptMissing() {
++        when(deptMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            // 部门 7 不存在
++            return ids.stream().filter(id -> id != 7L).map(this::deptRow).collect(Collectors.toList());
++        });
++        IotMetricCreateForm bad = createForm("GEN_GHOST_DEPT");
++        bad.setDeptId(7L);
++        IotMetricGenerateForm form = new IotMetricGenerateForm();
++        form.setMetrics(List.of(createForm("GEN_M1"), bad));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> metricService.generateMetrics(INSTANCE_ID, form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), codeOf(e));
++        assertTrue(e.getDefaultMessage().contains("绑定部门不存在"));
++        verify(baseMapper, never()).insert(any(IotMetric.class));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/MetricRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/MetricRedlineTest.java
+new file mode 100644
+index 0000000..7539c2f
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/MetricRedlineTest.java
+@@ -0,0 +1,297 @@
++package net.otlab.admin.module.iot.redline;
++
++import com.baomidou.mybatisplus.core.conditions.AbstractWrapper;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.dto.IotMetricUpdateForm;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 管理面指标域越权红线用例（TASK-0043，ADR-0016 裁决 2/6 同型 + brief 口径「红线套件
++ * 增补指标域用例——授权例外」）。
++ *
++ * <p>指标列表 + 详情双接口的裁剪接线回归 + 写路径防线三原语（brief 口径「数据权限裁剪——
++ * dept_id IN 部门集 OR instance_id ∈ 可见集，ADR-0016 裁决 6 同型；create_by 分支不适用
++ * 资产类——照 0021 口径；写路径防线 update/remove/status 照 0021 修订轮范式」）：
++ * <ol>
++ * <li>A 厂账号（scope=2 部门101）跨厂查询：列表只见 dept_id IN 部门集 OR instance_id IN
++ *     可见集行（指标域双条件——详细设计 §1.7「指标查询按 dept_id 与实例双重过滤」），
++ *     B 厂指标不返回；</li>
++ * <li>未绑部门指标 fail-closed：instance 20（LINE99 未绑部门产线）且 dept NULL——非
++ *     scope=1 用户列表不返回、详情 403（NULL 不特判，ADR-0016 裁决 6 结构性满足）；
++ *     scope=1 管理员可见（对照面）；</li>
++ * <li>详情 403（SCOPE_FORBIDDEN——单对象形态，裁决 2）：跨厂与 fail-closed 行均 403，
++ *     文案不泄露指标编码；</li>
++ * <li><b>纯 scope=4 空集</b>：create_by 分支不适用（资产类非个人创建物，brief 口径
++ *     留痕——与 REQ-0002 裁决 3 对齐）：即使指标行 create_by=本人，列表仍空集
++ *     （显式固化）；</li>
++ * <li>可见集空 fail-closed：恒假条件 1=0（漏拼权限条件时模拟器全量放行、断言即红）；</li>
++ * <li>写越权 403（写路径防线三原语）：直改/启停/删除不可见指标三路径全 403 文案不泄露
++ *     指标编码 + 可见指标写操作回归正常；创建侧防线（add/generate 目标实例须可见——
++ *     照 0012 修订轮 I-1 同型）。</li>
++ * </ol>
++ *
++ * <p>真实链口径：六步翻译组件（DataPermServiceImpl）→ 指标服务（IotMetricServiceImpl）→
++ * 真实 DataPermConditionAssembler 全真实实现，持久层为内存夹具（{@link RedlineFixture}）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class MetricRedlineTest {
++
++    private RedlineFixture fx;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        RedlineFixture.initEntityMeta();
++    }
++
++    @BeforeEach
++    void setUp() {
++        fx = new RedlineFixture();
++    }
++
++    @AfterEach
++    void tearDown() {
++        fx.close();
++    }
++
++    // ---------- 断言辅助 ----------
++
++    private Page<IotMetric> listPage() {
++        return fx.metricService.selectMetricList(new Page<>(1, 10), new IotMetric());
++    }
++
++    private static Set<Long> pageIds(Page<IotMetric> page) {
++        return page.getRecords().stream().map(IotMetric::getId).collect(Collectors.toSet());
++    }
++
++    /** 捕获列表查询 SQL 片段（条件形态回归断言） */
++    private String capturedListSqlSegment() {
++        ArgumentCaptor<Wrapper<IotMetric>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(fx.metricMapper()).selectPage(any(), captor.capture());
++        return ((AbstractWrapper<?, ?, ?>) captor.getValue()).getSqlSegment();
++    }
++
++    private static IotMetricUpdateForm updForm(long id) {
++        IotMetricUpdateForm form = new IotMetricUpdateForm();
++        form.setId(id);
++        form.setMetricName("越权改名");
++        return form;
++    }
++
++    // ---------- 场景 1：A 厂账号跨厂查询（列表双条件裁剪） ----------
++
++    @Test
++    @DisplayName("红线一-A · A厂账号（scope=2）跨厂查询：列表只见 dept_id IN 部门集 OR instance_id IN 可见集行")
++    void scenario1_redline1A_crossFactoryList_dualCondition() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        Page<IotMetric> page = listPage();
++
++        Set<Long> ids = pageIds(page);
++        assertTrue(ids.contains(RedlineFixture.METRIC_A_BY_DEPT),
++                "A 厂部门锚点指标可见（dept 分支）: " + ids);
++        assertTrue(ids.contains(RedlineFixture.METRIC_A_BY_INSTANCE),
++                "A 厂实例锚点指标可见（instance 分支——dept NULL 行经 instance 命中）: " + ids);
++        assertTrue(!ids.contains(RedlineFixture.METRIC_B),
++                "B 厂指标不可见（跨厂越权）: " + ids);
++        assertTrue(!ids.contains(RedlineFixture.METRIC_NO_ANCHOR),
++                "未绑部门指标 fail-closed（dept NULL 且 instance 20 ∉ 可见集）: " + ids);
++        assertEquals(Set.of(RedlineFixture.METRIC_A_BY_DEPT, RedlineFixture.METRIC_A_BY_INSTANCE), ids);
++
++        // 条件形态回归：真实 Assembler 渲染的双条件字面 SQL（漏拼/错列名即红）
++        String sql = capturedListSqlSegment();
++        assertTrue(sql.contains("dept_id IN"), "部门分支条件在 wrapper: " + sql);
++        assertTrue(sql.contains("instance_id IN"), "实例分支条件在 wrapper: " + sql);
++        assertTrue(sql.contains(" OR "), "双条件 OR 合并: " + sql);
++        assertTrue(!sql.contains("create_by"), "create_by 分支不适用（资产类非个人创建物）: " + sql);
++        assertTrue(!sql.contains("IS NULL"), "NULL 不特判（ADR-0016 裁决 6）: " + sql);
++    }
++
++    @Test
++    @DisplayName("对照面 · scope=1 管理员全量可见：不追加权限条件（未绑部门行对租户管理员可见）")
++    void adminSeesAll() {
++        fx.loginAs(RedlineFixture.ADMIN);
++
++        Set<Long> ids = pageIds(listPage());
++
++        assertEquals(Set.of(RedlineFixture.METRIC_A_BY_DEPT, RedlineFixture.METRIC_A_BY_INSTANCE,
++                RedlineFixture.METRIC_B, RedlineFixture.METRIC_NO_ANCHOR), ids,
++                "scope=1 全租户可见（含未绑部门行）");
++        String sql = capturedListSqlSegment();
++        assertTrue(!sql.contains("dept_id IN"), "allTenant 不追加权限条件: " + sql);
++    }
++
++    // ---------- 场景 2：未绑部门指标 fail-closed（列表不返回 / 详情 403） ----------
++
++    @Test
++    @DisplayName("未绑部门 fail-closed · 非 scope=1 用户：dept NULL 且 instance 不可见行列表不返回、详情 403")
++    void noAnchorRowFailClosed() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        assertTrue(!pageIds(listPage()).contains(RedlineFixture.METRIC_NO_ANCHOR), "fail-closed 行列表不返回");
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.getMetricDetail(RedlineFixture.METRIC_NO_ANCHOR));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode(), "fail-closed 行详情 403");
++        assertTrue(e.getDefaultMessage().contains("数据权限不命中"));
++    }
++
++    // ---------- 场景 3：详情 403（SCOPE_FORBIDDEN——单对象形态） ----------
++
++    @Test
++    @DisplayName("详情 403 · A厂账号查 B厂指标：403 不泄露指标配置（跨厂越权）")
++    void detailCrossFactory403() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.getMetricDetail(RedlineFixture.METRIC_B));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("M_B"), "文案不泄露指标编码");
++
++        assertNotNull(fx.metricService.getMetricDetail(RedlineFixture.METRIC_A_BY_DEPT), "可见行详情放行");
++    }
++
++    // ---------- 场景 4：纯 scope=4 空集——create_by 分支不适用（brief 口径显式固化） ----------
++
++    @Test
++    @DisplayName("仅本人不适用 · 纯 scope=4：指标列表空集——即使行 create_by=本人（资产类以 dept/instance 锚定）")
++    void scope4Only_listEmptyEvenForOwnRows() {
++        IotMetric ownRow = RedlineFixture.metricRow(850L, "M_ME_OWN", null, null);
++        ownRow.setInstanceId(RedlineFixture.INST_NO_DEPT);
++        ownRow.setCreateBy(RedlineFixture.USER_ME);
++        fx.addMetricRow(ownRow);
++        fx.loginAs(RedlineFixture.USER_ME);
++
++        Set<Long> ids = pageIds(listPage());
++
++        assertTrue(!ids.contains(850L),
++                "create_by 分支不适用——自建指标不入列表（与实例列表的 create_by 分支语义差异点，brief 口径留痕）: " + ids);
++        assertTrue(ids.isEmpty(), "纯 scope=4 指标列表空集（fail-closed）");
++    }
++
++    // ---------- 场景 5：可见集空 fail-closed ----------
++
++    @Test
++    @DisplayName("可见集空 fail-closed · 无角色用户：恒假条件 1=0 空列表而非全量放行")
++    void noRoleFailClosed() {
++        // userId=999 无任何角色（夹具未配置）→ 组件默认拒绝
++        fx.loginAs(999L);
++
++        Page<IotMetric> page = listPage();
++
++        assertTrue(page.getRecords().isEmpty(), "无角色=无任何可见性（默认拒绝）");
++        String sql = capturedListSqlSegment();
++        assertTrue(sql.contains("1 = 0"), "FAIL_CLOSED 恒假条件进 wrapper: " + sql);
++    }
++
++    // ---------- 场景 6：写路径数据权限防线（三写原语越权 403 / 可见回归） ----------
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号直改 B厂指标：编辑防线——403 不泄露指标编码，updateById 不触达")
++    void writePath_update_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.updateMetric(updForm(RedlineFixture.METRIC_B)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("M_B"), "403 文案不泄露指标编码");
++        verify(fx.metricMapper(), never()).updateById(any(IotMetric.class));
++
++        // 可见指标写操作回归正常（instance 3 ∈ A 厂可见实例集）
++        fx.metricService.updateMetric(updForm(RedlineFixture.METRIC_A_BY_INSTANCE));
++        verify(fx.metricMapper()).updateById(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号启停 B厂指标：启停防线（整批 fail-closed 不半批启停）；可见指标停用放行")
++    void writePath_changeStatus_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.changeMetricStatus(List.of(RedlineFixture.METRIC_B), 0));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        verify(fx.metricMapper(), never()).updateById(any(IotMetric.class));
++
++        // 可见指标停用回归正常（停用=停止调度结果保留——status=0 落库断言）
++        assertTrue(fx.metricService.changeMetricStatus(List.of(RedlineFixture.METRIC_A_BY_INSTANCE), 0));
++        verify(fx.metricMapper()).updateById(any(IotMetric.class));
++    }
++
++    @Test
++    @DisplayName("写越权 403 · A厂账号删除 B厂指标：删除防线——403；可见指标删除放行（软删归档不复用）")
++    void writePath_delete_invisibleForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.deleteMetrics(List.of(RedlineFixture.METRIC_B)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("M_B"), "403 文案不泄露指标编码");
++        verify(fx.metricMapper(), never()).deleteByIds(any());
++
++        // 可见指标删除回归正常（无入向引用保护需求——本期 iot_metric 无引用表）
++        assertTrue(fx.metricService.deleteMetrics(List.of(RedlineFixture.METRIC_A_BY_INSTANCE)));
++        verify(fx.metricMapper()).deleteByIds(any());
++    }
++
++    // ---------- 场景 7：创建侧防线（add/generate 目标实例须可见——照 0012 修订轮 I-1 同型） ----------
++
++    @Test
++    @DisplayName("创建越权 403 · A厂账号向 B厂实例生成指标：创建侧防线——403 不泄露实例标识，insert 不触达")
++    void createPath_generate_invisibleInstanceForbidden() {
++        fx.loginAs(RedlineFixture.USER_A);
++
++        net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm form =
++                new net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm();
++        form.setMetricCode("M_B_CREATE");
++        form.setMetricName("越权生成指标");
++        form.setInstanceId(RedlineFixture.INST_B_DEVICE);
++        form.setAggType(1);
++        form.setPeriod("DAY");
++        net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm invisibleForm =
++                new net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm();
++        invisibleForm.setMetrics(List.of(form));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> fx.metricService.generateMetrics(RedlineFixture.INST_B_DEVICE, invisibleForm));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertTrue(!e.getDefaultMessage().contains("FB"), "403 文案不泄露实例标识");
++        verify(fx.metricMapper(), never()).insert(any(IotMetric.class));
++
++        // 可见实例创建回归正常（instance 3 ∈ A 厂可见实例集；比值引用校验走夹具数据项 300）
++        net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm visible =
++                new net.otlab.admin.module.iot.metric.dto.IotMetricCreateForm();
++        visible.setMetricCode("M_A_CREATE_OK");
++        visible.setMetricName("A厂可建指标");
++        visible.setInstanceId(RedlineFixture.INST_A_DEVICE);
++        visible.setAggType(1);
++        visible.setPeriod("DAY");
++        net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm visibleForm =
++                new net.otlab.admin.module.iot.metric.dto.IotMetricGenerateForm();
++        visibleForm.setMetrics(List.of(visible));
++        int count = fx.metricService.generateMetrics(RedlineFixture.INST_A_DEVICE, visibleForm);
++        assertEquals(1, count, "可见实例批量生成放行");
++        verify(fx.metricMapper()).insert(any(IotMetric.class));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+index 638fcab..273ddf0 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+@@ -37,6 +37,11 @@ import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
+ import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
+ import net.otlab.admin.module.iot.gateway.service.impl.IotGatewayServiceImpl;
+ import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricCodeMapper;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.metric.service.IotMetricService;
++import net.otlab.admin.module.iot.metric.service.impl.IotMetricServiceImpl;
+ import net.otlab.admin.module.iot.instance.mapper.IotInstanceCodeMapper;
+ import net.otlab.admin.module.iot.instance.service.IotModelInstanceService;
+ import net.otlab.admin.module.iot.instance.service.impl.IotModelInstanceServiceImpl;
+@@ -165,6 +170,16 @@ class RedlineFixture implements AutoCloseable {
+     static final long GW_B_FACTORY = 702L;
+     static final long GW_NO_ANCHOR = 703L;
+ 
++    // ---------- 指标（iot_metric.id，TASK-0043 红线场景常驻行） ----------
++    /** A 厂指标（dept 101 锚点——dept 分支命中） */
++    static final long METRIC_A_BY_DEPT = 800L;
++    /** A 厂指标（instance 3 锚点、dept NULL——instance 分支命中） */
++    static final long METRIC_A_BY_INSTANCE = 801L;
++    /** B 厂指标（instance 10 / dept 201——A 厂账号跨厂越权对象） */
++    static final long METRIC_B = 802L;
++    /** 未绑部门指标（instance 20=LINE99 未绑部门产线、dept NULL——fail-closed 场景主角） */
++    static final long METRIC_NO_ANCHOR = 803L;
++
+     private static final long TENANT = 1L;
+ 
+     // ---------- 会话模拟（Sa-Token 读取入口静态 mock，照 0012 范式） ----------
+@@ -192,6 +207,8 @@ class RedlineFixture implements AutoCloseable {
+     private final SysDictDataMapper dictDataMapper = mock(SysDictDataMapper.class);
+     private final IotGatewayMapper gatewayMapper = mock(IotGatewayMapper.class);
+     private final IotGatewayCodeMapper gatewayCodeMapper = mock(IotGatewayCodeMapper.class);
++    private final IotMetricMapper metricMapper = mock(IotMetricMapper.class);
++    private final IotMetricCodeMapper metricCodeMapper = mock(IotMetricCodeMapper.class);
+     private final GatewayReferenceGuard gatewayReferenceGuard = mock(GatewayReferenceGuard.class);
+     private final GatewayOfflineEventPublisher offlineEventPublisher = mock(GatewayOfflineEventPublisher.class);
+     private final SysTenantMapper tenantMapper = mock(SysTenantMapper.class);
+@@ -206,6 +223,7 @@ class RedlineFixture implements AutoCloseable {
+     private final List<IotDataItem> itemRows = new ArrayList<>();
+     private final List<IotPoint> pointRows = new ArrayList<>();
+     private final List<IotGateway> gatewayRows = new ArrayList<>();
++    private final List<IotMetric> metricRows = new ArrayList<>();
+     private final AtomicLong generatedInstanceId = new AtomicLong(1000);
+ 
+     /** 用户 → 启用角色（可变表：改角色场景直接改此表模拟 sys_role.data_scope 变更） */
+@@ -228,6 +246,8 @@ class RedlineFixture implements AutoCloseable {
+     final IotPointService pointService;
+     /** 网关服务（TASK-0021 F5 裁剪接线消费方） */
+     final IotGatewayService gatewayService;
++    /** 指标服务（TASK-0043 数据权限裁剪 + 写路径防线消费方——真实实现） */
++    final IotMetricService metricService;
+ 
+     /**
+      * 组装内存夹具与真实组件链（每用例新建，try-with-resources 或 @AfterEach close）
+@@ -243,17 +263,25 @@ class RedlineFixture implements AutoCloseable {
+         seedItems();
+         seedPoints();
+         seedGateways();
++        seedMetrics();
+         stubDataPermMappers();
+         stubInstanceMapper();
+         stubDeptMapper();
+         stubItemMapper();
+         stubPointMapper();
+         stubGatewayMapper();
++        stubMetricMapper();
+ 
+-        // 0006 缓存链：真实 Publisher →（直连事件总线）→ 真实 Listener → 内存缓存
++        // 0006 缓存链：真实 Publisher →（直连事件总线）→ 真实 Listener → 内存缓存。
++        // 总线只分发缓存失效事件；其余领域事件（0021 PointEnabledEvent / 0043
++        // MetricStatusChangedEvent——只发布不建监听）原样放行不分发（TASK-0043 增补：
++        // 指标写路径可见回归会真实发启停事件，类型过滤防 ClassCastException 炸穿）
+         cacheEvictListener = new DataPermCacheEvictListener(scopeCache);
+-        ApplicationEventPublisher directBus = event ->
+-                cacheEvictListener.onCacheEvict((DataPermCacheEvictEvent) event);
++        ApplicationEventPublisher directBus = event -> {
++            if (event instanceof DataPermCacheEvictEvent evictEvent) {
++                cacheEvictListener.onCacheEvict(evictEvent);
++            }
++        };
+         cacheEvictPublisher = new DataPermCacheEvictPublisher(directBus);
+ 
+         // 六步翻译组件（真实实现 + 内存缓存 + 默认配置）
+@@ -312,6 +340,18 @@ class RedlineFixture implements AutoCloseable {
+         ReflectionTestUtils.setField(gatewayService, "offlineEventPublisher", offlineEventPublisher);
+         ReflectionTestUtils.setField(gatewayService, "dataPermService", dataPermService);
+         ReflectionTestUtils.setField(gatewayService, "dataPermConditionAssembler", new DataPermConditionAssembler());
++
++        // 指标服务（TASK-0043 裁剪/写防线消费方——真实实现 + 条件拼装真实 Assembler；写路径
++        // 落库桩按可见回归用例需要给出；引用校验走 itemMapper 真实内存行模拟）
++        metricService = new IotMetricServiceImpl();
++        ReflectionTestUtils.setField(metricService, "baseMapper", metricMapper);
++        ReflectionTestUtils.setField(metricService, "metricCodeMapper", metricCodeMapper);
++        ReflectionTestUtils.setField(metricService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(metricService, "dataItemMapper", itemMapper);
++        ReflectionTestUtils.setField(metricService, "deptMapper", deptMapper);
++        ReflectionTestUtils.setField(metricService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(metricService, "dataPermConditionAssembler", new DataPermConditionAssembler());
++        ReflectionTestUtils.setField(metricService, "eventPublisher", directBus);
+     }
+ 
+     @Override
+@@ -362,6 +402,16 @@ class RedlineFixture implements AutoCloseable {
+         gatewayRows.add(row);
+     }
+ 
++    /** 追加指标行（场景自建数据） */
++    void addMetricRow(IotMetric row) {
++        metricRows.add(row);
++    }
++
++    /** 指标 Mapper 访问器（用例对查询条件形态做 ArgumentCaptor 回归断言） */
++    IotMetricMapper metricMapper() {
++        return metricMapper;
++    }
++
+     /** 组件角色 Mapper 访问器（用例断言缓存失效后立即重查=重新触达角色求解） */
+     DataPermRoleMapper roleMapper() {
+         return dataPermRoleMapper;
+@@ -575,6 +625,11 @@ class RedlineFixture implements AutoCloseable {
+         when(itemMapper.selectById(anyLong())).thenAnswer(inv -> itemRows.stream()
+                 .filter(i -> i.getId().equals(inv.getArgument(0, Long.class)))
+                 .findFirst().orElse(null));
++        // TASK-0043 指标来源/比值引用批内预载入口（selectByIds——引用校验用例按需重桩）
++        when(itemMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return itemRows.stream().filter(i -> ids.contains(i.getId())).collect(Collectors.toList());
++        });
+         when(itemMapper.selectList(any())).thenAnswer(this::emulateItemList);
+         // TASK-0023 详情聚合/停用影响计数的引用计数入口（Mockito 默认 null Long 会 NPE，
+         // 按无引用语义桩 0；引用计数用例按需重桩）
+@@ -597,6 +652,15 @@ class RedlineFixture implements AutoCloseable {
+         gatewayRows.add(gatewayRow(GW_NO_ANCHOR, "GW_ORPHAN", null, null));
+     }
+ 
++    private void seedMetrics() {
++        metricRows.add(metricRow(METRIC_A_BY_DEPT, "M_A_DEPT", DEPT_A_FACTORY, INST_A_DEVICE));
++        metricRows.add(metricRow(METRIC_A_BY_INSTANCE, "M_A_INST", null, INST_A_DEVICE));
++        metricRows.add(metricRow(METRIC_B, "M_B", DEPT_B_FACTORY, INST_B_DEVICE));
++        // 未绑部门指标（instance 20=LINE99 未绑部门产线且 dept NULL——dept/instance 皆不命中
++        // A 厂部门集/可见集，fail-closed 场景主角）
++        metricRows.add(metricRow(METRIC_NO_ANCHOR, "M_ORPHAN", null, INST_NO_DEPT));
++    }
++
+     /** 新建点位行构建器（默认启用；createBy=ADMIN 可覆盖——仅本人适用性用例需要自建行时覆盖） */
+     static IotPoint pointRow(long id, String code, Long deptId, Long boundInstanceId, Long createBy) {
+         IotPoint point = new IotPoint();
+@@ -628,6 +692,25 @@ class RedlineFixture implements AutoCloseable {
+         return gw;
+     }
+ 
++    /** 新建指标行构建器（默认启用、聚合 AVG/DAY、无比值字段；dept/instance 锚点按场景传） */
++    static IotMetric metricRow(long id, String code, Long deptId, Long instanceId) {
++        IotMetric metric = new IotMetric();
++        metric.setId(id);
++        metric.setTenantId(TENANT);
++        metric.setMetricCode(code);
++        metric.setMetricName("指标-" + code);
++        metric.setInstanceId(instanceId);
++        metric.setAggType(1);
++        metric.setPeriod("DAY");
++        metric.setCalendarType(1);
++        metric.setYoyFlag(0);
++        metric.setMomFlag(0);
++        metric.setDeptId(deptId);
++        metric.setStatus(1);
++        metric.setCreateBy(ADMIN);
++        return metric;
++    }
++
+     private void stubPointMapper() {
+         when(pointMapper.selectById(anyLong())).thenAnswer(inv -> pointRows.stream()
+                 .filter(p -> p.getId().equals(inv.getArgument(0, Long.class)))
+@@ -651,6 +734,34 @@ class RedlineFixture implements AutoCloseable {
+         when(gatewayMapper.selectPage(any(), any())).thenAnswer(this::emulateGatewaySelectPage);
+     }
+ 
++    private void stubMetricMapper() {
++        when(metricMapper.selectById(anyLong())).thenAnswer(inv -> metricRows.stream()
++                .filter(m -> m.getId().equals(inv.getArgument(0, Long.class)))
++                .findFirst().orElse(null));
++        // MP 3.5.17 ServiceImpl.listByIds 委托 baseMapper.selectByIds（批量写原语存在性校验入口）
++        when(metricMapper.selectByIds(anyCollection())).thenAnswer(inv -> {
++            Collection<Long> ids = inv.getArgument(0);
++            return metricRows.stream().filter(m -> ids.contains(m.getId())).collect(Collectors.toList());
++        });
++        // 分页查询：按 wrapper 实际生成的权限条件求值（模拟器——漏拼权限条件即全量放行、断言即红）
++        when(metricMapper.selectPage(any(), any())).thenAnswer(this::emulateMetricSelectPage);
++        // 写路径桩（可见指标写操作回归正常——403 场景不触达）
++        when(metricMapper.updateById(any(IotMetric.class))).thenReturn(1);
++        when(metricMapper.deleteByIds(anyCollection())).thenReturn(1);
++        // 编码占用旁路预检默认空（创建侧防线可见回归用例——越权 403 场景在预检前拦截）
++        when(metricCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++    }
++
++    private Page<IotMetric> emulateMetricSelectPage(InvocationOnMock inv) {
++        Page<IotMetric> page = inv.getArgument(0);
++        Wrapper<IotMetric> wrapper = inv.getArgument(1);
++        List<IotMetric> matched = evaluateDualConditionFilter(wrapper, metricRows,
++                "dept_id", "instance_id", IotMetric::getDeptId, IotMetric::getInstanceId);
++        page.setRecords(matched);
++        page.setTotal(matched.size());
++        return page;
++    }
++
+     private Page<IotPoint> emulatePointSelectPage(InvocationOnMock inv) {
+         Page<IotPoint> page = inv.getArgument(0);
+         Wrapper<IotPoint> wrapper = inv.getArgument(1);
+@@ -882,5 +993,6 @@ class RedlineFixture implements AutoCloseable {
+         TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
+         TableInfoHelper.initTableInfo(assistant, IotPoint.class);
+         TableInfoHelper.initTableInfo(assistant, IotGateway.class);
++        TableInfoHelper.initTableInfo(assistant, IotMetric.class);
+     }
+ }
+diff --git a/resources/sql/upgrade/20261122_iot_metric_domain.sql b/resources/sql/upgrade/20261122_iot_metric_domain.sql
+new file mode 100644
+index 0000000..b87e32b
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_metric_domain.sql
+@@ -0,0 +1,134 @@
++-- ============================================================
++-- 存量库升级脚本：iot_metric 指标定义表 + 指标管理按钮权限种子（TASK-0043 / FEAT-0014 / REQ-0024）
++--
++-- 用途：
++--   1) 建 iot_metric 指标定义表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1 附录 A p33，
++--      brief 已提取逐字贴回；字形规范化（⼾→户、⽐→比等康熙部首区字形）不改语义）；
++--   2) sys_menu 登记指标管理页（sys_menu 4014「指标管理」，20261121_iot_console_menus.sql
++--      已建）之下的五个按钮权限行（menu_type=3）：iot:metric:list/query/add/edit/remove；
++--   3) sys_role_menu 将上述五行授予超级管理员（role_id=1；照 20261122_iot_point_domain.sql 范式）。
++--
++-- 与上游差异（无）：附录 A p33 逐字 DDL 的唯一键与二级索引（uk_tenant_metric_code /
++--   idx_tenant_instance / idx_period_status）在 MySQL 8 InnoDB 键长均可行
++--   （bigint+varchar(96) utf8mb4 = 8+384 字节），无需前缀降级，头注如实登记「无差异」。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 p22 指标段 + 本任务 brief；
++--   pypdf 提取核对：指标段共 3 行接口——list / CRUD / changeStatus）：
++--   iot:metric:list    GET    /iot/metric/list（指标分页列表：过滤 metricCode/metricName/
++--                            instanceId/period/status + 数据权限裁剪——dept_id IN 部门集
++--                            OR instance_id IN 可见集，ADR-0016 裁决 6 同型；create_by
++--                            分支不适用资产类——照 0021 口径）
++--   iot:metric:query   GET    /iot/metric/{id}（指标详情；越权 403 SCOPE_FORBIDDEN——
++--                            brief 五权限码含 query，详情端点照 0021 点位域形态）
++--   iot:metric:add     POST   /iot/metric（新增指标：口径强制标注——agg_type/period 必填
++--                            且 period ∈ HOUR/DAY/MONTH/YEAR，未标注不可保存；比值型
++--                            agg_type=5 分子分母数据项 id 齐备且同实例/同租户存在启用；
++--                            非比值型 ratio_* 置 NULL；calendar_type 锁 1 自然（班次 2
++--                            拒创建——REQ-0024 一期不做班次口径）；编码租户内唯一双道闸
++--                            4002、字符集 [A-Za-z0-9_]；编码不入业务字典——ADR-0014）
++--   iot:metric:add     POST   /iot/metric/generate?instanceId=（按请求传入指标清单批量
++--                            生成——同 0011 批量保存范式，整批事务逐项校验；「模板自动
++--                            生成」占位：指标模板载体未定义，留待 REQ-0024 后续裁决/
++--                            0024 发布链，brief 裁决）
++--   iot:metric:edit    PUT    /iot/metric（修改指标：metric_code 不可改；字段白名单）
++--   iot:metric:edit    PUT    /iot/metric/changeStatus（指标启停——§3.1 p22 指标段独立行；
++--                            停用停止调度、已算结果保留（REQ-0024 口径），置 0/置 1 发
++--                            MetricStatusChangedEvent 占位（只发布不建监听——调度消费方
++--                            归 FEAT-0013/0045，照 0013 范式））
++--   iot:metric:remove  DELETE /iot/metric/{ids}（批量软删除；编码删除归档不复用——
++--                            uk_tenant_metric_code 不含 deleted，逻辑删行永久占用编码）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4053-4057：TASK-0021 占用（点位按钮五行）；
++--   本脚本占用 sys_menu id 4058-4062（指标按钮五行，parent_id=4014），连续取号。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.7 / §3.1 p22 / REQ-0024 / ADR-0009/0011/0014/0016）：
++--   uk_tenant_metric_code 为 (tenant_id, metric_code) 物理唯一索引、不含 deleted 列：
++--   metric_code 租户内唯一双道闸 4002（含已删行旁路预检 + DuplicateKey 兜底），删除为
++--   逻辑删（deleted=1）且编码归档不复用（REQ-0024「指标编码租户内唯一停用不复用」）。
++--   metric_code 创建后不可改（编码即指标锚点与看板取数标识）；停用后编码同样不复用。
++--   metric_code 不纳入 iot_data_dict 业务数据字典（TD-0036/ADR-0014——字典只管业务数据
++--   编码 data_code，指标编码独立清单、无字典校验）。
++--   口径强制标注（REQ-0024 验收 3 的应用层承载）：agg_type/period 必填合法
++--   （agg_type ∈ 1-5、period ∈ HOUR/DAY/MONTH/YEAR），未标注不可保存；calendar_type
++--   一期锁 1 自然日历（班次 2 拒创建——REQ-0024 非目标「一期不做班次口径聚合」），
++--   同一指标不混用两种日历口径随「列级单值 + 禁班次」结构性成立。
++--   比值型指标（agg_type=5，REQ-0024 验收 2）：ratio_num_item_id/ratio_den_item_id 必填
++--   齐备，且分子分母数据项必须同实例/同租户存在且启用（iot_data_item.enabled=1）；
++--   非比值型 ratio_* 忽略请求值强制置 NULL（分母聚合值为 0 的「无值留痕不写 0/无穷大」
++--   是计算侧语义，归 FEAT-0012/REQ-0025）。
++--   yoy_flag/mom_flag 同比环比开关（REQ-0024 业务能力，0 否 1 是）。
++--   上看板标记（TD-0039/ADR-0011）：本期逐字 DDL 无该列——占位登记（REQ-0029 上看板
++--   标记随展示端任务落，报告遗留）；src_type 级联标记（TD-0027）同口径——逐字 DDL 无
++--   该列，本期来源仅数据项（source_item_id），上游指标级联随月年逐级聚合链（FEAT-0012）
++--   与上游 DDL 修订落。
++--   dept_id 绑定部门（数据权限锚点）+ instance_id 归属实例（必填）：指标查询数据权限
++--   按 dept_id 与实例双重过滤（详细设计 §1.7 p15——指标列表 dept_id/instance_id 双重
++--   过滤，ADR-0016 裁决 6 同型 NULL 不特判 fail-closed）。
++--   status 列即启停（0 禁用 1 启用，DDL DEFAULT '1'）：停用=停止调度、已算结果保留
++--   （REQ-0024 口径）；启停发 Spring 应用事件 MetricStatusChangedEvent（占位只发布——
++--   调度消费方归 FEAT-0013/0045，照 0013 范式）。
++--   多租户：iot_metric 属 iot_ 前缀表，由 TASK-0002 TenantLineInnerInterceptor
++--   （OtTenantLineHandler 前缀规则）自动按会话租户注入条件，tenant_id 服务层从会话
++--   覆盖、禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4014 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_metric` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '指标 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `metric_code` varchar(96) NOT NULL COMMENT '指标编码（租户内唯一）',
++  `metric_name` varchar(100) NOT NULL COMMENT '指标名称',
++  `instance_id` bigint NOT NULL COMMENT '归属实例 ID',
++  `source_item_id` bigint DEFAULT NULL COMMENT '来源数据项 ID（比值型可空）',
++  `agg_type` tinyint NOT NULL COMMENT '聚合 1 平均 2 累计 3 最大 4 最小 5 比值',
++  `period` varchar(8) NOT NULL COMMENT '周期 HOUR/DAY/MONTH/YEAR',
++  `calendar_type` tinyint DEFAULT '1' COMMENT '日历口径 1 自然 2 班次（预留）',
++  `ratio_num_item_id` bigint DEFAULT NULL COMMENT '比值分子数据项 ID',
++  `ratio_den_item_id` bigint DEFAULT NULL COMMENT '比值分母数据项 ID',
++  `yoy_flag` tinyint DEFAULT '0' COMMENT '是否算同比 0 否 1 是',
++  `mom_flag` tinyint DEFAULT '0' COMMENT '是否算环比 0 否 1 是',
++  `dept_id` bigint DEFAULT NULL COMMENT '绑定部门 ID',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_metric_code` (`tenant_id`,`metric_code`),
++  KEY `idx_tenant_instance` (`tenant_id`,`instance_id`),
++  KEY `idx_period_status` (`period`,`status`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='指标定义表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4058, 4014, 4, '指标查询', 3, NULL, NULL, NULL, 'iot:metric:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4059, 4014, 4, '指标详情', 3, NULL, NULL, NULL, 'iot:metric:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4060, 4014, 4, '指标新增', 3, NULL, NULL, NULL, 'iot:metric:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4061, 4014, 4, '指标修改', 3, NULL, NULL, NULL, 'iot:metric:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4062, 4014, 4, '指标删除', 3, NULL, NULL, NULL, 'iot:metric:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4058), (1, 4059), (1, 4060), (1, 4061), (1, 4062);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构、第二条应 5 行、第三条应 5 行）：
++--   SHOW CREATE TABLE iot_metric;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4058 AND 4062;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4058 AND 4062;
++-- ============================================================

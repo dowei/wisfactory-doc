@@ -1,0 +1,1446 @@
+commit e30de0a9b8c0aaac85c839eac3f60d4d2c3fdae5
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 01:58:21 2026 +0800
+
+    feat(iot): 字典批量导入（Excel 模板/逐行回执/整批原子/错误清单下载），横切分页 setMaxLimit(500)（TASK-0009，含横切顺带项）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+index e3e03a8..df7e0e8 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+@@ -1,27 +1,48 @@
+ package net.otlab.admin.module.iot.controller;
+ 
+ import cn.dev33.satoken.annotation.SaCheckPermission;
++import cn.hutool.core.convert.Convert;
++import cn.hutool.poi.excel.ExcelReader;
++import cn.hutool.poi.excel.ExcelUtil;
++import cn.hutool.poi.excel.ExcelWriter;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletResponse;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
++import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
+ import net.otlab.admin.module.iot.service.IotDataDictService;
+ import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.annotation.RepeatSubmit;
+ import net.otlab.core.constant.BusinessType;
+ import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.web.bind.annotation.*;
++import org.springframework.web.multipart.MultipartFile;
++
++import java.io.IOException;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
+ 
+ /**
+- * 业务数据字典控制器（TASK-0008）
++ * 业务数据字典控制器（TASK-0008 / TASK-0009）
+  *
+  * <p>路径命名空间 /iot/dict（本批定版：iot 域控制器统一 /iot/&lt;resource&gt;，
+- * 消除与框架 /dict 等扁平路径的撞名隐患）；权限前缀 iot:dict:*（sys_menu 4018-4022）。
++ * 消除与框架 /dict 等扁平路径的撞名隐患）；权限前缀 iot:dict:*（sys_menu 4018-4023）。
+  * CONV-01：本控制器是业务数据字典（模板选码唯一来源），与框架系统枚举字典 sys_dict 不混用。
+  *
+- * <p>import 接口归 TASK-0009（届时登记 iot:dict:import 权限行，维持「权限标识与接口
+- * 清单一一对应」）。
++ * <p>导入三接口（TASK-0009）共用 iot:dict:import 权限点（sys_menu 4023）：
++ * POST /import（multipart Excel，单批 ≤5000 行，整批原子 + 逐行回执）、
++ * GET /import/template（模板下载）、POST /import/error-report（错误行清单下载，
++ * 回执失败行渲染 xlsx，复用同一 Hutool Excel 组件）。
+  *
+  * @author dowei
+  * @date 2026-11-21
+@@ -31,6 +52,12 @@ import org.springframework.web.bind.annotation.*;
+ @RequestMapping("/iot/dict")
+ public class IotDataDictController {
+ 
++    /** 模板说明行文案（首列以「说明：」开头，导入时由服务层自动跳过） */
++    static final String TEMPLATE_NOTE = "说明：data_code/data_name/data_type 必填；data_type 仅允许 DOUBLE/INT/BOOL/ENUM；"
++            + "category 仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER（可空）；长度上限 data_code 64、data_name 100、"
++            + "category/default_unit 32；data_code 租户内唯一且不复用，重复编码拒绝落库；单批上限 5000 行；"
++            + "示例行导入前请删除或替换；本说明行导入时自动跳过。";
++
+     @Autowired
+     private IotDataDictService dictService;
+ 
+@@ -81,4 +108,111 @@ public class IotDataDictController {
+         dictService.disableDict(id);
+         return Result.success();
+     }
++
++    // ---------- 批量导入（TASK-0009，共用 iot:dict:import 权限点） ----------
++
++    /**
++     * 批量导入（整批原子 + 逐行回执）：控制器只做 Excel 单元格→字符串的机械提取
++     * （照 SysUserController 导入范式，Hutool ExcelReader），导入语义全归服务层。
++     *
++     * <p>整批拒绝口径（brief 裁决 2）：全部成功 body code=200；任一行校验失败整批拒绝，
++     * body code=PARAM_ERROR(400) 且 data 携带完整逐行回执清单（4002 语义留给单点
++     * 编码重复接口，批量口径在 data 内逐行标注）。
++     */
++    @OperateLog(title = "数据字典", businessType = BusinessType.IMPORT)
++    @Operation(summary = "批量导入数据字典（Excel，单批≤5000 行，整批原子；失败整批拒绝并返回逐行回执）")
++    @RepeatSubmit(interval = 3000)
++    @PostMapping("/import")
++    @SaCheckPermission("iot:dict:import")
++    public Result<DictImportReceipt> importDict(@RequestParam("file") MultipartFile file) throws IOException {
++        List<DictImportRow> rows = parseImportRows(file);
++        try {
++            return Result.success(dictService.importDicts(rows));
++        } catch (DictImportRejectException e) {
++            Result<DictImportReceipt> result = Result.error(ResultCode.PARAM_ERROR.getCode(), e.getMessage());
++            result.setData(e.getReceipt());
++            return result;
++        }
++    }
++
++    /**
++     * 模板下载：单 sheet 表头五列 + 示例行 + 说明行（值域口径写入说明行文案，
++     * 说明行首列带「说明：」前缀——导入解析时自动跳过，模板→填写→导入闭环无死行）。
++     */
++    @Operation(summary = "下载字典导入模板（表头+示例行+说明行）")
++    @GetMapping("/import/template")
++    @SaCheckPermission("iot:dict:import")
++    public void importTemplate(HttpServletResponse response) throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("data_code", "data_name", "category", "data_type", "default_unit"));
++        rows.add(Arrays.asList("ELEC_CONS", "用电量（示例行，导入前请删除或替换）", "ELEC", "DOUBLE", "kWh"));
++        rows.add(Arrays.asList(TEMPLATE_NOTE, null, null, null, null));
++        writeExcel(response, "数据字典导入模板", rows);
++    }
++
++    /**
++     * 错误行清单下载：前端把导入回执 POST 回来，失败行渲染 xlsx（复用同一 Excel 组件）——
++     * 无状态设计，服务端不持久化回执；无失败行时返回仅含表头的清单。
++     */
++    @Operation(summary = "下载导入错误行清单（回执失败行 → xlsx，复用模板同款组件）")
++    @PostMapping("/import/error-report")
++    @SaCheckPermission("iot:dict:import")
++    public void importErrorReport(@RequestBody DictImportReceipt receipt, HttpServletResponse response) throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("行号", "数据编码", "原因码", "说明"));
++        if (receipt != null && receipt.getRows() != null) {
++            for (DictImportRowResult rr : receipt.getRows()) {
++                if (!Boolean.TRUE.equals(rr.getSuccess())) {
++                    rows.add(Arrays.asList(rr.getRowIndex(), rr.getDataCode(), rr.getReasonCode(), rr.getMessage()));
++                }
++            }
++        }
++        writeExcel(response, "导入错误行清单", rows);
++    }
++
++    /**
++     * Excel 机械解析：行号保持 Excel 物理行号（表头占第 1 行，数据自第 2 行起）；
++     * 单元格值 trim 后按位映射五列；说明行/空行原样透传（服务层统一裁剪）。
++     */
++    private List<DictImportRow> parseImportRows(MultipartFile file) throws IOException {
++        List<DictImportRow> rows = new ArrayList<>();
++        try (ExcelReader reader = ExcelUtil.getReader(file.getInputStream())) {
++            List<List<Object>> dataRows = reader.read(1);
++            int rowIndex = 2;
++            for (List<Object> cells : dataRows) {
++                DictImportRow row = new DictImportRow();
++                row.setRowIndex(rowIndex++);
++                row.setDataCode(cell(cells, 0));
++                row.setDataName(cell(cells, 1));
++                row.setCategory(cell(cells, 2));
++                row.setDataType(cell(cells, 3));
++                row.setDefaultUnit(cell(cells, 4));
++                rows.add(row);
++            }
++        }
++        return rows;
++    }
++
++    private String cell(List<Object> cells, int index) {
++        if (cells == null || cells.size() <= index) {
++            return null;
++        }
++        String value = Convert.toStr(cells.get(index));
++        return value == null ? null : value.trim();
++    }
++
++    /** xlsx 下载出口（模板与错误清单共用，照 SysUserController.export 范式） */
++    private void writeExcel(HttpServletResponse response, String fileName, List<List<Object>> rows) throws IOException {
++        response.setContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
++        response.setCharacterEncoding("utf-8");
++        String encoded = URLEncoder.encode(fileName, StandardCharsets.UTF_8).replace("+", "%20");
++        response.setHeader("Content-Disposition", "attachment;filename=" + encoded + ".xlsx");
++        ExcelWriter writer = ExcelUtil.getBigWriter();
++        try {
++            writer.write(rows);
++            writer.flush(response.getOutputStream());
++        } finally {
++            writer.close();
++        }
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportReceipt.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportReceipt.java
+new file mode 100644
+index 0000000..eafb3dd
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportReceipt.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 字典批量导入回执（TASK-0009）
++ *
++ * <p>成败计数 + 逐行清单。整批原子口径：{@link #persisted}=true 时 successCount 行已落库；
++ * false 时（整批拒绝，body code=PARAM_ERROR(400)）任何行都未落库，successCount 仅表示
++ * 「校验通过行数」——回执给用户看修正，落库原子性照旧整批。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DictImportReceipt {
++
++    /** 参与校验的数据行数（模板说明行/空行不计） */
++    private Integer totalCount;
++
++    /** 校验通过行数（persisted=true 时即实际落库行数） */
++    private Integer successCount;
++
++    /** 校验失败行数 */
++    private Integer failCount;
++
++    /** 整批是否已落库：true=全部成功入库；false=整批拒绝（任何行未入库） */
++    private Boolean persisted;
++
++    /** 逐行回执清单（按导入顺序） */
++    private List<DictImportRowResult> rows;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRejectException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRejectException.java
+new file mode 100644
+index 0000000..54a6eb1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRejectException.java
+@@ -0,0 +1,30 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import lombok.Getter;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++
++/**
++ * 字典批量导入整批拒绝异常（TASK-0009）
++ *
++ * <p>任一行校验失败即抛出（@Transactional 整批回滚，不半落库）；body code 取
++ * PARAM_ERROR(400)（裁决 2：4002 语义留给「编码重复」单点接口，批量整批拒绝统一
++ * PARAM_ERROR + data 携带完整逐行回执清单）。控制器捕获本异常后把回执装配进
++ * {@code Result.data}——BusinessException 本体不携带数据体，故由此特化承载。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Getter
++public class DictImportRejectException extends BusinessException {
++
++    private static final long serialVersionUID = 1L;
++
++    /** 完整逐行回执（含失败行与校验通过行，供用户下载修正） */
++    private final transient DictImportReceipt receipt;
++
++    public DictImportRejectException(String message, DictImportReceipt receipt) {
++        super(ResultCode.PARAM_ERROR.getCode(), message);
++        this.receipt = receipt;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java
+new file mode 100644
+index 0000000..b0f31e5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRow.java
+@@ -0,0 +1,38 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import lombok.Data;
++
++/**
++ * 字典批量导入行（Excel 单行 → 服务层的原始输入，TASK-0009）
++ *
++ * <p>控制器只做机械的「单元格 → 字符串」提取（照 SysUserController 导入范式），
++ * 一切导入语义（说明行/空行裁剪、必填/超长/值域/重复校验、行号回执）归服务层——
++ * 行号携带 Excel 物理行号（表头占第 1 行，数据自第 2 行起），回执按此标注。
++ *
++ * <p>DTO 只含五个业务列 + 行号：不存在 status/deleted/id/审计字段的注入通道
++ * （mass assignment 在导入侧结构性不可能，落库实体仍由服务层白名单构建）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DictImportRow {
++
++    /** Excel 物理行号（表头=1，数据自 2 起），回执与错误清单按此标注 */
++    private Integer rowIndex;
++
++    /** data_code 列原始值（已 trim） */
++    private String dataCode;
++
++    /** data_name 列原始值（已 trim） */
++    private String dataName;
++
++    /** category 列原始值（已 trim，可空） */
++    private String category;
++
++    /** data_type 列原始值（已 trim） */
++    private String dataType;
++
++    /** default_unit 列原始值（已 trim，可空） */
++    private String defaultUnit;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowResult.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowResult.java
+new file mode 100644
+index 0000000..8b7f4e4
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/DictImportRowResult.java
+@@ -0,0 +1,49 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import lombok.Data;
++
++/**
++ * 字典批量导入逐行回执结果（TASK-0009）
++ *
++ * <p>失败原因分类（brief 裁决，五类）：
++ * {@link #REASON_MISSING_REQUIRED} 必填缺失 / {@link #REASON_TOO_LONG} 超长 /
++ * {@link #REASON_INVALID_DATA_TYPE} 类型非法 / {@link #REASON_INVALID_CATEGORY} 值域非法 /
++ * {@link #REASON_DUPLICATE_CODE} 重复编码（批内互撞与库内已有均报，4002 语义在批量口径内逐行标注）。
++ * 成功行 reasonCode 为 null。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DictImportRowResult {
++
++    /** 必填缺失（data_code/data_name/data_type） */
++    public static final String REASON_MISSING_REQUIRED = "MISSING_REQUIRED";
++
++    /** 超长（varchar 限长：data_code 64 / data_name 100 / category 32 / default_unit 32） */
++    public static final String REASON_TOO_LONG = "TOO_LONG";
++
++    /** 类型非法（data_type 不在 DOUBLE/INT/BOOL/ENUM） */
++    public static final String REASON_INVALID_DATA_TYPE = "INVALID_DATA_TYPE";
++
++    /** 值域非法（category 不在 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER 七选一） */
++    public static final String REASON_INVALID_CATEGORY = "INVALID_CATEGORY";
++
++    /** 重复编码（批内互撞与库内已有同口径，均报此码） */
++    public static final String REASON_DUPLICATE_CODE = "DUPLICATE_CODE";
++
++    /** Excel 物理行号（表头=1，数据自 2 起） */
++    private Integer rowIndex;
++
++    /** 原始 data_code（未修正的导入值，便于用户定位行） */
++    private String dataCode;
++
++    /** 该行校验是否通过（整批被拒时 persisted=false，true 仅代表「校验通过、本可入库」） */
++    private Boolean success;
++
++    /** 失败原因码（成功行为 null） */
++    private String reasonCode;
++
++    /** 人读文案（失败原因明细或成功确认） */
++    private String message;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+index 6b8d629..4c8d0a8 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+@@ -3,6 +3,10 @@ package net.otlab.admin.module.iot.service;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.IService;
+ import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++
++import java.util.List;
+ 
+ /**
+  * 业务数据字典服务接口（TASK-0008）
+@@ -35,4 +39,17 @@ public interface IotDataDictService extends IService<IotDataDict> {
+      * （详细设计 §1.5A「只增不删」，与 uk_tenant_data_code 物理唯一自洽）；可重复禁用。
+      */
+     boolean disableDict(Long id);
++
++    /**
++     * 批量导入字典（TASK-0009）：逐行校验回执 + 整批原子。
++     *
++     * <p>批级拒绝（PARAM_ERROR 400，无回执）：无数据行 / 超 5000 行；逐行校验五分类
++     * （必填缺失/超长/类型非法/值域非法/重复编码——批内互撞与库内已有同口径均报 DUPLICATE_CODE），
++     * 任一行失败即抛 {@link DictImportRejectException} 整批拒绝（PARAM_ERROR + 回执清单，
++     * 任何行不落库——回执给用户看，落库原子性照旧整批）；全部通过才白名单构建逐行落库。
++     *
++     * @param rows 控制器解析的原始导入行（说明行/空行由本方法裁剪，行号为 Excel 物理行号）
++     * @return 导入回执（成败计数 + 逐行清单，persisted 标记整批是否落库）
++     */
++    DictImportReceipt importDicts(List<DictImportRow> rows);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+index 6425ff3..876f3ca 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+@@ -5,6 +5,10 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
++import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
+ import net.otlab.admin.module.iot.mapper.IotDataDictMapper;
+ import net.otlab.admin.module.iot.service.IotDataDictService;
+ import net.otlab.core.exception.BusinessException;
+@@ -15,8 +19,16 @@ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Pattern;
++
+ /**
+- * 业务数据字典服务实现类（TASK-0008）
++ * 业务数据字典服务实现类（TASK-0008 / TASK-0009）
+  *
+  * <p>编码唯一性双道闸（照 SysTenantServiceImpl 范式）：先对活跃行（@TableLogic 过滤
+  * deleted=0）预检，友好报 4002；再捕获 {@link DuplicateKeyException} 兜底——
+@@ -28,6 +40,12 @@ import org.springframework.transaction.annotation.Transactional;
+  * 编码永不复用——物理唯一索引天然阻止同码重建，历史数据项与 TDengine 标签含义不漂移
+  * （REQ-0003 核心规则）。
+  *
++ * <p>批量导入（TASK-0009）：逐行校验回执与整批原子性并存——回执是给用户看的校验结果，
++ * 任一行失败即整批拒绝不半落库（{@link DictImportRejectException} → PARAM_ERROR(400) +
++ * data 携带完整回执清单，裁决 2：4002 语义留给单点编码重复接口）；批内互撞先于落库判定；
++ * 单批上限 5000 行；库内已有判定与单接口同口径（活跃行预检，@TableLogic 过滤已删行、
++ * 租户条件由插件追加）。
++ *
+  * @author dowei
+  * @date 2026-11-21
+  */
+@@ -35,6 +53,22 @@ import org.springframework.transaction.annotation.Transactional;
+ @Service
+ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDataDict> implements IotDataDictService {
+ 
++    /** 导入单批上限（brief 裁决 1：超限整批拒绝） */
++    static final int IMPORT_MAX_ROWS = 5000;
++
++    /** varchar 限长口径（与 iot_data_dict DDL 一致） */
++    private static final int MAX_LEN_DATA_CODE = 64;
++    private static final int MAX_LEN_DATA_NAME = 100;
++    private static final int MAX_LEN_CATEGORY = 32;
++    private static final int MAX_LEN_DEFAULT_UNIT = 32;
++
++    /** 值域口径（与实体 @Pattern 一致） */
++    private static final Pattern DATA_TYPE_PATTERN = Pattern.compile("DOUBLE|INT|BOOL|ENUM");
++    private static final Pattern CATEGORY_PATTERN = Pattern.compile("ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER");
++
++    /** 模板说明行识别前缀（首列以「说明：」开头的行导入时自动跳过，见模板说明行文案） */
++    static final String NOTE_ROW_PREFIX = "说明：";
++
+     @Override
+     public Page<IotDataDict> selectDictList(Page<IotDataDict> page, IotDataDict query) {
+         LambdaQueryWrapper<IotDataDict> wrapper = new LambdaQueryWrapper<>();
+@@ -135,6 +169,210 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+         return this.updateById(upd);
+     }
+ 
++    // ---------- 批量导入（TASK-0009） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public DictImportReceipt importDicts(List<DictImportRow> rows) {
++        // 批级前置拒绝（无回执——无可逐行标注的对象）：空文件/模板原样上传、超 5000 行
++        if (rows == null || rows.isEmpty()) {
++            throw paramError("导入文件无数据行");
++        }
++        List<DictImportRow> dataRows = new ArrayList<>();
++        for (DictImportRow row : rows) {
++            if (isSkippableRow(row)) {
++                continue;
++            }
++            dataRows.add(row);
++        }
++        if (dataRows.isEmpty()) {
++            throw paramError("导入文件无数据行（模板说明行与空行不计入）");
++        }
++        if (dataRows.size() > IMPORT_MAX_ROWS) {
++            throw paramError("单批导入上限 " + IMPORT_MAX_ROWS + " 行，当前 " + dataRows.size() + " 行");
++        }
++
++        // 第一遍：字段级校验（必填→超长→类型→值域）+ 批内互撞判定（先于落库，brief 裁决 4）
++        Map<String, Integer> firstSeenRow = new HashMap<>();
++        List<DictImportRowResult> rowResults = new ArrayList<>(dataRows.size());
++        List<DictImportRow> validRows = new ArrayList<>(dataRows.size());
++        for (DictImportRow row : dataRows) {
++            DictImportRowResult rr = new DictImportRowResult();
++            rr.setRowIndex(row.getRowIndex());
++            rr.setDataCode(row.getDataCode());
++            String[] fieldReason = validateFields(row);
++            if (fieldReason != null) {
++                rr.setSuccess(false);
++                rr.setReasonCode(fieldReason[0]);
++                rr.setMessage(fieldReason[1]);
++            } else {
++                Integer firstRow = firstSeenRow.get(row.getDataCode());
++                if (firstRow != null) {
++                    rr.setSuccess(false);
++                    rr.setReasonCode(DictImportRowResult.REASON_DUPLICATE_CODE);
++                    rr.setMessage("批内重复（与第 " + firstRow + " 行撞码）");
++                } else {
++                    firstSeenRow.put(row.getDataCode(), row.getRowIndex());
++                    rr.setSuccess(true);
++                    rr.setMessage("校验通过");
++                    validRows.add(row);
++                }
++            }
++            rowResults.add(rr);
++        }
++
++        // 第二遍：库内已有编码预检（活跃行，@TableLogic 过滤已删行；租户条件由插件追加；
++        // 与单接口 insertDict 的预检闸同口径——含已禁用行，编码永不复用）。一次 IN 查询，
++        // 避免逐行 count 的 5000 次往返。
++        if (!validRows.isEmpty()) {
++            Set<String> existing = selectExistingCodes(validRows);
++            if (!existing.isEmpty()) {
++                List<DictImportRow> stillValid = new ArrayList<>(validRows.size());
++                for (DictImportRowResult rr : rowResults) {
++                    if (Boolean.TRUE.equals(rr.getSuccess()) && existing.contains(rr.getDataCode())) {
++                        rr.setSuccess(false);
++                        rr.setReasonCode(DictImportRowResult.REASON_DUPLICATE_CODE);
++                        rr.setMessage("库内已存在同编码条目（含已禁用，编码不复用）");
++                    }
++                }
++                for (DictImportRow row : validRows) {
++                    if (!existing.contains(row.getDataCode())) {
++                        stillValid.add(row);
++                    }
++                }
++                validRows = stillValid;
++            }
++        }
++
++        // 回执汇总：成功行数=校验通过行数；persisted 标记整批是否真正落库
++        long failCount = rowResults.stream().filter(rr -> !Boolean.TRUE.equals(rr.getSuccess())).count();
++        DictImportReceipt receipt = new DictImportReceipt();
++        receipt.setTotalCount(dataRows.size());
++        receipt.setSuccessCount((int) (dataRows.size() - failCount));
++        receipt.setFailCount((int) failCount);
++        receipt.setRows(rowResults);
++
++        if (failCount > 0) {
++            // 整批拒绝：PARAM_ERROR(400) + data 携带完整回执清单（裁决 2）；事务内未执行任何
++            // INSERT，rollbackFor 兜底回滚任何残留状态，语义与「失败整批拒绝不半落库」一致
++            receipt.setPersisted(false);
++            throw new DictImportRejectException(
++                    "导入校验未通过，整批未入库（校验通过 " + receipt.getSuccessCount()
++                            + " 行 / 失败 " + receipt.getFailCount() + " 行），请按回执修正后重新导入",
++                    receipt);
++        }
++
++        // 全部通过：白名单构建实体逐行落库（照 insertDict 范式——status=1/deleted=0/tenant_id 会话覆盖；
++        // 导入行 DTO 结构性不含 status/deleted/id/审计字段，mass assignment 无注入通道）
++        try {
++            for (DictImportRow row : validRows) {
++                this.save(buildImportEntity(row));
++            }
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的并发撞码窗口（物理唯一索引 uk_tenant_data_code），
++            // rollbackFor=Exception 整批回滚——批量口径统一 PARAM_ERROR（裁决 2，不用 4002）
++            throw paramError("导入失败：编码并发冲突，整批未入库，请重试");
++        }
++        receipt.setPersisted(true);
++        return receipt;
++    }
++
++    /**
++     * 模板说明行（首列「说明：」前缀）与全空行（分隔空行）不计入数据行。
++     */
++    private boolean isSkippableRow(DictImportRow row) {
++        boolean hasAnyValue = row.getDataCode() != null || row.getDataName() != null
++                || row.getCategory() != null || row.getDataType() != null || row.getDefaultUnit() != null;
++        if (!hasAnyValue) {
++            return true;
++        }
++        return row.getDataCode() != null && row.getDataCode().startsWith(NOTE_ROW_PREFIX);
++    }
++
++    /**
++     * 字段级校验：必填缺失 → 超长 → 类型非法 → 值域非法（逐行首个命中即返回）。
++     *
++     * @return null=通过；否则 [原因码, 文案]
++     */
++    private String[] validateFields(DictImportRow row) {
++        List<String> missing = new ArrayList<>(3);
++        if (isBlank(row.getDataCode())) {
++            missing.add("data_code");
++        }
++        if (isBlank(row.getDataName())) {
++            missing.add("data_name");
++        }
++        if (isBlank(row.getDataType())) {
++            missing.add("data_type");
++        }
++        if (!missing.isEmpty()) {
++            return new String[]{DictImportRowResult.REASON_MISSING_REQUIRED, "必填字段缺失: " + String.join(", ", missing)};
++        }
++        List<String> tooLong = new ArrayList<>(4);
++        if (row.getDataCode().length() > MAX_LEN_DATA_CODE) {
++            tooLong.add("data_code(" + row.getDataCode().length() + ">" + MAX_LEN_DATA_CODE + ")");
++        }
++        if (row.getDataName().length() > MAX_LEN_DATA_NAME) {
++            tooLong.add("data_name(" + row.getDataName().length() + ">" + MAX_LEN_DATA_NAME + ")");
++        }
++        if (row.getCategory() != null && row.getCategory().length() > MAX_LEN_CATEGORY) {
++            tooLong.add("category(" + row.getCategory().length() + ">" + MAX_LEN_CATEGORY + ")");
++        }
++        if (row.getDefaultUnit() != null && row.getDefaultUnit().length() > MAX_LEN_DEFAULT_UNIT) {
++            tooLong.add("default_unit(" + row.getDefaultUnit().length() + ">" + MAX_LEN_DEFAULT_UNIT + ")");
++        }
++        if (!tooLong.isEmpty()) {
++            return new String[]{DictImportRowResult.REASON_TOO_LONG, "字段超长: " + String.join(", ", tooLong)};
++        }
++        if (!DATA_TYPE_PATTERN.matcher(row.getDataType()).matches()) {
++            return new String[]{DictImportRowResult.REASON_INVALID_DATA_TYPE,
++                    "数据类型非法: " + row.getDataType() + "（仅允许 DOUBLE/INT/BOOL/ENUM）"};
++        }
++        if (row.getCategory() != null && !CATEGORY_PATTERN.matcher(row.getCategory()).matches()) {
++            return new String[]{DictImportRowResult.REASON_INVALID_CATEGORY,
++                    "类别非法: " + row.getCategory() + "（仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER）"};
++        }
++        return null;
++    }
++
++    private boolean isBlank(String value) {
++        return value == null || value.isEmpty();
++    }
++
++    /**
++     * 库内已有编码集合（活跃行预检，一次 IN 查询）：@TableLogic 自动过滤 deleted=0，
++     * 已禁用行（status=0）仍占用编码；租户条件由多租户插件对 iot_ 前缀表追加。
++     */
++    private Set<String> selectExistingCodes(List<DictImportRow> validRows) {
++        Set<String> codes = new HashSet<>();
++        for (DictImportRow row : validRows) {
++            codes.add(row.getDataCode());
++        }
++        LambdaQueryWrapper<IotDataDict> wrapper = new LambdaQueryWrapper<>();
++        wrapper.select(IotDataDict::getDataCode).in(IotDataDict::getDataCode, codes);
++        Set<String> existing = new HashSet<>();
++        for (IotDataDict item : this.list(wrapper)) {
++            existing.add(item.getDataCode());
++        }
++        return existing;
++    }
++
++    /**
++     * 导入行 → 落库实体（白名单构建，照 insertDict 范式）。
++     */
++    private IotDataDict buildImportEntity(DictImportRow row) {
++        IotDataDict entity = new IotDataDict();
++        entity.setDataCode(row.getDataCode());
++        entity.setDataName(row.getDataName());
++        entity.setCategory(row.getCategory());
++        entity.setDataType(row.getDataType());
++        entity.setDefaultUnit(row.getDefaultUnit());
++        entity.setStatus(1);
++        entity.setDeleted(0);
++        entity.setTenantId(TenantContext.getTenantId());
++        return entity;
++    }
++
+     private BusinessException duplicateDataCode(String dataCode) {
+         return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "数据编码已存在: " + dataCode);
+     }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java
+new file mode 100644
+index 0000000..2ca8bf7
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/IotDataDictImportControllerTest.java
+@@ -0,0 +1,317 @@
++package net.otlab.admin.module.iot.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import cn.hutool.poi.excel.ExcelReader;
++import cn.hutool.poi.excel.ExcelUtil;
++import cn.hutool.poi.excel.ExcelWriter;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
++import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
++import net.otlab.admin.module.iot.service.IotDataDictService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.mock.web.MockMultipartFile;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.MvcResult;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.lang.reflect.Method;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 字典批量导入控制器测试（TASK-0009 接口层）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），Excel 解析用真实 Hutool
++ * 组件在内存中构造 .xlsx（照 SysUserController 导入范式）；权限注解以反射断言。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataDictImportControllerTest {
++
++    private static final String XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
++
++    private MockMvc mockMvc;
++    private final ObjectMapper objectMapper = new ObjectMapper();
++
++    @Mock
++    private IotDataDictService dictService;
++
++    private IotDataDictController dictController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        dictController = new IotDataDictController();
++        ReflectionTestUtils.setField(dictController, "dictService", dictService);
++        mockMvc = MockMvcBuilders.standaloneSetup(dictController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    /** 用框架同款 Hutool 组件在内存构造 .xlsx（模板/导入文件测试夹具） */
++    private byte[] buildExcel(List<List<Object>> rows) throws IOException {
++        ExcelWriter writer = ExcelUtil.getBigWriter();
++        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            writer.write(rows);
++            writer.flush(out);
++            return out.toByteArray();
++        } finally {
++            writer.close();
++        }
++    }
++
++    private MockMultipartFile excelFile(byte[] bytes) {
++        return new MockMultipartFile("file", "dict.xlsx", MediaType.APPLICATION_OCTET_STREAM_VALUE, bytes);
++    }
++
++    // ---------- 权限与注解（standalone 环境下反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - import/template/error-report 三接口共用 iot:dict:import 权限点")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:dict:import", IotDataDictController.class
++                .getMethod("importDict", org.springframework.web.multipart.MultipartFile.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:dict:import", IotDataDictController.class
++                .getMethod("importTemplate", jakarta.servlet.http.HttpServletResponse.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:dict:import", IotDataDictController.class
++                .getMethod("importErrorReport", DictImportReceipt.class, jakarta.servlet.http.HttpServletResponse.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 导入接口 @OperateLog businessType=IMPORT")
++    void testOperateLogAnnotation() throws Exception {
++        OperateLog log = IotDataDictController.class
++                .getMethod("importDict", org.springframework.web.multipart.MultipartFile.class)
++                .getAnnotation(OperateLog.class);
++        assertNotNull(log);
++        assertEquals(BusinessType.IMPORT, log.businessType());
++    }
++
++    // ---------- POST /iot/dict/import ----------
++
++    @Test
++    @DisplayName("导入 - 真实 xlsx 解析：五列按位映射、行号自 2 起、说明行透传给服务层裁剪")
++    void testImport_ParsesExcelRows() throws Exception {
++        byte[] bytes = buildExcel(Arrays.asList(
++                Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
++                Arrays.asList("说明：data_type 仅允许 DOUBLE/INT/BOOL/ENUM", null, null, null, null),
++                Arrays.asList("ELEC_CONS", "用电量", "ELEC", "DOUBLE", "kWh"),
++                Arrays.asList("WATER_CONS", "用水量", "WATER", "INT", "t")));
++        when(dictService.importDicts(anyList())).thenReturn(receiptOf(2, 0, true));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.successCount").value(2))
++                .andExpect(jsonPath("$.data.persisted").value(true));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
++        verify(dictService).importDicts(captor.capture());
++        List<DictImportRow> parsed = captor.getValue();
++        assertEquals(3, parsed.size(), "表头被 read(1) 跳过；说明行按原样透传（服务层裁剪）");
++        DictImportRow note = parsed.get(0);
++        assertEquals(2, note.getRowIndex(), "说明行占 Excel 第 2 行，行号保持物理对齐");
++        assertTrue(note.getDataCode().startsWith("说明："));
++        DictImportRow first = parsed.get(1);
++        assertEquals(3, first.getRowIndex());
++        assertEquals("ELEC_CONS", first.getDataCode());
++        assertEquals("用电量", first.getDataName());
++        assertEquals("ELEC", first.getCategory());
++        assertEquals("DOUBLE", first.getDataType());
++        assertEquals("kWh", first.getDefaultUnit());
++        assertEquals(4, parsed.get(2).getRowIndex());
++        assertEquals("WATER_CONS", parsed.get(2).getDataCode());
++    }
++
++    @Test
++    @DisplayName("导入 - 空白行同样透传（服务层统一裁剪），单元格值去除首尾空白")
++    void testImport_TrimsCellsAndKeepsBlankRows() throws Exception {
++        byte[] bytes = buildExcel(Arrays.asList(
++                Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"),
++                Arrays.asList("  ELEC_CONS  ", " 用电量 ", null, " DOUBLE ", null)));
++        when(dictService.importDicts(anyList())).thenReturn(receiptOf(1, 0, true));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<List<DictImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
++        verify(dictService).importDicts(captor.capture());
++        DictImportRow parsed = captor.getValue().get(0);
++        assertEquals("ELEC_CONS", parsed.getDataCode(), "单元格值 trim");
++        assertEquals("DOUBLE", parsed.getDataType());
++    }
++
++    @Test
++    @DisplayName("导入 - 整批拒绝透传：body code=400（PARAM_ERROR）且 data 携带完整逐行回执清单")
++    void testImport_BatchRejectBody400WithReceipt() throws Exception {
++        byte[] bytes = buildExcel(List.of(Arrays.asList("ELEC_CONS", "用电量", "ELEC", "TEXT", "kWh")));
++        DictImportReceipt receipt = receiptOf(0, 1, false);
++        DictImportRowResult fail = receipt.getRows().get(0);
++        fail.setReasonCode(DictImportRowResult.REASON_INVALID_DATA_TYPE);
++        fail.setMessage("数据类型非法: TEXT");
++        when(dictService.importDicts(anyList()))
++                .thenThrow(new DictImportRejectException("导入校验未通过，整批未入库（成功 0 行 / 失败 1 行）", receipt));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.data.persisted").value(false))
++                .andExpect(jsonPath("$.data.failCount").value(1))
++                .andExpect(jsonPath("$.data.rows[0].reasonCode").value(DictImportRowResult.REASON_INVALID_DATA_TYPE))
++                .andExpect(jsonPath("$.data.rows[0].message").value("数据类型非法: TEXT"));
++    }
++
++    @Test
++    @DisplayName("导入 - 批级拒绝（超上限/空文件）经全局异常处理器返回业务码 400")
++    void testImport_BatchLevelRejectPassthrough() throws Exception {
++        byte[] bytes = buildExcel(List.of(Arrays.asList("ELEC_CONS", "用电量", "ELEC", "DOUBLE", "kWh")));
++        when(dictService.importDicts(anyList()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "单批导入上限 5000 行，当前 5001 行"));
++
++        mockMvc.perform(multipart("/iot/dict/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("单批导入上限 5000 行，当前 5001 行"));
++    }
++
++    // ---------- GET /iot/dict/import/template ----------
++
++    @Test
++    @DisplayName("模板下载 - HTTP 200 + xlsx 文件头；表头五列、示例行与说明行齐备")
++    void testTemplate_Download() throws Exception {
++        MvcResult result = mockMvc.perform(get("/iot/dict/import/template"))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        String contentType = result.getResponse().getContentType();
++        assertNotNull(contentType);
++        assertTrue(contentType.contains("spreadsheetml"), "xlsx MIME：实际 " + contentType);
++        assertTrue(result.getResponse().getContentAsByteArray().length > 0, "响应体非空");
++        String disposition = result.getResponse().getHeader("Content-Disposition");
++        assertTrue(disposition != null && disposition.endsWith(".xlsx"), "附件文件名以 .xlsx 结尾：" + disposition);
++
++        // 回读校验模板结构：表头（1 行）+ 示例行（2）+ 说明行（3）
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(3, rows.size(), "模板=表头+示例行+说明行");
++            assertEquals(Arrays.asList("data_code", "data_name", "category", "data_type", "default_unit"), rows.get(0));
++            assertEquals("ELEC_CONS", rows.get(1).get(0), "第 2 行为示例数据行");
++            assertEquals("DOUBLE", rows.get(1).get(3));
++            assertTrue(String.valueOf(rows.get(2).get(0)).startsWith("说明："), "第 3 行为说明行（导入时自动跳过）");
++            assertTrue(String.valueOf(rows.get(2).get(0)).contains("DOUBLE/INT/BOOL/ENUM"), "说明行含值域口径");
++        }
++    }
++
++    // ---------- POST /iot/dict/import/error-report ----------
++
++    @Test
++    @DisplayName("错误清单下载 - 回执失败行渲染为 xlsx（成功行不进清单），HTTP 200")
++    void testErrorReport_DownloadFailRowsOnly() throws Exception {
++        DictImportReceipt receipt = receiptOf(0, 2, false);
++        DictImportRowResult f1 = receipt.getRows().get(0);
++        f1.setRowIndex(4);
++        f1.setDataCode("STEAM_CONS");
++        f1.setReasonCode(DictImportRowResult.REASON_INVALID_DATA_TYPE);
++        f1.setMessage("数据类型非法: TEXT");
++        DictImportRowResult f2 = receipt.getRows().get(1);
++        f2.setRowIndex(6);
++        f2.setDataCode("LONG_CODE");
++        f2.setReasonCode(DictImportRowResult.REASON_TOO_LONG);
++        f2.setMessage("字段超长: data_code");
++
++        MvcResult result = mockMvc.perform(post("/iot/dict/import/error-report")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(receipt)))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        assertTrue(result.getResponse().getContentType().contains("spreadsheetml"));
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(3, rows.size(), "表头 + 2 条失败行（成功行不进清单）");
++            assertEquals("行号", rows.get(0).get(0));
++            assertEquals(4, ((Number) rows.get(1).get(0)).intValue());
++            assertEquals("STEAM_CONS", rows.get(1).get(1));
++            assertEquals(DictImportRowResult.REASON_INVALID_DATA_TYPE, rows.get(1).get(2));
++            assertEquals(6, ((Number) rows.get(2).get(0)).intValue());
++            assertEquals(DictImportRowResult.REASON_TOO_LONG, rows.get(2).get(2));
++        }
++    }
++
++    @Test
++    @DisplayName("错误清单下载 - 无失败行（null 回执）时返回仅含表头的 xlsx")
++    void testErrorReport_EmptyReceiptHeaderOnly() throws Exception {
++        MvcResult result = mockMvc.perform(post("/iot/dict/import/error-report")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{}"))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(1, rows.size(), "仅表头一行");
++            assertEquals("行号", rows.get(0).get(0));
++        }
++    }
++
++    // ---------- 夹具 ----------
++
++    private DictImportReceipt receiptOf(int successCount, int failCount, boolean persisted) {
++        DictImportReceipt receipt = new DictImportReceipt();
++        receipt.setTotalCount(successCount + failCount);
++        receipt.setSuccessCount(successCount);
++        receipt.setFailCount(failCount);
++        receipt.setPersisted(persisted);
++        List<DictImportRowResult> rows = new java.util.ArrayList<>();
++        for (int i = 0; i < successCount + failCount; i++) {
++            DictImportRowResult rr = new DictImportRowResult();
++            rr.setRowIndex(2 + i);
++            rr.setDataCode("CODE_" + i);
++            rr.setSuccess(i < successCount);
++            rr.setMessage(i < successCount ? "校验通过" : "失败");
++            rows.add(rr);
++        }
++        receipt.setRows(rows);
++        return receipt;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictImportServiceTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictImportServiceTest.java
+new file mode 100644
+index 0000000..0b7c27c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictImportServiceTest.java
+@@ -0,0 +1,368 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
++import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
++import net.otlab.admin.module.iot.entity.dto.DictImportRow;
++import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
++import net.otlab.admin.module.iot.mapper.IotDataDictMapper;
++import net.otlab.core.exception.BusinessException;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.stream.IntStream;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 字典批量导入服务单元测试（TASK-0009）
++ *
++ * <p>核心契约（brief 裁决）：① 逐行回执与整批原子性并存——回执是给用户看的校验结果，
++ * 任一行失败即整批拒绝不半落库（@Transactional 整批回滚）；② 4002 语义留给单点编码重复，
++ * 批量整批拒绝 body code 用 PARAM_ERROR(400) + data 携带逐行回执清单；③ 批内互撞先于落库判定；
++ * ④ 单批上限 5000 行；⑤ 失败分类五类：必填缺失/超长/类型非法/值域非法/重复编码。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataDictImportServiceTest {
++
++    @Mock
++    private IotDataDictMapper baseMapper;
++
++    private IotDataDictServiceImpl dictService;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), IotDataDict.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        dictService = new IotDataDictServiceImpl();
++        ReflectionTestUtils.setField(dictService, "baseMapper", baseMapper);
++    }
++
++    private DictImportRow row(int excelRow, String code, String name, String category, String type, String unit) {
++        DictImportRow r = new DictImportRow();
++        r.setRowIndex(excelRow);
++        r.setDataCode(code);
++        r.setDataName(name);
++        r.setCategory(category);
++        r.setDataType(type);
++        r.setDefaultUnit(unit);
++        return r;
++    }
++
++    private DictImportRow validRow(int excelRow, String code) {
++        return row(excelRow, code, "名称" + excelRow, "ELEC", "DOUBLE", "kWh");
++    }
++
++    // ---------- 正常导入 ----------
++
++    @Test
++    @DisplayName("导入 - 全部有效行：逐行落库（status=1/deleted=0/tenantId 会话覆盖），回执 successCount=N、persisted=true")
++    void testImport_Success_AllValidRows() {
++        when(baseMapper.selectList(any())).thenReturn(List.of()); // 库内预检：无同码活跃行
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++        List<DictImportRow> rows = List.of(
++                validRow(2, "ELEC_CONS"), validRow(3, "WATER_CONS"), validRow(4, "GAS_CONS"));
++
++        DictImportReceipt receipt = dictService.importDicts(rows);
++
++        assertEquals(3, receipt.getTotalCount());
++        assertEquals(3, receipt.getSuccessCount());
++        assertEquals(0, receipt.getFailCount());
++        assertTrue(receipt.getPersisted(), "全部通过即整批落库");
++        assertEquals(3, receipt.getRows().size());
++        for (DictImportRowResult rr : receipt.getRows()) {
++            assertTrue(rr.getSuccess());
++            assertNull(rr.getReasonCode(), "成功行无失败原因码");
++        }
++        ArgumentCaptor<IotDataDict> captor = ArgumentCaptor.forClass(IotDataDict.class);
++        verify(baseMapper, org.mockito.Mockito.times(3)).insert(captor.capture());
++        IotDataDict first = captor.getAllValues().get(0);
++        assertEquals("ELEC_CONS", first.getDataCode());
++        assertEquals("名称2", first.getDataName());
++        assertEquals("ELEC", first.getCategory());
++        assertEquals("DOUBLE", first.getDataType());
++        assertEquals("kWh", first.getDefaultUnit());
++        // 白名单不变量（TASK-0008 修订轮口径在导入侧同样成立）
++        assertEquals(1, first.getStatus(), "导入新增恒启用");
++        assertEquals(0, first.getDeleted(), "导入落库非幽灵行");
++        assertNull(first.getTenantId(), "tenantId 服务层会话覆盖（standalone 无会话为 null，运行时插件补列）");
++        assertNull(first.getId(), "id 由框架自增");
++        assertNull(first.getCreateBy(), "审计字段由 MetaObjectHandler 回填");
++    }
++
++    @Test
++    @DisplayName("导入 - 数据行号从 Excel 第 2 行起（表头占第 1 行）")
++    void testImport_RowIndexStartsAtTwo() {
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++
++        DictImportReceipt receipt = dictService.importDicts(List.of(validRow(2, "ELEC_CONS")));
++
++        assertEquals(2, receipt.getRows().get(0).getRowIndex());
++    }
++
++    // ---------- 逐行回执五分类 ----------
++
++    @Test
++    @DisplayName("回执分类 - 必填缺失（data_name 缺失）：MISSING_REQUIRED + 整批拒绝不落库")
++    void testImport_MissingRequired() {
++        List<DictImportRow> rows = List.of(row(2, "ELEC_CONS", null, "ELEC", "DOUBLE", "kWh"));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        assertEquals(400, e.getCode(), "整批拒绝 body code=PARAM_ERROR(400)，4002 留给单点编码重复语义");
++        assertFalse(e.getReceipt().getPersisted(), "整批拒绝：未落库");
++        DictImportRowResult rr = e.getReceipt().getRows().get(0);
++        assertFalse(rr.getSuccess());
++        assertEquals(DictImportRowResult.REASON_MISSING_REQUIRED, rr.getReasonCode());
++        assertTrue(rr.getMessage().contains("data_name"));
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("回执分类 - 类型非法（data_type=TEXT）：INVALID_DATA_TYPE")
++    void testImport_InvalidDataType() {
++        List<DictImportRow> rows = List.of(row(2, "ELEC_CONS", "用电量", "ELEC", "TEXT", "kWh"));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        DictImportRowResult rr = e.getReceipt().getRows().get(0);
++        assertEquals(DictImportRowResult.REASON_INVALID_DATA_TYPE, rr.getReasonCode());
++        assertTrue(rr.getMessage().contains("TEXT"));
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("回执分类 - 值域非法（category=POWER）：INVALID_CATEGORY")
++    void testImport_InvalidCategory() {
++        List<DictImportRow> rows = List.of(row(2, "ELEC_CONS", "用电量", "POWER", "DOUBLE", "kWh"));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        DictImportRowResult rr = e.getReceipt().getRows().get(0);
++        assertEquals(DictImportRowResult.REASON_INVALID_CATEGORY, rr.getReasonCode());
++        assertTrue(rr.getMessage().contains("POWER"));
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("回执分类 - 超长（data_code 65 字符 > varchar(64)）：TOO_LONG")
++    void testImport_TooLong() {
++        String longCode = "A".repeat(65);
++        List<DictImportRow> rows = List.of(row(2, longCode, "用电量", "ELEC", "DOUBLE", "kWh"));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        DictImportRowResult rr = e.getReceipt().getRows().get(0);
++        assertEquals(DictImportRowResult.REASON_TOO_LONG, rr.getReasonCode());
++        assertTrue(rr.getMessage().contains("64"), "文案提示 varchar 限长口径");
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("回执分类 - data_type 缺失归必填缺失（优先于类型非法判定）")
++    void testImport_MissingDataTypeCountsAsMissingRequired() {
++        List<DictImportRow> rows = List.of(row(2, "ELEC_CONS", "用电量", "ELEC", null, "kWh"));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        assertEquals(DictImportRowResult.REASON_MISSING_REQUIRED, e.getReceipt().getRows().get(0).getReasonCode());
++    }
++
++    // ---------- 批内互撞与库内已有 ----------
++
++    @Test
++    @DisplayName("批内互撞 - 同批同码：首行可入库、次行 DUPLICATE_CODE（批内，指向首现行号），整批拒绝不落库")
++    void testImport_BatchInternalCollision() {
++        when(baseMapper.selectList(any())).thenReturn(List.of()); // 库内无此码
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(List.of(validRow(2, "ELEC_CONS"), validRow(5, "ELEC_CONS"))));
++
++        List<DictImportRowResult> rrs = e.getReceipt().getRows();
++        assertEquals(2, rrs.size());
++        assertTrue(rrs.get(0).getSuccess(), "首个出现行校验通过（本可入库）");
++        assertFalse(rrs.get(1).getSuccess());
++        assertEquals(DictImportRowResult.REASON_DUPLICATE_CODE, rrs.get(1).getReasonCode());
++        assertTrue(rrs.get(1).getMessage().contains("2"), "批内互撞文案指向首现行号");
++        // 批内互撞先于落库判定：全批 0 次 insert（整批拒绝）
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("库内已有 - 预检命中活跃行：DUPLICATE_CODE（库内），整批拒绝不落库")
++    void testImport_ExistingCodeInDb() {
++        IotDataDict existing = new IotDataDict();
++        existing.setDataCode("ELEC_CONS");
++        when(baseMapper.selectList(any())).thenReturn(List.of(existing));
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(List.of(validRow(2, "ELEC_CONS"))));
++
++        DictImportRowResult rr = e.getReceipt().getRows().get(0);
++        assertEquals(DictImportRowResult.REASON_DUPLICATE_CODE, rr.getReasonCode());
++        assertTrue(rr.getMessage().contains("库内"));
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    // ---------- 整批原子性 ----------
++
++    @Test
++    @DisplayName("整批回滚 - 5 行混合文件（1 成功/1 批内重复/1 类型非法/1 库内已有/1 超长）：全批拒绝，0 行落库，回执逐行标注")
++    void testImport_AnyFailureRejectsWholeBatch() {
++        // 库内已有 GAS_CONS
++        IotDataDict existing = new IotDataDict();
++        existing.setDataCode("GAS_CONS");
++        when(baseMapper.selectList(any())).thenReturn(List.of(existing));
++
++        String longCode = "B".repeat(65);
++        List<DictImportRow> rows = List.of(
++                validRow(2, "ELEC_CONS"),                     // 校验通过（本可入库）
++                validRow(3, "WATER_CONS"),                    // 首现
++                validRow(4, "WATER_CONS"),                    // 批内重复（与第 3 行）
++                row(5, "STEAM_CONS", "蒸汽", "STEAM", "TEXT", "t"),   // 类型非法
++                validRow(6, "GAS_CONS"),                      // 库内已有
++                row(7, longCode, "超长", "ENV", "INT", null));        // 超长
++
++        DictImportRejectException e = assertThrows(DictImportRejectException.class,
++                () -> dictService.importDicts(rows));
++
++        DictImportReceipt receipt = e.getReceipt();
++        assertEquals(6, receipt.getTotalCount());
++        assertEquals(2, receipt.getSuccessCount(), "第 2 行（ELEC_CONS）与第 3 行（WATER_CONS 首现）校验通过");
++        assertEquals(4, receipt.getFailCount());
++        assertFalse(receipt.getPersisted(), "整批拒绝：任一行失败即全批不落库");
++        // 逐行标注逐一就位
++        assertNull(receipt.getRows().get(0).getReasonCode());
++        assertNull(receipt.getRows().get(1).getReasonCode(), "批内首现行为校验通过（非互撞）");
++        assertEquals(DictImportRowResult.REASON_DUPLICATE_CODE, receipt.getRows().get(2).getReasonCode());
++        assertEquals(DictImportRowResult.REASON_INVALID_DATA_TYPE, receipt.getRows().get(3).getReasonCode());
++        assertEquals(DictImportRowResult.REASON_DUPLICATE_CODE, receipt.getRows().get(4).getReasonCode());
++        assertEquals(DictImportRowResult.REASON_TOO_LONG, receipt.getRows().get(5).getReasonCode());
++        assertTrue(e.getMessage().contains("4"), "异常文案携带失败行数");
++        // 整批原子：校验通过行也不落库
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("整批回滚 - 校验全部通过但插入撞物理唯一索引（并发兜底）：PARAM_ERROR 整批拒绝")
++    void testImport_DuplicateKeyFallbackRejectsBatch() {
++        when(baseMapper.selectList(any())).thenReturn(List.of()); // 预检通过（并发窗口）
++        when(baseMapper.insert(any(IotDataDict.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '999-ELEC_CONS' for key 'uk_tenant_data_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> dictService.importDicts(List.of(validRow(2, "ELEC_CONS"))));
++
++        assertEquals(400, e.getCode(), "批量整批拒绝口径统一 PARAM_ERROR（裁决 2），不用 4002");
++        assertTrue(e.getDefaultMessage().contains("整批"));
++    }
++
++    // ---------- 批级拒绝（无回执） ----------
++
++    @Test
++    @DisplayName("行数上限 - 5001 行整批拒绝：PARAM_ERROR 提示 5000 上限，不触发校验/落库")
++    void testImport_OverLimitRejected() {
++        List<DictImportRow> rows = new ArrayList<>();
++        IntStream.rangeClosed(2, 5002).forEach(i -> rows.add(validRow(i, "CODE_" + i)));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.importDicts(rows));
++
++        assertEquals(400, e.getCode());
++        assertTrue(e.getDefaultMessage().contains("5000"));
++        verify(baseMapper, never()).selectList(any());
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("行数上限 - 恰好 5000 行放行（进入校验）")
++    void testImport_ExactlyAtLimitAccepted() {
++        List<DictImportRow> rows = new ArrayList<>();
++        IntStream.rangeClosed(2, 5001).forEach(i -> rows.add(validRow(i, "CODE_" + i)));
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++
++        DictImportReceipt receipt = dictService.importDicts(rows);
++
++        assertEquals(5000, receipt.getTotalCount());
++        assertEquals(5000, receipt.getSuccessCount());
++        assertTrue(receipt.getPersisted());
++        verify(baseMapper, org.mockito.Mockito.times(5000)).insert(any(IotDataDict.class));
++    }
++
++    @Test
++    @DisplayName("空文件 - 无数据行（空清单）拒绝：PARAM_ERROR")
++    void testImport_EmptyRowsRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.importDicts(List.of()));
++
++        assertEquals(400, e.getCode());
++        assertTrue(e.getDefaultMessage().contains("无数据行"));
++    }
++
++    @Test
++    @DisplayName("空文件 - 全部为说明行（未填任何数据的模板原样上传）同样拒绝")
++    void testImport_NoteOnlyTemplateRejected() {
++        List<DictImportRow> rows = List.of(row(2, "说明：data_code 必填，本行导入时自动跳过", null, null, null, null));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.importDicts(rows));
++
++        assertEquals(400, e.getCode());
++        assertTrue(e.getDefaultMessage().contains("无数据行"));
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++    }
++
++    // ---------- 模板说明行与空行跳过 ----------
++
++    @Test
++    @DisplayName("说明行跳过 - 模板说明行不进回执、不计失败，数据行行号保持 Excel 物理行号")
++    void testImport_NoteRowsAndBlankRowsSkipped() {
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++        List<DictImportRow> rows = List.of(
++                row(2, "说明：值域口径……", null, null, null, null),      // 模板说明行
++                validRow(3, "ELEC_CONS"),                              // 数据行 1
++                row(4, null, null, null, null, null),                  // 中间空行（分隔，无意图）
++                validRow(5, "WATER_CONS"));                            // 数据行 2
++
++        DictImportReceipt receipt = dictService.importDicts(rows);
++
++        assertEquals(2, receipt.getTotalCount(), "说明行与空行不计入数据行");
++        assertEquals(2, receipt.getRows().size());
++        assertEquals(3, receipt.getRows().get(0).getRowIndex(), "回执行号=Excel 物理行号");
++        assertEquals(5, receipt.getRows().get(1).getRowIndex());
++        assertTrue(receipt.getPersisted());
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java b/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
+index e7f72c1..25a4f8a 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
+@@ -35,7 +35,11 @@ public class MybatisPlusConfig implements MetaObjectHandler {
+         // 多租户插件（TASK-0002）：白名单式 TenantLineHandler（OtTenantLineHandler，fail-closed）。
+         // 官方建议顺序：租户/动态表名等「单次改造 SQL」的插件在前，分页等在后。
+         interceptor.addInnerInterceptor(new TenantLineInnerInterceptor(new OtTenantLineHandler()));
+-        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
++        // 分页上限 500（详细设计 §3.4「pageSize 上限 500」，TASK-0009 横切顺带项）：
++        // 超限请求被截断到 500，防止 pageSize 放大查询拖垮库
++        PaginationInnerInterceptor pagination = new PaginationInnerInterceptor(DbType.MYSQL);
++        pagination.setMaxLimit(500L);
++        interceptor.addInnerInterceptor(pagination);
+         return interceptor;
+     }
+ 
+diff --git a/resources/sql/upgrade/20261122_iot_dict_import.sql b/resources/sql/upgrade/20261122_iot_dict_import.sql
+new file mode 100644
+index 0000000..e117494
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_dict_import.sql
+@@ -0,0 +1,50 @@
++-- ============================================================
++-- 存量库升级脚本：字典批量导入权限行（TASK-0009 / FEAT-0003 / REQ-0003）
++--
++-- 用途：
++--   sys_menu 登记字典管理页（sys_menu 4008）之下的字典导入按钮权限行
++--   （menu_type=3，iot:dict:import，TASK-0008 脚本遗留的「import 归 TASK-0009 登记」承诺）；
++--   sys_role_menu 将该行授予超级管理员（role_id=1；admin 的权限集在代码层是
++--   sys_menu 实时并集，本行保证「角色管理」界面回显与脚本一致性，照 20261121_iot_data_dict.sql 范式）。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，REQ-0034）：
++--   iot:dict:import  POST   /iot/dict/import           批量导入（Excel，单批 ≤5000 行，整批原子 + 逐行回执）
++--                    GET    /iot/dict/import/template  模板下载
++--                    POST   /iot/dict/import/error-report  错误行清单下载
++--   三接口共用同一权限点（brief 裁决 3/6：同一权限点，一行种子）。
++--   （守卫：backend SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4000-4007：TASK-0001 占用（智慧工厂目录 4000 / 租户管理页 4001 / 租户按钮 4002-4007）；
++--   sys_menu id 4008-4016：TASK-0055 占用（控制台九个页面菜单，含字典管理页 4008）；
++--   sys_menu id 4017：TASK-0002 占用（初始化租户管理员按钮 iot:tenant:admin）；
++--   sys_menu id 4018-4022：TASK-0008 占用（字典按钮五行 iot:dict:list/query/add/edit/remove）；
++--   本脚本占用 sys_menu id 4023（字典导入按钮一行，parent_id=4008，sort=6 续号）。
++--
++-- 幂等口径：
++--   INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、不改已有行。可安全重复执行。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02/03 模块脚本）与 20261121_iot_console_menus.sql、
++--   20261121_iot_data_dict.sql 的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4023, 4008, 4, '字典导入', 3, NULL, NULL, NULL, 'iot:dict:import', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4023);
++
++-- ============================================================
++-- 执行后核对（第一条应 1 行、第二条应 1 行）：
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id = 4023;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id = 4023;
++-- ============================================================

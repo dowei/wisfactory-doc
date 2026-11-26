@@ -1,0 +1,3961 @@
+diff --git a/.gitignore b/.gitignore
+index b7274ea..395d2af 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,3 +2,6 @@
+ docs/
+ # Go 构建产物
+ ingest/*.exe
++
++# 快照本地存储运行时产物
++backend/data/
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+new file mode 100644
+index 0000000..76ff48c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+@@ -0,0 +1,31 @@
++package net.otlab.admin.module.iot.publish.config;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * 配置发布域属性（TASK-0024，配置键 {@code ot.publish.*}）。
++ *
++ * <p>一期本地目录裁决（brief 存储裁决）：快照文件写本地目录，MinIO 对象存储二期登记。
++ * 配置键仅 {@code ot.publish.storage-path} 一个（application.yml 仅允许新增对象存储
++ * 配置键）；二期换 MinIO 时在 {@code SnapshotStorage} 实现位替换、本键族扩展，不动发布
++ * 流程其余件。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.publish")
++public class PublishProperties {
++
++    /**
++     * 快照本地存储根目录（默认 {@code ./data/snapshots}）。文件布局
++     * {@code <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json}——租户子目录隔离
++     * （计算 scope 的 scope_id 恒 0，文件名不含租户会跨租户相撞），文件名本体照 brief
++     * 裁决 {@code <scope_type>-<scope_id>-<version>.json}。相对路径以进程工作目录解析
++     * （与框架 ot.file.upload-dir 同口径）。
++     */
++    private String storagePath = "./data/snapshots";
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java
+new file mode 100644
+index 0000000..702c98a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java
+@@ -0,0 +1,91 @@
++package net.otlab.admin.module.iot.publish.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.RollbackForm;
++import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.service.IotPublishService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 配置发布控制器（TASK-0024，配置发布页 4015 之下按钮权限行 4070-4073——发布链第一环）。
++ *
++ * <p>接口面四端点（权限标识与接口清单一一对应，升级脚本 20261122_iot_publish_domain.sql
++ * 头注登记）：
++ * <ul>
++ * <li>GET /iot/publish/list（iot:publish:list）——版本列表分页（version 降序）；</li>
++ * <li>GET /iot/publish/snapshot（iot:publish:query）——快照取回+哈希核对（version 缺省
++ *     最新版，照契约 §3.3）；</li>
++ * <li>POST /iot/publish/publish（iot:publish:publish）——发布生成单调新版本（并发
++ *     5001；确认门 NoOp 占位——TASK-0015 交付后接线）；</li>
++ * <li>POST /iot/publish/rollback（iot:publish:rollback）——回滚=新版本行复用旧快照。</li>
++ * </ul>
++ *
++ * <p>发布/回滚属高危配置操作（REQ-0033「单独权限+审计」）：单独权限码 + 全量
++ * {@code @OperateLog} 审计。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "配置发布")
++@RestController
++@RequestMapping("/iot/publish")
++public class IotPublishController {
++
++    @Autowired
++    private IotPublishService publishService;
++
++    @Operation(summary = "版本列表分页（version 降序；scope 必传——scopeType=1 网关 id / "
++            + "2 归一 0；数据权限防线：网关可见 / 计算管理员语义）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:publish:list")
++    public Result<Page<IotConfigVersion>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                               @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                               @RequestParam("scopeType") Integer scopeType,
++                                               @RequestParam("scopeId") Long scopeId) {
++        return Result.success(publishService.selectVersionList(pageNum, pageSize, scopeType, scopeId));
++    }
++
++    @Operation(summary = "快照取回（存储取回 + SHA-256 哈希核对——不一致 500 告警日志"
++            + "（存储损坏探测）；version 缺省返回最新版，照契约 §3.3）")
++    @GetMapping("/snapshot")
++    @SaCheckPermission("iot:publish:query")
++    public Result<SnapshotVO> snapshot(@RequestParam("scopeType") Integer scopeType,
++                                       @RequestParam("scopeId") Long scopeId,
++                                       @RequestParam(value = "version", required = false) Long version) {
++        return Result.success(publishService.retrieveSnapshot(scopeType, scopeId, version));
++    }
++
++    @OperateLog(title = "配置发布", businessType = BusinessType.OTHER)
++    @Operation(summary = "发布（组装 Schema v1.0.1 → 凭据终检 fail-closed → SHA-256 → "
++            + "本地目录存储 → 版本落库 publish_status=1；版本同 (tenant, scope) 单调递增——"
++            + "并发发布撞 uk_scope_version 报 5001；确认门 NoOp 占位，TASK-0015 交付后接线）")
++    @PostMapping("/publish")
++    @SaCheckPermission("iot:publish:publish")
++    public Result<IotConfigVersion> publish(@Valid @RequestBody PublishForm form) {
++        return Result.success(publishService.publish(form));
++    }
++
++    @OperateLog(title = "配置发布", businessType = BusinessType.OTHER)
++    @Operation(summary = "回滚（以 targetVersion 快照生成新版本——新版本行 snapshot_uri/"
++            + "snapshot_hash 复用旧快照文件（哈希同），历史版本不被改写；目标版本不存在 400）")
++    @PostMapping("/rollback")
++    @SaCheckPermission("iot:publish:rollback")
++    public Result<IotConfigVersion> rollback(@Valid @RequestBody RollbackForm form) {
++        return Result.success(publishService.rollback(form));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java
+new file mode 100644
+index 0000000..33195f9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishForm.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 配置发布请求表单（TASK-0024，brief D4——POST /iot/publish/publish，body:
++ * scopeType/scopeId）。
++ *
++ * <p>scopeType=2（计算范围）时 scopeId 由服务层归一为 0（租户粒度——Schema v1.0.1 派生
++ * 规则 7「scopeId=0」口径，请求携带值不参与存储键）；scopeType=1 时 scopeId 必须是存在
++ * 启用的网关（服务层校验）。tenantId 服务层从会话覆盖、禁前端传参。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "配置发布表单（TASK-0024）")
++public class PublishForm {
++
++    @NotNull(message = "scopeType 不能为空")
++    @Min(value = 1, message = "scopeType 只允许 1 网关 2 计算")
++    @Max(value = 2, message = "scopeType 只允许 1 网关 2 计算")
++    @Schema(description = "范围 1 网关 2 计算", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer scopeType;
++
++    @NotNull(message = "scopeId 不能为空")
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long scopeId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/RollbackForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/RollbackForm.java
+new file mode 100644
+index 0000000..c526da3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/RollbackForm.java
+@@ -0,0 +1,39 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 版本回滚请求表单（TASK-0024，brief D5——POST /iot/publish/rollback，body:
++ * scopeType/scopeId/targetVersion）。
++ *
++ * <p>回滚=以旧快照生成新版本（brief 裁决：新版本行 snapshot_uri 复用旧快照文件，哈希同
++ * ——版本单调递增但快照复用；TC-0008「历史版本不被改写」）。回滚目标版本不存在 → 400。
++ * scopeType=2 时 scopeId 服务层归一 0。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "版本回滚表单（TASK-0024）")
++public class RollbackForm {
++
++    @NotNull(message = "scopeType 不能为空")
++    @Min(value = 1, message = "scopeType 只允许 1 网关 2 计算")
++    @Max(value = 2, message = "scopeType 只允许 1 网关 2 计算")
++    @Schema(description = "范围 1 网关 2 计算", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer scopeType;
++
++    @NotNull(message = "scopeId 不能为空")
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long scopeId;
++
++    @NotNull(message = "targetVersion 不能为空")
++    @Min(value = 1, message = "targetVersion 必须为正整数")
++    @Schema(description = "回滚目标版本号（该 scope 的既有版本）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long targetVersion;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/SnapshotVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/SnapshotVO.java
+new file mode 100644
+index 0000000..6c69bb2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/SnapshotVO.java
+@@ -0,0 +1,39 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 快照取回响应（TASK-0024，brief D6——GET /iot/publish/snapshot：从对象存储取回快照体
++ * + 哈希核对；信封口径照契约 §3.3「响应含 version、snapshotHash 与快照体」）。
++ *
++ * <p>{@code snapshotBody} 为确定性序列化的快照体 JSON 原文（顶层含 schemaVersion/
++ * tenantId/scopeType/scopeId/version 与五对象数组）。取回哈希与落库哈希不一致 → 500
++ * 告警日志（存储损坏探测）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "快照取回响应（TASK-0024）")
++public class SnapshotVO {
++
++    @Schema(description = "范围 1 网关 2 计算")
++    private Integer scopeType;
++
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度）")
++    private Long scopeId;
++
++    @Schema(description = "版本号")
++    private Long version;
++
++    @Schema(description = "快照哈希（SHA-256，64 位小写十六进制；与快照体逐字节核对）")
++    private String snapshotHash;
++
++    @Schema(description = "快照体 JSON 原文（Schema v1.0.1）")
++    private String snapshotBody;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigVersion.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigVersion.java
+new file mode 100644
+index 0000000..589b5ea
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigVersion.java
+@@ -0,0 +1,76 @@
++package net.otlab.admin.module.iot.publish.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.time.LocalDateTime;
++
++/**
++ * 配置版本实体类（TASK-0024，详细设计 §1.8 / 附录 A p33 逐字 DDL）
++ *
++ * <p>iot_config_version 表随本任务升级脚本（20261122_iot_publish_domain.sql）建立，DDL
++ * 逐字照附录 A p33（与上游差异一处：{@code uk_scope_version} (tenant_id, scope_type,
++ * scope_id, version) 物理唯一键为本任务增补——上游 p33 仅列部分索引。版本号同
++ * (tenant, scope) 单调递增是 REQ-0033 核心规则，服务层「SELECT 末版 → +1 → INSERT」
++ * 的并发竞态由该唯一键物理兜底，撞键转 5001 版本冲突——TC-0008 步骤 5 的物理保证）。
++ *
++ * <p>本表只由发布链路写入（publish/rollback），无手工新增口子（保存≠生效，TD-0034）：
++ * <ul>
++ * <li>发布：组装快照（Schema v1.0.1，锁定实例按其有效版本——ADR-0008）→ SHA-256 →
++ *     存对象存储（一期本地目录，{@code ot.publish.storage-path}）→ 版本落库
++ *     （publish_status=1, publish_time=NOW）；</li>
++ * <li>回滚：新版本行 publish_status=1 复用 targetVersion 快照文件
++ *     （snapshot_uri/snapshot_hash 同旧快照——版本单调递增但快照复用，TC-0008
++ *     「历史版本不被改写」）；</li>
++ * <li>publish_status=2「已回滚」枚举上游 DDL 预留，本任务回滚不改写既有行，不产生
++ *     2 值（保守读 TC-0008「历史版本不被改写」；语义归属上游修订，报告登记）。</li>
++ * </ul>
++ *
++ * <p>多租户：iot_ 前缀表，OtTenantLineHandler 自动按会话租户注入；tenant_id 服务层从
++ * 会话覆盖、禁前端传参。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_config_version")
++@Schema(description = "配置版本（TASK-0024）")
++public class IotConfigVersion extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "配置版本ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "范围 1 网关 2 计算")
++    private Integer scopeType;
++
++    @Schema(description = "范围对象ID（1=网关 id；2=0 租户粒度，契约 §1.8/Schema v1.0.1 派生规则 7）")
++    private Long scopeId;
++
++    @Schema(description = "版本号（同 (tenant, scope) 单调递增；uk_scope_version 物理兜底）")
++    private Long version;
++
++    @Schema(description = "快照哈希（SHA-256，64 位小写十六进制）")
++    private String snapshotHash;
++
++    @Schema(description = "快照文件地址（一期本地目录相对路径；MinIO 二期）")
++    private String snapshotUri;
++
++    @Schema(description = "状态 1 已发布 2 已回滚（2 为上游 DDL 预留，本期流程不产生）")
++    private Integer publishStatus;
++
++    @Schema(description = "发布时间")
++    private LocalDateTime publishTime;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java
+new file mode 100644
+index 0000000..5ac0392
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/NoOpPublishConfirmGate.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.publish.gate;
++
++import org.springframework.stereotype.Component;
++
++/**
++ * 发布确认门 NoOp 实现（TASK-0024 占位——恒放行，<b>本期发布不阻断</b>，brief 裁决 D7）。
++ *
++ * <p>TASK-0015（模板变更控制——第二档强制影响预览+二次确认）未交付，本类仅占住发布
++ * 流程的调用接缝：发布服务在版本落库前调用 {@link #requireConfirm}，NoOp 恒返回 true
++ * 使流程直通。0015 交付后以强制确认实现替换本 Bean（同类型唯一 Bean 覆盖或在配置类
++ * 显式装配），发布流程其余件不动——接口 {@link PublishConfirmGate} javadoc 载明完整
++ * 接线义务（含 5002 专用码的登记归属）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class NoOpPublishConfirmGate implements PublishConfirmGate {
++
++    @Override
++    public boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
++        // 占位恒放行：TASK-0015 交付后替换为强制影响预览+二次确认实现（ADR-0008 第二档）。
++        // 本期发布不阻断（brief 裁决 D7）；接线义务已在接口 javadoc 与任务报告登记。
++        return true;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java
+new file mode 100644
+index 0000000..56e15e1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/PublishConfirmGate.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.iot.publish.gate;
++
++/**
++ * 发布确认门接口（TASK-0024 预留接线位——TASK-0015「模板第二档变更强制影响预览+二次
++ * 确认」未交付，本任务以接口 + NoOp 占位，<b>本期发布不阻断</b>，brief 裁决 D7）。
++ *
++ * <p>ADR-0008 三档裁决：第二档（语义变更类——改默认公式/有效范围默认值/计算周期/状态
++ * 规则门限等）随发布生效，但发布<b>强制影响预览（受影响实例数+变更 diff）+二次确认</b>。
++ * 该强制确认的动作位即本接口：发布流程在「组装 → 哈希 → 存储 → 落库」之前调用
++ * {@link #requireConfirm}，返回 false 即拒绝发布。
++ *
++ * <p><b>接线义务（TASK-0015 交付时）</b>：
++ * <ol>
++ * <li>实现强制确认版 gate（NoOp 实现替换为真实现）：识别第二档模板变更、产出影响预览、
++ *     校验二次确认凭据；</li>
++ * <li>拒绝语义：gate 返回 false 时发布流程以 BusinessException 拒绝（当前占位文案
++ *     「发布未通过确认门」）；如需专用错误码 5002「下发未确认」（FEAT-0008 业务规则
++ *     提及），由 0015 在 ot-core ResultCode 登记扩展——本任务不动 ot-core；</li>
++ * <li>本期实现 {@link NoOpPublishConfirmGate} 恒放行（javadoc 声明接线点，报告登记
++ *     接线义务）。</li>
++ * </ol>
++ *
++ * <p>第一档（纯新增/装饰类）与第三档（结构破坏类，逐台确认迁移）不走本门（ADR-0008
++ * 各自政策）；gate 实现内部自行判档，发布流程无感。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface PublishConfirmGate {
++
++    /**
++     * 发布前确认门（占位语义——本期 NoOp 恒 true，0015 交付后替换为强制实现）
++     *
++     * @param tenantId     发布租户 id（服务层从会话取，禁请求携带）
++     * @param scopeType    范围 1 网关 2 计算
++     * @param scopeId      范围对象 ID（1=网关 id；2=0 租户粒度）
++     * @param targetVersion 本次发布将写入的版本号（末版+1，供影响预览与确认凭据锚定）
++     * @return true=放行继续发布；false=拒绝发布（发布流程抛 BusinessException）
++     */
++    boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigVersionMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigVersionMapper.java
+new file mode 100644
+index 0000000..176d381
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigVersionMapper.java
+@@ -0,0 +1,42 @@
++package net.otlab.admin.module.iot.publish.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++/**
++ * 配置版本 Mapper（TASK-0024）
++ *
++ * <p>BaseMapper（iot_ 前缀表多租户插件注入：列表/取回等会话链路天然同租户隔离）+
++ * 一个显式租户的 {@code @Select}（末版查询）——发布/回滚的单调递增基线。显式 tenant_id
++ * 条件为防御纵深（与会话租户同值，只会更严不会更宽，0017/0019 内部链路同口径）；
++ * {@code deleted = 0} 显式声明（原生 @Select 不过 @TableLogic 逻辑删注入，0018 编码
++ * 预检同款口径——版本行经 API 无删除途径，该条件恒真，防御性保留）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotConfigVersionMapper extends BaseMapper<IotConfigVersion> {
++
++    /**
++     * 同 (tenant, scope) 当前最大版本号（无任何版本行返回 null，服务层按 0 起步 +1）
++     *
++     * <p>发布/回滚共用的单调递增基线：version = max + 1 后 INSERT；并发窗口两线程同读
++     * max 各写同版由 {@code uk_scope_version} 物理唯一兜底（第二个 INSERT 撞键转 5001，
++     * TC-0008 步骤 5）。
++     *
++     * @param tenantId  会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param scopeType 范围 1 网关 2 计算
++     * @param scopeId   范围对象 ID（1=网关 id；2=0 租户粒度）
++     * @return 当前最大版本号；无版本行返回 null
++     */
++    @Select("SELECT MAX(version) FROM iot_config_version "
++            + "WHERE tenant_id = #{tenantId} AND scope_type = #{scopeType} "
++            + "AND scope_id = #{scopeId} AND deleted = 0")
++    Long selectMaxVersion(@Param("tenantId") Long tenantId,
++                          @Param("scopeType") Integer scopeType,
++                          @Param("scopeId") Long scopeId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java
+new file mode 100644
+index 0000000..89fd2ef
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.publish.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.RollbackForm;
++import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++
++/**
++ * 配置发布服务（TASK-0024，FEAT-0008/REQ-0033——发布链第一环：快照生成 + 版本落库 +
++ * 回滚 + 取回；下发记录 ACK/通知归 TASK-0025/0026）。
++ *
++ * <p>发布流程（brief D4）：组装（Schema v1.0.1）→ 凭据终检（fail-closed）→ 哈希 →
++ * 存储 → 版本落库（publish_status=1, publish_time=NOW）→ config_version 回写。
++ * 并发发布由 uk_scope_version 物理兜底转 5001。回滚（brief D5 裁决）：新版本行复用旧
++ * 快照文件（哈希同），历史版本不改写。取回（brief D6）：存储取回 + 哈希核对，不一致
++ * 500 告警（存储损坏探测）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotPublishService {
++
++    /**
++     * 发布：按 scope 生成单调新版本 + 快照落盘落库
++     *
++     * @param form scopeType/scopeId（scopeType=2 时 scopeId 服务层归一 0）
++     * @return 新版本行（publish_status=1）
++     */
++    IotConfigVersion publish(PublishForm form);
++
++    /**
++     * 回滚：以 targetVersion 快照生成新版本（新版本行复用旧快照文件与哈希）
++     *
++     * @param form scopeType/scopeId/targetVersion
++     * @return 新版本行（publish_status=1，snapshot_uri/snapshot_hash 同 targetVersion）
++     */
++    IotConfigVersion rollback(RollbackForm form);
++
++    /**
++     * 版本列表分页（version 降序；scope 级可见性防线——网关 scope 校验网关可见、
++     * 计算 scope 仅管理员语义）
++     *
++     * @param pageNum  页码（1 起）
++     * @param pageSize 页长
++     * @param scopeType 范围 1 网关 2 计算
++     * @param scopeId   范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）
++     * @return 版本分页
++     */
++    Page<IotConfigVersion> selectVersionList(Integer pageNum, Integer pageSize,
++                                             Integer scopeType, Long scopeId);
++
++    /**
++     * 快照取回：存储取回快照体 + SHA-256 哈希核对（与落库 snapshot_hash 比对，不一致
++     * 500 告警日志——存储损坏探测）；version 缺省返回最新版（契约 §3.3 口径）
++     *
++     * @param scopeType 范围 1 网关 2 计算
++     * @param scopeId   范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）
++     * @param version   版本号（null=最新版）
++     * @return 版本信封 + 快照体 JSON 原文
++     */
++    SnapshotVO retrieveSnapshot(Integer scopeType, Long scopeId, Long version);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+new file mode 100644
+index 0000000..4616e66
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -0,0 +1,490 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.RollbackForm;
++import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.gate.PublishConfirmGate;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.service.IotPublishService;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.time.LocalDateTime;
++import java.util.List;
++
++/**
++ * 配置发布服务实现（TASK-0024，发布链第一环——快照生成 + 版本落库 + 回滚 + 取回；
++ * 下发记录 ACK/超时重发/config.changed 通知归 TASK-0025/0026）。
++ *
++ * <p>发布流程（brief D4）：组装（{@link ConfigSnapshotAssembler} 严格按契约 Schema
++ * v1.0.1；组装来源=实例有效版本——ADR-0008）→ 凭据终检（{@link SnapshotCredentialGuard}
++ * fail-closed——ADR-0006 双保险之二）→ 确定性序列化 SHA-256 → 本地目录存储（一期裁决）→
++ * 版本落库（publish_status=1, publish_time=NOW）→ iot_point/iot_data_item.config_version
++ * 回写（0021/0013 建列时声明「由配置发布链路回写」的承接）。
++ *
++ * <p><b>版本单调与并发（brief D3）</b>：version = selectMaxVersion + 1；同
++ * (tenant, scope) 并发发布的竞态由 {@code uk_scope_version} 物理唯一兜底——第二个
++ * INSERT 撞 {@link DuplicateKeyException}。<b>取舍：撞键即报 5001，不重试</b>——重试会
++ * 把「两人同时发布」的冲突静默变成先后两个新版本，违背 REQ-0033 核心规则「两人同时发布
++ * 报版本冲突 5001」与 TC-0008 步骤 5「后者报 5001」；撞键方持旧内容也复用价值存疑
++ * （发布前应基于最新配置重看影响），由用户刷新后重发。孤儿快照文件补偿删除（best-effort）。
++ *
++ * <p><b>回滚（brief D5 裁决）</b>：新版本行 publish_status=1，snapshot_uri/snapshot_hash
++ * <b>复用 targetVersion 快照文件</b>（版本单调递增但快照复用，哈希同旧快照——不复制
++ * 存储与重算哈希；权衡：快照体顶层 version 仍是 targetVersion 的原值，行信封 version
++ * 为新值，消费方以行信封+哈希为准；TC-0008「历史版本不被改写」——不更新任何既有行）。
++ * 回滚目标的快照行内容（取回解析）所含点位/数据项回写 config_version=新版本号——「随
++ * 配置发布递增」对回滚版本同样成立。
++ *
++ * <p><b>确认门（brief D7）</b>：发布流程调用 {@link PublishConfirmGate}
++ * （TASK-0015 接线位——NoOp 占位恒放行，本期不阻断）。
++ *
++ * <p><b>数据权限防线（brief D9）</b>：发布/回滚为写操作（运营方动作）——网关 scope 校验
++ * 网关可见（dept/instance 锚点，NULL 不特判 fail-closed——ADR-0016 裁决 6）且存在启用；
++ * 计算 scope=全租户仅管理员语义（allTenant 即 scope=1 全部角色）；列表/取回同防线裁剪
++ * （照 0021 范式 resolve——读路径不要求启用）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Service
++public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, IotConfigVersion>
++        implements IotPublishService {
++
++    private static final Logger log = LoggerFactory.getLogger(IotPublishServiceImpl.class);
++
++    /** scope_type 1 网关 2 计算（附录 A p33 iot_config_version.scope_type） */
++    private static final int SCOPE_GATEWAY = 1;
++    private static final int SCOPE_COMPUTE = 2;
++
++    /** publish_status 1 已发布（2 已回滚为上游 DDL 预留，本任务流程不产生——类注释） */
++    private static final int PUBLISH_STATUS_PUBLISHED = 1;
++
++    /** 通道启用状态（iot_gateway.status 同值域 0 禁用 1 启用） */
++    private static final int STATUS_ENABLED = 1;
++
++    /** 回滚复用快照体解析用（id 提取——与组装侧确定性序列化独立，只读不产哈希） */
++    private static final JsonMapper BODY_MAPPER = JsonMapper.builder().build();
++
++    @Autowired
++    private IotGatewayMapper gatewayMapper;
++
++    @Autowired
++    private IotPointMapper pointMapper;
++
++    @Autowired
++    private IotDataItemMapper dataItemMapper;
++
++    @Autowired
++    private ConfigSnapshotAssembler assembler;
++
++    @Autowired
++    private SnapshotCredentialGuard credentialGuard;
++
++    @Autowired
++    private SnapshotStorage snapshotStorage;
++
++    @Autowired
++    private PublishConfirmGate confirmGate;
++
++    @Autowired
++    private DataPermService dataPermService;
++
++    // ---------- 发布 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public IotConfigVersion publish(PublishForm form) {
++        Integer scopeType = normalizeScopeType(form.getScopeType());
++        Long scopeId = normalizeScopeId(scopeType, form.getScopeId());
++        Long tenantId = TenantContext.getTenantId();
++        assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
++
++        Long lastVersion = baseMapper.selectMaxVersion(tenantId, scopeType, scopeId);
++        Long version = (lastVersion == null ? 0L : lastVersion) + 1;
++
++        // 确认门（TASK-0015 接线位——NoOp 恒放行，本期不阻断；false 分支为 0015 强制实现
++        // 交付后的拒绝路径，占位文案，专用码归 0015 登记）
++        if (!confirmGate.requireConfirm(tenantId, scopeType, scopeId, version)) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "发布未通过确认门（TASK-0015：强制影响预览+二次确认）");
++        }
++
++        // 组装（Schema v1.0.1）→ 终检（fail-closed）→ 确定性序列化 → SHA-256
++        ConfigSnapshot snapshot = assembler.assemble(tenantId, scopeType, scopeId, version);
++        String json = assembler.serialize(snapshot);
++        credentialGuard.check(json);
++        String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++
++        // 存储（一期本地目录）→ 版本落库；撞 uk_scope_version = 并发发布 → 5001（不重试，类注释取舍）
++        String uri;
++        try {
++            uri = snapshotStorage.store(tenantId, scopeType, scopeId, version, json);
++        } catch (IOException e) {
++            log.error("[SNAPSHOT] store failed tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version, e);
++            throw new BusinessException(ResultCode.ERROR.getCode(), "快照存储失败: " + e.getMessage());
++        }
++        IotConfigVersion row = new IotConfigVersion();
++        row.setTenantId(tenantId);
++        row.setScopeType(scopeType);
++        row.setScopeId(scopeId);
++        row.setVersion(version);
++        row.setSnapshotHash(hash);
++        row.setSnapshotUri(uri);
++        row.setPublishStatus(PUBLISH_STATUS_PUBLISHED);
++        row.setPublishTime(LocalDateTime.now());
++        try {
++            baseMapper.insert(row);
++        } catch (DuplicateKeyException e) {
++            snapshotStorage.deleteQuietly(uri);
++            log.warn("[SNAPSHOT] concurrent publish rejected tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version);
++            throw new BusinessException(ResultCode.VERSION_CONFLICT.getCode(),
++                    "版本冲突：该范围存在并发发布，请刷新后重试");
++        }
++
++        writeBackConfigVersion(scopeType, version, pointIdsOf(snapshot), dataItemIdsOf(snapshot));
++        return row;
++    }
++
++    /**
++     * 回滚路径前置校验：取回复用快照并核对哈希（目标快照缺失/损坏时拒绝回滚——新版本行
++     * 不得指向已损坏文件），解析快照内容所含行 id 供 config_version 回写。
++     *
++     * @param target 回滚目标版本行
++     * @return 复用快照内容所含行 id：网关 scope=点位 id 集 / 计算 scope=数据项 id 集（另一侧 null）
++     */
++    private ReuseIds verifyTargetSnapshotAndExtractIds(IotConfigVersion target) {
++        byte[] bytes;
++        try {
++            bytes = snapshotStorage.readBytes(target.getSnapshotUri());
++        } catch (IOException e) {
++            log.error("[SNAPSHOT] rollback read failed tenant={} scope={}-{} version={} uri={}",
++                    target.getTenantId(), target.getScopeType(), target.getScopeId(),
++                    target.getVersion(), target.getSnapshotUri(), e);
++            throw new BusinessException(ResultCode.ERROR.getCode(), "回滚目标快照读取失败: " + e.getMessage());
++        }
++        if (bytes == null) {
++            log.error("[SNAPSHOT] rollback target snapshot missing tenant={} scope={}-{} version={} uri={}",
++                    target.getTenantId(), target.getScopeType(), target.getScopeId(),
++                    target.getVersion(), target.getSnapshotUri());
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "回滚目标快照文件缺失（存储损坏探测，见服务端告警日志）");
++        }
++        String actualHash = SnapshotStorage.sha256Hex(bytes);
++        if (!actualHash.equals(target.getSnapshotHash())) {
++            log.error("[SNAPSHOT] rollback target hash mismatch (storage corruption) tenant={} scope={}-{} "
++                            + "version={} expected={} actual={}", target.getTenantId(), target.getScopeType(),
++                    target.getScopeId(), target.getVersion(), target.getSnapshotHash(), actualHash);
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "回滚目标快照哈希核对失败（存储损坏探测，见服务端告警日志）");
++        }
++        ReuseIds ids = new ReuseIds();
++        if (target.getScopeType() != null && target.getScopeType() == SCOPE_COMPUTE) {
++            ids.dataItemIds = idArrayOf(bytes, "dataItems");
++        } else {
++            ids.pointIds = idArrayOf(bytes, "points");
++        }
++        return ids;
++    }
++
++    /** 复用快照内容所含行 id（网关 scope=点位 / 计算 scope=数据项——另一侧恒 null） */
++    private static final class ReuseIds {
++        private List<Long> pointIds;
++        private List<Long> dataItemIds;
++    }
++
++    // ---------- 回滚 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public IotConfigVersion rollback(RollbackForm form) {
++        Integer scopeType = normalizeScopeType(form.getScopeType());
++        Long scopeId = normalizeScopeId(scopeType, form.getScopeId());
++        Long tenantId = TenantContext.getTenantId();
++        assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
++
++        IotConfigVersion target = baseMapper.selectOne(new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, scopeType)
++                .eq(IotConfigVersion::getScopeId, scopeId)
++                .eq(IotConfigVersion::getVersion, form.getTargetVersion()));
++        if (target == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "回滚目标版本不存在: " + form.getTargetVersion());
++        }
++        if (target.getSnapshotUri() == null || target.getSnapshotHash() == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "回滚目标版本缺少快照文件或哈希: " + form.getTargetVersion());
++        }
++
++        Long lastVersion = baseMapper.selectMaxVersion(tenantId, scopeType, scopeId);
++        Long version = (lastVersion == null ? 0L : lastVersion) + 1;
++
++        // 复用前置校验：目标快照取回 + 哈希核对（损坏 fail-closed——新版本行不得指向损坏文件）
++        // + 内容 id 解析（config_version 回写用）。校验先于落库——不产生指向坏文件的版本行。
++        ReuseIds reuseIds = verifyTargetSnapshotAndExtractIds(target);
++
++        // 新版本行复用旧快照文件（哈希同）——不重存、不改写历史行（brief D5 裁决，类注释权衡）
++        IotConfigVersion row = new IotConfigVersion();
++        row.setTenantId(tenantId);
++        row.setScopeType(scopeType);
++        row.setScopeId(scopeId);
++        row.setVersion(version);
++        row.setSnapshotHash(target.getSnapshotHash());
++        row.setSnapshotUri(target.getSnapshotUri());
++        row.setPublishStatus(PUBLISH_STATUS_PUBLISHED);
++        row.setPublishTime(LocalDateTime.now());
++        try {
++            baseMapper.insert(row);
++        } catch (DuplicateKeyException e) {
++            log.warn("[SNAPSHOT] concurrent rollback rejected tenant={} scope={}-{} version={}", tenantId, scopeType, scopeId, version);
++            throw new BusinessException(ResultCode.VERSION_CONFLICT.getCode(),
++                    "版本冲突：该范围存在并发发布/回滚，请刷新后重试");
++        }
++
++        writeBackConfigVersion(scopeType, version, reuseIds.pointIds, reuseIds.dataItemIds);
++        return row;
++    }
++
++    // ---------- 版本列表 ----------
++
++    @Override
++    public Page<IotConfigVersion> selectVersionList(Integer pageNum, Integer pageSize,
++                                                    Integer scopeType, Long scopeId) {
++        Integer normalizedType = normalizeScopeType(scopeType);
++        Long normalizedId = normalizeScopeId(normalizedType, scopeId);
++        assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
++        int pn = pageNum == null || pageNum < 1 ? 1 : pageNum;
++        int ps = pageSize == null || pageSize < 1 ? 10 : pageSize;
++        return baseMapper.selectPage(new Page<>(pn, ps), new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, normalizedType)
++                .eq(IotConfigVersion::getScopeId, normalizedId)
++                .orderByDesc(IotConfigVersion::getVersion));
++    }
++
++    // ---------- 快照取回 ----------
++
++    @Override
++    public SnapshotVO retrieveSnapshot(Integer scopeType, Long scopeId, Long version) {
++        Integer normalizedType = normalizeScopeType(scopeType);
++        Long normalizedId = normalizeScopeId(normalizedType, scopeId);
++        assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
++
++        LambdaQueryWrapper<IotConfigVersion> wrapper = new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, normalizedType)
++                .eq(IotConfigVersion::getScopeId, normalizedId);
++        if (version != null) {
++            wrapper.eq(IotConfigVersion::getVersion, version);
++        } else {
++            wrapper.orderByDesc(IotConfigVersion::getVersion).last("LIMIT 1");
++        }
++        IotConfigVersion row = baseMapper.selectOne(wrapper);
++        if (row == null) {
++            throw new BusinessException(ResultCode.NOT_FOUND.getCode(),
++                    version == null ? "该范围尚无已发布版本" : "指定版本不存在: " + version);
++        }
++
++        byte[] bytes;
++        try {
++            bytes = snapshotStorage.readBytes(row.getSnapshotUri());
++        } catch (IOException e) {
++            log.error("[SNAPSHOT] read failed tenant={} scope={}-{} version={} uri={}",
++                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(), row.getSnapshotUri(), e);
++            throw new BusinessException(ResultCode.ERROR.getCode(), "快照读取失败: " + e.getMessage());
++        }
++        if (bytes == null) {
++            log.error("[SNAPSHOT] snapshot file missing tenant={} scope={}-{} version={} uri={}",
++                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(), row.getSnapshotUri());
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "快照文件缺失（存储损坏探测，见服务端告警日志）");
++        }
++        String actualHash = SnapshotStorage.sha256Hex(bytes);
++        if (!actualHash.equals(row.getSnapshotHash())) {
++            log.error("[SNAPSHOT] hash mismatch (storage corruption) tenant={} scope={}-{} version={} "
++                            + "expected={} actual={}", row.getTenantId(), row.getScopeType(), row.getScopeId(),
++                    row.getVersion(), row.getSnapshotHash(), actualHash);
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "快照哈希核对失败（存储损坏探测，见服务端告警日志）");
++        }
++        return new SnapshotVO(normalizedType, normalizedId, row.getVersion(),
++                row.getSnapshotHash(), new String(bytes, StandardCharsets.UTF_8));
++    }
++
++    // ---------- scope 归一与防线 ----------
++
++    private Integer normalizeScopeType(Integer scopeType) {
++        if (scopeType == null || (scopeType != SCOPE_GATEWAY && scopeType != SCOPE_COMPUTE)) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeType 只允许 1 网关 2 计算");
++        }
++        return scopeType;
++    }
++
++    /** 计算 scope 归一 0（租户粒度——Schema v1.0.1 派生规则 7；请求携带值不参与存储键） */
++    private Long normalizeScopeId(Integer scopeType, Long scopeId) {
++        if (scopeId == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeId 不能为空");
++        }
++        return scopeType == SCOPE_COMPUTE ? 0L : scopeId;
++    }
++
++    /** 写路径防线：网关 scope 存在+启用+可见；计算 scope 全租户仅管理员语义（brief D9） */
++    private void assertScopeWritable(Integer scopeType, Long scopeId, Long userId) {
++        VisibleScope visible = dataPermService.resolve(userId);
++        if (scopeType == SCOPE_COMPUTE) {
++            if (!visible.allTenant()) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                        "计算范围发布/回滚仅限全租户（管理员）语义角色");
++            }
++            return;
++        }
++        IotGateway gateway = gatewayMapper.selectById(scopeId);
++        if (gateway == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
++        }
++        if (gateway.getStatus() == null || gateway.getStatus() != STATUS_ENABLED) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关已禁用，禁止发布/回滚: " + scopeId);
++        }
++        assertGatewayVisible(visible, gateway);
++    }
++
++    /** 读路径防线：网关 scope 校验网关可见（不要求启用——读无害）；计算 scope 管理员语义 */
++    private void assertScopeReadable(Integer scopeType, Long scopeId, Long userId) {
++        VisibleScope visible = dataPermService.resolve(userId);
++        if (scopeType == SCOPE_COMPUTE) {
++            if (!visible.allTenant()) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                        "计算范围版本/快照仅限全租户（管理员）语义角色");
++            }
++            return;
++        }
++        IotGateway gateway = gatewayMapper.selectById(scopeId);
++        if (gateway == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
++        }
++        assertGatewayVisible(visible, gateway);
++    }
++
++    /** 网关可见性：dept/instance 锚点任一命中；NULL 不特判 fail-closed（ADR-0016 裁决 6） */
++    private void assertGatewayVisible(VisibleScope visible, IotGateway gateway) {
++        if (visible.allTenant()) {
++            return;
++        }
++        boolean deptVisible = gateway.getDeptId() != null && visible.deptIds().contains(gateway.getDeptId());
++        boolean instanceVisible = gateway.getInstanceId() != null
++                && visible.instanceIds().contains(gateway.getInstanceId());
++        if (!deptVisible && !instanceVisible) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                    "网关不在可见范围（数据权限 fail-closed）: " + gateway.getId());
++        }
++    }
++
++    // ---------- config_version 回写（0021/0013 建列时声明「由配置发布链路回写」的承接） ----------
++
++    /**
++     * 回写 config_version=本次版本号（0021/0013 建列时声明「由配置发布链路回写」的承接）：
++     * 发布=组装内容所含行（snapshot ids 精确一致——快照 v N 内 configVersion=N）；回滚=
++     * 目标快照内容所含行（复用快照解析取 id——被回滚内容之外、期间新增的行不误标）。
++     *
++     * @param scopeType   范围 1 网关 2 计算
++     * @param version     本次版本号
++     * @param pointIds    网关 scope：快照内容所含点位 id 集（回滚路径取自复用快照解析）
++     * @param dataItemIds 计算 scope：快照内容所含数据项 id 集
++     */
++    private void writeBackConfigVersion(Integer scopeType, Long version,
++                                        List<Long> pointIds, List<Long> dataItemIds) {
++        if (scopeType == SCOPE_COMPUTE) {
++            if (dataItemIds == null || dataItemIds.isEmpty()) {
++                return;
++            }
++            dataItemMapper.update(null, new LambdaUpdateWrapper<IotDataItem>()
++                    .set(IotDataItem::getConfigVersion, version)
++                    .in(IotDataItem::getId, dataItemIds));
++            return;
++        }
++        if (pointIds == null || pointIds.isEmpty()) {
++            return;
++        }
++        pointMapper.update(null, new LambdaUpdateWrapper<IotPoint>()
++                .set(IotPoint::getConfigVersion, version)
++                .in(IotPoint::getId, pointIds));
++    }
++
++    /** 发布路径：组装内容所含点位 id（快照 v N 内点位 configVersion=N——与快照体一致） */
++    private List<Long> pointIdsOf(ConfigSnapshot snapshot) {
++        if (snapshot.getPoints() == null) {
++            return List.of();
++        }
++        return snapshot.getPoints().stream()
++                .map(net.otlab.admin.module.iot.publish.snapshot.SnapshotPoint::getId)
++                .collect(java.util.stream.Collectors.toList());
++    }
++
++    /** 发布路径（计算 scope）：组装内容所含数据项 id（快照 v N 内 configVersion=N） */
++    private List<Long> dataItemIdsOf(ConfigSnapshot snapshot) {
++        if (snapshot.getDataItems() == null) {
++            return List.of();
++        }
++        return snapshot.getDataItems().stream()
++                .map(net.otlab.admin.module.iot.publish.snapshot.SnapshotDataItem::getId)
++                .collect(java.util.stream.Collectors.toList());
++    }
++
++    /** 回滚路径（网关 scope）：复用快照体解析点位 id（已先过哈希核对） */
++    private List<Long> pointIdsOf(byte[] snapshotBytes) {
++        return idArrayOf(snapshotBytes, "points");
++    }
++
++    /** 回滚路径（计算 scope）：复用快照体解析数据项 id（已先过哈希核对） */
++    private List<Long> dataItemIdsOf(byte[] snapshotBytes) {
++        return idArrayOf(snapshotBytes, "dataItems");
++    }
++
++    /** 从快照体 JSON 提取对象数组 id 列（points/dataItems；数组缺省/空返回空集） */
++    private List<Long> idArrayOf(byte[] snapshotBytes, String arrayKey) {
++        try {
++            com.fasterxml.jackson.databind.JsonNode body =
++                    BODY_MAPPER.readTree(new String(snapshotBytes, StandardCharsets.UTF_8));
++            com.fasterxml.jackson.databind.JsonNode array = body.get(arrayKey);
++            if (array == null || !array.isArray()) {
++                return List.of();
++            }
++            List<Long> ids = new java.util.ArrayList<>();
++            for (com.fasterxml.jackson.databind.JsonNode element : array) {
++                if (element.isObject() && element.has("id")) {
++                    ids.add(element.get("id").asLong());
++                }
++            }
++            return ids;
++        } catch (IOException e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "回滚目标快照解析失败: " + e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshot.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshot.java
+new file mode 100644
+index 0000000..38e07b3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshot.java
+@@ -0,0 +1,74 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.util.List;
++
++/**
++ * 配置快照体顶层结构（TASK-0024，契约 {@code resources/contract/config-snapshot-schema.md}
++ * v1.0.1「快照体字段级 Schema（v1.0.1 派生）」章顶层键——派生声明第 10 条 v1.0.1 拟定，
++ * {@code schemaVersion} 一并下发为 §3.3 已承诺）。
++ *
++ * <p>装载口径（Schema v1.0.1 派生规则 7，本组装器的硬约束）：
++ * <ul>
++ * <li>网关范围（scopeType=1，scopeId=网关 id）：装载 {@code points + channels}；</li>
++ * <li>计算范围（scopeType=2，scopeId=0 租户粒度）：装载 {@code dataItems + formulas +
++ *     metrics}（公式对象=iot_data_item_ref 引用边行——派生声明第 8 条落位）；</li>
++ * <li>未装载的对象键<b>省略</b>（省略=该范围不涉及）——本类五数组全可空，null 序列化时
++ *     统一省略（NON_NULL）。</li>
++ * </ul>
++ *
++ * <p>冻结口径：additionalProperties=false——序列化结果经
++ * {@link SnapshotCredentialGuard} 终检（键白名单 + 凭据关键词拒绝 fail-closed）。
++ * 确定性序列化：字段序由 {@code @JsonPropertyOrder} 逐类钉死、Map（JSON 列）键序
++ * ORDER_MAP_ENTRIES_BY_KEYS、行序按库内 id 升序——两次组装哈希一致（验收项）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"schemaVersion", "tenantId", "scopeType", "scopeId", "version",
++        "points", "channels", "dataItems", "formulas", "metrics"})
++public class ConfigSnapshot {
++
++    /** 快照 Schema 版本（契约冻结稿 v1.0.1，随体下发——§3.3 已承诺） */
++    public static final String SCHEMA_VERSION = "1.0.1";
++
++    private String schemaVersion;
++
++    /** 租户 id（配置按租户隔离的根——派生规则 5） */
++    private Long tenantId;
++
++    /** 范围 1 网关 2 计算 */
++    private Integer scopeType;
++
++    /** 范围对象 ID（1=网关 id；2=0 租户粒度） */
++    private Long scopeId;
++
++    /** 版本号（顶层 version 与响应信封 version 同值，随体下发供网关本地缓存自校验） */
++    private Long version;
++
++    /** 点位对象集（网关范围装载；计算范围省略） */
++    private List<SnapshotPoint> points;
++
++    /** 通道对象集（网关范围装载；计算范围省略） */
++    private List<SnapshotChannel> channels;
++
++    /** 数据项对象集（计算范围装载；网关范围省略） */
++    private List<SnapshotDataItem> dataItems;
++
++    /** 公式对象集=引用边行（计算范围装载；网关范围省略） */
++    private List<SnapshotFormula> formulas;
++
++    /** 指标对象集（计算范围装载；网关范围省略） */
++    private List<SnapshotMetric> metrics;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssembler.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssembler.java
+new file mode 100644
+index 0000000..3efef42
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssembler.java
+@@ -0,0 +1,348 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.SerializationFeature;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.stream.Collectors;
++
++/**
++ * 快照组装器（TASK-0024，brief D1——快照体<b>严格按契约
++ * {@code resources/contract/config-snapshot-schema.md} v1.0.1 字段级 Schema</b> 组装，
++ * 不猜字段；组装来源=实例有效版本，锁定实例按其版本——ADR-0008）。
++ *
++ * <p>装载口径（Schema v1.0.1 派生规则 7）：
++ * <ul>
++ * <li>网关范围（scopeType=1，scopeId=网关 id）：装载该网关的通道（iot_channel.gateway_id=
++ *     scope_id）+ 点位（iot_point.channel_id ∈ 网关通道集——点位经通道挂网关，手工/虚拟
++ *     点位无通道不属网关范围）——顶层只出 points/channels 两键；</li>
++ * <li>计算范围（scopeType=2，scopeId=0 租户粒度）：装载全租户数据项（iot_data_item）+
++ *     公式引用边（iot_data_item_ref）+ 指标（iot_metric）——顶层只出 dataItems/formulas/
++ *     metrics 三键；未装载对象键省略（省略=该范围不涉及）。</li>
++ * </ul>
++ *
++ * <p><b>组装来源=实例有效版本（ADR-0008）</b>：iot_data_item 行即实例的有效配置内容——
++ * 实例创建按当时模板版本生成、模板升版不自动跟随（REQ-0005 锁定口径），锁定/未锁定实例
++ * 均以各自库内行组装；0015 交付实例升级链后，锁定实例保持其 applied_template_version
++ * 对应内容，组装器读行即按实例有效版本合成（无需特判）。多租户条件由插件注入（会话
++ * 链路）；deleted 行经 @TableLogic 运行时过滤（快照不含已逻辑删行——派生规则 4）。
++ *
++ * <p><b>确定性序列化</b>（验收项：两次组装哈希一致）：POJO 字段序由 @JsonPropertyOrder
++ * 钉死、JSON 列（conn_config/protocol_addr）解析后 Map 键序 ORDER_MAP_ENTRIES_BY_KEYS、
++ * 行序按 id 升序（DB ORDER BY + 组装器再排序兜底）、可空字段 null 统一省略（NON_NULL）。
++ *
++ * <p><b>configVersion 统一置本次发布版本号</b>：快照 v N 内所有点位/数据项
++ * configVersion=N，与发布成功后的 iot_point/iot_data_item.config_version 回写一致
++ * （「随配置发布递增」——快照自洽，回写同值，报告登记）。
++ *
++ * <p><b>通道凭据派生标记</b>（Schema v1.0.1 派生声明第 9 条，§1.3A 口径）：凭据表
++ * iot_channel_credential 不在快照数据源（各列不进快照）——只读 status=1 启用行派生
++ * hasCredential/credentialTypes 两标记字段（仅类型不含材料）；凭据材料的排除终检归
++ * {@link SnapshotCredentialGuard}（双保险之二）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class ConfigSnapshotAssembler {
++
++    /**
++     * 确定性序列化 Mapper：NON_NULL（可空字段省略——JSON Schema type 不含 null）+
++     * ORDER_MAP_ENTRIES_BY_KEYS（JSON 列解析出的 Map 键序稳定）。POJO 字段序由
++     * @JsonPropertyOrder 钉死。
++     */
++    private static final JsonMapper CANONICAL_MAPPER = JsonMapper.builder()
++            .serializationInclusion(JsonInclude.Include.NON_NULL)
++            .enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
++            .build();
++
++    /** JSON 列（conn_config/protocol_addr）解析用：原样解析、键序归一在序列化侧完成 */
++    private static final ObjectMapper PARSE_MAPPER = new ObjectMapper();
++
++    @Autowired
++    private IotChannelMapper channelMapper;
++
++    @Autowired
++    private IotPointMapper pointMapper;
++
++    @Autowired
++    private IotChannelCredentialMapper credentialMapper;
++
++    @Autowired
++    private IotDataItemMapper dataItemMapper;
++
++    @Autowired
++    private IotDataItemRefMapper dataItemRefMapper;
++
++    @Autowired
++    private IotMetricMapper metricMapper;
++
++    /**
++     * 组装快照体（仅组装，不含终检/哈希/存储/落库——顺序由发布服务编排）
++     *
++     * @param tenantId  租户 id（顶层 tenantId 根，派生规则 5）
++     * @param scopeType 范围 1 网关 2 计算
++     * @param scopeId   范围对象 ID（1=网关 id；2=0 租户粒度）
++     * @param version   本次发布版本号（顶层 version；对象 configVersion 同值）
++     * @return 快照体对象（序列化走 {@link #serialize(ConfigSnapshot)}）
++     */
++    public ConfigSnapshot assemble(Long tenantId, Integer scopeType, Long scopeId, Long version) {
++        ConfigSnapshot snapshot = new ConfigSnapshot();
++        snapshot.setSchemaVersion(ConfigSnapshot.SCHEMA_VERSION);
++        snapshot.setTenantId(tenantId);
++        snapshot.setScopeType(scopeType);
++        snapshot.setScopeId(scopeId);
++        snapshot.setVersion(version);
++        if (scopeType != null && scopeType == 1) {
++            assembleGatewayScope(snapshot, scopeId, version);
++        } else {
++            assembleComputeScope(snapshot, version);
++        }
++        return snapshot;
++    }
++
++    /**
++     * 确定性序列化（两次调用同一快照体产物逐字节一致——哈希确定性的直接来源）
++     *
++     * @param snapshot 快照体
++     * @return 紧凑 JSON（UTF-8）
++     */
++    public String serialize(ConfigSnapshot snapshot) {
++        try {
++            return CANONICAL_MAPPER.writeValueAsString(snapshot);
++        } catch (JsonProcessingException e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "快照体序列化失败: " + e.getMessage());
++        }
++    }
++
++    // ---------- 网关范围：通道 + 点位 ----------
++
++    private void assembleGatewayScope(ConfigSnapshot snapshot, Long gatewayId, Long version) {
++        // 通道：该网关全部通道（deleted 由 @TableLogic 过滤、tenant 由插件注入）
++        List<IotChannel> channels = channelMapper.selectList(new LambdaQueryWrapper<IotChannel>()
++                .eq(IotChannel::getGatewayId, gatewayId)
++                .orderByAsc(IotChannel::getId));
++
++        List<Long> channelIds = channels.stream().map(IotChannel::getId).toList();
++        List<SnapshotChannel> channelObjects = new ArrayList<>();
++        Map<Long, List<IotChannelCredential>> credentialsByChannel = loadEnabledCredentials(channelIds);
++        for (IotChannel channel : sortById(channels, IotChannel::getId)) {
++            channelObjects.add(toChannelObject(channel, credentialsByChannel.get(channel.getId())));
++        }
++        snapshot.setChannels(channelObjects);
++
++        // 点位：该网关全部通道下的点位（经通道挂网关）；无通道（手工/虚拟点位）不属网关范围
++        if (channelIds.isEmpty()) {
++            snapshot.setPoints(List.of());
++            return;
++        }
++        List<IotPoint> points = pointMapper.selectList(new LambdaQueryWrapper<IotPoint>()
++                .in(IotPoint::getChannelId, channelIds)
++                .orderByAsc(IotPoint::getId));
++        List<SnapshotPoint> pointObjects = new ArrayList<>();
++        for (IotPoint point : sortById(points, IotPoint::getId)) {
++            pointObjects.add(toPointObject(point, version));
++        }
++        snapshot.setPoints(pointObjects);
++    }
++
++    /** 启用凭据行（status=1）按通道分组——§1.3A 派生标记来源；各列本体不进快照 */
++    private Map<Long, List<IotChannelCredential>> loadEnabledCredentials(List<Long> channelIds) {
++        if (channelIds.isEmpty()) {
++            return Map.of();
++        }
++        List<IotChannelCredential> credentials = credentialMapper.selectList(
++                new LambdaQueryWrapper<IotChannelCredential>()
++                        .in(IotChannelCredential::getChannelId, channelIds)
++                        .eq(IotChannelCredential::getStatus, 1));
++        Map<Long, List<IotChannelCredential>> grouped = new LinkedHashMap<>();
++        for (IotChannelCredential cred : credentials) {
++            grouped.computeIfAbsent(cred.getChannelId(), k -> new ArrayList<>()).add(cred);
++        }
++        return grouped;
++    }
++
++    // ---------- 计算范围：数据项 + 公式引用边 + 指标 ----------
++
++    private void assembleComputeScope(ConfigSnapshot snapshot, Long version) {
++        List<IotDataItem> items = dataItemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
++                .orderByAsc(IotDataItem::getId));
++        List<IotDataItemRef> refs = dataItemRefMapper.selectList(new LambdaQueryWrapper<IotDataItemRef>()
++                .orderByAsc(IotDataItemRef::getId));
++        List<IotMetric> metrics = metricMapper.selectList(new LambdaQueryWrapper<IotMetric>()
++                .orderByAsc(IotMetric::getId));
++
++        List<SnapshotDataItem> itemObjects = new ArrayList<>();
++        for (IotDataItem item : sortById(items, IotDataItem::getId)) {
++            itemObjects.add(toDataItemObject(item, version));
++        }
++        List<SnapshotFormula> formulaObjects = new ArrayList<>();
++        for (IotDataItemRef ref : sortById(refs, IotDataItemRef::getId)) {
++            formulaObjects.add(toFormulaObject(ref));
++        }
++        List<SnapshotMetric> metricObjects = new ArrayList<>();
++        for (IotMetric metric : sortById(metrics, IotMetric::getId)) {
++            metricObjects.add(toMetricObject(metric));
++        }
++        snapshot.setDataItems(itemObjects);
++        snapshot.setFormulas(formulaObjects);
++        snapshot.setMetrics(metricObjects);
++    }
++
++    // ---------- 对象映射（Schema v1.0.1 逐字段——业务列全量映射，审计五列剔除） ----------
++
++    private SnapshotPoint toPointObject(IotPoint point, Long version) {
++        SnapshotPoint o = new SnapshotPoint();
++        o.setId(point.getId());
++        o.setTenantId(point.getTenantId());
++        o.setPointCode(point.getPointCode());
++        o.setPointName(point.getPointName());
++        o.setDataType(point.getDataType());
++        o.setValueType(point.getValueType());
++        o.setUnit(point.getUnit());
++        o.setMinValue(point.getMinValue());
++        o.setMaxValue(point.getMaxValue());
++        o.setSamplePeriod(point.getSamplePeriod());
++        o.setDeadband(point.getDeadband());
++        o.setChannelId(point.getChannelId());
++        o.setProtocolAddr(parseJsonColumn(point.getProtocolAddr(), "protocol_addr", point.getPointCode()));
++        o.setBoundInstanceId(point.getBoundInstanceId());
++        o.setDeptId(point.getDeptId());
++        o.setStatus(point.getStatus());
++        o.setConfigVersion(version);
++        o.setRemark(point.getRemark());
++        return o;
++    }
++
++    private SnapshotChannel toChannelObject(IotChannel channel, List<IotChannelCredential> channelCredentials) {
++        SnapshotChannel o = new SnapshotChannel();
++        o.setId(channel.getId());
++        o.setTenantId(channel.getTenantId());
++        o.setGatewayId(channel.getGatewayId());
++        o.setChannelCode(channel.getChannelCode());
++        o.setChannelName(channel.getChannelName());
++        o.setProtocolType(channel.getProtocolType());
++        o.setConnConfig(parseJsonColumn(channel.getConnConfig(), "conn_config", channel.getChannelCode()));
++        o.setStatus(channel.getStatus());
++        // §1.3A 派生标记：仅是否有凭据/凭据类型清单（status=1 启用行），不含任何凭据材料
++        boolean hasCredential = channelCredentials != null && !channelCredentials.isEmpty();
++        o.setHasCredential(hasCredential);
++        if (hasCredential) {
++            o.setCredentialTypes(channelCredentials.stream()
++                    .map(IotChannelCredential::getCredType)
++                    .distinct()
++                    .sorted()
++                    .collect(Collectors.toList()));
++        }
++        return o;
++    }
++
++    private SnapshotDataItem toDataItemObject(IotDataItem item, Long version) {
++        SnapshotDataItem o = new SnapshotDataItem();
++        o.setId(item.getId());
++        o.setTenantId(item.getTenantId());
++        o.setInstanceId(item.getInstanceId());
++        o.setDataCode(item.getDataCode());
++        o.setFullKey(item.getFullKey());
++        o.setDataName(item.getDataName());
++        o.setCategory(item.getCategory());
++        o.setUnit(item.getUnit());
++        o.setSourceType(item.getSourceType());
++        o.setPointId(item.getPointId());
++        o.setFormula(item.getFormula());
++        o.setRollupMethod(item.getRollupMethod());
++        o.setCalcPeriod(item.getCalcPeriod());
++        o.setValidMin(item.getValidMin());
++        o.setValidMax(item.getValidMax());
++        o.setAlarmLow(item.getAlarmLow());
++        o.setAlarmHigh(item.getAlarmHigh());
++        o.setEnabled(item.getEnabled());
++        o.setConfigVersion(version);
++        o.setStatus(item.getStatus());
++        return o;
++    }
++
++    private SnapshotFormula toFormulaObject(IotDataItemRef ref) {
++        SnapshotFormula o = new SnapshotFormula();
++        o.setId(ref.getId());
++        o.setTenantId(ref.getTenantId());
++        o.setItemId(ref.getItemId());
++        o.setRefFullKey(ref.getRefFullKey());
++        o.setRefType(ref.getRefType());
++        o.setRefItemId(ref.getRefItemId());
++        return o;
++    }
++
++    private SnapshotMetric toMetricObject(IotMetric metric) {
++        SnapshotMetric o = new SnapshotMetric();
++        o.setId(metric.getId());
++        o.setTenantId(metric.getTenantId());
++        o.setMetricCode(metric.getMetricCode());
++        o.setMetricName(metric.getMetricName());
++        o.setInstanceId(metric.getInstanceId());
++        o.setSourceItemId(metric.getSourceItemId());
++        o.setAggType(metric.getAggType());
++        o.setPeriod(metric.getPeriod());
++        o.setCalendarType(metric.getCalendarType());
++        o.setRatioNumItemId(metric.getRatioNumItemId());
++        o.setRatioDenItemId(metric.getRatioDenItemId());
++        o.setYoyFlag(metric.getYoyFlag());
++        o.setMomFlag(metric.getMomFlag());
++        o.setDeptId(metric.getDeptId());
++        o.setStatus(metric.getStatus());
++        return o;
++    }
++
++    /**
++     * JSON 列解析为 Map（键序由序列化侧 ORDER_MAP_ENTRIES_BY_KEYS 归一）——落库侧经
++     * 0018 Schema 校验的合法 JSON；读取侧解析失败 fail-closed（组装失败，不带病发布）。
++     */
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> parseJsonColumn(String raw, String column, String rowCode) {
++        if (raw == null || raw.isBlank()) {
++            return null;
++        }
++        try {
++            Map<String, Object> parsed = PARSE_MAPPER.readValue(raw, LinkedHashMap.class);
++            return new TreeMap<>(parsed);
++        } catch (JsonProcessingException e) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "快照组装失败：" + column + " 不是合法 JSON（行 " + rowCode + "）: " + e.getMessage());
++        }
++    }
++
++    /** 行序按 id 升序兜底（DB 侧 ORDER BY id；确定性序列化的行序来源） */
++    private <T> List<T> sortById(List<T> rows, java.util.function.Function<T, Long> idGetter) {
++        if (rows == null) {
++            return List.of();
++        }
++        return rows.stream()
++                .sorted(java.util.Comparator.comparing(idGetter,
++                        java.util.Comparator.nullsLast(java.util.Comparator.naturalOrder())))
++                .toList();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotChannel.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotChannel.java
+new file mode 100644
+index 0000000..93d1bb6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotChannel.java
+@@ -0,0 +1,70 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * 快照体 · 通道对象（TASK-0024，契约 Schema v1.0.1「通道对象 channel」字段级 Schema 逐字段
++ * 映射 iot_channel；凭据标记口径 §1.3A——派生声明第 9 条）。
++ *
++ * <p><b>凭据排除（ADR-0006）</b>：iot_channel_credential 各列（cred_type/ciphertext/
++ * key_version 等）不进快照；本对象只携带派生标记两字段——{@code hasCredential}（是否有
++ * 启用凭据行 status=1，必填）与 {@code credentialTypes}（启用凭据的 cred_type 清单，仅
++ * 类型不含任何凭据材料）——两者为 Schema v1.0.1 拟定字段名（上游未给），且是快照体内
++ * 「凭据关键词」的<b>唯一合法落点</b>（终检 {@link SnapshotCredentialGuard} 白名单豁免
++ * 仅此两键）。
++ *
++ * <p>{@code connConfig} 为 json→object（内层键名上游未定版，按自由 object 承载且不得含
++ * 凭据明文——§1.3/附录 A DDL 注释；写入侧 0018 ChannelConnConfigValidator 已挡凭据键，
++ * 读取侧终检二道闸 fail-closed）。网关表 iot_gateway 不在信封五对象集内，不派生（差异
++ * 第 11 条）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"id", "tenantId", "gatewayId", "channelCode", "channelName",
++        "protocolType", "connConfig", "status", "hasCredential", "credentialTypes"})
++public class SnapshotChannel {
++
++    /** iot_channel.id 主键 */
++    private Long id;
++
++    /** tenant_id 租户 id */
++    private Long tenantId;
++
++    /** gateway_id 所属网关 id */
++    private Long gatewayId;
++
++    /** channel_code 通道编码，网关内唯一 */
++    private String channelCode;
++
++    /** channel_name 通道名称 */
++    private String channelName;
++
++    /** protocol_type 协议类型 MQTT/HTTP/MODBUS/OPCUA */
++    private String protocolType;
++
++    /** conn_config 连接配置 JSON（不含凭据明文；内层键名上游未定版） */
++    private Map<String, Object> connConfig;
++
++    /** status 1 启用 0 禁用 */
++    private Integer status;
++
++    /** §1.3A 派生标记（非表列）：是否有启用的凭据（iot_channel_credential.status=1）——字段名 v1.0.1 拟定 */
++    private Boolean hasCredential;
++
++    /** §1.3A 派生标记（非表列）：启用凭据的 cred_type 清单，仅类型不含材料——字段名 v1.0.1 拟定 */
++    private List<String> credentialTypes;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuard.java
+new file mode 100644
+index 0000000..9d308b6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuard.java
+@@ -0,0 +1,223 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.springframework.stereotype.Component;
++
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * 快照凭据终检（TASK-0024，ADR-0006 双保险之二——fail-closed）。
++ *
++ * <p>双保险布局（照 0018 conn_config 校验器同款关键词集与「结构校验+关键词拒绝」双道）：
++ * <ol>
++ * <li><b>保险一 · 组装器白名单字段</b>：{@link ConfigSnapshotAssembler} 严格按契约
++ *     Schema v1.0.1 五对象字段级 Schema 组装——凭据表 iot_channel_credential 不在数据源
++ *     清单（只读 status=1 行派生 hasCredential/credentialTypes 标记），凭据各列结构性
++ *     不进快照；</li>
++ * <li><b>保险二 · 组装后终检（本类）</b>：对序列化后的快照体 JSON 全深度递归做三道
++ *     机械检查——①顶层键 ⊆ Schema v1.0.1 顶层键集；②五对象数组元素的键 ⊆ 各对象
++ *     Schema 键集（additionalProperties=false 运行时复核）；③全树键名凭据关键词拒绝
++ *     （0018 同款八词：credential/password/passwd/secret/token/apikey/accesskey/
++ *     privatekey，大小写不敏感子串匹配）+ 字符串值高信号词扫描。任一命中即组装失败
++ *     （BusinessException PARAM_ERROR，文案直指 ADR-0006 防线语义）。</li>
++ * </ol>
++ *
++ * <p><b>合法豁免（仅两键）</b>：{@code hasCredential} 与 {@code credentialTypes} 是
++ * Schema v1.0.1 派生标记字段（§1.3A「通道只带是否有凭据、凭据类型标记」的结构化落点，
++ * 派生声明第 9 条）——键名本身含 credential 字样、credentialTypes 的取值含
++ * MQTT_PASSWORD 等类型字面量，为 Schema 明文承诺的合法内容，白名单精确豁免（不含
++ * 材料仅标记）。豁免键的<b>键名</b>不参与关键词判定、其<b>值</b>不参与值扫描；其余
++ * 一律不豁免。
++ *
++ * <p><b>值扫描词集收窄说明</b>：值扫描仅取高信号三词 password/passwd/secret——token/
++ * apikey 等词在合法配置值中存在既定先例（0018 已裁定 HTTP conn_config authType 枚举值
++ * "apiKey" 是鉴权方式标记而非凭据本体；MQTT topic 含 token 字样属主题命名非凭据），
++ * 按值扫描会误伤合法发布；键名扫描仍用全八词（键携带凭据必须走凭据表）。材料可能藏于
++ * 已知键值的残余风险由写入侧 0018 conn_config/protocol_addr 校验器与凭据表隔离共同
++ * 收敛（报告登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class SnapshotCredentialGuard {
++
++    /** Schema v1.0.1 顶层键集（派生声明第 10 条拟定键名） */
++    private static final Set<String> TOP_LEVEL_KEYS = Set.of(
++            "schemaVersion", "tenantId", "scopeType", "scopeId", "version",
++            "points", "channels", "dataItems", "formulas", "metrics");
++
++    /** point 对象键集（Schema v1.0.1 点位对象表，additionalProperties=false） */
++    private static final Set<String> POINT_KEYS = Set.of(
++            "id", "tenantId", "pointCode", "pointName", "dataType", "valueType", "unit",
++            "minValue", "maxValue", "samplePeriod", "deadband", "channelId",
++            "protocolAddr", "boundInstanceId", "deptId", "status", "configVersion", "remark");
++
++    /** channel 对象键集（Schema v1.0.1 通道对象表） */
++    private static final Set<String> CHANNEL_KEYS = Set.of(
++            "id", "tenantId", "gatewayId", "channelCode", "channelName", "protocolType",
++            "connConfig", "status", "hasCredential", "credentialTypes");
++
++    /** dataItem 对象键集（Schema v1.0.1 数据项对象表） */
++    private static final Set<String> DATA_ITEM_KEYS = Set.of(
++            "id", "tenantId", "instanceId", "dataCode", "fullKey", "dataName", "category",
++            "unit", "sourceType", "pointId", "formula", "rollupMethod", "calcPeriod",
++            "validMin", "validMax", "alarmLow", "alarmHigh", "enabled", "configVersion", "status");
++
++    /** formula 对象键集（Schema v1.0.1 公式对象表） */
++    private static final Set<String> FORMULA_KEYS = Set.of(
++            "id", "tenantId", "itemId", "refFullKey", "refType", "refItemId");
++
++    /** metric 对象键集（Schema v1.0.1 指标对象表） */
++    private static final Set<String> METRIC_KEYS = Set.of(
++            "id", "tenantId", "metricCode", "metricName", "instanceId", "sourceItemId",
++            "aggType", "period", "calendarType", "ratioNumItemId", "ratioDenItemId",
++            "yoyFlag", "momFlag", "deptId", "status");
++
++    /**
++     * 键名凭据关键词（小写；0018 ChannelConnConfigValidator 同款八词，大小写不敏感
++     * 「包含」匹配——mqttPassword/accessToken 等变体一并命中）
++     */
++    private static final List<String> FORBIDDEN_KEY_WORDS =
++            List.of("credential", "password", "passwd", "secret", "token", "apikey",
++                    "accesskey", "privatekey");
++
++    /**
++     * 字符串值扫描词（高信号三词，见类注释值扫描收窄说明；豁免键的值不扫描）
++     */
++    private static final List<String> FORBIDDEN_VALUE_WORDS =
++            List.of("password", "passwd", "secret");
++
++    /** Schema v1.0.1 派生标记两字段——键名/值关键词判定的唯一合法豁免 */
++    private static final Set<String> SANCTIONED_MARKER_KEYS = Set.of("hasCredential", "credentialTypes");
++
++    private static final JsonMapper MAPPER = JsonMapper.builder().build();
++
++    /**
++     * 快照体终检入口（组装 → 序列化后、哈希前调用）
++     *
++     * @param snapshotJson 确定性序列化后的快照体 JSON
++     * @throws BusinessException PARAM_ERROR——顶层键越集 / 对象键越集 / 凭据关键词键 /
++     *                          值含高信号凭据词 / 非法 JSON
++     */
++    public void check(String snapshotJson) {
++        JsonNode root;
++        try {
++            root = MAPPER.readTree(snapshotJson);
++        } catch (JsonProcessingException e) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "快照终检失败：快照体不是合法 JSON: " + e.getMessage());
++        }
++        if (root == null || !root.isObject()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "快照终检失败：快照体必须是 JSON 对象");
++        }
++
++        // ① 顶层键白名单（additionalProperties=false 顶层复核）
++        Set<String> topLevelViolations = new LinkedHashSet<>();
++        root.fieldNames().forEachRemaining(name -> {
++            if (!TOP_LEVEL_KEYS.contains(name)) {
++                topLevelViolations.add(name);
++            }
++        });
++        if (!topLevelViolations.isEmpty()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "快照终检失败：快照体出现 Schema v1.0.1 之外顶层键: " + String.join("、", topLevelViolations));
++        }
++
++        // ② 五对象数组元素键白名单（按容器键取对应 Schema 键集）
++        checkObjectArray(root, "points", POINT_KEYS);
++        checkObjectArray(root, "channels", CHANNEL_KEYS);
++        checkObjectArray(root, "dataItems", DATA_ITEM_KEYS);
++        checkObjectArray(root, "formulas", FORMULA_KEYS);
++        checkObjectArray(root, "metrics", METRIC_KEYS);
++
++        // ③ 凭据关键词全深度递归（键全八词 + 值高信号三词；豁免键除外）
++        Set<String> credentialKeys = new LinkedHashSet<>();
++        Set<String> credentialValues = new LinkedHashSet<>();
++        collectCredentialHits(root, "", credentialKeys, credentialValues);
++        if (!credentialKeys.isEmpty() || !credentialValues.isEmpty()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "快照终检失败：快照体含凭据关键词（ADR-0006：凭据独立存凭据管理，不入配置快照）: "
++                            + String.join("、", credentialKeys) + String.join("、", credentialValues));
++        }
++    }
++
++    /** 校验五对象数组元素的键 ⊆ 对应 Schema 键集 */
++    private void checkObjectArray(JsonNode root, String arrayKey, Set<String> objectKeys) {
++        JsonNode array = root.get(arrayKey);
++        if (array == null || !array.isArray()) {
++            return;
++        }
++        for (JsonNode element : array) {
++            if (!element.isObject()) {
++                throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "快照终检失败：" + arrayKey + " 数组元素必须是 JSON 对象");
++            }
++            Set<String> violations = new LinkedHashSet<>();
++            element.fieldNames().forEachRemaining(name -> {
++                if (!objectKeys.contains(name)) {
++                    violations.add(name);
++                }
++            });
++            if (!violations.isEmpty()) {
++                throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "快照终检失败：" + arrayKey + " 对象出现 Schema v1.0.1 之外字段: "
++                                + String.join("、", violations));
++            }
++        }
++    }
++
++    /**
++     * 全深度递归收集凭据命中（数组元素逐个递归——{"creds":[{"password":...}]} 类形状
++     * 不得逃逸双保险，照 0018 同款口径）；路径标注如 points[0].protocolAddr.password。
++     */
++    private void collectCredentialHits(JsonNode node, String path,
++                                       Set<String> keyHits, Set<String> valueHits) {
++        if (node.isObject()) {
++            node.fields().forEachRemaining(entry -> {
++                String name = entry.getKey();
++                String childPath = path.isEmpty() ? name : path + "." + name;
++                if (!SANCTIONED_MARKER_KEYS.contains(name)
++                        && containsAnyWord(name.toLowerCase(Locale.ROOT), FORBIDDEN_KEY_WORDS)) {
++                    keyHits.add(childPath);
++                }
++                collectCredentialHits(entry.getValue(), childPath, keyHits, valueHits);
++            });
++        } else if (node.isArray()) {
++            for (int i = 0; i < node.size(); i++) {
++                collectCredentialHits(node.get(i), path + "[" + i + "]", keyHits, valueHits);
++            }
++        } else if (node.isTextual()) {
++            String fieldName = fieldNameOf(path);
++            if (!SANCTIONED_MARKER_KEYS.contains(fieldName)
++                    && containsAnyWord(node.asText().toLowerCase(Locale.ROOT), FORBIDDEN_VALUE_WORDS)) {
++                valueHits.add(path);
++            }
++        }
++    }
++
++    /** 从路径尾段取字段名（数组下标回退——credentialTypes[0] → credentialTypes） */
++    private String fieldNameOf(String path) {
++        int dot = path.lastIndexOf('.');
++        String tail = dot >= 0 ? path.substring(dot + 1) : path;
++        int bracket = tail.indexOf('[');
++        return bracket >= 0 ? tail.substring(0, bracket) : tail;
++    }
++
++    private boolean containsAnyWord(String text, List<String> words) {
++        for (String word : words) {
++            if (text.contains(word)) {
++                return true;
++            }
++        }
++        return false;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotDataItem.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotDataItem.java
+new file mode 100644
+index 0000000..88a74b2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotDataItem.java
+@@ -0,0 +1,95 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.math.BigDecimal;
++
++/**
++ * 快照体 · 数据项对象（TASK-0024，契约 Schema v1.0.1「数据项对象 dataItem」字段级 Schema
++ * 逐字段映射 iot_data_item——业务列全量映射、审计五列剔除，additionalProperties=false）。
++ *
++ * <p>阈值继承规则（实例四字段未填时继承模板 default_ 四字段）属管理系统生成口径——快照
++ * <b>如实携带实例行原值</b>（可空即为空），不代做继承展开（Schema v1.0.1 章明文）。
++ * {@code configVersion} 组装器统一置本次发布版本号（与 iot_data_item.config_version
++ * 回写一致）。模板数据项表 iot_data_item_template 不在信封五对象集内，不派生（差异
++ * 第 11 条）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"id", "tenantId", "instanceId", "dataCode", "fullKey", "dataName",
++        "category", "unit", "sourceType", "pointId", "formula", "rollupMethod",
++        "calcPeriod", "validMin", "validMax", "alarmLow", "alarmHigh", "enabled",
++        "configVersion", "status"})
++public class SnapshotDataItem {
++
++    /** iot_data_item.id 主键 */
++    private Long id;
++
++    /** tenant_id 租户 id */
++    private Long tenantId;
++
++    /** instance_id 所属实例 id */
++    private Long instanceId;
++
++    /** data_code 数据编码（iot_data_dict 口径） */
++    private String dataCode;
++
++    /** full_key 全键 = instance_code + "." + data_code */
++    private String fullKey;
++
++    /** data_name 数据名称（可覆盖模板） */
++    private String dataName;
++
++    /** category 类别 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER */
++    private String category;
++
++    /** unit 单位 */
++    private String unit;
++
++    /** source_type 取值方式 1 绑定（点位） 2 公式 3 汇总 */
++    private Integer sourceType;
++
++    /** point_id 绑定的点位 id（sourceType=1 时有值） */
++    private Long pointId;
++
++    /** formula 公式（Aviator，含 DELTA()/INTEGRAL() 算子；引用边随 formula 对象下发） */
++    private String formula;
++
++    /** rollup_method 汇总方式 SUM/AVG（sourceType=3 时有值） */
++    private String rollupMethod;
++
++    /** calc_period 计算周期（秒）；0 表示到达驱动 */
++    private Integer calcPeriod;
++
++    /** valid_min 有效范围下限（空则不判定） */
++    private BigDecimal validMin;
++
++    /** valid_max 有效范围上限 */
++    private BigDecimal validMax;
++
++    /** alarm_low 告警低阈值（展示标红用） */
++    private BigDecimal alarmLow;
++
++    /** alarm_high 告警高阈值 */
++    private BigDecimal alarmHigh;
++
++    /** enabled 是否启用计算 1 启用 0 停用 */
++    private Integer enabled;
++
++    /** config_version 配置版本号（随发布递增；组装器统一置本次发布版本号） */
++    private Long configVersion;
++
++    /** status 1 启用 0 禁用 */
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotFormula.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotFormula.java
+new file mode 100644
+index 0000000..45d4b38
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotFormula.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 快照体 · 公式对象（TASK-0024，契约 Schema v1.0.1「公式对象 formula」字段级 Schema 逐字段
++ * 映射 iot_data_item_ref 公式引用关系表——引用边行）。
++ *
++ * <p>落位说明（差异第 8 条）：上游未为「公式」单独建表——公式表达式是 iot_data_item.formula
++ * 列（随数据项对象下发），公式保存时由解析器在本表自动生成引用边（不允许人工维护）；信封
++ * 承诺的「公式」对象映射为本表引用边行，计算引擎据此重建依赖图、做循环检测与变更影响
++ * 分析。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"id", "tenantId", "itemId", "refFullKey", "refType", "refItemId"})
++public class SnapshotFormula {
++
++    /** iot_data_item_ref.id 主键 */
++    private Long id;
++
++    /** tenant_id 租户 id */
++    private Long tenantId;
++
++    /** item_id 引用方数据项 id（公式所在项） */
++    private Long itemId;
++
++    /** ref_full_key 被引用数据项的全键；引用点位直绑时存点位编码并以 refType 区分 */
++    private String refFullKey;
++
++    /** ref_type 引用类型 1 数据项 2 点位 */
++    private Integer refType;
++
++    /** ref_item_id 被引用数据项 id（refType=1 时回填） */
++    private Long refItemId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotMetric.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotMetric.java
+new file mode 100644
+index 0000000..5dde936
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotMetric.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 快照体 · 指标对象（TASK-0024，契约 Schema v1.0.1「指标对象 metric」字段级 Schema 逐字段
++ * 映射 iot_metric——业务列全量映射、审计五列剔除，additionalProperties=false）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"id", "tenantId", "metricCode", "metricName", "instanceId",
++        "sourceItemId", "aggType", "period", "calendarType", "ratioNumItemId",
++        "ratioDenItemId", "yoyFlag", "momFlag", "deptId", "status"})
++public class SnapshotMetric {
++
++    /** iot_metric.id 主键 */
++    private Long id;
++
++    /** tenant_id 租户 id */
++    private Long tenantId;
++
++    /** metric_code 指标编码，租户内唯一 */
++    private String metricCode;
++
++    /** metric_name 指标名称 */
++    private String metricName;
++
++    /** instance_id 归属实例 id（统计对象） */
++    private Long instanceId;
++
++    /** source_item_id 来源数据项 id（比值型可空） */
++    private Long sourceItemId;
++
++    /** agg_type 聚合类型 1 平均 2 累计 3 最大 4 最小 5 比值 */
++    private Integer aggType;
++
++    /** period 统计周期 HOUR/DAY/MONTH/YEAR */
++    private String period;
++
++    /** calendar_type 日历口径 1 自然日历 2 班次日历（预留） */
++    private Integer calendarType;
++
++    /** ratio_num_item_id 比值分子数据项 id（aggType=5 时必填） */
++    private Long ratioNumItemId;
++
++    /** ratio_den_item_id 比值分母数据项 id */
++    private Long ratioDenItemId;
++
++    /** yoy_flag 是否计算同比 1 是 0 否 */
++    private Integer yoyFlag;
++
++    /** mom_flag 是否计算环比 1 是 0 否 */
++    private Integer momFlag;
++
++    /** dept_id 绑定部门 id */
++    private Long deptId;
++
++    /** status 1 启用 0 禁用 */
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotPoint.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotPoint.java
+new file mode 100644
+index 0000000..d44f2f1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotPoint.java
+@@ -0,0 +1,91 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonInclude;
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.math.BigDecimal;
++import java.util.Map;
++
++/**
++ * 快照体 · 点位对象（TASK-0024，契约 Schema v1.0.1「点位对象 point」字段级 Schema 逐字段
++ * 映射 iot_point——业务列全量映射、审计五列剔除（派生规则 4），additionalProperties=false）。
++ *
++ * <p>类型映射（派生规则 3）：bigint→integer（JSON number）、int/tinyint→integer、
++ * decimal(20,6)→number（BigDecimal 原样序列化）、json→object（protocol_addr 解析为
++ * Map，键序 ORDER_MAP_ENTRIES_BY_KEYS——内层键名上游未定版，按自由 object 承载且不得
++ * 含凭据）。可空字段 null 序列化统一省略（NON_NULL——JSON Schema type 不含 null）。
++ *
++ * <p>{@code configVersion} 为发布链路回写列（随配置发布递增）：本组装器统一置本次发布
++ * 版本号（快照 v N 内所有点位 configVersion=N，与落库回写一致——快照自洽）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@JsonInclude(JsonInclude.Include.NON_NULL)
++@JsonIgnoreProperties(ignoreUnknown = false)
++@JsonPropertyOrder({"id", "tenantId", "pointCode", "pointName", "dataType", "valueType",
++        "unit", "minValue", "maxValue", "samplePeriod", "deadband", "channelId",
++        "protocolAddr", "boundInstanceId", "deptId", "status", "configVersion", "remark"})
++public class SnapshotPoint {
++
++    /** iot_point.id 主键；跨对象引用用 */
++    private Long id;
++
++    /** tenant_id 租户 id */
++    private Long tenantId;
++
++    /** point_code 点位编码，租户内唯一；消息与网关只认编码不认 id */
++    private String pointCode;
++
++    /** point_name 点位名称 */
++    private String pointName;
++
++    /** data_type 1 瞬时量 2 累计量 3 状态量 4 开关量 */
++    private Integer dataType;
++
++    /** value_type 值类型 DOUBLE/INT/BOOL/ENUM */
++    private String valueType;
++
++    /** unit 单位 */
++    private String unit;
++
++    /** min_value 有效范围下限（超限只打质量码不丢弃） */
++    private BigDecimal minValue;
++
++    /** max_value 有效范围上限 */
++    private BigDecimal maxValue;
++
++    /** sample_period 采样/上报周期（秒） */
++    private Integer samplePeriod;
++
++    /** deadband 死区 */
++    private BigDecimal deadband;
++
++    /** channel_id 来源通道 id（手工/虚拟点位可空） */
++    private Long channelId;
++
++    /** protocol_addr 协议地址 JSON（内层键名上游未定版；不得含凭据） */
++    private Map<String, Object> protocolAddr;
++
++    /** bound_instance_id 冗余归属实例 id */
++    private Long boundInstanceId;
++
++    /** dept_id 绑定部门 id */
++    private Long deptId;
++
++    /** status 1 启用 0 禁用 */
++    private Integer status;
++
++    /** config_version 点位配置版本号（随配置发布递增；组装器统一置本次发布版本号） */
++    private Long configVersion;
++
++    /** remark 备注 */
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java
+new file mode 100644
+index 0000000..3cafa68
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorage.java
+@@ -0,0 +1,133 @@
++package net.otlab.admin.module.iot.publish.storage;
++
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardCopyOption;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++
++/**
++ * 快照对象存储（TASK-0024，一期本地目录裁决——brief 存储裁决：本地目录
++ * {@code ot.publish.storage-path}（默认 ./data/snapshots），MinIO 对象存储二期登记）。
++ *
++ * <p>文件布局 {@code <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json}：
++ * 文件名本体照 brief 裁决 {@code <scope_type>-<scope_id>-<version>.json}；其上加租户
++ * 子目录隔离——计算 scope（scopeType=2）的 scope_id 恒 0，文件名不含租户会跨租户相撞
++ * （uk_scope_version 以 (tenant_id, scope_type, scope_id, version) 为键，存储键须同粒度）。
++ * snapshot_uri 落库存相对路径（{@code <tenant_id>/<文件名>}）。
++ *
++ * <p>写入原子性：临时文件 + {@link StandardCopyOption#ATOMIC_MOVE} 落位——半截文件不会
++ * 以正式名存在，取回侧哈希核对（{@code sha256Hex(readBytes(uri))} vs 落库
++ * snapshot_hash，不一致 500 告警——存储损坏探测）是最后防线而非常规路径。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class SnapshotStorage {
++
++    private final PublishProperties properties;
++
++    @Autowired
++    public SnapshotStorage(PublishProperties properties) {
++        this.properties = properties;
++    }
++
++    /**
++     * 存储快照体（临时文件 + 原子落位）
++     *
++     * @param tenantId  租户 id（子目录隔离）
++     * @param scopeType 范围 1 网关 2 计算
++     * @param scopeId   范围对象 ID（2 时为 0）
++     * @param version   版本号
++     * @param json      快照体 JSON（UTF-8）
++     * @return 相对路径 snapshot_uri（{@code <tenant_id>/<scope_type>-<scope_id>-<version>.json}）
++     * @throws IOException 目录创建/写入/落位失败
++     */
++    public String store(Long tenantId, Integer scopeType, Long scopeId, Long version, String json)
++            throws IOException {
++        Path target = resolveAbsolutePath(relativeUri(tenantId, scopeType, scopeId, version));
++        Files.createDirectories(target.getParent());
++        Path tmp = Files.createTempFile(target.getParent(), "snapshot-", ".tmp");
++        try {
++            Files.write(tmp, json.getBytes(StandardCharsets.UTF_8));
++            try {
++                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
++            } catch (IOException atomicUnsupported) {
++                // 部分文件系统不支持跨目录原子落位——降级非原子替换（仍先写临时文件，半截风险仅剩 move 窗口）
++                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
++            }
++        } finally {
++            Files.deleteIfExists(tmp);
++        }
++        return relativeUri(tenantId, scopeType, scopeId, version);
++    }
++
++    /**
++     * 读取快照体字节（取回链路哈希核对用）
++     *
++     * @param relativeUri 落库 snapshot_uri（相对路径）
++     * @return 文件字节；文件不存在返回 null（取回侧转 500 快照缺失告警）
++     * @throws IOException 读取失败
++     */
++    public byte[] readBytes(String relativeUri) throws IOException {
++        Path path = resolveAbsolutePath(relativeUri);
++        if (!Files.exists(path)) {
++            return null;
++        }
++        return Files.readAllBytes(path);
++    }
++
++    /**
++     * 删除快照文件（发布落库失败的孤儿补偿，best-effort——删除失败仅告警不抛）
++     *
++     * @param relativeUri 落库 snapshot_uri（相对路径）
++     */
++    public void deleteQuietly(String relativeUri) {
++        try {
++            Files.deleteIfExists(resolveAbsolutePath(relativeUri));
++        } catch (IOException e) {
++            // best-effort 补偿：孤儿文件清理失败不影响主流程（下个同版本号发布会覆盖同名文件）
++        }
++    }
++
++    /** 相对路径 snapshot_uri（落库存值；租户子目录隔离，见类注释） */
++    public static String relativeUri(Long tenantId, Integer scopeType, Long scopeId, Long version) {
++        return tenantId + "/" + scopeType + "-" + scopeId + "-" + version + ".json";
++    }
++
++    /** 相对路径 → 绝对路径（根目录取 ot.publish.storage-path；相对根按进程工作目录解析） */
++    private Path resolveAbsolutePath(String relativeUri) {
++        Path root = Paths.get(properties.getStoragePath());
++        return root.isAbsolute() ? root.resolve(relativeUri) : Paths.get("").toAbsolutePath().resolve(root).resolve(relativeUri);
++    }
++
++    /**
++     * SHA-256 十六进制（小写 64 字符——iot_config_version.snapshot_hash varchar(64) 口径）。
++     *
++     * @param bytes 原文字节
++     * @return 64 位小写十六进制哈希
++     */
++    public static String sha256Hex(byte[] bytes) {
++        try {
++            MessageDigest digest = MessageDigest.getInstance("SHA-256");
++            byte[] hash = digest.digest(bytes);
++            StringBuilder sb = new StringBuilder(hash.length * 2);
++            for (byte b : hash) {
++                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
++                sb.append(Character.forDigit(b & 0xF, 16));
++            }
++            return sb.toString();
++        } catch (NoSuchAlgorithmException e) {
++            // JDK 必带 SHA-256，不可达
++            throw new IllegalStateException("SHA-256 algorithm unavailable", e);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index da307f1..8ec3054 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -45,6 +45,8 @@ ot:
+     rate-limit-window-seconds: ${OT_OPENAPI_RATE_LIMIT_WINDOW_SECONDS:60}   # 限流固定窗宽（秒，brief：简单固定窗 60s——RedisService.incrementWithTtl 原子 INCR+TTL，BUG-0053 口径）
+     realtime-cache-key-prefix: ${OT_OPENAPI_REALTIME_CACHE_KEY_PREFIX:openapi:realtime:}   # Redis 实时值键前缀（0068 联调契约锚）：键 = 前缀 + tenantId + ":" + fullKey，值 JSON {"v","q","ts"}；ingest 写链未交付，本期读取恒未命中 → 空集如实
+     realtime-cache-ttl-seconds: ${OT_OPENAPI_REALTIME_CACHE_TTL_SECONDS:60}   # 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填的键必须短 TTL 过期——键过期即回源，杜绝 ingest 停写后旧值长期充当「实时值」与键无限累积（BUG-0053 同危害类）
++  publish:
++    storage-path: ${OT_PUBLISH_STORAGE_PATH:./data/snapshots}   # 配置版本快照本地存储根目录（TASK-0024 一期本地目录裁决；文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，snapshot_uri 存相对路径）；MinIO 对象存储二期登记
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..9e9f2c9
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java
+@@ -0,0 +1,123 @@
++package net.otlab.admin.module.iot.publish.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.publish.controller.IotPublishController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0024 守卫测试：配置发布域菜单权限（sys_menu 4070-4073 四行）与控制器接口对应。
++ *
++ * <p>brief 硬要求「权限标识与接口清单一一对应」（照 IotStatusRuleMenuPermissionGuardTest
++ * 范式）。本测试锁定：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_publish_domain.sql 的 sys_menu 四行种子
++ *     （id 4070-4073，parent_id=4015 配置发布页）权限码必须恰好等于预期的四值映射——
++ *     删行/换码/挪 parent 即红；</li>
++ * <li>代码侧：发布域 @RestController 全部 @SaCheckPermission 权限码必须恰好等于四值集合
++ *     （写错码/未登记码即红——越出集合的码在 sys_menu 无行，任何角色都无法获得）；</li>
++ * <li>uk_scope_version 差异登记：升级脚本头注含「与上游差异」声明（物理唯一键为单调
++ *     递增并发防护的物理保证）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPublishMenuPermissionGuardTest {
++
++    /** 四行菜单种子的预期映射（id → perms），与升级脚本 4070-4073 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4070L, "iot:publish:list",
++            4071L, "iot:publish:query",
++            4072L, "iot:publish:publish",
++            4073L, "iot:publish:rollback");
++
++    /** 升级脚本路径（从测试工作目录向上定位仓库根的 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_publish_domain.sql";
++
++    /** 菜单种子行形如 (4070, 4015, 4, '发布版本查询', 3, NULL, NULL, NULL, 'iot:publish:list', ...) */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[0-9]\\d),\\s*4015,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的发布域菜单行恰好等于预期四值映射（4070-4073，挂 4015）")
++    void scriptRegistersExactlyTheFourMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4070-4073 四行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 发布控制器权限码恰好 = 四码（list/query/publish/rollback）")
++    void controllerPermsExact() {
++        Set<String> perms = collectPerms();
++        assertEquals(Set.copyOf(EXPECTED_MENU_ROWS.values()), perms,
++                "控制器权限码与登记集合双向不漂移（越出集合的码在 sys_menu 无行）");
++    }
++
++    @Test
++    @DisplayName("SQL 侧 - uk_scope_version 差异头注在位（单调递增并发防护的物理保证登记）")
++    void scriptRegistersUpstreamDifference() throws Exception {
++        String script = readScript();
++        assertTrue(script.contains("uk_scope_version"), "唯一键在位");
++        assertTrue(script.contains("与上游差异"), "头注含与上游差异声明");
++        assertTrue(script.contains("物理唯一") && script.contains("5001"),
++                "头注说明唯一键的并发防护语义（撞键转 5001）");
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 反射收集控制器全部 @SaCheckPermission 权限码（去重） */
++    private Set<String> collectPerms() {
++        return Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(SaCheckPermission.class))
++                .flatMap(m -> Arrays.stream(m.getAnnotation(SaCheckPermission.class).value()))
++                .collect(Collectors.toSet());
++    }
++
++    /** 从测试工作目录逐级向上定位仓库根的升级脚本（照 IotStatusRuleMenuPermissionGuardTest 口径） */
++    private String readScript() throws Exception {
++        Path cwd = Paths.get("").toAbsolutePath();
++        Path p = cwd;
++        while (p != null) {
++            Path candidate = p.resolve(SCRIPT_RELATIVE);
++            if (Files.exists(candidate)) {
++                return Files.readString(candidate, StandardCharsets.UTF_8);
++            }
++            p = p.getParent();
++        }
++        throw new IllegalStateException("升级脚本未找到: " + SCRIPT_RELATIVE + "（cwd=" + cwd + "）");
++    }
++
++    private Map<Long, String> parseMenuRows(String script) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(script);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java
+new file mode 100644
+index 0000000..5303e5a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java
+@@ -0,0 +1,184 @@
++package net.otlab.admin.module.iot.publish.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.RollbackForm;
++import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.service.IotPublishService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.time.LocalDateTime;
++import java.util.Arrays;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 配置发布控制器测试（TASK-0024 接口层——standalone MockMvc + Mockito，权限注解以反射
++ * 断言，路由与参数校验走真实 MockMvc 请求，照 IotChannelControllerTest 范式）。
++ *
++ * <p>接口面锁定四端点（4070-4073 权限行一一对应）：list（iot:publish:list）/ snapshot
++ * （iot:publish:query）/ publish（iot:publish:publish）/ rollback（iot:publish:rollback）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPublishControllerTest {
++
++    private MockMvc mockMvc;
++
++    @Mock
++    private IotPublishService publishService;
++
++    private IotPublishController controller;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        controller = new IotPublishController();
++        ReflectionTestUtils.setField(controller, "publishService", publishService);
++        // standalone MockMvc 不自带 jakarta Validator——显式接 SpringValidatorAdapter 使 @Valid 生效
++        // （全局异常处理器把 MethodArgumentNotValidException 归一为 HTTP 200 + body.code=400——照
++        // GlobalExceptionHandler.handleMethodArgumentNotValidException 行为断言）
++        jakarta.validation.Validator jakartaValidator =
++                jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator();
++        mockMvc = MockMvcBuilders.standaloneSetup(controller)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .setValidator(new org.springframework.validation.beanvalidation.SpringValidatorAdapter(jakartaValidator))
++                .build();
++    }
++
++    @Test
++    @DisplayName("路由与权限注解 - 四端点路径与权限码一一对应（4070-4073）")
++    void endpointsAndPermissions() {
++        assertEquals(Set.of("iot:publish:list", "iot:publish:query", "iot:publish:publish",
++                        "iot:publish:rollback"),
++                collectPerms(), "权限码集合必须恰为登记四码（多码/漏码/错码即红）");
++    }
++
++    @Test
++    @DisplayName("GET /iot/publish/list - 参数透传（scopeType/scopeId 必传 + 分页默认值）")
++    void listRoute() throws Exception {
++        when(publishService.selectVersionList(1, 10, 1, 88L)).thenReturn(new Page<>(1, 10));
++
++        mockMvc.perform(get("/iot/publish/list")
++                        .param("scopeType", "1").param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(publishService).selectVersionList(1, 10, 1, 88L);
++    }
++
++    @Test
++    @DisplayName("GET /iot/publish/snapshot - version 可缺省（缺省=最新版）")
++    void snapshotRouteWithOptionalVersion() throws Exception {
++        when(publishService.retrieveSnapshot(eq(1), eq(88L), isNull())).thenReturn(
++                new SnapshotVO(1, 88L, 9L, "a".repeat(64), "{}"));
++
++        mockMvc.perform(get("/iot/publish/snapshot")
++                        .param("scopeType", "1").param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.version").value(9));
++        verify(publishService).retrieveSnapshot(1, 88L, null);
++    }
++
++    @Test
++    @DisplayName("POST /iot/publish/publish - body 校验（缺 scopeType 400）与正常路径")
++    void publishRouteValidation() throws Exception {
++        when(publishService.publish(any(PublishForm.class))).thenAnswer(inv -> {
++            IotConfigVersion row = new IotConfigVersion();
++            row.setVersion(1L);
++            row.setScopeType(1);
++            row.setScopeId(88L);
++            row.setPublishStatus(1);
++            row.setPublishTime(LocalDateTime.now());
++            return row;
++        });
++
++        mockMvc.perform(post("/iot/publish/publish")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"scopeType\":1,\"scopeId\":88}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.data.version").value(1));
++
++        mockMvc.perform(post("/iot/publish/publish")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"scopeId\":88}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400));
++    }
++
++    @Test
++    @DisplayName("POST /iot/publish/rollback - body 校验（缺 targetVersion 400）与并发冲突透传 5001")
++    void rollbackRouteAndConflictPassThrough() throws Exception {
++        when(publishService.rollback(any(RollbackForm.class))).thenAnswer(inv -> {
++            IotConfigVersion row = new IotConfigVersion();
++            row.setVersion(4L);
++            return row;
++        });
++        mockMvc.perform(post("/iot/publish/rollback")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"scopeType\":1,\"scopeId\":88,\"targetVersion\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.data.version").value(4));
++
++        mockMvc.perform(post("/iot/publish/rollback")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"scopeType\":1,\"scopeId\":88}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400));
++
++        BusinessException conflict = new BusinessException(ResultCode.VERSION_CONFLICT.getCode(), "版本冲突");
++        when(publishService.rollback(any(RollbackForm.class))).thenThrow(conflict);
++        mockMvc.perform(post("/iot/publish/rollback")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"scopeType\":1,\"scopeId\":88,\"targetVersion\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(5001));
++    }
++
++    @Test
++    @DisplayName("发布/回滚端点必须挂 @OperateLog（REQ-0033 高危操作审计）")
++    void publishAndRollbackAreAudited() {
++        Method publish = Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> "publish".equals(m.getName())).findFirst().orElseThrow();
++        Method rollback = Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> "rollback".equals(m.getName())).findFirst().orElseThrow();
++        assertNotNull(publish.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "发布缺审计注解");
++        assertNotNull(rollback.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "回滚缺审计注解");
++    }
++
++    private Set<String> collectPerms() {
++        return Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(SaCheckPermission.class))
++                .flatMap(m -> Arrays.stream(m.getAnnotation(SaCheckPermission.class).value()))
++                .collect(Collectors.toSet());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+new file mode 100644
+index 0000000..75af56c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+@@ -0,0 +1,566 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.RollbackForm;
++import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.gate.NoOpPublishConfirmGate;
++import net.otlab.admin.module.iot.publish.gate.PublishConfirmGate;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 配置发布服务单元测试（TASK-0024，brief 测试口径：版本单调 / 并发发布 5001 / 回滚复用
++ * 快照 / 取回哈希核对与存储损坏探测 / 确认门 NoOp / 数据权限防线红转绿）。
++ *
++ * <p>standalone Mockito 范式：Mapper 全 mock；组装器/终检/存储用真实实现（存储指向
++ * @TempDir——哈希与文件布局端到端校验），并发竞态以「同读末版 + 第二次 INSERT 撞键」
++ * 顺序模拟（uk_scope_version 兜底的物理语义等价）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPublishServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long USER_ID = 10L;
++    private static final long GATEWAY_ID = 88L;
++
++    @TempDir
++    Path tempDir;
++
++    @Mock
++    private IotConfigVersionMapper versionMapper;
++
++    @Mock
++    private IotGatewayMapper gatewayMapper;
++
++    @Mock
++    private IotPointMapper pointMapper;
++
++    @Mock
++    private IotDataItemMapper dataItemMapper;
++
++    @Mock
++    private IotChannelMapper channelMapper;
++
++    @Mock
++    private IotChannelCredentialMapper credentialMapper;
++
++    @Mock
++    private IotDataItemRefMapper dataItemRefMapper;
++
++    @Mock
++    private IotMetricMapper metricMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    private IotPublishServiceImpl publishService;
++
++    private SnapshotStorage storage;
++
++    private PublishConfirmGate confirmGate;
++
++    private AutoCloseable mocks;
++
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++
++    private org.mockito.MockedStatic<SecurityUtils> securityUtils;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotConfigVersion.class);
++        TableInfoHelper.initTableInfo(assistant, IotPoint.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotGateway.class);
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.iot.credential.entity.IotChannelCredential.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.iot.metric.entity.IotMetric.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(USER_ID);
++
++        // 真实组装器/终检/存储（Mapper mock 注入）——发布管线端到端
++        ConfigSnapshotAssembler assembler = new ConfigSnapshotAssembler();
++        ReflectionTestUtils.setField(assembler, "channelMapper", channelMapper);
++        ReflectionTestUtils.setField(assembler, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(assembler, "credentialMapper", credentialMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemRefMapper", dataItemRefMapper);
++        ReflectionTestUtils.setField(assembler, "metricMapper", metricMapper);
++
++        PublishProperties properties = new PublishProperties();
++        properties.setStoragePath(tempDir.toString());
++        storage = new SnapshotStorage(properties);
++
++        confirmGate = new NoOpPublishConfirmGate();
++
++        publishService = new IotPublishServiceImpl();
++        ReflectionTestUtils.setField(publishService, "baseMapper", versionMapper);
++        ReflectionTestUtils.setField(publishService, "gatewayMapper", gatewayMapper);
++        ReflectionTestUtils.setField(publishService, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(publishService, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(publishService, "assembler", assembler);
++        ReflectionTestUtils.setField(publishService, "credentialGuard", new SnapshotCredentialGuard());
++        ReflectionTestUtils.setField(publishService, "snapshotStorage", storage);
++        ReflectionTestUtils.setField(publishService, "confirmGate", confirmGate);
++        ReflectionTestUtils.setField(publishService, "dataPermService", dataPermService);
++
++        // 默认防线与数据（异常用例逐用例覆盖）
++        when(dataPermService.resolve(USER_ID)).thenReturn(
++                new VisibleScope(true, Set.of(), Set.of(), false));
++        when(versionMapper.selectMaxVersion(anyLong(), org.mockito.ArgumentMatchers.anyInt(), anyLong()))
++                .thenReturn(null);
++        when(gatewayMapper.selectById(anyLong())).thenAnswer(inv -> enabledGateway(inv.getArgument(0, Long.class)));
++        when(channelMapper.selectList(any())).thenReturn(List.of());
++        when(pointMapper.selectList(any())).thenReturn(List.of());
++        when(credentialMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        when(metricMapper.selectList(any())).thenReturn(List.of());
++        when(versionMapper.insert(any(IotConfigVersion.class))).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 发布：版本单调 + 落库 + 快照文件 ----------
++
++    @Test
++    @DisplayName("发布 - 版本=max+1 落库（publish_status=1/publish_time），文件存在且哈希与落库一致")
++    void publishCreatesMonotonicVersionAndVerifiableFile() throws Exception {
++        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(2L);
++        mockGatewayScopeData();
++
++        IotConfigVersion row = publishService.publish(gatewayForm());
++
++        assertEquals(3L, row.getVersion(), "版本单调递增：末版 2 → 3");
++        assertEquals(1, row.getPublishStatus(), "publish_status=1 已发布");
++        assertNotNull(row.getPublishTime(), "publish_time=NOW");
++        assertEquals(TENANT, row.getTenantId());
++        assertEquals(1, row.getScopeType());
++        assertEquals(GATEWAY_ID, row.getScopeId());
++
++        // 文件存在且哈希可验可取回（验收项）
++        byte[] stored = storage.readBytes(row.getSnapshotUri());
++        assertNotNull(stored, "快照文件存在（一期本地目录）");
++        assertEquals(row.getSnapshotHash(),
++                SnapshotStorage.sha256Hex(stored), "落库哈希=文件内容 SHA-256");
++
++        ArgumentCaptor<IotConfigVersion> captor = ArgumentCaptor.forClass(IotConfigVersion.class);
++        verify(versionMapper).insert(captor.capture());
++        assertEquals(row, captor.getValue());
++    }
++
++    @Test
++    @DisplayName("发布 - 首版从 1 起步（无历史版本行）")
++    void publishFirstVersionIsOne() {
++        mockGatewayScopeData();
++        IotConfigVersion row = publishService.publish(gatewayForm());
++        assertEquals(1L, row.getVersion(), "无版本行时 selectMaxVersion null → 0+1");
++    }
++
++    @Test
++    @DisplayName("发布 - 计算范围 scopeId 归一 0（请求携带值不参与存储键）且 dataItem 回写 config_version")
++    void computeScopeNormalizesScopeIdAndWritesBack() {
++        PublishForm form = new PublishForm();
++        form.setScopeType(2);
++        form.setScopeId(99L);
++        IotDataItem item = new IotDataItem();
++        item.setId(601L);
++        item.setTenantId(TENANT);
++        item.setInstanceId(501L);
++        item.setDataCode("ELEC_ENERGY");
++        item.setFullKey("F01.WS01.EQ001.ELEC_ENERGY");
++        item.setSourceType(2);
++        item.setEnabled(1);
++        item.setStatus(1);
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(item));
++
++        IotConfigVersion row = publishService.publish(form);
++
++        assertEquals(0L, row.getScopeId(), "计算 scope scopeId=0（Schema v1.0.1 派生规则 7）");
++        ArgumentCaptor<IotConfigVersion> captor = ArgumentCaptor.forClass(IotConfigVersion.class);
++        verify(versionMapper).insert(captor.capture());
++        assertEquals(0L, captor.getValue().getScopeId());
++        verify(dataItemMapper).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("发布 - 网关 scope 回写 config_version=新版本（0021/0013 建列声明的承接）")
++    void publishWritesBackPointConfigVersion() {
++        mockGatewayScopeData();
++        publishService.publish(gatewayForm());
++        verify(pointMapper).update(isNull(), any());
++    }
++
++    // ---------- 并发发布 5001（验收项） ----------
++
++    @Test
++    @DisplayName("并发发布 - 两线程同 scope 同读末版，后者 INSERT 撞 uk_scope_version → 5001（不重试）")
++    void concurrentPublishSecondGets5001() throws Exception {
++        // 竞态模拟：两线程同读末版 1 → 各算 version=2；前者 INSERT 成功，后者撞 uk
++        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(1L);
++        mockGatewayScopeData();
++        when(versionMapper.insert(any(IotConfigVersion.class)))
++                .thenReturn(1)
++                .thenThrow(new DuplicateKeyException("Duplicate entry '1-1-88-2' for key 'uk_scope_version'"));
++
++        publishService.publish(gatewayForm());
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> publishService.publish(gatewayForm()),
++                "并发发布后者必须报 5001 版本冲突（TC-0008 步骤 5）");
++        assertEquals(ResultCode.VERSION_CONFLICT.getCode(), ex.getCode());
++        // 孤儿快照文件补偿删除（撞键方不留半截产物）
++        assertNull(storage.readBytes("1/1-88-2.json"), "撞键方孤儿快照文件已补偿删除");
++    }
++
++    // ---------- 回滚：新版本行复用旧快照 ----------
++
++    @Test
++    @DisplayName("回滚 - 新版本行 publish_status=1 复用 targetVersion 快照文件（uri/哈希同），版本单调递增，内容行回写 config_version")
++    void rollbackReusesTargetSnapshotFile() throws Exception {
++        // 准备 target 快照（v1 已发布、文件在存储；内容含点位 301——回写 id 从复用快照解析）
++        String targetJson = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[{\"id\":301}],\"channels\":[]}";
++        String targetHash = SnapshotStorage.sha256Hex(targetJson.getBytes(StandardCharsets.UTF_8));
++        String targetUri = storage.store(TENANT, 1, GATEWAY_ID, 1L, targetJson);
++        IotConfigVersion target = new IotConfigVersion();
++        target.setId(1L);
++        target.setTenantId(TENANT);
++        target.setScopeType(1);
++        target.setScopeId(GATEWAY_ID);
++        target.setVersion(1L);
++        target.setSnapshotHash(targetHash);
++        target.setSnapshotUri(targetUri);
++        target.setPublishStatus(1);
++        when(versionMapper.selectOne(any())).thenReturn(target);
++        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(3L);
++
++        IotConfigVersion row = publishService.rollback(rollbackForm(1L));
++
++        assertEquals(4L, row.getVersion(), "版本单调递增（回滚也是新版本）");
++        assertEquals(targetUri, row.getSnapshotUri(), "快照复用旧文件（brief D5 裁决）");
++        assertEquals(targetHash, row.getSnapshotHash(), "哈希同旧快照");
++        assertEquals(1, row.getPublishStatus());
++        verify(versionMapper).insert(any(IotConfigVersion.class));
++        verify(pointMapper).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("回滚 - 目标版本不存在 → 400（brief D5）")
++    void rollbackTargetMissing400() {
++        when(versionMapper.selectOne(any())).thenReturn(null);
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.rollback(rollbackForm(42L)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("回滚 - 目标快照文件被篡改（哈希不符）→ 拒绝回滚并告警（新版本行不得指向损坏文件）")
++    void rollbackRejectsCorruptedTarget() throws Exception {
++        String targetJson = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[],\"channels\":[]}";
++        String tampered = targetJson.replace("1.0.1", "1.0.2");
++        String targetUri = storage.store(TENANT, 1, GATEWAY_ID, 1L, targetJson);
++        Files.write(tempDir.resolve("1").resolve("1-88-1.json"), tampered.getBytes(StandardCharsets.UTF_8));
++        IotConfigVersion target = new IotConfigVersion();
++        target.setTenantId(TENANT);
++        target.setScopeType(1);
++        target.setScopeId(GATEWAY_ID);
++        target.setVersion(1L);
++        target.setSnapshotHash(SnapshotStorage.sha256Hex(targetJson.getBytes(StandardCharsets.UTF_8)));
++        target.setSnapshotUri(targetUri);
++        when(versionMapper.selectOne(any())).thenReturn(target);
++        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(1L);
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.rollback(rollbackForm(1L)));
++        assertEquals(ResultCode.ERROR.getCode(), ex.getCode());
++        verify(versionMapper, never()).insert(any(IotConfigVersion.class));
++    }
++
++    // ---------- 取回：哈希核对 + 存储损坏探测 ----------
++
++    @Test
++    @DisplayName("取回 - 指定版本取回快照体 + 哈希核对通过（信封 version/snapshotHash/快照体）")
++    void retrieveSnapshotVerifiesHash() throws Exception {
++        String json = assemblerJsonForGatewayScope(5L);
++        String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++        String uri = storage.store(TENANT, 1, GATEWAY_ID, 5L, json);
++        when(versionMapper.selectOne(any())).thenReturn(versionRow(5L, hash, uri));
++
++        SnapshotVO vo = publishService.retrieveSnapshot(1, GATEWAY_ID, 5L);
++
++        assertEquals(5L, vo.getVersion());
++        assertEquals(hash, vo.getSnapshotHash());
++        assertEquals(json, vo.getSnapshotBody(), "快照体取回原文一致");
++    }
++
++    @Test
++    @DisplayName("取回 - version 缺省返回最新版（契约 §3.3 口径）")
++    void retrieveSnapshotDefaultsToLatest() throws Exception {
++        String json = assemblerJsonForGatewayScope(9L);
++        String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++        String uri = storage.store(TENANT, 1, GATEWAY_ID, 9L, json);
++        when(versionMapper.selectOne(any())).thenReturn(versionRow(9L, hash, uri));
++
++        SnapshotVO vo = publishService.retrieveSnapshot(1, GATEWAY_ID, null);
++        assertEquals(9L, vo.getVersion());
++    }
++
++    @Test
++    @DisplayName("取回 - 存储文件被篡改 → 500 告警（存储损坏探测）")
++    void retrieveSnapshotDetectsCorruption() throws Exception {
++        String json = assemblerJsonForGatewayScope(5L);
++        String hash = SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++        String uri = storage.store(TENANT, 1, GATEWAY_ID, 5L, json);
++        Files.write(tempDir.resolve("1").resolve("1-88-5.json"),
++                "tampered-body".getBytes(StandardCharsets.UTF_8));
++        when(versionMapper.selectOne(any())).thenReturn(versionRow(5L, hash, uri));
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshot(1, GATEWAY_ID, 5L),
++                "取回哈希与落库哈希不一致 → 500 告警（brief D6）");
++        assertEquals(ResultCode.ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("取回 - 快照文件缺失 → 500（同存储损坏探测族）")
++    void retrieveSnapshotMissingFile500() {
++        when(versionMapper.selectOne(any())).thenReturn(versionRow(5L, "a".repeat(64), "1/1-88-5.json"));
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshot(1, GATEWAY_ID, 5L));
++        assertEquals(ResultCode.ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("取回 - 版本行不存在 → 404")
++    void retrieveSnapshotUnknownVersion404() {
++        when(versionMapper.selectOne(any())).thenReturn(null);
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshot(1, GATEWAY_ID, 99L));
++        assertEquals(ResultCode.NOT_FOUND.getCode(), ex.getCode());
++    }
++
++    // ---------- 确认门（TASK-0015 接线位） ----------
++
++    @Test
++    @DisplayName("确认门 - NoOp 恒放行（本期发布不阻断）；返回 false 的实现拒绝发布")
++    void confirmGateWiring() {
++        mockGatewayScopeData();
++        publishService.publish(gatewayForm());
++        verify(versionMapper).insert(any(IotConfigVersion.class));
++
++        // false 分支：0015 交付后强制实现的拒绝路径
++        PublishConfirmGate strict = mock(PublishConfirmGate.class);
++        when(strict.requireConfirm(anyLong(), org.mockito.ArgumentMatchers.anyInt(), anyLong(), anyLong()))
++                .thenReturn(false);
++        ReflectionTestUtils.setField(publishService, "confirmGate", strict);
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.publish(gatewayForm()));
++        assertTrue(ex.getMessage().contains("确认门"), "文案指认确认门拒绝: " + ex.getMessage());
++        verify(versionMapper, Mockito.times(1)).insert(any(IotConfigVersion.class));
++    }
++
++    // ---------- 数据权限防线（brief D9） ----------
++
++    @Test
++    @DisplayName("防线 - 网关 scope：不在可见范围（dept/instance 锚点均空且非 allTenant）→ 403 fail-closed")
++    void gatewayInvisibleForbidden() {
++        when(dataPermService.resolve(USER_ID)).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(), false));
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.publish(gatewayForm()));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex.getCode());
++        verify(versionMapper, never()).insert(any(IotConfigVersion.class));
++    }
++
++    @Test
++    @DisplayName("防线 - 网关 scope：dept 锚点命中可见 → 放行（0016 裁决 6 NULL 不特判）")
++    void gatewayDeptVisiblePasses() {
++        IotGateway gateway = enabledGateway(GATEWAY_ID);
++        gateway.setDeptId(101L);
++        gateway.setInstanceId(null);
++        when(gatewayMapper.selectById(GATEWAY_ID)).thenReturn(gateway);
++        when(dataPermService.resolve(USER_ID)).thenReturn(
++                new VisibleScope(false, Set.of(101L), Set.of(), false));
++        mockGatewayScopeData();
++        assertNotNull(publishService.publish(gatewayForm()));
++    }
++
++    @Test
++    @DisplayName("防线 - 网关不存在/已禁用 → 400（brief D4 存在启用校验）")
++    void gatewayMissingOrDisabled400() {
++        when(gatewayMapper.selectById(GATEWAY_ID)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class, () -> publishService.publish(gatewayForm()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        IotGateway disabled = enabledGateway(GATEWAY_ID);
++        disabled.setStatus(0);
++        when(gatewayMapper.selectById(GATEWAY_ID)).thenReturn(disabled);
++        BusinessException off = assertThrows(BusinessException.class, () -> publishService.publish(gatewayForm()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), off.getCode());
++    }
++
++    @Test
++    @DisplayName("防线 - 计算 scope：非全租户（管理员）语义 → 403；列表/取回同防线")
++    void computeScopeAdminOnly() {
++        when(dataPermService.resolve(USER_ID)).thenReturn(
++                new VisibleScope(false, Set.of(101L), Set.of(501L), false));
++        PublishForm form = new PublishForm();
++        form.setScopeType(2);
++        form.setScopeId(0L);
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.publish(form));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex.getCode());
++
++        BusinessException listEx = assertThrows(BusinessException.class,
++                () -> publishService.selectVersionList(1, 10, 2, 0L));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), listEx.getCode());
++    }
++
++    @Test
++    @DisplayName("防线 - 版本列表分页（version 降序）走同款可见性裁剪")
++    void versionListTrimmed() {
++        Page<IotConfigVersion> page = new Page<>(1, 10);
++        when(versionMapper.selectPage(any(), any())).thenReturn(page);
++        Page<IotConfigVersion> result = publishService.selectVersionList(1, 10, 1, GATEWAY_ID);
++        assertEquals(page, result);
++        verify(versionMapper).selectPage(any(), any());
++    }
++
++    // ---------- 夹具 ----------
++
++    private PublishForm gatewayForm() {
++        PublishForm form = new PublishForm();
++        form.setScopeType(1);
++        form.setScopeId(GATEWAY_ID);
++        return form;
++    }
++
++    private RollbackForm rollbackForm(Long targetVersion) {
++        RollbackForm form = new RollbackForm();
++        form.setScopeType(1);
++        form.setScopeId(GATEWAY_ID);
++        form.setTargetVersion(targetVersion);
++        return form;
++    }
++
++    private IotGateway enabledGateway(Long id) {
++        IotGateway gateway = new IotGateway();
++        gateway.setId(id);
++        gateway.setTenantId(TENANT);
++        gateway.setGatewayCode("GW01");
++        gateway.setGatewayName("一号网关");
++        gateway.setStatus(1);
++        return gateway;
++    }
++
++    private void mockGatewayScopeData() {
++        IotChannel channel = new IotChannel();
++        channel.setId(201L);
++        channel.setTenantId(TENANT);
++        channel.setGatewayId(GATEWAY_ID);
++        channel.setChannelCode("CH_MQTT_01");
++        channel.setChannelName("一号空压机 MQTT");
++        channel.setProtocolType("MQTT");
++        channel.setConnConfig("{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}");
++        channel.setStatus(1);
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel));
++
++        IotPoint point = new IotPoint();
++        point.setId(301L);
++        point.setTenantId(TENANT);
++        point.setPointCode("P_ELEC_01");
++        point.setPointName("进线电量");
++        point.setDataType(1);
++        point.setValueType("DOUBLE");
++        point.setChannelId(201L);
++        point.setStatus(1);
++        when(pointMapper.selectList(any())).thenReturn(List.of(point));
++    }
++
++    /** 网关 scope 最小合法快照体（顶层五键 + 空集）——回滚/取回夹具 */
++    private String assemblerJsonForGatewayScope(long version) {
++        return "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":" + version + ",\"points\":[],\"channels\":[]}";
++    }
++
++    private IotConfigVersion versionRow(long version, String hash, String uri) {
++        IotConfigVersion row = new IotConfigVersion();
++        row.setId(version);
++        row.setTenantId(TENANT);
++        row.setScopeType(1);
++        row.setScopeId(GATEWAY_ID);
++        row.setVersion(version);
++        row.setSnapshotHash(hash);
++        row.setSnapshotUri(uri);
++        row.setPublishStatus(1);
++        return row;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssemblerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssemblerTest.java
+new file mode 100644
+index 0000000..61fd73c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/ConfigSnapshotAssemblerTest.java
+@@ -0,0 +1,443 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.metric.entity.IotMetric;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.core.exception.BusinessException;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.when;
++
++/**
++ * 快照组装器单元测试（TASK-0024，brief 测试口径：按 Schema v1.0.1 字段完整性逐段断言 /
++ * 锁定实例按版本（实例有效行）/ 凭据排除终检 / 确定性序列化——两次组装哈希一致）。
++ *
++ * <p>standalone Mockito 范式（照 IotStatusRuleServiceImplTest）：Mapper 全 mock 不触真实库；
++ * 多租户条件在真实运行时由插件注入（mock 链路不依赖）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class ConfigSnapshotAssemblerTest {
++
++    private static final long TENANT = 1L;
++    private static final long GATEWAY_ID = 88L;
++    private static final long VERSION = 17L;
++
++    @Mock
++    private IotChannelMapper channelMapper;
++
++    @Mock
++    private IotPointMapper pointMapper;
++
++    @Mock
++    private IotChannelCredentialMapper credentialMapper;
++
++    @Mock
++    private IotDataItemMapper dataItemMapper;
++
++    @Mock
++    private IotDataItemRefMapper dataItemRefMapper;
++
++    @Mock
++    private IotMetricMapper metricMapper;
++
++    private ConfigSnapshotAssembler assembler;
++
++    private SnapshotCredentialGuard credentialGuard;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotPoint.class);
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++        TableInfoHelper.initTableInfo(assistant, IotChannelCredential.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemRef.class);
++        TableInfoHelper.initTableInfo(assistant, IotMetric.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        assembler = new ConfigSnapshotAssembler();
++        ReflectionTestUtils.setField(assembler, "channelMapper", channelMapper);
++        ReflectionTestUtils.setField(assembler, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(assembler, "credentialMapper", credentialMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemRefMapper", dataItemRefMapper);
++        ReflectionTestUtils.setField(assembler, "metricMapper", metricMapper);
++        credentialGuard = new SnapshotCredentialGuard();
++        // 默认无凭据行/无数据（异常用例逐用例覆盖）
++        when(channelMapper.selectList(any())).thenReturn(List.of());
++        when(pointMapper.selectList(any())).thenReturn(List.of());
++        when(credentialMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        when(metricMapper.selectList(any())).thenReturn(List.of());
++    }
++
++    // ---------- 顶层结构与装载口径（Schema v1.0.1 派生规则 7） ----------
++
++    @Test
++    @DisplayName("网关 scope - 顶层只出 schemaVersion/tenantId/scopeType/scopeId/version/points/channels，未装载对象键省略")
++    void gatewayScopeOmitsUnloadedKeys() {
++        when(channelMapper.selectList(any())).thenReturn(List.of(channelRow(201L, "CH_MQTT_01")));
++        when(pointMapper.selectList(any())).thenReturn(List.of(pointRow(301L, 201L)));
++
++        ConfigSnapshot snapshot = assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION);
++        String json = assembler.serialize(snapshot);
++
++        assertTrue(json.contains("\"schemaVersion\":\"1.0.1\""), "schemaVersion 一并下发（§3.3 承诺）");
++        assertTrue(json.contains("\"tenantId\":" + TENANT), "顶层 tenantId 租户根（派生规则 5）");
++        assertTrue(json.contains("\"scopeType\":1"), "scopeType 1 网关");
++        assertTrue(json.contains("\"scopeId\":" + GATEWAY_ID), "scopeId=网关 id");
++        assertTrue(json.contains("\"version\":" + VERSION), "顶层 version 随体下发（网关缓存自校验）");
++        assertTrue(json.contains("\"points\":["), "网关 scope 装载点位");
++        assertTrue(json.contains("\"channels\":["), "网关 scope 装载通道");
++        assertFalse(json.contains("\"dataItems\""), "未装载对象键省略（派生规则 7）——dataItems 不出现");
++        assertFalse(json.contains("\"formulas\""), "未装载对象键省略——formulas 不出现");
++        assertFalse(json.contains("\"metrics\""), "未装载对象键省略——metrics 不出现");
++    }
++
++    @Test
++    @DisplayName("计算 scope - scopeId 归一 0（租户粒度），装载 dataItems/formulas/metrics，points/channels 省略")
++    void computeScopeLoadsDataItemsFormulasMetrics() {
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(dataItemRow(601L, 501L)));
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of(refRow(701L, 601L)));
++        when(metricMapper.selectList(any())).thenReturn(List.of(metricRow(801L, 501L)));
++
++        ConfigSnapshot snapshot = assembler.assemble(TENANT, 2, 0L, VERSION);
++        String json = assembler.serialize(snapshot);
++
++        assertTrue(json.contains("\"scopeType\":2"), "scopeType 2 计算");
++        assertTrue(json.contains("\"scopeId\":0"), "计算 scope scopeId=0（租户粒度，派生规则 7）");
++        assertTrue(json.contains("\"dataItems\":["), "计算 scope 装载数据项");
++        assertTrue(json.contains("\"formulas\":["), "计算 scope 装载公式引用边（差异第 8 条落位）");
++        assertTrue(json.contains("\"metrics\":["), "计算 scope 装载指标");
++        assertFalse(json.contains("\"points\""), "未装载对象键省略——points 不出现");
++        assertFalse(json.contains("\"channels\""), "未装载对象键省略——channels 不出现");
++    }
++
++    // ---------- 字段完整性（Schema v1.0.1 五对象逐字段——业务列全量映射） ----------
++
++    @Test
++    @DisplayName("point 对象 - Schema v1.0.1 字段全量映射（camelCase）+ configVersion=本次发布版本号")
++    void pointObjectFieldCompleteness() {
++        when(channelMapper.selectList(any())).thenReturn(List.of(channelRow(201L, "CH_MQTT_01")));
++        when(pointMapper.selectList(any())).thenReturn(List.of(pointRow(301L, 201L)));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++
++        String[] pointFields = {"\"id\":301", "\"tenantId\":1", "\"pointCode\":\"P_ELEC_01\"",
++                "\"pointName\":\"进线电量\"", "\"dataType\":1", "\"valueType\":\"DOUBLE\"",
++                "\"unit\":\"kWh\"", "\"minValue\":0", "\"maxValue\":9999.5", "\"samplePeriod\":60",
++                "\"deadband\":0.5", "\"channelId\":201", "\"protocolAddr\":{", "\"boundInstanceId\":501",
++                "\"deptId\":101", "\"status\":1", "\"configVersion\":17", "\"remark\":\"主进线\""};
++        for (String field : pointFields) {
++            assertTrue(json.contains(field), "point 字段缺失或值不符: " + field + " in " + json);
++        }
++        assertTrue(json.contains("\"protocolAddr\":{\"topic\":\"factory/gw01/up\"}"),
++                "protocol_addr json→object（内层键序归一）");
++    }
++
++    @Test
++    @DisplayName("channel 对象 - Schema v1.0.1 字段全量映射 + §1.3A 派生标记 hasCredential/credentialTypes")
++    void channelObjectFieldCompleteness() {
++        IotChannel channel = channelRow(201L, "CH_MQTT_01");
++        channel.setStatus(1);
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel));
++        IotChannelCredential cred = credentialRow(901L, 201L, "MQTT_PASSWORD");
++        when(credentialMapper.selectList(any())).thenReturn(List.of(cred));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++
++        String[] channelFields = {"\"id\":201", "\"tenantId\":1", "\"gatewayId\":88",
++                "\"channelCode\":\"CH_MQTT_01\"", "\"channelName\":\"一号空压机 MQTT\"",
++                "\"protocolType\":\"MQTT\"", "\"connConfig\":{", "\"status\":1",
++                "\"hasCredential\":true", "\"credentialTypes\":[\"MQTT_PASSWORD\"]"};
++        for (String field : channelFields) {
++            assertTrue(json.contains(field), "channel 字段缺失或值不符: " + field);
++        }
++        assertFalse(json.contains("ciphertext"), "凭据密文列结构性不进快照（ADR-0006）");
++        assertFalse(json.contains("keyVersion"), "凭据密钥版本列不进快照（派生声明第 9 条——仅类型标记）");
++    }
++
++    @Test
++    @DisplayName("channel 对象 - 无启用凭据行时 hasCredential=false 且 credentialTypes 省略")
++    void channelWithoutCredentialOmitsTypes() {
++        when(channelMapper.selectList(any())).thenReturn(List.of(channelRow(202L, "CH_HTTP_02")));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++
++        assertTrue(json.contains("\"hasCredential\":false"), "无启用凭据 → false");
++        assertFalse(json.contains("\"credentialTypes\""), "空清单省略（NON_NULL）");
++    }
++
++    @Test
++    @DisplayName("dataItem 对象 - Schema v1.0.1 字段全量映射（实例行原值如实——锁定/未锁定实例同口径按行组装）")
++    void dataItemObjectFieldCompleteness() {
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(dataItemRow(601L, 501L)));
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        when(metricMapper.selectList(any())).thenReturn(List.of());
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 2, 0L, VERSION));
++
++        String[] itemFields = {"\"id\":601", "\"tenantId\":1", "\"instanceId\":501",
++                "\"dataCode\":\"ELEC_ENERGY\"", "\"fullKey\":\"F01.WS01.EQ001.ELEC_ENERGY\"",
++                "\"dataName\":\"用电量\"", "\"category\":\"ELEC\"", "\"unit\":\"kWh\"",
++                "\"sourceType\":2", "\"formula\":\"DELTA(#{P_ELEC_01})\"", "\"calcPeriod\":60",
++                "\"validMin\":0", "\"validMax\":999999",
++                "\"enabled\":1", "\"configVersion\":17", "\"status\":1"};
++        // alarmLow 为空——可空字段省略（NON_NULL，JSON Schema type 不含 null）
++        for (String field : itemFields) {
++            assertTrue(json.contains(field), "dataItem 字段缺失或值不符: " + field);
++        }
++        assertFalse(json.contains("\"alarmLow\""), "可空字段 null 省略（JSON Schema type 不含 null）");
++        assertFalse(json.contains("\"rollupMethod\""), "sourceType=2 无汇总方式——可空省略");
++        assertFalse(json.contains("\"createTime\""), "审计列剔除（派生规则 4）");
++        assertFalse(json.contains("\"deleted\""), "逻辑删列剔除（派生规则 4）");
++    }
++
++    @Test
++    @DisplayName("formula 对象 - iot_data_item_ref 引用边行映射（差异第 8 条落位）")
++    void formulaObjectMapsRefRows() {
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(dataItemRow(601L, 501L)));
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of(refRow(701L, 601L)));
++        when(metricMapper.selectList(any())).thenReturn(List.of(metricRow(801L, 501L)));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 2, 0L, VERSION));
++
++        assertTrue(json.contains("\"formulas\":[{\"id\":701,\"tenantId\":1,\"itemId\":601,"
++                        + "\"refFullKey\":\"F01.WS01.EQ001.ELEC_ENERGY_REF\",\"refType\":1,\"refItemId\":602}]"),
++                "formula 对象=引用边行逐字段映射: " + json);
++    }
++
++    @Test
++    @DisplayName("metric 对象 - Schema v1.0.1 字段全量映射")
++    void metricObjectFieldCompleteness() {
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        when(metricMapper.selectList(any())).thenReturn(List.of(metricRow(801L, 501L)));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 2, 0L, VERSION));
++
++        String[] metricFields = {"\"id\":801", "\"tenantId\":1", "\"metricCode\":\"F01_WATER_AVG_DAY\"",
++                "\"metricName\":\"一厂日均用水量\"", "\"instanceId\":501", "\"sourceItemId\":601",
++                "\"aggType\":1", "\"period\":\"DAY\"", "\"calendarType\":1", "\"yoyFlag\":1",
++                "\"momFlag\":0", "\"deptId\":101", "\"status\":1"};
++        for (String field : metricFields) {
++            assertTrue(json.contains(field), "metric 字段缺失或值不符: " + field);
++        }
++        assertFalse(json.contains("\"ratioNumItemId\""), "非比值型 ratio_* 强制 NULL——可空省略");
++    }
++
++    // ---------- 确定性序列化（验收项：两次组装哈希一致） ----------
++
++    @Test
++    @DisplayName("确定性序列化 - 同库态两次组装（含 conn_config/protocol_addr JSON 列乱序键）哈希一致")
++    void deterministicSerializationSameHash() {
++        IotChannel channelA = channelRow(201L, "CH_MQTT_01");
++        IotChannel channelB = channelRow(202L, "CH_HTTP_02");
++        when(channelMapper.selectList(any()))
++                .thenReturn(List.of(channelA, channelB))
++                .thenReturn(List.of(channelB, channelA));
++        when(pointMapper.selectList(any())).thenReturn(List.of(pointRow(301L, 201L), pointRow(302L, 202L)));
++
++        ConfigSnapshot first = assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION);
++        String firstJson = assembler.serialize(first);
++        String firstHash = SnapshotStorage.sha256Hex(firstJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
++
++        ConfigSnapshot second = assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION);
++        String secondJson = assembler.serialize(second);
++        String secondHash = SnapshotStorage.sha256Hex(secondJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
++
++        assertEquals(firstJson, secondJson, "两次组装产物逐字节一致（键序/行序/null 省略全确定性）");
++        assertEquals(firstHash, secondHash, "两次组装哈希一致（验收项）");
++    }
++
++    // ---------- 凭据排除终检（ADR-0006 双保险之二——fail-closed） ----------
++
++    @Test
++    @DisplayName("凭据终检 - 手工塞含凭据键行（绕过写入侧 0018 校验）→ 发布组装链 fail-closed 拒绝")
++    void credentialKeyRowFailsFinalCheck() {
++        IotChannel smuggled = channelRow(203L, "CH_BAD_03");
++        smuggled.setConnConfig("{\"broker\":\"tcp://x:1883\",\"password\":\"hunter2\"}");
++        when(channelMapper.selectList(any())).thenReturn(List.of(smuggled));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++        BusinessException ex = assertThrows(BusinessException.class, () -> credentialGuard.check(json),
++                "含凭据键的快照体必须被终检拒绝（fail-closed）");
++        assertTrue(ex.getMessage().contains("凭据"), "文案直指凭据防线语义: " + ex.getMessage());
++    }
++
++    @Test
++    @DisplayName("凭据终检 - protocol_addr 内嵌凭据键（深层数组/对象形状）不得逃逸")
++    void deepCredentialKeyFailsFinalCheck() {
++        IotPoint smuggled = pointRow(303L, 201L);
++        smuggled.setProtocolAddr("{\"regs\":[{\"passwd\":\"abc\"}]}");
++        when(channelMapper.selectList(any())).thenReturn(List.of(channelRow(201L, "CH_MQTT_01")));
++        when(pointMapper.selectList(any())).thenReturn(List.of(smuggled));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++        assertThrows(BusinessException.class, () -> credentialGuard.check(json),
++                "数组深层凭据键不得逃逸（照 0018 全深度递归口径）");
++    }
++
++    @Test
++    @DisplayName("凭据终检 - Schema v1.0.1 派生标记 hasCredential/credentialTypes 为唯一合法豁免")
++    void sanctionedMarkerFieldsPass() {
++        IotChannel channel = channelRow(201L, "CH_MQTT_01");
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel));
++        when(credentialMapper.selectList(any())).thenReturn(List.of(
++                credentialRow(901L, 201L, "MQTT_PASSWORD"),
++                credentialRow(902L, 201L, "DEVICE_TOKEN")));
++
++        String json = assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION));
++        credentialGuard.check(json);
++        assertTrue(json.contains("\"credentialTypes\":[\"DEVICE_TOKEN\",\"MQTT_PASSWORD\"]"),
++                "类型清单仅类型字面量（排序稳定），不含任何凭据材料");
++    }
++
++    // ---------- JSON 列 fail-closed ----------
++
++    @Test
++    @DisplayName("JSON 列 - conn_config 落库脏数据（非法 JSON）→ 组装失败 fail-closed 不带病发布")
++    void brokenJsonColumnFailsAssembly() {
++        IotChannel broken = channelRow(204L, "CH_BAD_04");
++        broken.setConnConfig("not-a-json{");
++        when(channelMapper.selectList(any())).thenReturn(List.of(broken));
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> assembler.serialize(assembler.assemble(TENANT, 1, GATEWAY_ID, VERSION)),
++                "JSON 列脏数据组装失败（不带病发布）");
++        assertTrue(ex.getMessage().contains("conn_config"), "文案直指脏列: " + ex.getMessage());
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotPoint pointRow(long id, long channelId) {
++        IotPoint p = new IotPoint();
++        p.setId(id);
++        p.setTenantId(TENANT);
++        p.setPointCode("P_ELEC_0" + (id - 300));
++        p.setPointName("进线电量");
++        p.setDataType(1);
++        p.setValueType("DOUBLE");
++        p.setUnit("kWh");
++        p.setMinValue(new BigDecimal("0"));
++        p.setMaxValue(new BigDecimal("9999.5"));
++        p.setSamplePeriod(60);
++        p.setDeadband(new BigDecimal("0.5"));
++        p.setChannelId(channelId);
++        p.setProtocolAddr("{\"topic\":\"factory/gw01/up\"}");
++        p.setBoundInstanceId(501L);
++        p.setDeptId(101L);
++        p.setStatus(1);
++        p.setRemark("主进线");
++        return p;
++    }
++
++    private IotChannel channelRow(long id, String code) {
++        IotChannel c = new IotChannel();
++        c.setId(id);
++        c.setTenantId(TENANT);
++        c.setGatewayId(GATEWAY_ID);
++        c.setChannelCode(code);
++        c.setChannelName("一号空压机 MQTT");
++        c.setProtocolType("MQTT");
++        c.setConnConfig("{\"qos\":1,\"topic\":\"factory/gw01/up\",\"broker\":\"tcp://192.168.1.10:1883\"}");
++        c.setStatus(1);
++        return c;
++    }
++
++    private IotChannelCredential credentialRow(long id, long channelId, String credType) {
++        IotChannelCredential c = new IotChannelCredential();
++        c.setId(id);
++        c.setTenantId(TENANT);
++        c.setChannelId(channelId);
++        c.setCredType(credType);
++        c.setCiphertext("{v1}dummy-cipher-text");
++        c.setKeyVersion("1");
++        c.setStatus(1);
++        return c;
++    }
++
++    private IotDataItem dataItemRow(long id, long instanceId) {
++        IotDataItem d = new IotDataItem();
++        d.setId(id);
++        d.setTenantId(TENANT);
++        d.setInstanceId(instanceId);
++        d.setDataCode("ELEC_ENERGY");
++        d.setFullKey("F01.WS01.EQ001.ELEC_ENERGY");
++        d.setDataName("用电量");
++        d.setCategory("ELEC");
++        d.setUnit("kWh");
++        d.setSourceType(2);
++        d.setFormula("DELTA(#{P_ELEC_01})");
++        d.setCalcPeriod(60);
++        d.setValidMin(new BigDecimal("0"));
++        d.setValidMax(new BigDecimal("999999"));
++        d.setEnabled(1);
++        d.setStatus(1);
++        return d;
++    }
++
++    private IotDataItemRef refRow(long id, long itemId) {
++        IotDataItemRef r = new IotDataItemRef();
++        r.setId(id);
++        r.setTenantId(TENANT);
++        r.setItemId(itemId);
++        r.setRefFullKey("F01.WS01.EQ001.ELEC_ENERGY_REF");
++        r.setRefType(1);
++        r.setRefItemId(602L);
++        return r;
++    }
++
++    private IotMetric metricRow(long id, long instanceId) {
++        IotMetric m = new IotMetric();
++        m.setId(id);
++        m.setTenantId(TENANT);
++        m.setMetricCode("F01_WATER_AVG_DAY");
++        m.setMetricName("一厂日均用水量");
++        m.setInstanceId(instanceId);
++        m.setSourceItemId(601L);
++        m.setAggType(1);
++        m.setPeriod("DAY");
++        m.setCalendarType(1);
++        m.setYoyFlag(1);
++        m.setMomFlag(0);
++        m.setDeptId(101L);
++        m.setStatus(1);
++        return m;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuardTest.java
+new file mode 100644
+index 0000000..234bad0
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/snapshot/SnapshotCredentialGuardTest.java
+@@ -0,0 +1,114 @@
++package net.otlab.admin.module.iot.publish.snapshot;
++
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 快照凭据终检单元测试（TASK-0024，ADR-0006 双保险之二——fail-closed；照 0018
++ * ChannelConnConfigValidator 同款八词全深度递归口径，Schema v1.0.1 派生标记两键为唯一
++ * 合法豁免）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class SnapshotCredentialGuardTest {
++
++    private static final JsonMapper MAPPER = JsonMapper.builder().build();
++
++    private SnapshotCredentialGuard guard;
++
++    @BeforeEach
++    void setUp() {
++        guard = new SnapshotCredentialGuard();
++    }
++
++    @Test
++    @DisplayName("合法快照体（五对象空集 + 顶层键）直过")
++    void legalSnapshotPasses() throws Exception {
++        String json = MAPPER.writeValueAsString(MAPPER.readTree(
++                "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,\"version\":1,"
++                        + "\"points\":[],\"channels\":[]}"));
++        assertDoesNotThrow(() -> guard.check(json));
++    }
++
++    @Test
++    @DisplayName("顶层键越集（Schema 外键）拒绝——additionalProperties=false 顶层复核")
++    void topLevelKeyOutsideSchemaFails() throws Exception {
++        String json = MAPPER.writeValueAsString(MAPPER.readTree(
++                "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,\"version\":1,"
++                        + "\"points\":[],\"channels\":[],\"gateways\":[]}"));
++        BusinessException ex = assertThrows(BusinessException.class, () -> guard.check(json));
++        assertTrue(ex.getMessage().contains("顶层键"), "文案直指顶层键白名单: " + ex.getMessage());
++    }
++
++    @Test
++    @DisplayName("对象键越集（points 元素出现 Schema 外字段）拒绝")
++    void objectKeyOutsideSchemaFails() throws Exception {
++        String json = MAPPER.writeValueAsString(MAPPER.readTree(
++                "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,\"version\":1,"
++                        + "\"points\":[{\"id\":1,\"tenantId\":1,\"pointCode\":\"P1\",\"pointName\":\"n\","
++                        + "\"dataType\":1,\"valueType\":\"DOUBLE\",\"internalNote\":\"x\"}],\"channels\":[]}"));
++        BusinessException ex = assertThrows(BusinessException.class, () -> guard.check(json));
++        assertTrue(ex.getMessage().contains("points 对象出现 Schema"), "文案直指对象键白名单: " + ex.getMessage());
++    }
++
++    @Test
++    @DisplayName("凭据键（credential/password/passwd/secret/token/apikey/accesskey/privatekey 八词变体）全拒")
++    void credentialKeysFail() throws Exception {
++        String[] keys = {"credential", "mqttPassword", "passwd", "clientSecret", "accessToken",
++                "apiKey", "accessKey", "privateKey"};
++        for (String key : keys) {
++            String json = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                    + "\"version\":1,\"points\":[],\"channels\":[{\"id\":1,\"tenantId\":1,"
++                    + "\"gatewayId\":88,\"channelCode\":\"C\",\"channelName\":\"n\","
++                    + "\"protocolType\":\"MQTT\",\"hasCredential\":false,\"connConfig\":{\"" + key + "\":\"x\"}}]}";
++            BusinessException ex = assertThrows(BusinessException.class, () -> guard.check(json),
++                    "键 " + key + " 必须被拒");
++            assertTrue(ex.getMessage().contains("凭据关键词"), "文案直指凭据防线: " + ex.getMessage());
++        }
++    }
++
++    @Test
++    @DisplayName("派生标记豁免 - hasCredential/credentialTypes 键名与类型字面量值直过（仅类型不含材料）")
++    void sanctionedMarkerFieldsExempt() throws Exception {
++        String json = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[],\"channels\":[{\"id\":1,\"tenantId\":1,\"gatewayId\":88,"
++                + "\"channelCode\":\"C\",\"channelName\":\"n\",\"protocolType\":\"MQTT\","
++                + "\"hasCredential\":true,\"credentialTypes\":[\"MQTT_PASSWORD\",\"DEVICE_TOKEN\",\"HTTP_SECRET\"]}]}";
++        assertDoesNotThrow(() -> guard.check(json), "§1.3A 派生标记为 Schema v1.0.1 承诺的合法内容");
++    }
++
++    @Test
++    @DisplayName("值扫描 - 已知键值含高信号凭据词（password/passwd/secret）拒绝；authType=apiKey 标记值不误伤")
++    void valueScanHighSignalWords() throws Exception {
++        // 泄漏材料藏于合法键值（point.remark——渠道对象无 remark 字段，白名单拦截在先；
++        // 值扫描针对「合法键+非法值」残余风险）
++        String leaked = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[{\"id\":1,\"tenantId\":1,\"pointCode\":\"P1\","
++                + "\"pointName\":\"n\",\"dataType\":1,\"valueType\":\"DOUBLE\","
++                + "\"remark\":\"password=abc123\"}],\"channels\":[]}";
++        BusinessException ex = assertThrows(BusinessException.class, () -> guard.check(leaked),
++                "已知键值携带凭据材料被值扫描拦截");
++        assertTrue(ex.getMessage().contains("凭据关键词"), "实际文案: " + ex.getMessage());
++
++        String apiKeyMarker = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[],\"channels\":[{\"id\":1,\"tenantId\":1,\"gatewayId\":88,"
++                + "\"channelCode\":\"C\",\"channelName\":\"n\",\"protocolType\":\"HTTP\","
++                + "\"hasCredential\":false,\"connConfig\":{\"authType\":\"apiKey\",\"reportPath\":\"/api/v1/report\"}}]}";
++        assertDoesNotThrow(() -> guard.check(apiKeyMarker),
++                "0018 先例：authType 枚举值 apiKey 是鉴权方式标记而非凭据本体，不误伤");
++    }
++
++    @Test
++    @DisplayName("非法 JSON fail-closed")
++    void brokenJsonFails() {
++        assertThrows(BusinessException.class, () -> guard.check("not-a-json{"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java
+new file mode 100644
+index 0000000..a3dd6f8
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/storage/SnapshotStorageTest.java
+@@ -0,0 +1,112 @@
++package net.otlab.admin.module.iot.publish.storage;
++
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertArrayEquals;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 快照本地存储单元测试（TASK-0024，一期本地目录裁决——ot.publish.storage-path；SHA-256
++ * 哈希、原子落位、取回与删除）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class SnapshotStorageTest {
++
++    @TempDir
++    Path tempDir;
++
++    private SnapshotStorage storage;
++
++    @BeforeEach
++    void setUp() {
++        PublishProperties properties = new PublishProperties();
++        properties.setStoragePath(tempDir.toString());
++        storage = new SnapshotStorage(properties);
++    }
++
++    @AfterEach
++    void tearDown() {
++        // @TempDir 自动清理
++    }
++
++    @Test
++    @DisplayName("存储 - 文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，uri 相对路径")
++    void storeUsesLayoutAndReturnsRelativeUri() throws IOException {
++        String json = "{\"schemaVersion\":\"1.0.1\"}";
++        String uri = storage.store(1L, 1, 88L, 17L, json);
++
++        assertEquals("1/1-88-17.json", uri, "snapshot_uri 相对路径（租户子目录 + brief 裁决文件名）");
++        Path file = tempDir.resolve("1").resolve("1-88-17.json");
++        assertTrue(Files.exists(file), "正式名文件落位");
++        assertEquals(json, Files.readString(file, StandardCharsets.UTF_8), "内容逐字节一致");
++
++        // 计算范围 scope_id=0 与网关 scope 同名不同租户目录隔离
++        storage.store(2L, 2, 0L, 17L, "{}");
++        assertTrue(Files.exists(tempDir.resolve("2").resolve("2-0-17.json")),
++                "计算 scope（scopeId=0）文件名在租户子目录下隔离，不与租户 1 相撞");
++    }
++
++    @Test
++    @DisplayName("取回 - readBytes 原文一致；缺失文件返回 null（存储损坏探测入口）")
++    void readBytesRoundtripAndMissing() throws IOException {
++        byte[] payload = "snapshot-body--json".getBytes(StandardCharsets.UTF_8);
++        String uri = storage.store(1L, 1, 88L, 17L, new String(payload, StandardCharsets.UTF_8));
++
++        assertArrayEquals(payload, storage.readBytes(uri));
++        assertNull(storage.readBytes("1/1-88-99.json"), "不存在返回 null（调用方转 500 快照缺失告警）");
++    }
++
++    @Test
++    @DisplayName("SHA-256 - 64 位小写十六进制；内容逐位敏感（损坏探测的比对基准）")
++    void sha256HexFormatAndSensitivity() {
++        String h1 = SnapshotStorage.sha256Hex("abc".getBytes(StandardCharsets.UTF_8));
++        String h2 = SnapshotStorage.sha256Hex("abd".getBytes(StandardCharsets.UTF_8));
++
++        assertEquals(64, h1.length(), "iot_config_version.snapshot_hash varchar(64) 口径");
++        assertTrue(h1.matches("[0-9a-f]{64}"), "小写十六进制");
++        assertNotEquals(h1, h2, "单字节差异哈希必变");
++        // 公认向量：SHA-256("abc") = ba7816bf...
++        assertTrue(h1.startsWith("ba7816bf8f01cfea414140de5dae2223"), "JDK SHA-256 标准向量");
++    }
++
++    @Test
++    @DisplayName("覆盖写 - 同文件重复存储替换旧内容（临时文件不残留）")
++    void overwriteReplacesContent() throws IOException {
++        storage.store(1L, 1, 88L, 17L, "old");
++        String uri = storage.store(1L, 1, 88L, 17L, "new-content");
++
++        assertEquals("new-content", new String(storage.readBytes(uri), StandardCharsets.UTF_8));
++        try (var files = Files.list(tempDir.resolve("1"))) {
++            List<String> leftovers = files.map(p -> p.getFileName().toString())
++                    .filter(name -> name.endsWith(".tmp")).toList();
++            assertTrue(leftovers.isEmpty(), "临时文件已清理: " + leftovers);
++        }
++    }
++
++    @Test
++    @DisplayName("删除 - deleteQuietly 删既有/容忍不存在（孤儿补偿 best-effort）")
++    void deleteQuietly() throws IOException {
++        String uri = storage.store(1L, 1, 88L, 17L, "x");
++        storage.deleteQuietly(uri);
++        assertFalse(Files.exists(tempDir.resolve("1").resolve("1-88-17.json")));
++        storage.deleteQuietly(uri);
++        storage.deleteQuietly("99/1-1-1.json");
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_iot_publish_domain.sql b/resources/sql/upgrade/20261122_iot_publish_domain.sql
+new file mode 100644
+index 0000000..4055667
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_publish_domain.sql
+@@ -0,0 +1,109 @@
++-- ============================================================
++-- 存量库升级脚本：iot_config_version 配置版本表 + 配置发布页按钮权限种子
++--   （TASK-0024 / FEAT-0008 / REQ-0033 / ADR-0005、ADR-0006、ADR-0008）
++--
++-- 用途：
++--   1) 建 iot_config_version 配置版本表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1
++--      附录 A p33，brief 已提取；字形规范化不改语义）；
++--   2) sys_menu 登记配置发布页（4015「配置发布」，20261121_iot_console_menus.sql 已建）
++--      之下的四个按钮权限行（menu_type=3）：iot:publish:list/query/publish/rollback；
++--   3) sys_role_menu 将上述四行授予超级管理员（role_id=1；照 20261122_iot_metric_domain.sql
++--      范式）。
++--
++-- 与上游差异（一处，登记待回写上游）：
++--   **uk_scope_version (tenant_id, scope_type, scope_id, version) 为本任务增补的物理唯一键**：
++--   上游附录 A p33 逐字 DDL 仅列 PRIMARY KEY 与部分二级索引，无该唯一约束。版本号同
++--   (tenant, scope) 单调递增是 REQ-0033 核心规则，服务层「SELECT 末版 → version=末版+1 →
++--   INSERT」存在并发竞态窗口（两线程同读末版 N 各写 N+1）——uk_scope_version 是该竞态的
++--   物理兜底：第二个 INSERT 必然撞唯一键，服务层捕获 DuplicateKeyException 转 5001 版本
++--   冲突（TC-0008 步骤 5「两人同时发布 → 后者报 5001」的物理保证）。**建议回写上游**
++--   （照 TASK-0021 补 tenant_id 先例的「攒下一版小修订」处理）。
++--   逐字部分（列序/列型/注释）与附录 A p33 完全一致；idx_scope_status 随 brief 提取的
++--   p33 DDL 一并保留。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 + 本任务 brief D3-D6）：
++--   iot:publish:list      GET    /iot/publish/list?scopeType=&scopeId=（版本列表分页，
++--                           version 降序；scope 校验网关可见/计算管理员语义）
++--   iot:publish:query     GET    /iot/publish/snapshot?scopeType=&scopeId=&version=
++--                           （快照取回：从对象存储取回快照体 + SHA-256 哈希核对——
++--                           取回哈希与落库哈希不一致 500 告警日志（存储损坏探测）；
++--                           version 缺省返回最新版，照契约 §3.3「不带 version 返回最新版」）
++--   iot:publish:publish   POST   /iot/publish/publish（body: scopeType/scopeId——流程
++--                           组装→哈希→存储→版本落库（publish_status=1, publish_time=NOW）；
++--                           scope_type=1 校验存在启用网关、scope_type=2 仅管理员语义；
++--                           并发发布撞 uk_scope_version → 5001；确认门
++--                           PublishConfirmGate NoOp 占位——TASK-0015 交付后接线强制
++--                           影响预览+二次确认，本期不阻断）
++--   iot:publish:rollback  POST   /iot/publish/rollback（body: scopeType/scopeId/targetVersion
++--                           ——新版本行 publish_status=1 复用 targetVersion 快照文件
++--                           （snapshot_uri/snapshot_hash 同旧快照——版本单调递增但快照
++--                           复用，brief 裁决「uri 指向旧快照」）；回滚目标版本不存在 400）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4070-4073：本任务（TASK-0024）占用（四行，parent_id=4015），连续取号；
++--   4069 已被 TASK-0048 占用（状态字典禁用）。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（REQ-0033 / FEAT-0008 / ADR-0005、ADR-0006、ADR-0008 / 本任务 brief）：
++--   保存≠生效（TD-0034 定版）：iot_config_version 只由发布链路写入（publish/rollback），
++--   无手工新增口子；版本号同 (tenant_id, scope_type, scope_id) 单调递增、物理兜底
++--   uk_scope_version；快照不含通道凭据（ADR-0006——组装器白名单字段 + 组装后凭据关键词
++--   终检 fail-closed 双保险，照 0018 conn_config 校验器同款关键词集）；回滚=以旧快照生成
++--   新版本（TC-0008「历史版本不被改写」——回滚不改写任何既有版本行，新版本行复用旧快照
++--   文件）；发布属高危配置操作（REQ-0033）：单独权限四码 + @OperateLog 审计 + 数据权限
++--   防线（网关 scope 校验网关可见；计算 scope=全租户仅管理员语义）。
++--   多租户：iot_config_version 属 iot_ 前缀表，由 TASK-0002 TenantLineInnerInterceptor
++--   （OtTenantLineHandler 前缀规则）自动按会话租户注入条件；tenant_id 服务层从会话覆盖、
++--   禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4015 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_config_version` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '配置版本 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `scope_type` tinyint NOT NULL COMMENT '范围 1 网关 2 计算',
++  `scope_id` bigint NOT NULL COMMENT '范围对象 ID',
++  `version` bigint NOT NULL COMMENT '版本号（单调递增）',
++  `snapshot_hash` varchar(64) DEFAULT NULL COMMENT '快照哈希',
++  `snapshot_uri` varchar(500) DEFAULT NULL COMMENT '快照文件地址',
++  `publish_status` tinyint DEFAULT '1' COMMENT '状态 1 已发布 2 已回滚',
++  `publish_time` datetime DEFAULT NULL COMMENT '发布时间',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_scope_version` (`tenant_id`,`scope_type`,`scope_id`,`version`),
++  KEY `idx_scope_status` (`tenant_id`,`scope_type`,`scope_id`,`publish_status`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='配置版本表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4070, 4015, 4, '发布版本查询', 3, NULL, NULL, NULL, 'iot:publish:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4071, 4015, 4, '快照取回', 3, NULL, NULL, NULL, 'iot:publish:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4072, 4015, 4, '配置发布', 3, NULL, NULL, NULL, 'iot:publish:publish', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4073, 4015, 4, '版本回滚', 3, NULL, NULL, NULL, 'iot:publish:rollback', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4070), (1, 4071), (1, 4072), (1, 4073);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构含 uk_scope_version、第二条应 4 行、第三条应 4 行）：
++--   SHOW CREATE TABLE iot_config_version;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4070 AND 4073;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4070 AND 4073;
++-- ============================================================

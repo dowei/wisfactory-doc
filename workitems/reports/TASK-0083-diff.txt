@@ -1,0 +1,587 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index 8751eae..fd4c96f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -31,6 +31,16 @@ import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+ import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
+ import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
+ import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotUpgradeApplyService;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeTier;
++import net.otlab.admin.module.iot.template.tier.TemplateContentDiffEngine;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -163,6 +173,24 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     @Autowired
+     private SysTenantMapper tenantMapper;
+ 
++    // ---------- TASK-0083 发布自动跟随（二档政策，复用 0081 applyToVersion 接缝） ----------
++
++    /** 待升级实例筛选（同租户 + 引用模板 + locked=0 + applied &lt; current） */
++    @Autowired
++    private IotModelInstanceMapper instanceMapper;
++
++    /** 模板当前版本反查（计算 scope 内引用本模板的实例判定滞后） */
++    @Autowired
++    private IotModelTemplateMapper templateMapper;
++
++    /** 版本历史 content（applied→current 判档：含 T3 条目则跳过自动跟随） */
++    @Autowired
++    private IotModelTemplateVersionMapper templateVersionMapper;
++
++    /** 0081 可复用接缝：按目标版本对齐实例数据面（同步/事务内/逐台留痕） */
++    @Autowired
++    private IotUpgradeApplyService upgradeApplyService;
++
+     // ---------- 发布 ----------
+ 
+     @Override
+@@ -233,9 +261,124 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         writeBackConfigVersion(scopeType, version, pointIdsOf(snapshot), dataItemIdsOf(snapshot));
+         // 下发记录落行（TASK-0025）：版本落库后同事务派生目标落行（ack_status=0）+ 触发通知接缝
+         publishLogService.recordDispatch(row);
++
++        // TASK-0083（二档政策）：发布事务内为未锁定滞后实例自动跟随（复用 0081 applyToVersion）。
++        // 网关 scope 与模板实例无关——不触发；任一实例失败抛异常 → 本 @Transactional 整批回滚，
++        // 不产生「版本已发布但实例未跟随」半态（brief 失败语义 / fail-closed）。
++        followUnlockedInstances(tenantId, scopeType);
++
+         return row;
+     }
+ 
++    /**
++     * TASK-0083 发布自动跟随（ADR-0008 二档政策 / REQ-0006 验收 1 / TC-0005 步骤 3）：
++     * 计算域发布（scopeType=2）时，对租户内每个模板筛「locked=0 且 applied&lt;current」的滞后
++     * 实例，逐台复用 0081 {@link IotUpgradeApplyService#applyToVersion} 对齐数据面 + 乐观锁推进
++     * 簿记。含 {@link TemplateChangeTier#TIER_3} 条目的滞后实例跳过（T3 永不自动——0081 评审红线：
++     * 自动跟随不得触碰含 T3 的滞后实例，仍走 0016 逐台确认）；锁定实例（locked=1）由筛选条件
++     * 排除，保持旧版本并留在 0016 清单。
++     *
++     * <p><b>事务与失败语义</b>：不另开事务——加入 publish 的 {@code @Transactional}；apply 抛
++     * 异常（数据面失败/上下文缺失/坏默认 fail-closed）直接逃出 → 整批回滚（版本行/快照/下发
++     * 记录/实例推进同原子）。<b>上下文核实（0081 m-1）</b>：applyToVersion 经 regenerate 依赖
++     * SecurityUtils.getUserId()/TenantContext；计算域发布端点带 @SaCheckPermission 且
++     * PublishScopeGuard 已要求 allTenant 角色，二者在 publish 入口已取用成功——上下文必然齐备。
++     *
++     * @param tenantId  当前租户（插件注入 + 显式会话读）
++     * @param scopeType 发布范围（1 网关 / 2 计算——仅计算触发跟随）
++     */
++    private void followUnlockedInstances(Long tenantId, Integer scopeType) {
++        if (scopeType == null || scopeType != SCOPE_COMPUTE) {
++            return; // 网关 scope 与模板实例无关（brief 决策 2）
++        }
++        List<IotModelTemplate> templates = templateMapper.selectList(new LambdaQueryWrapper<>());
++        if (templates == null || templates.isEmpty()) {
++            return;
++        }
++        for (IotModelTemplate template : templates) {
++            Integer current = template.getVersion();
++            if (template.getId() == null || current == null) {
++                continue;
++            }
++            // 未锁定（locked=0）+ 滞后（applied<current）实例；租户条件由插件注入（同租户）
++            List<IotModelInstance> lagging = instanceMapper.selectList(new LambdaQueryWrapper<IotModelInstance>()
++                    .eq(IotModelInstance::getTemplateId, template.getId())
++                    .eq(IotModelInstance::getLocked, 0)
++                    .lt(IotModelInstance::getAppliedTemplateVersion, current)
++                    .orderByAsc(IotModelInstance::getId));
++            if (lagging == null || lagging.isEmpty()) {
++                continue;
++            }
++            String currentContent = loadTemplateVersionContent(template.getId(), current);
++            if (currentContent == null) {
++                log.warn("[PUBLISH-FOLLOW] current content missing templateId={} version={} skipped",
++                        template.getId(), current);
++                continue;
++            }
++            JsonNode currentNode = parseFollowContent(currentContent);
++            if (currentNode == null) {
++                continue;
++            }
++            for (IotModelInstance inst : lagging) {
++                Integer applied = inst.getAppliedTemplateVersion();
++                // 内存二次防线（筛选已在 SQL 层 locked=0 / applied<current；此处防御桩返回/并发漂移）
++                if (applied == null || applied >= current
++                        || (inst.getLocked() != null && inst.getLocked() == 1)) {
++                    continue;
++                }
++                String appliedContent = loadTemplateVersionContent(template.getId(), applied);
++                if (appliedContent == null) {
++                    log.warn("[PUBLISH-FOLLOW] applied content missing instanceId={} templateId={} applied={} skipped",
++                            inst.getId(), template.getId(), applied);
++                    continue;
++                }
++                JsonNode appliedNode = parseFollowContent(appliedContent);
++                if (appliedNode == null) {
++                    continue;
++                }
++                // T3 永不自动：applied→current 净 diff 含 T3 条目则跳过该实例（仍走 0016 逐台确认）
++                List<TemplateChangeEntry> diff = TemplateContentDiffEngine.diff(appliedNode, currentNode);
++                boolean hasTier3 = diff.stream().anyMatch(e -> e.getTier() == TemplateChangeTier.TIER_3);
++                if (hasTier3) {
++                    log.info("[PUBLISH-FOLLOW] skipped (T3 never auto) instanceId={} templateId={} applied={} current={}",
++                            inst.getId(), template.getId(), applied, current);
++                    continue;
++                }
++                // 数据面应用 + 乐观锁簿记推进（同事务；失败抛异常整批回滚）
++                upgradeApplyService.applyToVersion(inst, current);
++                int rows = instanceMapper.update(null, new LambdaUpdateWrapper<IotModelInstance>()
++                        .eq(IotModelInstance::getId, inst.getId())
++                        .eq(IotModelInstance::getAppliedTemplateVersion, applied)
++                        .set(IotModelInstance::getAppliedTemplateVersion, current));
++                if (rows == 0) {
++                    throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                            "发布自动跟随版本并发冲突，请重试: instanceId=" + inst.getId());
++                }
++                log.info("[PUBLISH-FOLLOW] instanceId={} templateId={} applied {} -> {} (userId={})",
++                        inst.getId(), template.getId(), applied, current, SecurityUtils.getUserId());
++            }
++        }
++    }
++
++    /** 版本历史 content（applied / current 判档基线）——无历史行返回 null（跳过自动跟随，保守方向） */
++    private String loadTemplateVersionContent(Long templateId, Integer version) {
++        IotModelTemplateVersion row = templateVersionMapper.selectOne(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .eq(IotModelTemplateVersion::getTemplateId, templateId)
++                .eq(IotModelTemplateVersion::getVersion, version)
++                .last("LIMIT 1"));
++        return row == null ? null : row.getContent();
++    }
++
++    /** 判档 content 解析（畸形快照跳过该实例，fail-closed；不污染发布主链） */
++    private JsonNode parseFollowContent(String content) {
++        try {
++            return BODY_MAPPER.readTree(content);
++        } catch (IOException e) {
++            log.warn("[PUBLISH-FOLLOW] content parse failed skipped: {}", e.getMessage());
++            return null;
++        }
++    }
++
+     /**
+      * 回滚路径前置校验：取回复用快照并核对哈希（目标快照缺失/损坏时拒绝回滚——新版本行
+      * 不得指向已损坏文件），解析快照内容所含行 id 供 config_version 回写。
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java
+new file mode 100644
+index 0000000..11a638b
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java
+@@ -0,0 +1,353 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.metric.mapper.IotMetricMapper;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.gate.NoOpPublishConfirmGate;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
++import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotUpgradeApplyService;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeTier;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0083 发布自动跟随红线测试（ADR-0008 二档政策 / REQ-0006 验收 1 / TC-0005 步骤 3）。
++ *
++ * <p>经 {@link IotPublishServiceImpl#publish} 公共入口驱动（接线在发布事务内），Mapper 全 mock、
++ * 0081 接缝 {@link IotUpgradeApplyService} mock（断言调用/参数/异常传播，数据面行应用由 0081
++ * 自身 12 例单测覆盖，本类聚焦发布侧接线）。六条红线：
++ * <ol>
++ * <li>计算域发布——未锁定滞后实例调用 applyToVersion + 乐观锁推进 applied；</li>
++ * <li>锁定实例（locked=1，SQL 筛选排除）不推进；</li>
++ * <li>网关 scope 发布不触发跟随（连模板都不查）；</li>
++ * <li>T3 净 diff 的实例跳过自动跟随（永不自动）；</li>
++ * <li>失败整批回滚：applyToVersion 抛异常 → publish 抛异常（异常穿透发布链，簿记不推进）；</li>
++ * <li>并发冲突：乐观锁 update affected=0 → 4002 整批回滚。</li>
++ * </ol>
++ *
++ * <p>上下文核实（0081 m-1）：单测以静态桩固定 SecurityUtils/TenantContext 返回非空值，保证
++ * 行为确定；「发布场景真实会话下 applyToVersion 不抛上下文异常、操作人正确」由 dev 冒烟实证
++ * （见报告验收 2），本类不重复。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotPublishAutoFollowTest {
++
++    private static final long TENANT = 1L;
++    private static final long USER_ID = 10L;
++    private static final long TEMPLATE_ID = 101L;
++    private static final long INSTANCE_ID = 201L;
++
++    @TempDir
++    Path tempDir;
++
++    @Mock private IotConfigVersionMapper versionMapper;
++    @Mock private IotGatewayMapper gatewayMapper;
++    @Mock private IotPointMapper pointMapper;
++    @Mock private IotDataItemMapper dataItemMapper;
++    @Mock private IotChannelMapper channelMapper;
++    @Mock private IotChannelCredentialMapper credentialMapper;
++    @Mock private IotDataItemRefMapper dataItemRefMapper;
++    @Mock private IotMetricMapper metricMapper;
++    @Mock private DataPermService dataPermService;
++    @Mock private IotPublishLogService publishLogService;
++    @Mock private IotModelInstanceMapper instanceMapper;
++    @Mock private IotModelTemplateMapper templateMapper;
++    @Mock private IotModelTemplateVersionMapper templateVersionMapper;
++    @Mock private IotUpgradeApplyService upgradeApplyService;
++
++    private IotPublishServiceImpl publishService;
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++    private org.mockito.MockedStatic<SecurityUtils> securityUtils;
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant a = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(a, IotConfigVersion.class);
++        TableInfoHelper.initTableInfo(a, IotDataItem.class);
++        TableInfoHelper.initTableInfo(a, IotGateway.class);
++        TableInfoHelper.initTableInfo(a, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(a, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(a, IotModelTemplateVersion.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(USER_ID);
++
++        ConfigSnapshotAssembler assembler = new ConfigSnapshotAssembler();
++        ReflectionTestUtils.setField(assembler, "channelMapper", channelMapper);
++        ReflectionTestUtils.setField(assembler, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(assembler, "credentialMapper", credentialMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(assembler, "dataItemRefMapper", dataItemRefMapper);
++        ReflectionTestUtils.setField(assembler, "metricMapper", metricMapper);
++
++        PublishProperties properties = new PublishProperties();
++        properties.setStoragePath(tempDir.toString());
++        SnapshotStorage storage = new SnapshotStorage(properties);
++        PublishScopeGuard scopeGuard = new PublishScopeGuard(gatewayMapper, dataPermService);
++
++        publishService = new IotPublishServiceImpl();
++        ReflectionTestUtils.setField(publishService, "baseMapper", versionMapper);
++        ReflectionTestUtils.setField(publishService, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(publishService, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(publishService, "assembler", assembler);
++        ReflectionTestUtils.setField(publishService, "credentialGuard", new SnapshotCredentialGuard());
++        ReflectionTestUtils.setField(publishService, "snapshotStorage", storage);
++        ReflectionTestUtils.setField(publishService, "confirmGate", new NoOpPublishConfirmGate());
++        ReflectionTestUtils.setField(publishService, "scopeGuard", scopeGuard);
++        ReflectionTestUtils.setField(publishService, "publishLogService", publishLogService);
++        ReflectionTestUtils.setField(publishService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(publishService, "templateMapper", templateMapper);
++        ReflectionTestUtils.setField(publishService, "templateVersionMapper", templateVersionMapper);
++        ReflectionTestUtils.setField(publishService, "upgradeApplyService", upgradeApplyService);
++
++        when(dataPermService.resolve(USER_ID)).thenReturn(new VisibleScope(true, Set.of(), Set.of(), false));
++        when(versionMapper.selectMaxVersion(anyLong(), anyInt(), anyLong())).thenReturn(0L);
++        when(versionMapper.insert(any(IotConfigVersion.class))).thenReturn(1);
++        when(channelMapper.selectList(any())).thenReturn(List.of());
++        when(pointMapper.selectList(any())).thenReturn(List.of());
++        when(credentialMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        when(metricMapper.selectList(any())).thenReturn(List.of());
++        when(gatewayMapper.selectById(anyLong())).thenAnswer(inv -> {
++            IotGateway g = new IotGateway();
++            g.setId(inv.getArgument(0, Long.class));
++            g.setStatus(1);
++            g.setDeptId(1L);
++            return g;
++        });
++        when(upgradeApplyService.applyToVersion(any(), anyInt())).thenReturn(new TemplateUpgradeResultVO());
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 红线 1：计算域发布 → 未锁定滞后实例 applyToVersion + 簿记推进 ----------
++
++    @Test
++    @DisplayName("红线1 - 计算域发布：未锁定滞后实例调用 applyToVersion 并乐观锁推进 applied")
++    void computePublishFollowsUnlockedLaggingInstance() {
++        stubFollowContext(t2Content(), t3FormulaContent()); // applied=v2, current=v3(T2)
++        when(instanceMapper.update(any(), any(LambdaUpdateWrapper.class))).thenReturn(1);
++
++        IotConfigVersion row = publishService.publish(computeForm());
++
++        assertNotNull(row);
++        ArgumentCaptor<IotModelInstance> instCap = ArgumentCaptor.forClass(IotModelInstance.class);
++        verify(upgradeApplyService, times(1)).applyToVersion(instCap.capture(), eq(3));
++        assertEquals(INSTANCE_ID, instCap.getValue().getId(), "传入 applyToVersion 的实例=筛选出的滞后实例");
++        verify(instanceMapper, times(1)).update(any(), any(LambdaUpdateWrapper.class));
++    }
++
++    // ---------- 红线 2：锁定实例不推进 ----------
++
++    @Test
++    @DisplayName("红线2 - 锁定实例（SQL 筛选 locked=0 排除）不自动跟随")
++    void lockedInstanceNotFollowed() {
++        when(templateMapper.selectList(any())).thenReturn(List.of(template(TEMPLATE_ID, 3)));
++        when(instanceMapper.selectList(any())).thenReturn(List.of()); // locked=0 无命中（锁定实例被排除）
++
++        publishService.publish(computeForm());
++
++        verify(upgradeApplyService, never()).applyToVersion(any(), anyInt());
++        verify(instanceMapper, never()).update(any(), any(LambdaUpdateWrapper.class));
++    }
++
++    // ---------- 红线 3：网关 scope 不触发 ----------
++
++    @Test
++    @DisplayName("红线3 - 网关 scope 发布不触发实例跟随（连模板都不查）")
++    void gatewayPublishNoFollow() {
++        PublishForm form = new PublishForm();
++        form.setScopeType(1);
++        form.setScopeId(88L);
++
++        publishService.publish(form);
++
++        verify(upgradeApplyService, never()).applyToVersion(any(), anyInt());
++        verify(templateMapper, never()).selectList(any());
++    }
++
++    // ---------- 红线 4：T3 不自动 ----------
++
++    @Test
++    @DisplayName("红线4 - applied→current 净 diff 含 T3 条目的滞后实例跳过自动跟随（永不自动）")
++    void tier3InstanceSkipped() {
++        // applied=v2 含 PARAM_C；current=v3 删除 PARAM_C → diff 含 T3 REMOVED
++        stubFollowContext(appliedContentWithParamC(), currentContentWithoutParamC());
++
++        publishService.publish(computeForm());
++
++        verify(upgradeApplyService, never()).applyToVersion(any(), anyInt());
++        verify(instanceMapper, never()).update(any(), any(LambdaUpdateWrapper.class));
++    }
++
++    // ---------- 红线 5：失败整批回滚语义（异常穿透发布链） ----------
++
++    @Test
++    @DisplayName("红线5 - applyToVersion 抛异常 → publish 抛异常（整批回滚 fail-closed，簿记不推进）")
++    void followFailureAbortsPublish() {
++        stubFollowContext(t2Content(), t3FormulaContent());
++        when(upgradeApplyService.applyToVersion(any(), anyInt()))
++                .thenThrow(new BusinessException(ResultCode.ERROR.getCode(), "数据面应用失败"));
++
++        assertThrows(BusinessException.class, () -> publishService.publish(computeForm()),
++                "自动跟随失败必须穿透发布链（@Transactional 整批回滚，不产生半态）");
++        verify(instanceMapper, never()).update(any(), any(LambdaUpdateWrapper.class));
++    }
++
++    // ---------- 红线 6：并发冲突 4002 ----------
++
++    @Test
++    @DisplayName("红线6 - 跟随乐观锁冲突（update affected=0）→ 4002 整批回滚")
++    void followOptimisticConflictAborts() {
++        stubFollowContext(t2Content(), t3FormulaContent());
++        when(instanceMapper.update(any(), any(LambdaUpdateWrapper.class))).thenReturn(0);
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> publishService.publish(computeForm()));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), ex.getCode());
++    }
++
++    // ---------- 夹具 ----------
++
++    /**
++     * 单模板单实例跟随上下文：versionMapper.selectOne 调用序 = ① current ② applied（见
++     * followUnlockedInstances）——用 thenReturn 序列精确区分两版 content。
++     */
++    private void stubFollowContext(String appliedContent, String currentContent) {
++        when(templateMapper.selectList(any())).thenReturn(List.of(template(TEMPLATE_ID, 3)));
++        when(instanceMapper.selectList(any())).thenReturn(List.of(instance(INSTANCE_ID, TEMPLATE_ID, 2, 0)));
++        when(templateVersionMapper.selectOne(any())).thenReturn(
++                versionRow(TEMPLATE_ID, 3, currentContent),   // ① current
++                versionRow(TEMPLATE_ID, 2, appliedContent));  // ② applied
++    }
++
++    private PublishForm computeForm() {
++        PublishForm form = new PublishForm();
++        form.setScopeType(2);
++        form.setScopeId(0L);
++        return form;
++    }
++
++    private IotModelTemplate template(long id, int version) {
++        IotModelTemplate t = new IotModelTemplate();
++        t.setId(id);
++        t.setTemplateCode("TPL-" + id);
++        t.setVersion(version);
++        return t;
++    }
++
++    private IotModelInstance instance(long id, long templateId, int applied, int locked) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setInstanceCode("F01.WS01.EQ" + id);
++        inst.setTemplateId(templateId);
++        inst.setAppliedTemplateVersion(applied);
++        inst.setLocked(locked);
++        inst.setStatus(1);
++        return inst;
++    }
++
++    private IotModelTemplateVersion versionRow(long templateId, int version, String content) {
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setTemplateId(templateId);
++        row.setVersion(version);
++        row.setContent(content);
++        row.setTierSummary("T2:1");
++        return row;
++    }
++
++    /** applied=v2：LOAD_RATE /100 + PARAM_C（基线） */
++    private String appliedContentWithParamC() {
++        return "{\"template\":{\"templateCode\":\"TPL-101\"},\"dataItems\":["
++                + "{\"dataCode\":\"LOAD_RATE\",\"defaultFormula\":\"{SELF.ELEC}/100\"},"
++                + "{\"dataCode\":\"PARAM_C\",\"defaultFormula\":null}],\"statusRules\":[]}";
++    }
++
++    /** current=v3：删除 PARAM_C（T3 REMOVED），其余同 → 净 diff 含 T3 */
++    private String currentContentWithoutParamC() {
++        return "{\"template\":{\"templateCode\":\"TPL-101\"},\"dataItems\":["
++                + "{\"dataCode\":\"LOAD_RATE\",\"defaultFormula\":\"{SELF.ELEC}/100\"}],\"statusRules\":[]}";
++    }
++
++    /** applied=v2：LOAD_RATE /100（基线） */
++    private String t2Content() {
++        return "{\"template\":{\"templateCode\":\"TPL-101\"},\"dataItems\":["
++                + "{\"dataCode\":\"LOAD_RATE\",\"defaultFormula\":\"{SELF.ELEC}/100\"}],\"statusRules\":[]}";
++    }
++
++    /** current=v3：LOAD_RATE /1000（T2 CHANGED defaultFormula）——无 T3 → 触发跟随 */
++    private String t3FormulaContent() {
++        return "{\"template\":{\"templateCode\":\"TPL-101\"},\"dataItems\":["
++                + "{\"dataCode\":\"LOAD_RATE\",\"defaultFormula\":\"{SELF.ELEC}/1000\"}],\"statusRules\":[]}";
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+index 7fd7369..04b2f82 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+@@ -29,6 +29,13 @@ import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+ import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
+ import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
+ import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotUpgradeApplyService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -132,6 +139,18 @@ class IotPublishServiceImplTest {
+     @Mock
+     private IotPublishLogService publishLogService;
+ 
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private IotModelTemplateMapper templateMapper;
++
++    @Mock
++    private IotModelTemplateVersionMapper templateVersionMapper;
++
++    @Mock
++    private IotUpgradeApplyService upgradeApplyService;
++
+     private IotPublishServiceImpl publishService;
+ 
+     private SnapshotStorage storage;
+@@ -193,6 +212,10 @@ class IotPublishServiceImplTest {
+         ReflectionTestUtils.setField(publishService, "confirmGate", confirmGate);
+         ReflectionTestUtils.setField(publishService, "scopeGuard", scopeGuard);
+         ReflectionTestUtils.setField(publishService, "publishLogService", publishLogService);
++        ReflectionTestUtils.setField(publishService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(publishService, "templateMapper", templateMapper);
++        ReflectionTestUtils.setField(publishService, "templateVersionMapper", templateVersionMapper);
++        ReflectionTestUtils.setField(publishService, "upgradeApplyService", upgradeApplyService);
+ 
+         // 默认防线与数据（异常用例逐用例覆盖）
+         when(dataPermService.resolve(USER_ID)).thenReturn(
+@@ -207,6 +230,8 @@ class IotPublishServiceImplTest {
+         when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
+         when(metricMapper.selectList(any())).thenReturn(List.of());
+         when(versionMapper.insert(any(IotConfigVersion.class))).thenReturn(1);
++        // TASK-0083 默认无模板 → 发布自动跟随为零操作（红线用例逐用例覆盖）
++        when(templateMapper.selectList(any())).thenReturn(List.of());
+     }
+ 
+     @AfterEach

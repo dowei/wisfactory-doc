@@ -1,0 +1,1422 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusCurrentVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusCurrentVO.java
+new file mode 100644
+index 0000000..4ee1d15
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusCurrentVO.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.statusread;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 当前状态展示载荷（TASK-0050）：对外与管理面共用的状态读口单一形状。
++ *
++ * <p>字段口径：statusCode 稳定编码 / statusName+color 由规则表+字典动态翻译（非 Redis
++ * 里的硬编码值）/ seq 稳定序号 / quality 质量码 / changeTime 状态变化时刻（ms）；
++ * 无该设备状态返回 UNKNOWN（seq=null、quality=3，0049 写侧同口径），不报错。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "设备当前状态（管理面/对外共用读口载荷）")
++public class StatusCurrentVO {
++
++    @Schema(description = "模型实例 ID")
++    private Long instanceId;
++
++    @Schema(description = "实例编码（路径式 F01.WS01.EQ001）")
++    private String instanceCode;
++
++    @Schema(description = "状态编码（RUNNING/FAULT/UNKNOWN…）")
++    private String statusCode;
++
++    @Schema(description = "状态名称（规则表/字典动态翻译）")
++    private String statusName;
++
++    @Schema(description = "展示颜色（规则表/字典动态翻译）")
++    private String color;
++
++    @Schema(description = "稳定序号（UNKNOWN=null；只增不复用，ADR-0009）")
++    private Integer seq;
++
++    @Schema(description = "质量码（0 正常；UNKNOWN=3）")
++    private Integer quality;
++
++    @Schema(description = "状态变化时刻（epoch 毫秒；无状态为 null）")
++    private Long changeTime;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusHistoryPointVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusHistoryPointVO.java
+new file mode 100644
+index 0000000..401b69f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusHistoryPointVO.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.statusread;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 状态历史时间线点（TASK-0050）：st_item_value 留痕行（value=稳定序号、quality）翻译后载荷。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "状态历史时间线点（由稳定序号翻译）")
++public class StatusHistoryPointVO {
++
++    @Schema(description = "变化时刻（epoch 毫秒）")
++    private Long ts;
++
++    @Schema(description = "稳定序号（UNKNOWN 对外 null；写侧 -1 哨兵不暴露）")
++    private Integer seq;
++
++    @Schema(description = "状态编码（按序号从字典动态翻译）")
++    private String statusCode;
++
++    @Schema(description = "状态名称")
++    private String statusName;
++
++    @Schema(description = "展示颜色")
++    private String color;
++
++    @Schema(description = "质量码（0 正常；UNKNOWN=3）")
++    private Integer quality;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusReadService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusReadService.java
+new file mode 100644
+index 0000000..550ce16
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/StatusReadService.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.statusread;
++
++import java.util.List;
++
++/**
++ * 状态展示读口服务（TASK-0050）：展示端/对外 API 统一经本服务读状态——不现算（ADR-0004）。
++ *
++ * <p>当前状态读 Redis {@code iot:st:{tenant}:{instance}}（0049 写入侧形态：值含 statusCode/
++ * seq/quality/ts，statusName/color 是 calc 硬编码不采纳）；历史读 st_item_value（0049 留痕：
++ * value=稳定序号、quality=0）。名称/颜色翻译以规则表 iot_status_rule + 字典 iot_status_dict
++ * 为单一动态来源（0049 F-06 反例约束：不硬编码状态名/颜色；规则发布后翻译随之变化）。
++ *
++ * <p>两条路径：管理面（本服务自解析会话租户 + 实例 + 数据权限）；对外面（由 openapi 服务
++ * 已做 HMAC 鉴权 + scope 裁剪后以显式 tenantId 调用，不再重复裁剪）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface StatusReadService {
++
++    /** 管理面当前状态（会话租户 + 实例解析 + 数据权限；越权 403；无状态 UNKNOWN 不报错） */
++    StatusCurrentVO current(Long instanceId);
++
++    /** 管理面历史时间线（会话租户 + 实例解析 + 数据权限；from/to 为 epoch 毫秒） */
++    List<StatusHistoryPointVO> history(Long instanceId, Long fromMs, Long toMs);
++
++    /** 对外当前状态（已 scope 校验；显式租户，不重复裁剪） */
++    StatusCurrentVO currentForClient(Long tenantId, Long instanceId);
++
++    /** 对外历史时间线（已 scope 校验；显式租户，不重复裁剪） */
++    List<StatusHistoryPointVO> historyForClient(Long tenantId, Long instanceId, Long fromMs, Long toMs);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadController.java
+new file mode 100644
+index 0000000..03f04c0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadController.java
+@@ -0,0 +1,56 @@
++package net.otlab.admin.module.iot.statusread.controller;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * 管理面状态展示读口（TASK-0050）：/api/v1/iot/status/current + /history。
++ *
++ * <p>展示端详情页（0059 后续）/色块（0058 批二后续）与对外 API 三处均经本数据服务读口——
++ * 同一翻译逻辑单一来源（StatusReadService）。数据权限在 service 层裁剪（目标实例 ∈ 可见集，
++ * 否则 403 不泄露存在性）；本控制器只做参数透传与载荷装配。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "设备状态展示读口")
++@RestController
++@RequestMapping("/api/v1/iot/status")
++public class IotStatusReadController {
++
++    private final StatusReadService statusReadService;
++
++    public IotStatusReadController(StatusReadService statusReadService) {
++        this.statusReadService = statusReadService;
++    }
++
++    @Operation(summary = "当前状态（Redis 直读不现算；无状态 UNKNOWN 不报错；规则/字典动态翻译）")
++    @GetMapping("/current")
++    public Result<StatusCurrentVO> current(@RequestParam("instanceId") Long instanceId) {
++        return Result.success(statusReadService.current(instanceId));
++    }
++
++    @Operation(summary = "历史时间线（st_item_value 状态留痕；稳定序号按字典翻译）")
++    @GetMapping("/history")
++    public Result<List<StatusHistoryPointVO>> history(
++            @RequestParam("instanceId") Long instanceId,
++            @RequestParam("from") Long fromMs,
++            @RequestParam("to") Long toMs) {
++        if (instanceId == null || fromMs == null || toMs == null || fromMs < 0 || toMs < 0 || fromMs >= toMs) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "instanceId/from/to 必填且 from < to（epoch 毫秒）");
++        }
++        return Result.success(statusReadService.history(instanceId, fromMs, toMs));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImpl.java
+new file mode 100644
+index 0000000..8bbd915
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImpl.java
+@@ -0,0 +1,273 @@
++package net.otlab.admin.module.iot.statusread.impl;
++
++import cn.hutool.json.JSONObject;
++import cn.hutool.json.JSONUtil;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.admin.module.iot.statusread.mapper.StatusTranslationMapper;
++import net.otlab.admin.module.iot.statusread.mapper.StatusTranslationRow;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.stereotype.Service;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * 状态展示读口实现（TASK-0050）：Redis 当前状态直读 + st_item_value 历史 + 动态翻译。
++ *
++ * <p><b>单一来源纪律</b>：状态名称/颜色只从 iot_status_dict + iot_status_rule 动态取——
++ * 0049 calc 写入侧 Redis 里的 statusName/color 是硬编码（0049 修订轮 F-06 deferred 反例），
++ * 读侧一律丢弃、按编码重新翻译（规则发布后自动跟随，不需前端/本服务改动）。
++ *
++ * <p><b>rawStringRedisTemplate</b>：calc 用 RESP2 直接写 {@code iot:st:{tenant}:{instance}} 原始
++ * JSON（无应用 key-prefix、db 与 ot 同源），必须用不带前缀的 raw 模板按原样读取（BUG-1110
++ * 同款：本项目业务模板会二次拼前缀导致读空）。
++ *
++ * <p><b>fail-soft</b>：Redis 读异常/不可解析 → UNKNOWN（不报错、不炸展示）；历史查询的
++ * TDengine 不可用由 timeseriesClient 内部 fail-soft 空集（TD-0053 环境恢复后补真机读回）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class StatusReadServiceImpl implements StatusReadService {
++
++    /** Redis 当前状态键前缀（0049 写入侧契约 iot:st:{tenant}:{instance}） */
++    private static final String STATE_KEY_PREFIX = "iot:st:";
++
++    /** UNKNOWN 哨兵（0049 写侧 st_item_value value=-1 + quality=3；读侧对外 seq=null） */
++    private static final double UNKNOWN_TRACE_VALUE = -1.0;
++    private static final int QUALITY_UNKNOWN = 3;
++
++    private final StringRedisTemplate rawStringRedisTemplate;
++    private final StatusTranslationMapper translationMapper;
++    private final OpenApiTimeseriesClient timeseriesClient;
++
++    // 会话/manager 与 client 路径的解析依赖（核心读方法不依赖，单测可传 null）
++    private final OpenApiInstanceMapper instanceMapper;
++    private final OpenApiTenantMapper tenantMapper;
++    private final DataPermService dataPermService;
++
++    /** Spring 装配（全依赖） */
++    @Autowired
++    public StatusReadServiceImpl(@Qualifier("rawStringRedisTemplate") StringRedisTemplate rawStringRedisTemplate,
++                                 StatusTranslationMapper translationMapper,
++                                 OpenApiTimeseriesClient timeseriesClient,
++                                 OpenApiInstanceMapper instanceMapper,
++                                 OpenApiTenantMapper tenantMapper,
++                                 DataPermService dataPermService) {
++        this.rawStringRedisTemplate = rawStringRedisTemplate;
++        this.translationMapper = translationMapper;
++        this.timeseriesClient = timeseriesClient;
++        this.instanceMapper = instanceMapper;
++        this.tenantMapper = tenantMapper;
++        this.dataPermService = dataPermService;
++    }
++
++    /** 核心读单测构造（只装配 Redis/翻译/历史三个核心依赖） */
++    public StatusReadServiceImpl(StringRedisTemplate rawStringRedisTemplate,
++                                 StatusTranslationMapper translationMapper,
++                                 OpenApiTimeseriesClient timeseriesClient) {
++        this(rawStringRedisTemplate, translationMapper, timeseriesClient, null, null, null);
++    }
++
++    // ---------- 管理面（会话租户 + 数据权限） ----------
++
++    @Override
++    public StatusCurrentVO current(Long instanceId) {
++        requireIds(instanceId);
++        Long tenantId = requireSessionTenant();
++        requireVisibleBySession(instanceId);
++        return current(tenantId, tenantCode(tenantId), instanceId, resolveInstanceCode(tenantId, instanceId));
++    }
++
++    @Override
++    public List<StatusHistoryPointVO> history(Long instanceId, Long fromMs, Long toMs) {
++        requireIds(instanceId);
++        Long tenantId = requireSessionTenant();
++        requireVisibleBySession(instanceId);
++        String instanceCode = resolveInstanceCode(tenantId, instanceId);
++        return history(tenantId, tenantCode(tenantId), instanceId, instanceCode, fromMs, toMs);
++    }
++
++    // ---------- 对外面（显式租户；scope 由 openapi 服务已裁剪） ----------
++
++    @Override
++    public StatusCurrentVO currentForClient(Long tenantId, Long instanceId) {
++        requireIds(instanceId);
++        return current(tenantId, tenantCode(tenantId), instanceId, resolveInstanceCode(tenantId, instanceId));
++    }
++
++    @Override
++    public List<StatusHistoryPointVO> historyForClient(Long tenantId, Long instanceId, Long fromMs, Long toMs) {
++        requireIds(instanceId);
++        return history(tenantId, tenantCode(tenantId), instanceId,
++                resolveInstanceCode(tenantId, instanceId), fromMs, toMs);
++    }
++
++    // ---------- 核心读（纯读，给定显式上下文；单测直击） ----------
++
++    /**
++     * 当前状态核心读：Redis iot:st:{tenantCode}:{instanceCode} → 解析 statusCode/seq/quality/ts →
++     * 按字典/规则动态翻译 name/color。无键或读失败 → UNKNOWN（seq=null/quality=3）。
++     */
++    public StatusCurrentVO current(Long tenantId, String tenantCode, Long instanceId, String instanceCode) {
++        StatusCurrentVO vo = new StatusCurrentVO();
++        vo.setInstanceId(instanceId);
++        vo.setInstanceCode(instanceCode);
++        String raw = readRedis(tenantCode, instanceCode);
++        String code = "UNKNOWN";
++        Integer seq = null;
++        int quality = QUALITY_UNKNOWN;
++        Long ts = null;
++        if (raw != null) {
++            try {
++                JSONObject json = JSONUtil.parseObj(raw);
++                String parsedCode = json.getStr("statusCode");
++                if (parsedCode != null && !parsedCode.isBlank()) {
++                    code = parsedCode;
++                }
++                seq = json.getInt("seq");
++                Integer q = json.getInt("quality");
++                quality = q == null ? 0 : q;
++                ts = json.getLong("ts");
++            } catch (Exception e) {
++                // 残留脏值按无状态处理（UNKNOWN），不炸展示
++                code = "UNKNOWN";
++                seq = null;
++                quality = QUALITY_UNKNOWN;
++                ts = null;
++            }
++        }
++        if ("UNKNOWN".equals(code)) {
++            seq = null;
++            quality = QUALITY_UNKNOWN;
++        }
++        vo.setStatusCode(code);
++        vo.setSeq(seq);
++        vo.setQuality(quality);
++        vo.setChangeTime(ts);
++        applyTranslation(vo.getStatusCode(), tenantId, vo);
++        return vo;
++    }
++
++    /**
++     * 历史时间线核心读：经 timeseriesClient 查 st_item_value（full_key={instance}.STATUS，
++     * value=稳定序号、quality），按字典把序号翻译为编码/名称/颜色。
++     */
++    public List<StatusHistoryPointVO> history(Long tenantId, String tenantCode, Long instanceId,
++                                              String instanceCode, Long fromMs, Long toMs) {
++        if (fromMs == null || toMs == null || fromMs < 0 || toMs < 0 || fromMs >= toMs) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "from/to 必填且须 epoch 毫秒、from < to");
++        }
++        if (instanceCode == null || instanceCode.isBlank()) {
++            return List.of();
++        }
++        OpenApiPage<OpenApiHistoryPointVO> page = timeseriesClient.queryStatusHistory(
++                tenantId, tenantCode, instanceCode, fromMs, toMs);
++        List<StatusHistoryPointVO> result = new ArrayList<>();
++        for (OpenApiHistoryPointVO point : page.rows()) {
++            StatusHistoryPointVO vo = new StatusHistoryPointVO();
++            vo.setTs(point.getTs());
++            vo.setQuality(point.getQ() == null ? 0 : point.getQ());
++            Integer seq = point.getV() == null ? null : (int) Math.round(point.getV());
++            // UNKNOWN 写侧哨兵 -1（quality=3）→ 对外 seq=null/UNKNOWN，不暴露哨兵
++            if (seq == null || seq == (int) UNKNOWN_TRACE_VALUE || vo.getQuality() == QUALITY_UNKNOWN) {
++                vo.setStatusCode("UNKNOWN");
++                vo.setStatusName("UNKNOWN");
++                vo.setSeq(null);
++            } else {
++                vo.setSeq(seq);
++                StatusTranslationRow row = translationMapper.selectDictBySeq(tenantId, seq);
++                vo.setStatusCode(row == null ? null : row.getStatusCode());
++                vo.setStatusName(row == null ? null : row.getStatusName());
++                vo.setColor(row == null ? null : row.getColor());
++            }
++            result.add(vo);
++        }
++        return result;
++    }
++
++    // ---------- 内部：翻译（单一动态来源） ----------
++
++    /** 状态名称/颜色：字典优先 → 规则表兜底 → 以编码本身作名称（颜色 null），不硬编码。 */
++    private void applyTranslation(String code, Long tenantId, StatusCurrentVO vo) {
++        StatusTranslationRow row = translationMapper.selectDictByCode(tenantId, code);
++        if (row == null) {
++            row = translationMapper.selectRuleByCode(tenantId, code);
++        }
++        if (row == null) {
++            vo.setStatusName(code);
++            vo.setColor(null);
++            return;
++        }
++        vo.setStatusName(row.getStatusName() == null ? code : row.getStatusName());
++        vo.setColor(row.getColor());
++    }
++
++    // ---------- 内部：Redis / 解析 / 权限 ----------
++
++    /** rawStringRedisTemplate 直读（无 key-prefix）；故障 fail-soft 返回 null */
++    private String readRedis(String tenantCode, String instanceCode) {
++        if (tenantCode == null || tenantCode.isBlank() || instanceCode == null || instanceCode.isBlank()) {
++            return null;
++        }
++        try {
++            return rawStringRedisTemplate.opsForValue().get(STATE_KEY_PREFIX + tenantCode + ":" + instanceCode);
++        } catch (Exception e) {
++            return null;
++        }
++    }
++
++    private Long requireSessionTenant() {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无租户上下文（数据权限不命中）");
++        }
++        return tenantId;
++    }
++
++    /** 管理面数据权限裁剪：目标实例 ∈ 可见集（allTenant 直过），否则 403 不泄露存在性 */
++    private void requireVisibleBySession(Long instanceId) {
++        if (dataPermService == null) {
++            return;
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(instanceId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）");
++        }
++    }
++
++    private String resolveInstanceCode(Long tenantId, Long instanceId) {
++        if (instanceMapper == null || tenantId == null) {
++            return null;
++        }
++        List<OpenApiInstanceRow> rows = instanceMapper.selectByIdsForTenant(tenantId, List.of(instanceId));
++        return rows.isEmpty() ? null : rows.get(0).getInstanceCode();
++    }
++
++    private String tenantCode(Long tenantId) {
++        return tenantMapper == null || tenantId == null ? null : tenantMapper.selectTenantCodeById(tenantId);
++    }
++
++    private static void requireIds(Long instanceId) {
++        if (instanceId == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "instanceId 不能为空");
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationMapper.java
+new file mode 100644
+index 0000000..d8524bf
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationMapper.java
+@@ -0,0 +1,43 @@
++package net.otlab.admin.module.iot.statusread.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++/**
++ * 状态翻译只读 Mapper（TASK-0050）：稳定序号/编码 → 名称/颜色的动态翻译源。
++ *
++ * <p>以 0048 交付的 iot_status_dict（稳定字典，TD-0013 单一来源）与 iot_status_rule
++ * （规则表 status_code/status_name/color）为唯一翻译来源——读侧不硬编码名称/颜色
++ * （0049 F-06 反例：calc 写侧 Redis 里的 statusName/color 是硬编码，读侧不采纳）。
++ * 每次查询实时读表——规则/字典发布变化后翻译随之变化（REQ-0007 验收 4 / TC-0016 步骤 6）。
++ *
++ * <p>显式租户条件 + 旁路插件（机器路径无会话上下文），隔离不依赖会话；不含 deleted
++ * 行的过滤差异——字典只增不删（禁用行仍保留序号锚，翻译历史值故意图可解）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Mapper
++public interface StatusTranslationMapper {
++
++    /** 字典按编码取名称/颜色（含禁用行——历史序号翻译不因禁用丢失） */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT status_code AS statusCode, status_name AS statusName, color, status "
++            + "FROM iot_status_dict WHERE tenant_id = #{tenantId} AND status_code = #{code} LIMIT 1")
++    StatusTranslationRow selectDictByCode(@Param("tenantId") Long tenantId, @Param("code") String code);
++
++    /** 规则表按编码兜底取名称/颜色（自定状态编码未在字典登记时） */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT status_code AS statusCode, status_name AS statusName, color, 1 AS status "
++            + "FROM iot_status_rule WHERE tenant_id = #{tenantId} AND status_code = #{code} "
++            + "AND deleted = 0 ORDER BY priority ASC LIMIT 1")
++    StatusTranslationRow selectRuleByCode(@Param("tenantId") Long tenantId, @Param("code") String code);
++
++    /** 字典按稳定序号取编码/名称/颜色（历史时间线 value=seq 的翻译入口） */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT status_code AS statusCode, status_name AS statusName, color, status "
++            + "FROM iot_status_dict WHERE tenant_id = #{tenantId} AND seq = #{seq} LIMIT 1")
++    StatusTranslationRow selectDictBySeq(@Param("tenantId") Long tenantId, @Param("seq") Integer seq);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationRow.java
+new file mode 100644
+index 0000000..b5a62e3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusread/mapper/StatusTranslationRow.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.iot.statusread.mapper;
++
++/**
++ * 状态翻译行投影（iot_status_dict / iot_status_rule 共形：编码/名称/颜色/启用态）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class StatusTranslationRow {
++
++    private String statusCode;
++    private String statusName;
++    private String color;
++    private Integer status;
++
++    public StatusTranslationRow() {
++    }
++
++    public StatusTranslationRow(String statusCode, String statusName, String color, Integer status) {
++        this.statusCode = statusCode;
++        this.statusName = statusName;
++        this.color = color;
++        this.status = status;
++    }
++
++    public String getStatusCode() {
++        return statusCode;
++    }
++
++    public String getStatusName() {
++        return statusName;
++    }
++
++    public String getColor() {
++        return color;
++    }
++
++    public Integer getStatus() {
++        return status;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+index ff5e521..72cd81f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+@@ -5,6 +5,8 @@ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.servlet.http.HttpServletResponse;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
+ import net.otlab.admin.module.openapi.support.OpenApiPage;
+ import net.otlab.core.annotation.Anonymous;
+ import net.otlab.admin.module.openapi.OpenApiCodes;
+@@ -126,6 +128,23 @@ public class OpenApiController {
+         return Result.success(queryService.dictSync(requireIdentity(request), since));
+     }
+ 
++    @Operation(summary = "设备当前状态（scope 内实例；Redis 直读；无状态 UNKNOWN 不报错）")
++    @GetMapping("/status/current")
++    public Result<StatusCurrentVO> statusCurrent(
++            @RequestParam("instanceId") Long instanceId, HttpServletRequest request) {
++        return Result.success(queryService.statusCurrent(requireIdentity(request), instanceId));
++    }
++
++    @Operation(summary = "设备状态历史时间线（scope 内实例；st_item_value 留痕序号→字典翻译）")
++    @GetMapping("/status/history")
++    public Result<List<StatusHistoryPointVO>> statusHistory(
++            @RequestParam("instanceId") Long instanceId,
++            @RequestParam("from") Long from,
++            @RequestParam("to") Long to,
++            HttpServletRequest request) {
++        return Result.success(queryService.statusHistory(requireIdentity(request), instanceId, from, to));
++    }
++
+     /** 验签产物读取（过滤器写入）；缺位 fail-closed——不给过滤器误配置时的匿名通道 */
+     private OpenApiClientIdentity requireIdentity(HttpServletRequest request) {
+         Object identity = request.getAttribute(OpenApiCodes.ATTR_CLIENT_IDENTITY);
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+index 7278114..2c67997 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+@@ -1,6 +1,8 @@
+ package net.otlab.admin.module.openapi.service;
+ 
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
+ import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
+ import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
+@@ -77,4 +79,20 @@ public interface OpenApiQueryService {
+      * 租户隔离由验签产物 tenantId 显式带参收敛，不消费 dataperm（§3.5 原文）。
+      */
+     OpenApiDictSyncVO dictSync(OpenApiClientIdentity identity, Long since);
++
++    /**
++     * GET /openapi/v1/status/current：对外当前状态（TASK-0050）。
++     *
++     * <p>scope 含目标实例（单目标详情类语义——scope 外 6003）；无该设备状态 → UNKNOWN
++     * （seq=null/quality=3，不报错）；载荷由状态读口单一来源装配（statusCode/name/color/changeTime）。
++     */
++    StatusCurrentVO statusCurrent(OpenApiClientIdentity identity, Long instanceId);
++
++    /**
++     * GET /openapi/v1/status/history：对外状态历史时间线（TASK-0050）。
++     *
++     * <p>scope 外 6003；参数错 400；载荷为按 ts 升序的状态点清单（稳定序号→字典动态翻译）。
++     */
++    List<StatusHistoryPointVO> statusHistory(OpenApiClientIdentity identity, Long instanceId,
++                                            Long fromMs, Long toMs);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+index ef4cfb7..1fb3773 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+@@ -4,6 +4,9 @@ import cn.hutool.core.util.StrUtil;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
+ import net.otlab.admin.module.openapi.OpenApiCodes;
+ import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
+@@ -80,6 +83,9 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     private final OpenApiRealtimeStore realtimeStore;
+     private final OpenApiTimeseriesClient timeseriesClient;
+ 
++    /** 状态读口（TASK-0050）：setter 注入保持既有 8 参构造与 0051 测试零改动 */
++    private StatusReadService statusReadService;
++
+     public OpenApiQueryServiceImpl(DataPermService dataPermService,
+                                    OpenApiInstanceMapper instanceMapper,
+                                    OpenApiItemMapper itemMapper,
+@@ -98,6 +104,12 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         this.timeseriesClient = timeseriesClient;
+     }
+ 
++    /** 状态读口注入（TASK-0050；@Autowired setter，既有 8 参构造保持向后兼容） */
++    @org.springframework.beans.factory.annotation.Autowired
++    public void setStatusReadService(StatusReadService statusReadService) {
++        this.statusReadService = statusReadService;
++    }
++
+     // ---------- 1) models/tree ----------
+ 
+     @Override
+@@ -303,6 +315,36 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+                 itemMapper.selectChangedForTenant(identity.getTenantId(), cursor));
+     }
+ 
++    // ---------- 7) status/current + status/history（TASK-0050） ----------
++
++    @Override
++    public StatusCurrentVO statusCurrent(OpenApiClientIdentity identity, Long instanceId) {
++        if (instanceId == null) {
++            throw paramError("instanceId 不能为空");
++        }
++        requireInstanceVisible(identity, instanceId, "instanceId");
++        return requireStatusReader().currentForClient(identity.getTenantId(), instanceId);
++    }
++
++    @Override
++    public List<StatusHistoryPointVO> statusHistory(OpenApiClientIdentity identity, Long instanceId,
++                                                    Long fromMs, Long toMs) {
++        if (instanceId == null) {
++            throw paramError("instanceId 不能为空");
++        }
++        requireTimeRange(fromMs, toMs);
++        requireInstanceVisible(identity, instanceId, "instanceId");
++        return requireStatusReader().historyForClient(identity.getTenantId(), instanceId, fromMs, toMs);
++    }
++
++    /** 状态读口缺位（接线遗漏）fail-closed：500 而非空载荷——避免静默返回假 UNKNOWN 掩盖故障 */
++    private StatusReadService requireStatusReader() {
++        if (statusReadService == null) {
++            throw new IllegalStateException("状态读口未装配（StatusReadService）");
++        }
++        return statusReadService;
++    }
++
+     // ---------- 内部 ----------
+ 
+     /**
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
+index 96d0e40..82a5103 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
+@@ -128,6 +128,28 @@ public class OpenApiTimeseriesClient {
+         return toPointPage(executeQuietly(sql));
+     }
+ 
++    /**
++     * 状态历史时间线（TASK-0050）：st_item_value 中 value=稳定序号、quality=质量码的行，
++     * 按 {@code full_key = '{instance}.STATUS'} 精确过滤（0049 F-02 规范形态，无 full: 前缀）。
++     *
++     * <p>SQL 与 read side 契约：库名 iot_{tenantCode}、tenant_id 显式、时间范围下推、
++     * ORDER BY ts ASC 时间线序列；fail-soft 空页（TDengine REST 故障期不炸展示，真机读回
++     * 列为 TD-0053 环境恢复后条件）。
++     */
++    public OpenApiPage<OpenApiHistoryPointVO> queryStatusHistory(Long tenantId, String tenantCode,
++                                                                 String instanceCode, Long startMs, Long endMs) {
++        String fullKey = instanceCode + ".STATUS";
++        if (!safeContext(tenantId, tenantCode) || !SAFE_CODE.matcher(nullToBlank(fullKey)).matches()) {
++            log.warn("[OPENAPI-TS] fail-soft 空集：状态历史查询上下文不安全（实例编码白名单外或租户缺失）");
++            return new OpenApiPage<>(List.of(), false);
++        }
++        String sql = "SELECT ts, value, quality FROM " + database(tenantCode) + ".st_item_value"
++                + " WHERE tenant_id = " + tenantId + " AND full_key = '" + fullKey + "'"
++                + " AND ts >= " + startMs + " AND ts <= " + endMs
++                + " ORDER BY ts ASC LIMIT " + FETCH_LIMIT;
++        return toPointPage(executeQuietly(sql));
++    }
++
+     /**
+      * 点位原始历史（st_point_num / st_point_state 按 value_type 选表——只查不算，§3.5）。
+      * 截断契约同类注释 I-4。
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadControllerTest.java
+new file mode 100644
+index 0000000..da51a20
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/controller/IotStatusReadControllerTest.java
+@@ -0,0 +1,127 @@
++package net.otlab.admin.module.iot.statusread.controller;
++
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 管理面状态读口控制器单测（TASK-0050）：/api/v1/iot/status/current + /history。
++ *
++ * <p>控制器只负责参数透传与载荷装配；租户/实例解析与数据权限裁剪在服务层
++ * （StatusReadService.current(instanceId)/history(instanceId,...)）——本测锁定该边界。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotStatusReadControllerTest {
++
++    @Mock
++    private StatusReadService statusReadService;
++
++    private AutoCloseable mocks;
++    private IotStatusReadController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new IotStatusReadController(statusReadService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private static StatusCurrentVO current(String code, Integer seq, int quality, Long ts) {
++        StatusCurrentVO vo = new StatusCurrentVO();
++        vo.setInstanceId(2L);
++        vo.setInstanceCode("F01.WS01.EQ001");
++        vo.setStatusCode(code);
++        vo.setStatusName(code + "-名");
++        vo.setColor("#1E90FF");
++        vo.setSeq(seq);
++        vo.setQuality(quality);
++        vo.setChangeTime(ts);
++        return vo;
++    }
++
++    @Test
++    @DisplayName("管理面当前状态：参数透传，200 载荷含 statusCode/name/color/seq/quality/changeTime")
++    void currentPassthrough() {
++        when(statusReadService.current(2L)).thenReturn(current("RUNNING", 1, 0, 123L));
++
++        Result<StatusCurrentVO> result = controller.current(2L);
++
++        assertEquals(200, result.getCode());
++        assertNotNull(result.getData());
++        assertEquals("RUNNING", result.getData().getStatusCode());
++        assertEquals("F01.WS01.EQ001", result.getData().getInstanceCode());
++        verify(statusReadService).current(2L);
++    }
++
++    @Test
++    @DisplayName("管理面 UNKNOWN 空态：无状态返回 UNKNOWN/seq=null/quality=3，不报错")
++    void currentUnknown() {
++        when(statusReadService.current(2L)).thenReturn(current("UNKNOWN", null, 3, null));
++
++        Result<StatusCurrentVO> result = controller.current(2L);
++
++        assertEquals(200, result.getCode());
++        assertEquals("UNKNOWN", result.getData().getStatusCode());
++        assertNull(result.getData().getSeq());
++        assertEquals(3, result.getData().getQuality());
++    }
++
++    @Test
++    @DisplayName("管理面历史时间线：参数透传，载荷为按 ts 升序的状态点清单")
++    void historyPassthrough() {
++        StatusHistoryPointVO point = new StatusHistoryPointVO();
++        point.setTs(2000L);
++        point.setStatusCode("FAULT");
++        point.setStatusName("故障");
++        point.setColor("#FF0000");
++        point.setSeq(4);
++        point.setQuality(0);
++        when(statusReadService.history(2L, 1000L, 9000L)).thenReturn(List.of(point));
++
++        Result<List<StatusHistoryPointVO>> result = controller.history(2L, 1000L, 9000L);
++
++        assertEquals(200, result.getCode());
++        assertEquals(1, result.getData().size());
++        assertEquals("FAULT", result.getData().get(0).getStatusCode());
++        verify(statusReadService).history(2L, 1000L, 9000L);
++    }
++
++    @Test
++    @DisplayName("历史参数校验：start>=end → 400")
++    void historyBadRange() {
++        assertThrows(BusinessException.class, () -> controller.history(2L, 9000L, 1000L));
++    }
++
++    @Test
++    @DisplayName("越权实例：service 抛 403，控制器不吞（数据权限拦截直达）")
++    void currentForbiddenPropagates() {
++        when(statusReadService.current(2L))
++                .thenThrow(new BusinessException(403, "无权访问该实例（数据权限不命中）"));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> controller.current(2L));
++        assertEquals(403, ex.getCode());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImplTest.java
+new file mode 100644
+index 0000000..2d6f567
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/impl/StatusReadServiceImplTest.java
+@@ -0,0 +1,240 @@
++package net.otlab.admin.module.iot.statusread.impl;
++
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.admin.module.iot.statusread.impl.StatusReadServiceImpl;
++import net.otlab.admin.module.iot.statusread.mapper.StatusTranslationMapper;
++import net.otlab.admin.module.iot.statusread.mapper.StatusTranslationRow;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.data.redis.core.StringRedisTemplate;
++import org.springframework.data.redis.core.ValueOperations;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.nullable;
++import static org.mockito.Mockito.when;
++
++/**
++ * 状态读口核心单测（TASK-0050）：Redis 当前状态直读（不现算）、动态翻译、UNKNOWN 空态、历史序号翻译。
++ *
++ * <p>反例锚定（0049 F-06）：Redis 值中的 statusName/color 是计算侧硬编码（RUNNING=#00FF00），
++ * 读侧不得采纳——必须以规则表/字典动态翻译为准（本测断言读侧返回字典值而非 Redis 硬编码值）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class StatusReadServiceImplTest {
++
++    private static final Long TENANT_ID = 1L;
++    private static final String TENANT_CODE = "default";
++    private static final Long INSTANCE_ID = 42L;
++    private static final String INSTANCE_CODE = "F01.WS01.EQ001";
++    private static final String REDIS_KEY = "iot:st:default:F01.WS01.EQ001";
++
++    @Mock
++    private StringRedisTemplate rawStringRedisTemplate;
++    @Mock
++    private ValueOperations<String, String> valueOperations;
++    @Mock
++    private StatusTranslationMapper translationMapper;
++    @Mock
++    private OpenApiTimeseriesClient timeseriesClient;
++
++    private AutoCloseable mocks;
++    private StatusReadServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        when(rawStringRedisTemplate.opsForValue()).thenReturn(valueOperations);
++        // 默认 stub：未特别指定的字典/规则查询返回 null（UNKNOWN 空态等场景无需额外 mock）
++        when(translationMapper.selectDictByCode(anyLong(), anyString())).thenReturn(null);
++        when(translationMapper.selectRuleByCode(anyLong(), anyString())).thenReturn(null);
++        when(translationMapper.selectDictBySeq(anyLong(), nullable(Integer.class))).thenReturn(null);
++        service = new StatusReadServiceImpl(rawStringRedisTemplate, translationMapper, timeseriesClient);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private static String redisJson(String code, String hardcodedName, String hardcodedColor,
++                                    Integer seq, Integer quality, long ts) {
++        return "{\"statusCode\":\"" + code + "\",\"statusName\":\"" + hardcodedName
++                + "\",\"color\":\"" + hardcodedColor + "\",\"seq\":" + (seq == null ? "null" : seq)
++                + ",\"quality\":" + quality + ",\"ts\":" + ts + "}";
++    }
++
++    private static StatusTranslationRow dict(String code, String name, String color) {
++        return new StatusTranslationRow(code, name, color, 1);
++    }
++
++    // ---------- 当前状态：Redis 直读 + 动态翻译 ----------
++
++    @Test
++    @DisplayName("当前状态：读 Redis iot:st:{tenant}:{instance}，翻译取字典（不采纳 calc 硬编码的 name/color）")
++    void currentReadsRedisAndTranslatesFromDict() {
++        when(valueOperations.get(REDIS_KEY)).thenReturn(redisJson("RUNNING", "RUNNING", "#00FF00", 1, 0, 1795211995000L));
++        when(translationMapper.selectDictByCode(TENANT_ID, "RUNNING")).thenReturn(dict("RUNNING", "运行中", "#1E90FF"));
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals(INSTANCE_ID, vo.getInstanceId());
++        assertEquals(INSTANCE_CODE, vo.getInstanceCode());
++        assertEquals("RUNNING", vo.getStatusCode());
++        assertEquals("运行中", vo.getStatusName(), "必须取字典动态翻译，不得用 Redis 里 calc 硬编码的 RUNNING");
++        assertEquals("#1E90FF", vo.getColor(), "必须取字典颜色，不得用 Redis 里 calc 硬编码的 #00FF00");
++        assertEquals(1, vo.getSeq());
++        assertEquals(0, vo.getQuality());
++        assertEquals(1795211995000L, vo.getChangeTime());
++    }
++
++    @Test
++    @DisplayName("翻译动态性：字典改名改色后再次查询立即跟随（无硬编码、无缓存）")
++    void currentTranslationFollowsDictChange() {
++        when(valueOperations.get(REDIS_KEY)).thenReturn(redisJson("RUNNING", "RUNNING", "#00FF00", 1, 0, 123L));
++        when(translationMapper.selectDictByCode(TENANT_ID, "RUNNING"))
++                .thenReturn(dict("RUNNING", "运行中", "#1E90FF"))
++                .thenReturn(dict("RUNNING", "运转中", "#2E8B57"));
++
++        StatusCurrentVO first = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++        StatusCurrentVO second = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("运行中", first.getStatusName());
++        assertEquals("运转中", second.getStatusName(), "规则/字典发布变化后翻译必须随之变化");
++        assertEquals("#2E8B57", second.getColor());
++    }
++
++    @Test
++    @DisplayName("翻译回退：字典无该编码时取规则表 status_name/color（同一动态来源）")
++    void currentFallsBackToRuleWhenDictMissing() {
++        when(valueOperations.get(REDIS_KEY)).thenReturn(redisJson("CUSTOM", "CUSTOM", "#FFFFFF", 9, 0, 123L));
++        when(translationMapper.selectDictByCode(TENANT_ID, "CUSTOM")).thenReturn(null);
++        when(translationMapper.selectRuleByCode(TENANT_ID, "CUSTOM"))
++                .thenReturn(new StatusTranslationRow("CUSTOM", "自定义态", "#123456", 9));
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("自定义态", vo.getStatusName());
++        assertEquals("#123456", vo.getColor());
++        assertEquals(9, vo.getSeq());
++    }
++
++    @Test
++    @DisplayName("UNKNOWN 空态：Redis 无该设备状态 → UNKNOWN/seq=null/quality=3，不报错")
++    void currentUnknownWhenNoRedisKey() {
++        when(valueOperations.get(REDIS_KEY)).thenReturn(null);
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("UNKNOWN", vo.getStatusCode());
++        assertNull(vo.getSeq(), "UNKNOWN 无字典序号——seq=null 不写 0（0049 口径）");
++        assertEquals(3, vo.getQuality());
++        assertNull(vo.getChangeTime());
++        assertEquals(INSTANCE_CODE, vo.getInstanceCode());
++    }
++
++    @Test
++    @DisplayName("UNKNOWN 空态也可从字典取名称/颜色（若已登记 UNKNOWN 编码），不硬编码颜色")
++    void currentUnknownTranslatesFromDictIfRegistered() {
++        when(valueOperations.get(REDIS_KEY)).thenReturn(null);
++        when(translationMapper.selectDictByCode(TENANT_ID, "UNKNOWN"))
++                .thenReturn(dict("UNKNOWN", "未知", "#9E9E9E"));
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("未知", vo.getStatusName());
++        assertEquals("#9E9E9E", vo.getColor());
++        assertNull(vo.getSeq());
++    }
++
++    @Test
++    @DisplayName("Redis 故障 fail-soft：读异常按无状态处理（UNKNOWN），不炸穿展示读路径")
++    void currentRedisFailureFailSoft() {
++        when(valueOperations.get(REDIS_KEY)).thenThrow(new RuntimeException("redis down"));
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("UNKNOWN", vo.getStatusCode());
++        assertEquals(3, vo.getQuality());
++    }
++
++    @Test
++    @DisplayName("Redis 残留质量码如实透传（UNKNOWN seq=null quality=3 与 0049 写侧同口径）")
++    void currentUnknownWrittenByCalcParsed() {
++        when(valueOperations.get(REDIS_KEY))
++                .thenReturn("{\"statusCode\":\"UNKNOWN\",\"statusName\":\"UNKNOWN\",\"color\":\"#FFFFFF\","
++                        + "\"seq\":null,\"quality\":3,\"ts\":1795211998000}");
++        when(translationMapper.selectDictByCode(TENANT_ID, "UNKNOWN")).thenReturn(null);
++        when(translationMapper.selectRuleByCode(TENANT_ID, "UNKNOWN")).thenReturn(null);
++
++        StatusCurrentVO vo = service.current(TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE);
++
++        assertEquals("UNKNOWN", vo.getStatusCode());
++        assertNull(vo.getSeq());
++        assertEquals(3, vo.getQuality());
++        assertEquals(1795211998000L, vo.getChangeTime());
++        assertEquals("UNKNOWN", vo.getStatusName(), "无字典登记时以状态编码作名称，不臆造颜色");
++        assertNull(vo.getColor());
++    }
++
++    // ---------- 历史时间线：st_item_value 序号 → 状态翻译 ----------
++
++    @Test
++    @DisplayName("历史时间线：value=稳定序号按字典翻译为 statusCode/name/color；quality 如实透传")
++    void historyTranslatesSeqViaDict() {
++        when(timeseriesClient.queryStatusHistory(TENANT_ID, TENANT_CODE, INSTANCE_CODE, 1000L, 9000L))
++                .thenReturn(new OpenApiPage<>(List.of(
++                        new OpenApiHistoryPointVO(2000L, 1.0, 0),
++                        new OpenApiHistoryPointVO(5000L, 4.0, 0)), false));
++        when(translationMapper.selectDictBySeq(TENANT_ID, 1)).thenReturn(dict("RUNNING", "运行中", "#1E90FF"));
++        when(translationMapper.selectDictBySeq(TENANT_ID, 4))
++                .thenReturn(new StatusTranslationRow("FAULT", "故障", "#FF0000", 4));
++
++        List<StatusHistoryPointVO> points = service.history(
++                TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE, 1000L, 9000L);
++
++        assertEquals(2, points.size());
++        assertEquals(2000L, points.get(0).getTs());
++        assertEquals(1, points.get(0).getSeq());
++        assertEquals("RUNNING", points.get(0).getStatusCode());
++        assertEquals("运行中", points.get(0).getStatusName());
++        assertEquals("#1E90FF", points.get(0).getColor());
++        assertEquals(0, points.get(0).getQuality());
++        assertEquals("FAULT", points.get(1).getStatusCode());
++        assertEquals("故障", points.get(1).getStatusName());
++    }
++
++    @Test
++    @DisplayName("历史时间线：UNKNOWN 哨兵 value=-1（0049 写入口径）→ UNKNOWN/quality=3 不冒充已知状态")
++    void historyUnknownSentinel() {
++        when(timeseriesClient.queryStatusHistory(TENANT_ID, TENANT_CODE, INSTANCE_CODE, 0L, 100L))
++                .thenReturn(new OpenApiPage<>(List.of(new OpenApiHistoryPointVO(10L, -1.0, 3)), false));
++
++        List<StatusHistoryPointVO> points = service.history(
++                TENANT_ID, TENANT_CODE, INSTANCE_ID, INSTANCE_CODE, 0L, 100L);
++
++        assertEquals(1, points.size());
++        assertEquals("UNKNOWN", points.get(0).getStatusCode());
++        assertNull(points.get(0).getSeq(), "UNKNOWN 序号对外为 null（-1 是写侧哨兵，不对外暴露）");
++        assertEquals(3, points.get(0).getQuality());
++        assertTrue(points.get(0).getStatusName().equals("UNKNOWN"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/support/StatusHistorySqlContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/support/StatusHistorySqlContractTest.java
+new file mode 100644
+index 0000000..737a1b4
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusread/support/StatusHistorySqlContractTest.java
+@@ -0,0 +1,100 @@
++package net.otlab.admin.module.iot.statusread.support;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.impl.StatusReadServiceImpl;
++import net.otlab.admin.module.iot.statusread.mapper.StatusTranslationMapper;
++import net.otlab.admin.module.iot.tdengine.TdengineProperties;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.data.redis.core.StringRedisTemplate;
++
++import java.io.ByteArrayOutputStream;
++import java.io.InputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++
++/**
++ * 历史时间线 SQL 契约测试（TASK-0050，TDengine REST 故障期替代真机读回）。
++ *
++ * <p>内置假 taosAdapter（JDK HttpServer）捕获真实客户端发出的 SELECT SQL，精确断言：
++ * ① full_key = {instance}.STATUS（0049 修订轮 F-02 锁定的规范形态，无 full: 前缀）；
++ * ② 时间范围 start/end 下推；③ tenant_id 显式；④ ORDER BY ts ASC 序列；⑤ 库名 iot_{tenantCode}。
++ * 真机读回列为 TD-0053 环境恢复后交付条件（本测不声称真实 TDengine 可用）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class StatusHistorySqlContractTest {
++
++    private HttpServer server;
++    private OpenApiTimeseriesClient client;
++    private StatusReadServiceImpl service;
++    private final AtomicReference<String> lastSql = new AtomicReference<>();
++
++    @BeforeEach
++    void setUp() throws Exception {
++        server = HttpServer.create(new InetSocketAddress(0), 0);
++        server.createContext("/rest/sql", exchange -> {
++            lastSql.set(readBody(exchange));
++            byte[] response = "{\"code\":0,\"data\":[]}".getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().set("Content-Type", "application/json");
++            exchange.sendResponseHeaders(200, response.length);
++            exchange.getResponseBody().write(response);
++            exchange.close();
++        });
++        server.start();
++        TdengineProperties props = new TdengineProperties();
++        props.setBaseUrl("http://localhost:" + server.getAddress().getPort());
++        props.setReadTimeoutMs(5000);
++        client = new OpenApiTimeseriesClient(props);
++        service = new StatusReadServiceImpl(mock(StringRedisTemplate.class), mock(StatusTranslationMapper.class), client);
++    }
++
++    @AfterEach
++    void tearDown() {
++        server.stop(0);
++    }
++
++    private static String readBody(HttpExchange exchange) {
++        try (InputStream in = exchange.getRequestBody(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            byte[] buf = new byte[4096];
++            int n;
++            while ((n = in.read(buf)) > 0) {
++                out.write(buf, 0, n);
++            }
++            return out.toString(StandardCharsets.UTF_8);
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    @Test
++    @DisplayName("历史 SELECT 精确契约：库名/full_key 规范形态/时间范围/tenant/排序")
++    void historySelectSqlContract() {
++        List<StatusHistoryPointVO> points = service.history(
++                1L, "default", 2L, "F01.WS01.EQ001",
++                1795211995000L, 1795212995000L);
++
++        assertTrue(points.isEmpty(), "假适配器无数据 → 空时间线（不炸）");
++        String sql = lastSql.get();
++        assertTrue(sql != null && !sql.isBlank(), "假适配器必须捕获到 SELECT SQL");
++        assertTrue(sql.contains("iot_default.st_item_value"), "库名 iot_<tenantCode>：" + sql);
++        assertTrue(sql.contains("full_key = 'F01.WS01.EQ001.STATUS'"),
++                "full_key 必须规范 instance.STATUS 且无 full: 前缀（0049 F-02）：" + sql);
++        assertTrue(!sql.contains("full:"), "不得出现 full: 前缀：" + sql);
++        assertTrue(sql.contains("tenant_id = 1"), "显式租户：" + sql);
++        assertTrue(sql.contains("ts >= 1795211995000") && sql.contains("ts <= 1795212995000"),
++                "时间范围下推：" + sql);
++        assertTrue(sql.contains("ORDER BY ts ASC"), "时间线序列升序：" + sql);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiStatusQueryTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiStatusQueryTest.java
+new file mode 100644
+index 0000000..1227f12
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiStatusQueryTest.java
+@@ -0,0 +1,182 @@
++package net.otlab.admin.module.openapi.service.impl;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
++import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
++import net.otlab.admin.module.iot.statusread.StatusReadService;
++import net.otlab.admin.module.openapi.OpenApiCodes;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiMetricVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiItemMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiItemRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiMetricMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiMetricRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiPointMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiPointRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.admin.module.openapi.support.OpenApiRealtimeStore;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.when;
++
++/**
++ * 对外状态查询接线单测（TASK-0050）：法向载荷 + scope 裁剪（6003）+ 参数错（400）。
++ *
++ * <p>对外状态查询复用 0051 既有链：HMAC 过滤器鉴权 → identity.scope 显式租户重载 →
++ * 单目标 scope 外 6003（详情类语义，与 items/history、points/history 同款）；业务载荷
++ * 由 0050 状态读口单一来源（StatusReadService）装配。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class OpenApiStatusQueryTest {
++
++    private static final Long CLIENT_ID = 7L;
++    private static final Long TENANT_ID = 1L;
++
++    @Mock
++    private DataPermService dataPermService;
++    @Mock
++    private StatusReadService statusReadService;
++
++    private AutoCloseable mocks;
++    private OpenApiQueryServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        service = new OpenApiQueryServiceImpl(dataPermService,
++                org.mockito.Mockito.mock(OpenApiInstanceMapper.class),
++                org.mockito.Mockito.mock(OpenApiItemMapper.class),
++                org.mockito.Mockito.mock(OpenApiPointMapper.class),
++                org.mockito.Mockito.mock(OpenApiMetricMapper.class),
++                org.mockito.Mockito.mock(OpenApiTenantMapper.class),
++                org.mockito.Mockito.mock(OpenApiRealtimeStore.class),
++                org.mockito.Mockito.mock(OpenApiTimeseriesClient.class));
++        service.setStatusReadService(statusReadService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private OpenApiClientIdentity identity() {
++        OpenApiClientIdentity identity = new OpenApiClientIdentity();
++        identity.setClientId(CLIENT_ID);
++        identity.setTenantId(TENANT_ID);
++        identity.setAppKey("test_client");
++        identity.setScopeJson("{\"instanceIds\":[2],\"subtree\":true}");
++        return identity;
++    }
++
++    private void scopeGrants(Long... ids) {
++        when(dataPermService.resolveClientScope(eq(CLIENT_ID), eq(TENANT_ID), any()))
++                .thenReturn(new VisibleScope(false, Set.of(), Set.of(ids), false));
++    }
++
++    private void scopeDenied() {
++        when(dataPermService.resolveClientScope(eq(CLIENT_ID), eq(TENANT_ID), any()))
++                .thenReturn(VisibleScope.denied());
++    }
++
++    private static StatusCurrentVO vo(String code, Integer seq, int quality) {
++        StatusCurrentVO vo = new StatusCurrentVO();
++        vo.setInstanceId(2L);
++        vo.setInstanceCode("F01.WS01.EQ001");
++        vo.setStatusCode(code);
++        vo.setStatusName(code + "名");
++        vo.setColor("#1E90FF");
++        vo.setSeq(seq);
++        vo.setQuality(quality);
++        vo.setChangeTime(123L);
++        return vo;
++    }
++
++    @Test
++    @DisplayName("对外当前状态：scope 内返回状态载荷（statusCode/name/color/changeTime）")
++    void currentInScope() {
++        scopeGrants(2L);
++        when(statusReadService.currentForClient(TENANT_ID, 2L)).thenReturn(vo("RUNNING", 1, 0));
++
++        StatusCurrentVO result = service.statusCurrent(identity(), 2L);
++
++        assertNotNull(result);
++        assertEquals("RUNNING", result.getStatusCode());
++        assertEquals("RUNNING名", result.getStatusName());
++        assertEquals("#1E90FF", result.getColor());
++        assertEquals(123L, result.getChangeTime());
++    }
++
++    @Test
++    @DisplayName("对外 scope 外：6003（不调读口，不泄露目标实例存在性）")
++    void currentScopeDenied() {
++        scopeDenied();
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.statusCurrent(identity(), 2L));
++        assertEquals(OpenApiCodes.SCOPE_DENIED, ex.getCode());
++    }
++
++    @Test
++    @DisplayName("对外参数错：instanceId 为空 → 400")
++    void currentParamError() {
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.statusCurrent(identity(), null));
++        assertEquals(400, ex.getCode());
++    }
++
++    @Test
++    @DisplayName("对外历史：scope 外 6003；scope 内透传读口时间线")
++    void historyScope() {
++        scopeDenied();
++        BusinessException denied = assertThrows(BusinessException.class,
++                () -> service.statusHistory(identity(), 2L, 100L, 900L));
++        assertEquals(OpenApiCodes.SCOPE_DENIED, denied.getCode());
++
++        scopeGrants(2L);
++        StatusHistoryPointVO p = new StatusHistoryPointVO();
++        p.setTs(200L);
++        p.setStatusName("故障");
++        when(statusReadService.historyForClient(TENANT_ID, 2L, 100L, 900L)).thenReturn(List.of(p));
++        List<StatusHistoryPointVO> rows = service.statusHistory(identity(), 2L, 100L, 900L);
++        assertEquals(1, rows.size());
++        assertEquals("故障", rows.get(0).getStatusName());
++    }
++
++    @Test
++    @DisplayName("对外历史参数错：start>=end → 400")
++    void historyParamError() {
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.statusHistory(identity(), 2L, 900L, 100L));
++        assertEquals(400, ex.getCode());
++    }
++}

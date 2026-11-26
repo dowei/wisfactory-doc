@@ -1,0 +1,2435 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/config/AlarmConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/config/AlarmConfig.java
+new file mode 100644
+index 0000000..54aa5aa
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/config/AlarmConfig.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.alarm.config;
++
++import net.otlab.admin.module.iot.alarm.service.impl.AlarmNoticeOutboxNotifier;
++import net.otlab.admin.module.iot.alarm.store.AlarmStore;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/**
++ * TASK-0062：告警域 Spring 装配（store + 站内提醒出口）。
++ *
++ * <p>JdbcTemplate 取主数据源（iot_alarm_record / iot_alarm_notice 属业务库 iot_ 前缀租户表）；
++ * 目标角色由 {@code ot.alarm.notice-target-role} 配置（默认 platform_admin，运维/平台管理员）。
++ * 邮件/企微配置预留不外发（本类只装站内出口）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration
++public class AlarmConfig {
++
++    @Bean
++    public AlarmStore alarmStore(JdbcTemplate jdbcTemplate) {
++        return new AlarmStore(jdbcTemplate);
++    }
++
++    @Bean
++    public AlarmNoticeOutboxNotifier alarmNoticeOutboxNotifier(
++            JdbcTemplate jdbcTemplate,
++            @Value("${ot.alarm.notice-target-role:platform_admin}") String targetRole) {
++        return new AlarmNoticeOutboxNotifier(jdbcTemplate, targetRole);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmController.java
+new file mode 100644
+index 0000000..c2a8c7c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmController.java
+@@ -0,0 +1,73 @@
++package net.otlab.admin.module.iot.alarm.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import net.otlab.admin.module.iot.alarm.vo.AlarmListVO;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * TASK-0062 D3：系统事件告警管理面端点（列表/确认/处理）。
++ *
++ * <p>GET /api/v1/iot/alarm/list?status=&type=&from=&to=&pageNum=&pageSize= 分页列表（tenant 从会话强制
++ * 注入）；POST /{id}/confirm 确认 0→1；POST /{id}/handle 处理 0/1→2。
++ *
++ * <p><b>审计纪律</b>：写口（确认/处理）挂 @OperateLog（0079 范式：写要审，与 0061 只读巡检
++ * 读不审相反）；读列表不挂。权限码沿用 {@code iot:instance:query}（0064 无 alarm:* 位，仿 0061/0063
++ * 口径）——确认/处理为登录态 + instance:query 持有者操作（0064 高危清单无独立 alarm:update 种子，
++ * 避免造出无人持有的权限位导致全角色 403）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "IoT 系统事件告警")
++@RestController
++@RequestMapping("/api/v1/iot/alarm")
++public class IotAlarmController {
++
++    private final AlarmRecordService service;
++
++    public IotAlarmController(AlarmRecordService service) {
++        this.service = service;
++    }
++
++    @Operation(summary = "告警分页列表（tenant 会话强制注入；status/type/时间窗过滤；跨租户 403）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:instance:query")
++    public Result<AlarmListVO> list(
++            @RequestParam(value = "status", required = false) Integer status,
++            @RequestParam(value = "type", required = false) String type,
++            @RequestParam(value = "from", required = false) Long fromMs,
++            @RequestParam(value = "to", required = false) Long toMs,
++            @RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++            @RequestParam(value = "pageSize", defaultValue = "20") Integer pageSize) {
++        return Result.success(service.list(status, type, fromMs, toMs,
++                pageNum == null ? 1 : pageNum, pageSize == null ? 20 : pageSize));
++    }
++
++    @Operation(summary = "确认告警（0→1；记 confirmed_at + handler_id；非法跃迁 409、跨租户 403）")
++    @PostMapping("/{id}/confirm")
++    @SaCheckPermission("iot:instance:query")
++    @OperateLog(title = "系统事件告警确认", businessType = BusinessType.UPDATE)
++    public Result<Integer> confirm(@PathVariable("id") Long id) {
++        return Result.success(service.confirm(id));
++    }
++
++    @Operation(summary = "处理告警（0/1→2；记 handled_at + handle_note + handler_id；非法跃迁 409、跨租户 403）")
++    @PostMapping("/{id}/handle")
++    @SaCheckPermission("iot:instance:query")
++    @OperateLog(title = "系统事件告警处理", businessType = BusinessType.UPDATE)
++    public Result<Integer> handle(@PathVariable("id") Long id,
++                                  @RequestParam(value = "note") String note) {
++        return Result.success(service.handle(id, note));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java
+new file mode 100644
+index 0000000..145ab56
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java
+@@ -0,0 +1,76 @@
++package net.otlab.admin.module.iot.alarm.entity;
++
++import java.sql.Timestamp;
++
++/**
++ * TASK-0062 D1：告警记录行（iot_alarm_record）。
++ *
++ * <p><b>审计四件套</b>：显式列 create_time/create_by/update_time/update_by/deleted（与 BaseEntity
++ * 口径一致，但本域走 JdbcTemplate——工程无全局 MetaObjectHandler，MP @TableField(fill=) 不会
++ * 真正自动填充；显式写列确保确认/处理留痕真实落库，REQ-0031 验收 5）。与巡检结果表
++ * （系统级无操作员，不套审计）不同——告警需确认/处理留操作人。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class AlarmRecord {
++
++    private Long id;
++    private Long tenantId;
++    private String type;
++    private String objectType;
++    private String objectCode;
++    private String level;
++    private String title;
++    private String detail;
++    private Integer status;
++    private Long handlerId;
++    private String handleNote;
++    private Timestamp occurredAt;
++    private Timestamp confirmedAt;
++    private Timestamp handledAt;
++    private Timestamp createTime;
++    private Long createBy;
++    private Timestamp updateTime;
++    private Long updateBy;
++    private Integer deleted;
++
++    public Long getId() { return id; }
++    public void setId(Long v) { this.id = v; }
++    public Long getTenantId() { return tenantId; }
++    public void setTenantId(Long v) { this.tenantId = v; }
++    public String getType() { return type; }
++    public void setType(String v) { this.type = v; }
++    public String getObjectType() { return objectType; }
++    public void setObjectType(String v) { this.objectType = v; }
++    public String getObjectCode() { return objectCode; }
++    public void setObjectCode(String v) { this.objectCode = v; }
++    public String getLevel() { return level; }
++    public void setLevel(String v) { this.level = v; }
++    public String getTitle() { return title; }
++    public void setTitle(String v) { this.title = v; }
++    public String getDetail() { return detail; }
++    public void setDetail(String v) { this.detail = v; }
++    public Integer getStatus() { return status; }
++    public void setStatus(Integer v) { this.status = v; }
++    public Long getHandlerId() { return handlerId; }
++    public void setHandlerId(Long v) { this.handlerId = v; }
++    public String getHandleNote() { return handleNote; }
++    public void setHandleNote(String v) { this.handleNote = v; }
++    public Timestamp getOccurredAt() { return occurredAt; }
++    public void setOccurredAt(Timestamp v) { this.occurredAt = v; }
++    public Timestamp getConfirmedAt() { return confirmedAt; }
++    public void setConfirmedAt(Timestamp v) { this.confirmedAt = v; }
++    public Timestamp getHandledAt() { return handledAt; }
++    public void setHandledAt(Timestamp v) { this.handledAt = v; }
++    public Timestamp getCreateTime() { return createTime; }
++    public void setCreateTime(Timestamp v) { this.createTime = v; }
++    public Long getCreateBy() { return createBy; }
++    public void setCreateBy(Long v) { this.createBy = v; }
++    public Timestamp getUpdateTime() { return updateTime; }
++    public void setUpdateTime(Timestamp v) { this.updateTime = v; }
++    public Long getUpdateBy() { return updateBy; }
++    public void setUpdateBy(Long v) { this.updateBy = v; }
++    public Integer getDeleted() { return deleted; }
++    public void setDeleted(Integer v) { this.deleted = v; }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmStatus.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmStatus.java
+new file mode 100644
+index 0000000..626fa37
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmStatus.java
+@@ -0,0 +1,38 @@
++package net.otlab.admin.module.iot.alarm.entity;
++
++/**
++ * TASK-0062 D3：告警状态值域与流转守卫（0 待确认 → 1 已确认 → 2 已处理；允许 0→2 直接处理）。
++ *
++ * <p>非法跃迁（如 2→0）由服务层显式拒绝（409），不静默改、不把已确认告警打回待确认。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class AlarmStatus {
++
++    public static final int PENDING = 0;
++    public static final int CONFIRMED = 1;
++    public static final int HANDLED = 2;
++
++    private AlarmStatus() {}
++
++    public static String text(Integer status) {
++        if (status == null) {
++            return "未知";
++        }
++        return switch (status) {
++            case PENDING -> "待确认";
++            case CONFIRMED -> "已确认";
++            case HANDLED -> "已处理";
++            default -> "未知";
++        };
++    }
++
++    public static boolean canConfirm(Integer status) {
++        return status != null && status == PENDING;
++    }
++
++    public static boolean canHandle(Integer status) {
++        return status != null && (status == PENDING || status == CONFIRMED);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmType.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmType.java
+new file mode 100644
+index 0000000..c3f6257
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmType.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.alarm.entity;
++
++/**
++ * TASK-0062 D2：系统事件告警类型（ADR-0013 增补 6 严格边界）。
++ *
++ * <p><b>仅三类系统事件</b>：网关异常离线（GATEWAY_OFFLINE）、数据超时未达（DATA_TIMEOUT）、
++ * 网关缓存积压（GW_CACHE_BACKLOG）。业务阈值告警事件化 / 通知矩阵 / 升级策略归三期（PB-14），
++ * 一期阈值只驱动展示标红——本枚举刻意只有三值，杜绝业务阈值类混入。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public enum AlarmType {
++
++    /** 网关异常离线（TIMEOUT / LWT_ABNORMAL；GRACEFUL 正常下线不生成） */
++    GATEWAY_OFFLINE,
++
++    /** 数据超时未达（计算滞后/停算，@Scheduled 扫描 iot_calc_state 近似） */
++    DATA_TIMEOUT,
++
++    /** 网关缓存积压（一期无真数据源，诚实空态/待核验，不造假） */
++    GW_CACHE_BACKLOG;
++
++    /** 枚举名精确解析（大小写敏感）；未知名/空白返回 null，调用方 fail-closed */
++    public static AlarmType fromName(String raw) {
++        if (raw == null || raw.isBlank()) {
++            return null;
++        }
++        String trimmed = raw.trim();
++        for (AlarmType type : values()) {
++            if (type.name().equals(trimmed)) {
++                return type;
++            }
++        }
++        return null;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListener.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListener.java
+new file mode 100644
+index 0000000..465f5e5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListener.java
+@@ -0,0 +1,50 @@
++package net.otlab.admin.module.iot.alarm.listener;
++
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
++import org.springframework.context.event.EventListener;
++import org.springframework.stereotype.Component;
++
++/**
++ * TASK-0062 D2：网关离线 → 告警记录监听器（只读消费既有 {@link GatewayOfflineEvent}，不改网关域代码）。
++ *
++ * <p><b>边界</b>：仅异常离线（TIMEOUT/LWT_ABNORMAL）生成告警；GRACEFUL 正常下线不生成
++ * （ADR-0013 增补 6 系统事件口径）。
++ *
++ * <p><b>fail-closed</b>：缺任一字段 WARN 忽略（仿 GatewayOfflineEventListener）；消费动作 try/catch
++ * 兜底不外溢——同步事件监听器异常会炸穿发布方线程（展示态/告警属可重建数据，下轮事件纠偏）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Slf4j
++@Component
++public class GatewayOfflineAlarmListener {
++
++    private final AlarmRecordService alarmService;
++
++    public GatewayOfflineAlarmListener(AlarmRecordService alarmService) {
++        this.alarmService = alarmService;
++    }
++
++    @EventListener
++    public void onGatewayOffline(GatewayOfflineEvent event) {
++        if (event == null || event.gatewayId() == null || event.tenantId() == null
++                || event.offlineReason() == null || event.occurredAt() == null) {
++            log.warn("[ALARM] 离线事件缺字段，fail-closed 忽略（不生成半截告警）: {}", event);
++            return;
++        }
++        if (event.offlineReason() == GatewayOfflineReason.GRACEFUL) {
++            return; // 正常下线不生成告警
++        }
++        try {
++            alarmService.raiseGatewayOffline(event.gatewayId(), event.tenantId(),
++                    event.offlineReason().name(), event.occurredAt());
++        } catch (Exception e) {
++            log.warn("[ALARM] 离线告警生成失败（兜底：下轮事件/扫描纠偏）gatewayId={} reason={} 摘要：{}",
++                    event.gatewayId(), event.offlineReason(), e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScanner.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScanner.java
+new file mode 100644
+index 0000000..77cfc32
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScanner.java
+@@ -0,0 +1,110 @@
++package net.otlab.admin.module.iot.alarm.scheduler;
++
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++import java.sql.Timestamp;
++import java.time.LocalDateTime;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0062 D2：数据超时未达（DATA_TIMEOUT）近似扫描定时任务（Spring @Scheduled，复用
++ * {@code PublishSchedulingConfig} 的 @EnableScheduling——不新增调度开关）。
++ *
++ * <p><b>口径</b>：扫描 0063 iot_calc.iot_calc_state 中 calc_status IN (2,3)（滞后/停算）且
++ * last_calc_time 早于 now - 阈值的项，<b>按数据项（full_key）逐项生成</b> ERROR 级告警（对象编码
++ * = full_key，唯一键去重，不重复刷；聚合为一条会丢失具体数据项定位，故逐项）。
++ * 周期 {@code ot.alarm.data-timeout-scan-seconds}（默认 300），fixedDelayString + initialDelay
++ * SpEL 秒转毫秒（0025/0063 范式）。
++ *
++ * <p><b>缓存积压</b>：一期无 Redis/点位现成积压指标 → 扫描入口返回 0，<b>不生成假数据</b>
++ * （诚实空态，报告登记「待核验」占位）；待真事件源/指标就位后由 {@link AlarmRecordService#raiseCacheBacklog}
++ * 显式生成。
++ *
++ * <p><b>fail-soft</b>：iot_calc 只读源未配置/不可用时 WARN 跳过本轮，不阻断管理系统（下轮重扫）。
++ * 扫描线程无会话 → tenantId 从行显式取（不依赖插件注入）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Component
++public class AlarmTimeoutScanner {
++
++    private static final Logger log = LoggerFactory.getLogger(AlarmTimeoutScanner.class);
++
++    private final AlarmRecordService alarmService;
++    private final JdbcTemplate calcJdbc;
++    private final int timeoutSeconds;
++
++    public AlarmTimeoutScanner(AlarmRecordService alarmService,
++                               @Qualifier("calcReadJdbcTemplate") JdbcTemplate calcJdbc,
++                               int timeoutSeconds) {
++        this.alarmService = alarmService;
++        this.calcJdbc = calcJdbc;
++        this.timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : 300;
++    }
++
++    /**
++     * 数据超时扫描入口（返回本轮生成告警数）；单测直接调用，绕开 @Scheduled 调度线程。
++     */
++    @Scheduled(fixedDelayString = "#{${ot.alarm.data-timeout-scan-seconds:300} * 1000}",
++            initialDelayString = "#{${ot.alarm.data-timeout-scan-seconds:300} * 1000}")
++    public void scan() {
++        try {
++            int n = scanDataTimeout();
++            if (n > 0) {
++                log.info("[ALARM] data-timeout scan generated {} alarm(s)", n);
++            }
++        } catch (Exception e) {
++            log.error("[ALARM] data-timeout scan failed (next round retries)", e);
++        }
++    }
++
++    /** 扫描并生成 DATA_TIMEOUT 告警；异常 fail-soft 吞掉返回 0（供单测断言） */
++    public int scanDataTimeout() {
++        try {
++            Timestamp cutoff = new Timestamp(System.currentTimeMillis() - timeoutSeconds * 1000L);
++            List<Map<String, Object>> rows = calcJdbc.queryForList(
++                    "SELECT tenant_id, full_key, last_calc_time, calc_status FROM iot_calc_state "
++                    + "WHERE calc_status IN (2,3) AND last_calc_time < ?",
++                    new Object[]{cutoff});
++            int created = 0;
++            for (Map<String, Object> row : rows) {
++                Object tenantRaw = row.get("tenant_id");
++                Object keyRaw = row.get("full_key");
++                Object lastRaw = row.get("last_calc_time");
++                if (!(tenantRaw instanceof Number tenant) || !(keyRaw instanceof String key)
++                        || key.isBlank() || !(lastRaw instanceof Timestamp last)) {
++                    log.warn("[ALARM] data-timeout 行缺字段，fail-closed 忽略: {}", row);
++                    continue;
++                }
++                try {
++                    alarmService.raiseDataTimeout(tenant.longValue(), key,
++                            last.toLocalDateTime());
++                    created++;
++                } catch (RuntimeException e) {
++                    log.warn("[ALARM] data-timeout 单行生成失败（下轮重试）fullKey={} 摘要：{}", key, e.getMessage());
++                }
++            }
++            return created;
++        } catch (RuntimeException e) {
++            log.warn("[ALARM] data-timeout 扫描降级（iot_calc 只读源不可用/DDL 未应用）: {}", e.getMessage());
++            return 0;
++        }
++    }
++
++    /**
++     * 网关缓存积压扫描：一期无真数据源 → 诚实返回 0（不造假数据）；报告登记「待核验」占位。
++     * 真指标接入后改此处调 alarmService.raiseCacheBacklog(tenant, code, detail)。
++     */
++    public int scanCacheBacklog() {
++        log.info("[ALARM] cache-backlog scan skipped: no authoritative backlog metric in phase-1 (待核验，不造假数据)");
++        return 0;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmNotifier.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmNotifier.java
+new file mode 100644
+index 0000000..8fb510b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmNotifier.java
+@@ -0,0 +1,25 @@
++package net.otlab.admin.module.iot.alarm.service;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++
++/**
++ * TASK-0062 D3：站内提醒出口（一期仅落站内记录，不外发邮件/企微）。
++ *
++ * <p>实现选择：<b>独立轻量通知表 iot_alarm_notice</b>（不复用 sys_notice）——sys_notice 是全员公告表
++ * （notice_type 1通知/2公告，列表默认无过滤会全量展示），即便加 type=3 也会污染公告列表与字典；
++ * 独立表零污染、按 tenant+target_role 可查。邮件/企微通道配置预留但一期不外发（REQ-0031 验收 4）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@FunctionalInterface
++public interface AlarmNotifier {
++
++    /**
++     * 告警生成时向目标角色写一条站内提醒。
++     *
++     * @param tenantId 租户 ID（来自事件/扫描，非请求参数）
++     * @param record   已生成的告警记录（title/detail/level 用于提醒内容）
++     */
++    void notify(Long tenantId, AlarmRecord record);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmRecordService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmRecordService.java
+new file mode 100644
+index 0000000..850496f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/AlarmRecordService.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.alarm.service;
++
++import net.otlab.admin.module.iot.alarm.vo.AlarmListVO;
++
++import java.time.LocalDateTime;
++
++/**
++ * TASK-0062：告警记录服务（生成/列表/状态流转/调度扫描）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface AlarmRecordService {
++
++    /** 网关异常离线生成告警（GRACEFUL 由 listener 层过滤，不入本方法） */
++    void raiseGatewayOffline(Long gatewayId, Long tenantId, String reason, LocalDateTime occurredAt);
++
++    /** 数据超时未达生成告警（@Scheduled 扫描近似） */
++    void raiseDataTimeout(Long tenantId, String dataItemKey, LocalDateTime lastCalcTime);
++
++    /** 网关缓存积压生成告警（一期无真数据源——仅扫描入口显式调用才生成，不造假） */
++    void raiseCacheBacklog(Long tenantId, String gatewayCode, String detail);
++
++    /** 分页列表（tenant 会话强制注入；status/type 为 Integer/String 可选，from/to 为 epoch 毫秒） */
++    AlarmListVO list(Integer status, String type, Long fromMs, Long toMs, int pageNum, int pageSize);
++
++    /** 确认 0→1；跨租户 403、非法跃迁 409；返回影响行数 */
++    int confirm(Long id);
++
++    /** 处理 0→2 或 1→2；跨租户 403、非法跃迁 409、空 note 400；返回影响行数 */
++    int handle(Long id, String note);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifier.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifier.java
+new file mode 100644
+index 0000000..6b099e1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifier.java
+@@ -0,0 +1,42 @@
++package net.otlab.admin.module.iot.alarm.service.impl;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.service.AlarmNotifier;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++/**
++ * TASK-0062 D3：站内提醒出口——写独立轻量表 {@code iot_alarm_notice}，按目标角色可见。
++ *
++ * <p><b>不碰 sys_notice</b>：公告表 notice_type 1/2 + 列表默认全量，写进去会污染公告列表与字典；
++ * 独立表语义单一、零污染。邮件/企微配置一期预留不外发（REQ-0031 验收 4）。
++ * <b>fail-soft</b>：提醒写失败仅 WARN，不阻断告警主记录生成（告警落库是主链路）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class AlarmNoticeOutboxNotifier implements AlarmNotifier {
++
++    private static final Logger log = LoggerFactory.getLogger(AlarmNoticeOutboxNotifier.class);
++
++    private final JdbcTemplate jdbc;
++    private final String targetRole;
++
++    public AlarmNoticeOutboxNotifier(JdbcTemplate jdbc, String targetRole) {
++        this.jdbc = jdbc;
++        this.targetRole = targetRole == null || targetRole.isBlank() ? "platform_admin" : targetRole;
++    }
++
++    @Override
++    public void notify(Long tenantId, AlarmRecord record) {
++        try {
++            jdbc.update("INSERT INTO iot_alarm_notice "
++                            + "(tenant_id, alarm_id, alarm_type, title, target_role, read_status) "
++                            + "VALUES (?,?,?,?,?,0)",
++                    tenantId, record.getId(), record.getType(), record.getTitle(), targetRole);
++        } catch (RuntimeException e) {
++            log.warn("[ALARM-NOTICE] 站内提醒写入失败（告警主记录不受影响，下轮生成重试）: {}", e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceImpl.java
+new file mode 100644
+index 0000000..6ae65f8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceImpl.java
+@@ -0,0 +1,167 @@
++package net.otlab.admin.module.iot.alarm.service.impl;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.entity.AlarmStatus;
++import net.otlab.admin.module.iot.alarm.entity.AlarmType;
++import net.otlab.admin.module.iot.alarm.service.AlarmNotifier;
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import net.otlab.admin.module.iot.alarm.store.AlarmStore;
++import net.otlab.admin.module.iot.alarm.vo.AlarmListVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++
++import java.sql.Timestamp;
++import java.time.LocalDateTime;
++
++/**
++ * TASK-0062 D2/D3：告警记录服务实现。
++ *
++ * <p><b>生成</b>：构造告警记录（title/detail 含 reason + gatewayId + occurredAt）→ store.upsert
++ * （唯一键去重，重复事件不改状态）→ notifier 站内出口（独立表，不外发）。生成动作不做事务外溢——
++ * 监听器层 try/catch 兜底（仿 GatewayOfflineEventListener）。
++ *
++ * <p><b>越权/流转守卫</b>：列表 tenant 从会话强制注入（禁请求参数）；confirm/handle 先 byId(会话 tenant)
++ * 判存，非本租户/不存在 = 403；非法跃迁（2→0 等）= 409；空 handle_note = 400。写操作审计由
++ * Controller 的 @OperateLog + 本服务写入 handler_id/update_by 双重留痕（REQ-0031 验收 5）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class AlarmRecordServiceImpl implements AlarmRecordService {
++
++    private static final Logger log = LoggerFactory.getLogger(AlarmRecordServiceImpl.class);
++
++    private final AlarmStore store;
++    private final AlarmNotifier notifier;
++
++    public AlarmRecordServiceImpl(AlarmStore store, AlarmNotifier notifier) {
++        this.store = store;
++        this.notifier = notifier;
++    }
++
++    @Override
++    public void raiseGatewayOffline(Long gatewayId, Long tenantId, String reason, LocalDateTime occurredAt) {
++        // 纵深防御：正常下线不生成告警（listener 层已过滤一次，服务层再守一道）
++        if (reason == null || "GRACEFUL".equalsIgnoreCase(reason)) {
++            return;
++        }
++        AlarmRecord a = base(tenantId, AlarmType.GATEWAY_OFFLINE, "GATEWAY", String.valueOf(gatewayId),
++                "WARN", "网关离线",
++                "reason=" + reason + ", gatewayId=" + gatewayId + ", occurredAt=" + occurredAt, occurredAt);
++        createAndNotify(tenantId, a);
++    }
++
++    @Override
++    public void raiseDataTimeout(Long tenantId, String dataItemKey, LocalDateTime lastCalcTime) {
++        AlarmRecord a = base(tenantId, AlarmType.DATA_TIMEOUT, "INSTANCE", dataItemKey,
++                "ERROR", "数据超时未达",
++                "fullKey=" + dataItemKey + ", lastCalcTime=" + lastCalcTime, lastCalcTime);
++        createAndNotify(tenantId, a);
++    }
++
++    @Override
++    public void raiseCacheBacklog(Long tenantId, String gatewayCode, String detail) {
++        AlarmRecord a = base(tenantId, AlarmType.GW_CACHE_BACKLOG, "GATEWAY", gatewayCode,
++                "WARN", "网关缓存积压", detail, LocalDateTime.now());
++        createAndNotify(tenantId, a);
++    }
++
++    private AlarmRecord base(Long tenantId, AlarmType type, String objectType, String objectCode,
++                             String level, String title, String detail, LocalDateTime occurredAt) {
++        AlarmRecord a = new AlarmRecord();
++        a.setTenantId(tenantId);
++        a.setType(type.name());
++        a.setObjectType(objectType);
++        a.setObjectCode(objectCode);
++        a.setLevel(level);
++        a.setTitle(title);
++        a.setDetail(detail);
++        a.setStatus(AlarmStatus.PENDING);
++        a.setOccurredAt(Timestamp.valueOf(occurredAt));
++        a.setCreateBy(0L); // 系统事件生成：0=system（确认/处理再由真实登录用户覆盖 update_by）
++        return a;
++    }
++
++    private void createAndNotify(Long tenantId, AlarmRecord a) {
++        try {
++            store.upsert(a);
++            notifier.notify(tenantId, a);
++        } catch (RuntimeException e) {
++            // 生成主链路异常由 listener / scheduler 层兜底；此处仅记日志不二次抛出破坏上层契约
++            log.warn("[ALARM] 告警生成失败（tenant={} type={} object={}）: {}",
++                    tenantId, a.getType(), a.getObjectCode(), e.getMessage());
++        }
++    }
++
++    @Override
++    public AlarmListVO list(Integer status, String type, Long fromMs, Long toMs, int pageNum, int pageSize) {
++        Long tenantId = requireTenant();
++        Timestamp from = fromMs == null ? null : new Timestamp(fromMs);
++        Timestamp to = toMs == null ? null : new Timestamp(toMs);
++        return new AlarmListVO(
++                store.list(tenantId, status, type, from, to, pageNum, pageSize),
++                store.count(tenantId, status, type, from, to));
++    }
++
++    @Override
++    public int confirm(Long id) {
++        Long tenantId = requireTenant();
++        AlarmRecord row = store.byId(tenantId, id);
++        if (row == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该告警记录（跨租户 403）");
++        }
++        if (!AlarmStatus.canConfirm(row.getStatus())) {
++            throw new BusinessException(409, "状态流转非法：仅待确认告警可确认（当前="
++                    + AlarmStatus.text(row.getStatus()) + "）");
++        }
++        Long handler = currentUserId();
++        int updated = store.confirm(tenantId, id, handler, new Timestamp(System.currentTimeMillis()));
++        if (updated == 0) {
++            throw new BusinessException(409, "告警状态已被并发修改，请刷新后重试");
++        }
++        return updated;
++    }
++
++    @Override
++    public int handle(Long id, String note) {
++        if (note == null || note.isBlank()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "handle_note 必填（处理留痕）");
++        }
++        Long tenantId = requireTenant();
++        AlarmRecord row = store.byId(tenantId, id);
++        if (row == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该告警记录（跨租户 403）");
++        }
++        if (!AlarmStatus.canHandle(row.getStatus())) {
++            throw new BusinessException(409, "状态流转非法：已处理告警不可重复处理");
++        }
++        Long handler = currentUserId();
++        int updated = store.handle(tenantId, id, handler, note.trim(), new Timestamp(System.currentTimeMillis()));
++        if (updated == 0) {
++            throw new BusinessException(409, "告警状态已被并发修改，请刷新后重试");
++        }
++        return updated;
++    }
++
++    private Long requireTenant() {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无租户上下文（数据权限不命中）");
++        }
++        return tenantId;
++    }
++
++    private Long currentUserId() {
++        try {
++            return SecurityUtils.getUserId();
++        } catch (RuntimeException e) {
++            throw new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "无登录态（无法留痕处理人）");
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java
+new file mode 100644
+index 0000000..158caeb
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java
+@@ -0,0 +1,187 @@
++package net.otlab.admin.module.iot.alarm.store;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.core.RowMapper;
++
++import java.sql.Timestamp;
++import java.util.List;
++
++/**
++ * TASK-0062 D1/D3：告警记录落库（iot_alarm_record，JdbcTemplate 直连业务库 primary 数据源）。
++ *
++ * <p><b>租户隔离</b>：iot_ 前缀表由多租户插件对 MyBatis mapper 自动注入 tenant_id；本类走
++ * JdbcTemplate 原生 SQL，所有读/写均显式带 tenant_id（会话强制注入，禁请求参数指定），
++ * 不依赖插件上下文（调度线程无会话时由调用方显式传 tenantId）。
++ *
++ * <p><b>去重</b>：uk(tenant_id, alarm_type, object_code, occurred_at) + upsert——重复事件只刷新
++ * detail/update_time/update_by，<b>不改 status/handler_id/confirm/handle 时间</b>（不把已确认
++ * 告警打回待确认）。H2 MySQL 模式与 MySQL 8 的 {@code ON DUPLICATE KEY UPDATE} 语义一致。
++ *
++ * <p><b>审计留痕</b>：显式写 create_time/create_by/update_time/update_by（无全局 MetaObjectHandler，
++ * 不依赖 MP 自动填充），确认/处理另写 handler_id + confirmed_at/handled_at + handle_note。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class AlarmStore {
++
++    private static final Logger log = LoggerFactory.getLogger(AlarmStore.class);
++
++    private static final String SELECT_COLS =
++            "id, tenant_id, alarm_type, object_type, object_code, alarm_level, title, detail, status, "
++            + "handler_id, handle_note, occurred_at, confirmed_at, handled_at, "
++            + "create_time, create_by, update_time, update_by, deleted";
++
++    private static final RowMapper<AlarmRecord> ROW_MAPPER = (rs, n) -> {
++        AlarmRecord a = new AlarmRecord();
++        a.setId(rs.getLong("id"));
++        a.setTenantId(rs.getLong("tenant_id"));
++        a.setType(rs.getString("alarm_type"));
++        a.setObjectType(rs.getString("object_type"));
++        a.setObjectCode(rs.getString("object_code"));
++        a.setLevel(rs.getString("alarm_level"));
++        a.setTitle(rs.getString("title"));
++        a.setDetail(rs.getString("detail"));
++        a.setStatus(rs.getInt("status"));
++        long handler = rs.getLong("handler_id");
++        a.setHandlerId(rs.wasNull() ? null : handler);
++        a.setHandleNote(rs.getString("handle_note"));
++        a.setOccurredAt(rs.getTimestamp("occurred_at"));
++        a.setConfirmedAt(rs.getTimestamp("confirmed_at"));
++        a.setHandledAt(rs.getTimestamp("handled_at"));
++        a.setCreateTime(rs.getTimestamp("create_time"));
++        long createBy = rs.getLong("create_by");
++        a.setCreateBy(rs.wasNull() ? null : createBy);
++        a.setUpdateTime(rs.getTimestamp("update_time"));
++        long updateBy = rs.getLong("update_by");
++        a.setUpdateBy(rs.wasNull() ? null : updateBy);
++        a.setDeleted(rs.getInt("deleted"));
++        return a;
++    };
++
++    private final JdbcTemplate jdbc;
++
++    public AlarmStore(JdbcTemplate jdbc) {
++        this.jdbc = jdbc;
++    }
++
++    /**
++     * 生成/重复事件 upsert：唯一键命中只刷新 detail/level/update_time/update_by，状态字段原样保留。
++     *
++     * @return 影响行数（1=新增，2=命中刷新；H2 MySQL 模式 update 计 1）
++     */
++    public int upsert(AlarmRecord a) {
++        Timestamp now = new Timestamp(System.currentTimeMillis());
++        Long createBy = a.getCreateBy() == null ? 0L : a.getCreateBy();
++        return jdbc.update(
++                "INSERT INTO iot_alarm_record "
++                + "(tenant_id, alarm_type, object_type, object_code, alarm_level, title, detail, status, "
++                + " occurred_at, create_time, create_by, update_time, update_by, deleted) "
++                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0) "
++                + "ON DUPLICATE KEY UPDATE detail=VALUES(detail), alarm_level=VALUES(alarm_level), "
++                + "update_time=VALUES(update_time), update_by=VALUES(update_by)",
++                a.getTenantId(), a.getType(), a.getObjectType(), a.getObjectCode(), a.getLevel(),
++                a.getTitle(), a.getDetail(), a.getStatus() == null ? 0 : a.getStatus(), a.getOccurredAt(),
++                now, createBy, now, createBy);
++    }
++
++    /** 分页列表：tenant 显式隔离 + status/type/时间窗可选过滤，按 occurred_at desc,id desc 排序 */
++    public List<AlarmRecord> list(Long tenantId, Integer status, String type, Timestamp from, Timestamp to,
++                                  int pageNum, int pageSize) {
++        StringBuilder sql = new StringBuilder("SELECT ").append(SELECT_COLS)
++                .append(" FROM iot_alarm_record WHERE tenant_id=? AND deleted=0");
++        java.util.List<Object> args = new java.util.ArrayList<>();
++        args.add(tenantId);
++        if (status != null) {
++            sql.append(" AND status=?");
++            args.add(status);
++        }
++        if (type != null && !type.isBlank()) {
++            sql.append(" AND alarm_type=?");
++            args.add(type.trim());
++        }
++        if (from != null) {
++            sql.append(" AND occurred_at>=?");
++            args.add(from);
++        }
++        if (to != null) {
++            sql.append(" AND occurred_at<=?");
++            args.add(to);
++        }
++        sql.append(" ORDER BY occurred_at DESC, id DESC LIMIT ? OFFSET ?");
++        int size = pageSize <= 0 || pageSize > 500 ? 50 : pageSize;
++        int page = pageNum <= 0 ? 1 : pageNum;
++        args.add(size);
++        args.add((page - 1) * size);
++        return jdbc.query(sql.toString(), ROW_MAPPER, args.toArray());
++    }
++
++    /** 总数（与 list 同过滤条件，不含分页）——用于 AlarmListVO.total */
++    public long count(Long tenantId, Integer status, String type, Timestamp from, Timestamp to) {
++        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM iot_alarm_record WHERE tenant_id=? AND deleted=0");
++        java.util.List<Object> args = new java.util.ArrayList<>();
++        args.add(tenantId);
++        if (status != null) {
++            sql.append(" AND status=?");
++            args.add(status);
++        }
++        if (type != null && !type.isBlank()) {
++            sql.append(" AND alarm_type=?");
++            args.add(type.trim());
++        }
++        if (from != null) {
++            sql.append(" AND occurred_at>=?");
++            args.add(from);
++        }
++        if (to != null) {
++            sql.append(" AND occurred_at<=?");
++            args.add(to);
++        }
++        Long n = jdbc.queryForObject(sql.toString(), Long.class, args.toArray());
++        return n == null ? 0L : n;
++    }
++
++    /** 明细（含租户隔离）；跨租户返回 null（服务层据此 403） */
++    public AlarmRecord byId(Long tenantId, Long id) {
++        List<AlarmRecord> rows = jdbc.query(
++                "SELECT " + SELECT_COLS + " FROM iot_alarm_record WHERE tenant_id=? AND id=? AND deleted=0",
++                ROW_MAPPER, tenantId, id);
++        return rows.isEmpty() ? null : rows.get(0);
++    }
++
++    /** 确认（0→1 由服务层守卫）：写 handler_id/confirmed_at/审计四件套，条件 status=0 幂等 */
++    public int confirm(Long tenantId, Long id, Long handlerId, Timestamp now) {
++        return jdbc.update(
++                "UPDATE iot_alarm_record SET status=1, handler_id=?, confirmed_at=?, "
++                + "update_time=?, update_by=? WHERE tenant_id=? AND id=? AND deleted=0 AND status=0",
++                handlerId, now, now, handlerId, tenantId, id);
++    }
++
++    /** 处理（0→2 或 1→2 由服务层守卫）：写 handle_note/handled_at/审计，条件 status IN (0,1) 幂等 */
++    public int handle(Long tenantId, Long id, Long handlerId, String note, Timestamp now) {
++        return jdbc.update(
++                "UPDATE iot_alarm_record SET status=2, handler_id=?, handle_note=?, handled_at=?, "
++                + "update_time=?, update_by=? WHERE tenant_id=? AND id=? AND deleted=0 AND status IN (0,1)",
++                handlerId, note, now, now, handlerId, tenantId, id);
++    }
++
++    /** 最近一条（按对象查，用于重复事件合并观察；也供单测断言去重结果） */
++    public AlarmRecord latest(Long tenantId, String type, String objectCode) {
++        List<AlarmRecord> rows = jdbc.query(
++                "SELECT " + SELECT_COLS + " FROM iot_alarm_record "
++                + "WHERE tenant_id=? AND alarm_type=? AND object_code=? AND deleted=0 "
++                + "ORDER BY occurred_at DESC, id DESC LIMIT 1",
++                ROW_MAPPER, tenantId, type, objectCode);
++        return rows.isEmpty() ? null : rows.get(0);
++    }
++
++    /** 本租户全部行数（单测去重断言用） */
++    public int countAll(Long tenantId) {
++        Long n = jdbc.queryForObject(
++                "SELECT COUNT(*) FROM iot_alarm_record WHERE tenant_id=? AND deleted=0", Long.class, tenantId);
++        return n == null ? 0 : n.intValue();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/vo/AlarmListVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/vo/AlarmListVO.java
+new file mode 100644
+index 0000000..da08602
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/vo/AlarmListVO.java
+@@ -0,0 +1,85 @@
++package net.otlab.admin.module.iot.alarm.vo;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.entity.AlarmStatus;
++
++import java.util.List;
++
++/**
++ * TASK-0062 D3：告警分页列表响应（total + rows；行 VO 不暴露 tenant_id 等内部字段）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class AlarmListVO {
++
++    /** 行视图（对齐前端 helper 的 AlarmRowVO） */
++    public static final class Row {
++        private Long id;
++        private String type;
++        private String objectType;
++        private String objectCode;
++        private String level;
++        private String title;
++        private String detail;
++        private Integer status;
++        private String statusText;
++        private Long handlerId;
++        private String handleNote;
++        private Long occurredAt;
++        private Long confirmedAt;
++        private Long handledAt;
++        private Long createdTime;
++
++        public static Row from(AlarmRecord a) {
++            Row r = new Row();
++            r.id = a.getId();
++            r.type = a.getType();
++            r.objectType = a.getObjectType();
++            r.objectCode = a.getObjectCode();
++            r.level = a.getLevel();
++            r.title = a.getTitle();
++            r.detail = a.getDetail();
++            r.status = a.getStatus();
++            r.statusText = AlarmStatus.text(a.getStatus());
++            r.handlerId = a.getHandlerId();
++            r.handleNote = a.getHandleNote();
++            r.occurredAt = ms(a.getOccurredAt());
++            r.confirmedAt = ms(a.getConfirmedAt());
++            r.handledAt = ms(a.getHandledAt());
++            r.createdTime = ms(a.getCreateTime());
++            return r;
++        }
++
++        private static Long ms(java.sql.Timestamp t) {
++            return t == null ? null : t.getTime();
++        }
++
++        public Long getId() { return id; }
++        public String getType() { return type; }
++        public String getObjectType() { return objectType; }
++        public String getObjectCode() { return objectCode; }
++        public String getLevel() { return level; }
++        public String getTitle() { return title; }
++        public String getDetail() { return detail; }
++        public Integer getStatus() { return status; }
++        public String getStatusText() { return statusText; }
++        public Long getHandlerId() { return handlerId; }
++        public String getHandleNote() { return handleNote; }
++        public Long getOccurredAt() { return occurredAt; }
++        public Long getConfirmedAt() { return confirmedAt; }
++        public Long getHandledAt() { return handledAt; }
++        public Long getCreatedTime() { return createdTime; }
++    }
++
++    private final List<Row> rows;
++    private final Long total;
++
++    public AlarmListVO(List<AlarmRecord> records, Long total) {
++        this.rows = records.stream().map(Row::from).toList();
++        this.total = total;
++    }
++
++    public List<Row> getRows() { return rows; }
++    public Long getTotal() { return total; }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmControllerTest.java
+new file mode 100644
+index 0000000..f780c47
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/controller/IotAlarmControllerTest.java
+@@ -0,0 +1,116 @@
++package net.otlab.admin.module.iot.alarm.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.entity.AlarmType;
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import net.otlab.admin.module.iot.alarm.vo.AlarmListVO;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++
++import java.sql.Timestamp;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0062 D3：管理面端点契约——列表 GET + 确认/处理写口 POST，
++ * 权限码 iot:instance:query、写口挂 @OperateLog（写要审，与 0061 读不审相反）、
++ * 跨租户 403 控制器透传。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotAlarmControllerTest {
++
++    @Mock private AlarmRecordService service;
++    private AutoCloseable mocks;
++    private IotAlarmController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new IotAlarmController(service);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    void listPassthroughAndForbidden() {
++        AlarmRecord row = new AlarmRecord();
++        row.setId(1L); row.setType(AlarmType.GATEWAY_OFFLINE.name());
++        row.setOccurredAt(Timestamp.valueOf("2026-11-24 10:00:00"));
++        AlarmListVO vo = new AlarmListVO(List.of(row), 1L);
++        when(service.list(null, null, null, null, 1, 10)).thenReturn(vo);
++        Result<AlarmListVO> r = controller.list(null, null, null, null, 1, 10);
++        assertEquals(200, r.getCode());
++        assertEquals(1L, r.getData().getTotal());
++
++        when(service.list(null, null, null, null, 1, 10))
++                .thenThrow(new BusinessException(403, "跨租户明细 403"));
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> controller.list(null, null, null, null, 1, 10));
++        assertEquals(403, ex.getCode().intValue());
++    }
++
++    @Test
++    void confirmAndHandlePassthrough() {
++        when(service.confirm(7L)).thenReturn(1);
++        when(service.handle(7L, "done")).thenReturn(1);
++        assertEquals(1, controller.confirm(7L).getData().intValue());
++        verify(service).confirm(7L);
++        assertEquals(1, controller.handle(7L, "done").getData().intValue());
++        verify(service).handle(7L, "done");
++    }
++
++    @Test
++    void annotationsLocked() throws Exception {
++        SaCheckPermission listPerm = IotAlarmController.class.getMethod("list", Integer.class, String.class,
++                Long.class, Long.class, Integer.class, Integer.class).getAnnotation(SaCheckPermission.class);
++        SaCheckPermission confirmPerm = IotAlarmController.class.getMethod("confirm", Long.class)
++                .getAnnotation(SaCheckPermission.class);
++        SaCheckPermission handlePerm = IotAlarmController.class.getMethod("handle", Long.class, String.class)
++                .getAnnotation(SaCheckPermission.class);
++        assertEquals("iot:instance:query", listPerm.value()[0]);
++        assertEquals("iot:instance:query", confirmPerm.value()[0]);
++        assertEquals("iot:instance:query", handlePerm.value()[0]);
++
++        // 写口挂审计（title + businessType），读口不挂
++        OperateLog confirmLog = IotAlarmController.class.getMethod("confirm", Long.class)
++                .getAnnotation(OperateLog.class);
++        OperateLog handleLog = IotAlarmController.class.getMethod("handle", Long.class, String.class)
++                .getAnnotation(OperateLog.class);
++        assertNotNull(confirmLog, "确认是写操作，必须挂 @OperateLog");
++        assertNotNull(handleLog, "处理是写操作，必须挂 @OperateLog");
++        assertEquals(BusinessType.UPDATE, confirmLog.businessType());
++        assertEquals(BusinessType.UPDATE, handleLog.businessType());
++        assertEquals(null, IotAlarmController.class.getMethod("list", Integer.class, String.class,
++                Long.class, Long.class, Integer.class, Integer.class).getAnnotation(OperateLog.class),
++                "读列表不挂审计");
++
++        long gets = java.util.Arrays.stream(IotAlarmController.class.getDeclaredMethods())
++                .filter(x -> x.isAnnotationPresent(GetMapping.class)).count();
++        long posts = java.util.Arrays.stream(IotAlarmController.class.getDeclaredMethods())
++                .filter(x -> x.isAnnotationPresent(PostMapping.class)).count();
++        assertEquals(1, gets);
++        assertEquals(2, posts);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/entity/AlarmEnumsTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/entity/AlarmEnumsTest.java
+new file mode 100644
+index 0000000..6b3f489
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/entity/AlarmEnumsTest.java
+@@ -0,0 +1,44 @@
++package net.otlab.admin.module.iot.alarm.entity;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0062：告警值域与状态流转规则纯函数契约（不连库，机械判定）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmEnumsTest {
++
++    @Test
++    @DisplayName("仅三类系统事件告警类型；业务阈值类不得混入")
++    void onlyThreeSystemEventTypes() {
++        assertEquals(3, AlarmType.values().length);
++        assertEquals("GATEWAY_OFFLINE", AlarmType.GATEWAY_OFFLINE.name());
++        assertEquals("DATA_TIMEOUT", AlarmType.DATA_TIMEOUT.name());
++        assertEquals("GW_CACHE_BACKLOG", AlarmType.GW_CACHE_BACKLOG.name());
++        assertEquals(AlarmType.GATEWAY_OFFLINE, AlarmType.fromName("GATEWAY_OFFLINE"));
++        assertNull(AlarmType.fromName("THRESHOLD"));
++        assertNull(AlarmType.fromName(null));
++    }
++
++    @Test
++    @DisplayName("状态流转：0→1→2、0→2 合法；2→0 等非法跃迁明确拒绝；只读展示映射")
++    void statusTransitionGuard() {
++        assertEquals("待确认", AlarmStatus.text(0));
++        assertEquals("已确认", AlarmStatus.text(1));
++        assertEquals("已处理", AlarmStatus.text(2));
++        assertTrue(AlarmStatus.canConfirm(0));
++        assertFalse(AlarmStatus.canConfirm(1), "已确认不可重复确认（不发回退）");
++        assertFalse(AlarmStatus.canConfirm(2));
++        assertTrue(AlarmStatus.canHandle(0), "允许直接处理");
++        assertTrue(AlarmStatus.canHandle(1));
++        assertFalse(AlarmStatus.canHandle(2), "已处理不可再处理");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListenerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListenerTest.java
+new file mode 100644
+index 0000000..ec7ca85
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/listener/GatewayOfflineAlarmListenerTest.java
+@@ -0,0 +1,81 @@
++package net.otlab.admin.module.iot.alarm.listener;
++
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.time.LocalDateTime;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++/**
++ * TASK-0062 D2：网关离线告警监听器契约——仿 GatewayOfflineEventListener 的 fail-closed +
++ * try/catch 不外溢；GRACEFUL 正常下线不生成告警。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class GatewayOfflineAlarmListenerTest {
++
++    @Mock private AlarmRecordService service;
++    private AutoCloseable mocks;
++    private GatewayOfflineAlarmListener listener;
++    private final LocalDateTime at = LocalDateTime.of(2026, 11, 24, 10, 0);
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        listener = new GatewayOfflineAlarmListener(service);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("异常离线 TIMEOUT/LWT_ABNORMAL 生成告警（reason 传递）")
++    void abnormalOfflineRaisesAlarm() {
++        listener.onGatewayOffline(GatewayOfflineEvent.ofTimeout(7L, 1L, at));
++        listener.onGatewayOffline(GatewayOfflineEvent.ofLwtAbnormal(8L, 1L, at));
++        verify(service).raiseGatewayOffline(7L, 1L, "TIMEOUT", at);
++        verify(service).raiseGatewayOffline(8L, 1L, "LWT_ABNORMAL", at);
++    }
++
++    @Test
++    @DisplayName("GRACEFUL 正常下线不生成告警")
++    void gracefulSkipped() {
++        listener.onGatewayOffline(GatewayOfflineEvent.ofGraceful(7L, 1L, at));
++        verify(service, never()).raiseGatewayOffline(any(), any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("缺字段 fail-closed：任一字段缺失 WARN 忽略，服务层不触达")
++    void missingFieldsIgnored() {
++        listener.onGatewayOffline(null);
++        listener.onGatewayOffline(GatewayOfflineEvent.of(null, 1L, GatewayOfflineReason.TIMEOUT, at));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, null, GatewayOfflineReason.TIMEOUT, at));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, 1L, null, at));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, 1L, GatewayOfflineReason.TIMEOUT, null));
++        verify(service, never()).raiseGatewayOffline(any(), any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("消费不外溢异常：服务失败被 try/catch 兜住（不炸穿发布方线程）")
++    void serviceFailureSwallowed() {
++        doThrow(new RuntimeException("db down")).when(service)
++                .raiseGatewayOffline(any(), any(), eq("TIMEOUT"), any());
++        assertDoesNotThrow(() -> listener.onGatewayOffline(GatewayOfflineEvent.ofTimeout(7L, 1L, at)));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScannerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScannerTest.java
+new file mode 100644
+index 0000000..159d743
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/scheduler/AlarmTimeoutScannerTest.java
+@@ -0,0 +1,80 @@
++package net.otlab.admin.module.iot.alarm.scheduler;
++
++import net.otlab.admin.module.iot.alarm.service.AlarmRecordService;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.sql.Timestamp;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0062 D2：数据超时扫描（Spring @Scheduled 近似）+ 缓存积压诚实空态契约。
++ *
++ * <p>DATA_TIMEOUT：calc_status=2/3 且 last_calc_time 逾阈值 → 按数据项生成告警（ObjectType=INSTANCE/DATA_ITEM，
++ * object_code 取 full_key）；阈值由配置注入。GW_CACHE_BACKLOG：无真数据源 → 不生成造假告警，
++ * 仅登记「待核验」占位（本报告登记，测试验证扫描入口可空跑不外溢）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmTimeoutScannerTest {
++
++    @Mock private AlarmRecordService service;
++    @Mock private org.springframework.jdbc.core.JdbcTemplate calcJdbc;
++    private AutoCloseable mocks;
++    private AlarmTimeoutScanner scanner;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        scanner = new AlarmTimeoutScanner(service, calcJdbc, 300); // 5 分钟阈值
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("calc_status=2/3 且 last_calc_time 逾阈值 → 按 full_key 生成 DATA_TIMEOUT 告警")
++    void dataTimeoutRaisesPerFullKey() {
++        List<Map<String, Object>> rows = List.of(
++                Map.of("tenant_id", 1L, "full_key", "1|t1|inst1|5m", "last_calc_time",
++                        Timestamp.valueOf("2026-11-24 09:00:00"), "calc_status", 2));
++        when(calcJdbc.queryForList(anyString(), any(Object[].class))).thenReturn(rows);
++
++        int n = scanner.scanDataTimeout();
++        assertEquals(1, n, "一条滞后数据项 → 一条告警");
++        verify(service).raiseDataTimeout(eq(1L), eq("1|t1|inst1|5m"), any());
++    }
++
++    @Test
++    @DisplayName("无真事件源/无积压指标：扫描不生成 GW_CACHE_BACKLOG 假数据（诚实空态）")
++    void cacheBacklogNoFakeData() {
++        int n = scanner.scanCacheBacklog();
++        assertEquals(0, n, "一期无积压指标 → 不造假数据（报告登记待核验占位）");
++        verify(service, never()).raiseCacheBacklog(any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("扫描异常 fail-soft 不外溢（下轮重试，不阻断管理系统）")
++    void scanFailureSwallowed() {
++        when(calcJdbc.queryForList(anyString(), any(Object[].class)))
++                .thenThrow(new RuntimeException("iot_calc 只读源不可用"));
++        assertDoesNotThrow(() -> scanner.scanDataTimeout());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifierTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifierTest.java
+new file mode 100644
+index 0000000..c7b058a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmNoticeOutboxNotifierTest.java
+@@ -0,0 +1,52 @@
++package net.otlab.admin.module.iot.alarm.service.impl;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.sql.Timestamp;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++/**
++ * TASK-0062 D3：站内提醒出口契约——独立轻量表 iot_alarm_notice（不污染 sys_notice 公告），
++ * 生成告警时写一条、目标角色可见、不外发。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmNoticeOutboxNotifierTest {
++
++    @Test
++    @DisplayName("站内出口：生成告警写 iot_alarm_notice（notice_type 独立，不碰 sys_notice）")
++    void writesOutboxNotAnnouncement() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:alarm_notice_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        JdbcTemplate jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_alarm_notice ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "alarm_id BIGINT NOT NULL, alarm_type VARCHAR(32) NOT NULL, title VARCHAR(256) NOT NULL, "
++                + "target_role VARCHAR(64) NOT NULL, read_status TINYINT NOT NULL DEFAULT 0, "
++                + "create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
++
++        AlarmNoticeOutboxNotifier notifier = new AlarmNoticeOutboxNotifier(jdbc, "platform_admin");
++        AlarmRecord a = new AlarmRecord();
++        a.setId(11L);
++        a.setType("GATEWAY_OFFLINE");
++        a.setTitle("网关离线");
++        a.setLevel("WARN");
++        a.setOccurredAt(Timestamp.valueOf("2026-11-24 10:00:00"));
++        notifier.notify(1L, a);
++
++        Integer count = jdbc.queryForObject("SELECT COUNT(*) FROM iot_alarm_notice", Integer.class);
++        assertEquals(1, count);
++        String role = jdbc.queryForObject("SELECT target_role FROM iot_alarm_notice", String.class);
++        assertEquals("platform_admin", role);
++        jdbc.execute("DROP TABLE iot_alarm_notice");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceContractTest.java
+new file mode 100644
+index 0000000..17c207f
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmRecordServiceContractTest.java
+@@ -0,0 +1,172 @@
++package net.otlab.admin.module.iot.alarm.service.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.entity.AlarmType;
++import net.otlab.admin.module.iot.alarm.service.AlarmNotifier;
++import net.otlab.admin.module.iot.alarm.store.AlarmStore;
++import net.otlab.admin.module.iot.alarm.vo.AlarmListVO;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.sql.Timestamp;
++import java.time.LocalDateTime;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0062 D2/D3：告警生成 + 状态流转 + 越权/非法跃迁 + 审计留痕契约（Mockito store + H2 另测）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmRecordServiceContractTest {
++
++    private static final long TENANT = 1L;
++    private AlarmStore store;
++    private AlarmNotifier notifier;
++    private final List<String> notices = new ArrayList<>();
++    private AlarmRecordServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login("42");
++        StpUtil.getSession().set("tenant_id", TENANT);
++        store = org.mockito.Mockito.mock(AlarmStore.class);
++        notifier = (tenantId, record) -> notices.add(tenantId + ":" + record.getObjectCode());
++        service = new AlarmRecordServiceImpl(store, notifier);
++    }
++
++    @AfterEach
++    void tearDown() {
++        StpUtil.logout();
++    }
++
++    private AlarmRecord sample(long tenant, AlarmType type, String code, int status) {
++        AlarmRecord a = new AlarmRecord();
++        a.setId(10L);
++        a.setTenantId(tenant);
++        a.setType(type.name());
++        a.setObjectCode(code);
++        a.setStatus(status);
++        a.setLevel("WARN");
++        a.setTitle("网关离线");
++        a.setOccurredAt(Timestamp.valueOf("2026-11-24 10:00:00"));
++        return a;
++    }
++
++    @Test
++    @DisplayName("网关离线生成：TIMEOUT/LWT_ABNORMAL 告警（WARN）+ 站内提醒出口（notice_type=3，不外发）")
++    void generateGatewayOfflineAlarm() {
++        service.raiseGatewayOffline(7L, TENANT, "TIMEOUT", LocalDateTime.of(2026, 11, 24, 10, 0));
++
++        org.mockito.Mockito.verify(store).upsert(org.mockito.ArgumentMatchers.argThat(a ->
++                a.getType().equals("GATEWAY_OFFLINE") && a.getObjectCode().equals("7")
++                        && a.getLevel().equals("WARN") && a.getTitle().contains("网关离线")
++                        && a.getDetail().contains("TIMEOUT") && a.getCreateBy() != null));
++        assertEquals(1, notices.size(), "生成即写一条站内提醒");
++        assertTrue(notices.get(0).startsWith(TENANT + ":"));
++    }
++
++    @Test
++    @DisplayName("GRACEFUL 正常下线不生成告警（仅异常离线入告警）")
++    void gracefulDoesNotRaise() {
++        service.raiseGatewayOffline(7L, TENANT, "GRACEFUL", LocalDateTime.of(2026, 11, 24, 10, 0));
++        org.mockito.Mockito.verify(store, org.mockito.Mockito.never()).upsert(org.mockito.ArgumentMatchers.any());
++        assertEquals(0, notices.size());
++    }
++
++    @Test
++    @DisplayName("列表：tenant 会话强制注入，不接受前端 tenant 参数（数据权限裁剪）")
++    void listUsesSessionTenant() {
++        org.mockito.Mockito.when(store.list(org.mockito.ArgumentMatchers.eq(TENANT),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt()))
++                .thenReturn(List.of(sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 0)));
++        org.mockito.Mockito.when(store.count(org.mockito.ArgumentMatchers.eq(TENANT),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(1L);
++        AlarmListVO vo = service.list(null, null, null, null, 1, 10);
++        assertEquals(1, vo.getTotal().longValue());
++        org.mockito.Mockito.verify(store).list(org.mockito.ArgumentMatchers.eq(TENANT),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.anyInt(), org.mockito.ArgumentMatchers.anyInt());
++    }
++
++    @Test
++    @DisplayName("确认 0→1：记 handler_id（当前登录用户）+ confirmed_at；重复确认/非法跃迁 409")
++    void confirmTransitions() {
++        AlarmRecord row = sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 0);
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(row);
++        org.mockito.Mockito.when(store.confirm(org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.any(java.sql.Timestamp.class))).thenReturn(1);
++        service.confirm(10L);
++        org.mockito.Mockito.verify(store).confirm(org.mockito.ArgumentMatchers.eq(TENANT),
++                org.mockito.ArgumentMatchers.eq(10L), org.mockito.ArgumentMatchers.eq(42L),
++                org.mockito.ArgumentMatchers.any(java.sql.Timestamp.class));
++        org.mockito.Mockito.verify(store, org.mockito.Mockito.never()).handle(
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.any());
++
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 2));
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.confirm(10L));
++        assertEquals(409, ex.getCode().intValue());
++    }
++
++    @Test
++    @DisplayName("处理 1→2 / 0→2；已处理再处理 409；handle_note 必填且留痕")
++    void handleTransitions() {
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 1));
++        org.mockito.Mockito.when(store.handle(org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(java.sql.Timestamp.class))).thenReturn(1);
++        service.handle(10L, "已检查网关网络");
++        org.mockito.Mockito.verify(store).handle(org.mockito.ArgumentMatchers.eq(TENANT),
++                org.mockito.ArgumentMatchers.eq(10L), org.mockito.ArgumentMatchers.eq(42L),
++                org.mockito.ArgumentMatchers.eq("已检查网关网络"),
++                org.mockito.ArgumentMatchers.any(java.sql.Timestamp.class));
++
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 2));
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.handle(10L, "again"));
++        assertEquals(409, ex.getCode().intValue());
++    }
++
++    @Test
++    @DisplayName("跨租户 403：非本租户告警 id 确认/处理抛 FORBIDDEN，不触达写库")
++    void crossTenantForbidden() {
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(null);
++        BusinessException confirmEx = assertThrows(BusinessException.class, () -> service.confirm(10L));
++        assertEquals(403, confirmEx.getCode().intValue());
++        BusinessException handleEx = assertThrows(BusinessException.class, () -> service.handle(10L, "x"));
++        assertEquals(403, handleEx.getCode().intValue());
++        org.mockito.Mockito.verify(store, org.mockito.Mockito.never()).confirm(
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any());
++        org.mockito.Mockito.verify(store, org.mockito.Mockito.never()).handle(
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
++                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any(),
++                org.mockito.ArgumentMatchers.any());
++    }
++
++    @Test
++    @DisplayName("空 handle_note 参数错误 400，不静默处理")
++    void blankNoteRejected() {
++        org.mockito.Mockito.when(store.byId(TENANT, 10L)).thenReturn(sample(TENANT, AlarmType.GATEWAY_OFFLINE, "gw-1", 1));
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.handle(10L, "  "));
++        assertEquals(400, ex.getCode().intValue());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/AlarmStoreTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/AlarmStoreTest.java
+new file mode 100644
+index 0000000..3dc8092
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/AlarmStoreTest.java
+@@ -0,0 +1,154 @@
++package net.otlab.admin.module.iot.alarm.store;
++
++import net.otlab.admin.module.iot.alarm.entity.AlarmRecord;
++import net.otlab.admin.module.iot.alarm.entity.AlarmType;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.sql.Timestamp;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0062 D1：告警落库契约（H2 真 SQL，DDL 未应用用户库）。
++ *
++ * <p>锁定：①唯一键 (tenant_id, alarm_type, object_code, occurred_at) 去重；②重复事件只更新
++ * 不改状态流转（已确认/已处理不被打回待确认）；③列表按 tenant+status+type+时间窗分页；
++ * ④确认/处理写入审计四列与 handler_id/handle_note。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmStoreTest {
++
++    private JdbcTemplate jdbc;
++    private AlarmStore store;
++    private final Timestamp t1 = Timestamp.valueOf("2026-11-24 10:00:00");
++    private final Timestamp t2 = Timestamp.valueOf("2026-11-24 11:00:00");
++
++    @BeforeEach
++    void setUp() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:alarm_store_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_alarm_record ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "alarm_type VARCHAR(32) NOT NULL, object_type VARCHAR(32) NOT NULL, "
++                + "object_code VARCHAR(96) NOT NULL, alarm_level VARCHAR(16) NOT NULL, "
++                + "title VARCHAR(256) NOT NULL, detail VARCHAR(1000), "
++                + "status TINYINT NOT NULL DEFAULT 0, handler_id BIGINT, handle_note VARCHAR(500), "
++                + "occurred_at TIMESTAMP NOT NULL, confirmed_at TIMESTAMP, handled_at TIMESTAMP, "
++                + "create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, create_by BIGINT, "
++                + "created_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
++                + "update_time TIMESTAMP, update_by BIGINT, deleted INT NOT NULL DEFAULT 0, "
++                + "CONSTRAINT uk_alarm UNIQUE (tenant_id, alarm_type, object_code, occurred_at))");
++        store = new AlarmStore(jdbc);
++    }
++
++    @AfterEach
++    void tearDown() {
++        jdbc.execute("DROP TABLE iot_alarm_record");
++    }
++
++    private AlarmRecord newAlarm(long tenant, AlarmType type, String code, Timestamp at) {
++        AlarmRecord a = new AlarmRecord();
++        a.setTenantId(tenant);
++        a.setType(type.name());
++        a.setObjectType("GATEWAY");
++        a.setObjectCode(code);
++        a.setLevel("WARN");
++        a.setTitle("网关离线");
++        a.setDetail("{\"reason\":\"TIMEOUT\"}");
++        a.setStatus(0);
++        a.setOccurredAt(at);
++        return a;
++    }
++
++    @Test
++    @DisplayName("生成告警：upsert 唯一键去重，重复事件只更新不改状态流转（已确认不被打回待确认）")
++    void dedupKeepsStatus() {
++        assertEquals(1, store.upsert(newAlarm(1L, AlarmType.GATEWAY_OFFLINE, "gw-1", t1)));
++        AlarmRecord first = store.latest(1L, "GATEWAY_OFFLINE", "gw-1");
++        assertNotNull(first);
++        assertEquals(0, first.getStatus());
++
++        assertEquals(1, store.confirm(1L, first.getId(), 42L, t2), "确认成功");
++        assertEquals(1, store.countAll(1L), "仍只有一条");
++
++        // 重复事件再至（同 tenant/type/code/occurredAt）
++        AlarmRecord repeat = newAlarm(1L, AlarmType.GATEWAY_OFFLINE, "gw-1", t1);
++        repeat.setDetail("{\"reason\":\"LWT_ABNORMAL\"}"); // 新上下文
++        store.upsert(repeat);
++
++        AlarmRecord again = store.latest(1L, "GATEWAY_OFFLINE", "gw-1");
++        assertEquals(1, store.countAll(1L), "重复事件未新增行（唯一键去重）");
++        assertEquals(1, again.getStatus(), "不把已确认告警打回待确认");
++        assertEquals("{\"reason\":\"LWT_ABNORMAL\"}", again.getDetail(), "上下文刷新");
++    }
++
++    @Test
++    @DisplayName("列表：按会话 tenant 强制过滤 + status/type 可选 + 时间窗 + 分页，跨租户不可见")
++    void listScopedAndPaged() {
++        store.upsert(newAlarm(1L, AlarmType.GATEWAY_OFFLINE, "gw-1", t1));
++        AlarmRecord offline = newAlarm(1L, AlarmType.GATEWAY_OFFLINE, "gw-2", t2);
++        offline.setLevel("ERROR");
++        offline.setStatus(1);
++        store.upsert(offline);
++        store.upsert(newAlarm(2L, AlarmType.GATEWAY_OFFLINE, "gw-9", t1));
++
++        List<AlarmRecord> all = store.list(1L, null, null, null, null, 1, 10);
++        assertEquals(2, all.size(), "仅本租户");
++        assertEquals(1, store.list(1L, null, null, null, null, 1, 1).size(), "分页 pageSize=1");
++        assertEquals(1, store.list(1L, 0, null, null, null, 1, 10).size(), "status 过滤");
++        assertEquals(2, store.list(1L, null, "GATEWAY_OFFLINE", null, null, 1, 10).size(), "两行同类型");
++        assertEquals(1, store.list(1L, null, null, t1, t1, 1, 10).size(), "时间窗");
++    }
++
++    @Test
++    @DisplayName("确认/处理：写审计四件套 + handler_id + note + 时间戳，状态 0→1→2")
++    void confirmAndHandleAudit() {
++        store.upsert(newAlarm(1L, AlarmType.DATA_TIMEOUT, "item-1", t1));
++        AlarmRecord row = store.latest(1L, "DATA_TIMEOUT", "item-1");
++        long id = row.getId();
++
++        assertEquals(1, store.confirm(1L, id, 7L, t1));
++        AlarmRecord confirmed = store.byId(1L, id);
++        assertEquals(1, confirmed.getStatus());
++        assertEquals(7L, confirmed.getHandlerId());
++        assertNotNull(confirmed.getConfirmedAt());
++        assertEquals(7L, confirmed.getUpdateBy());
++        assertNotNull(confirmed.getUpdateTime());
++
++        assertEquals(1, store.handle(1L, id, 8L, "已重启计算引擎", t2));
++        AlarmRecord handled = store.byId(1L, id);
++        assertEquals(2, handled.getStatus());
++        assertEquals(8L, handled.getHandlerId(), "处理人覆盖确认人（最后处理人）");
++        assertEquals("已重启计算引擎", handled.getHandleNote());
++        assertNotNull(handled.getHandledAt());
++        assertEquals(8L, handled.getUpdateBy());
++        assertTrue(handled.getUpdateTime() != null);
++    }
++
++    @Test
++    @DisplayName("审计四件套：生成落 create_by/create_time；跨租户 byId/confirm 返回 null/0 不越权")
++    void auditAndTenantIsolation() {
++        AlarmRecord a = newAlarm(1L, AlarmType.GW_CACHE_BACKLOG, "gw-3", t1);
++        a.setCreateBy(0L); // 系统事件生成：operator 0=system
++        store.upsert(a);
++        AlarmRecord row = store.latest(1L, "GW_CACHE_BACKLOG", "gw-3");
++        assertNotNull(row.getCreateTime());
++        assertEquals(0L, row.getCreateBy());
++        assertEquals(0, store.byId(2L, row.getId()) == null ? 0 : 1, "跨租户 byId 不可见");
++        assertEquals(0, store.confirm(2L, row.getId(), 9L, t1), "跨租户确认影响 0 行");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/IotAlarmDdlSplitContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/IotAlarmDdlSplitContractTest.java
+new file mode 100644
+index 0000000..83030bf
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/store/IotAlarmDdlSplitContractTest.java
+@@ -0,0 +1,103 @@
++package net.otlab.admin.module.iot.alarm.store;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0062 D1/D4：告警 DDL 静态契约——每条语句独占一行（兼容 sql-exec.sh 的 ;\n 切分）、
++ * 审计四件套齐全、三类告警/唯一键/索引齐全、菜单种子 id=172 挂 110 系统监控。
++ *
++ * <p>纯文本静态检查，不连用户库（brief：DDL 只产出不执行）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotAlarmDdlSplitContractTest {
++
++    private static final String REL = "resources/sql/upgrade/20261124_iot_alarm.sql";
++
++    private static Path repoRoot() {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位仓库根（resources/sql/01_base.sql）");
++        return dir;
++    }
++
++    private static List<String> executableSegments(String ddl) {
++        List<String> segments = new ArrayList<>();
++        for (String seg : ddl.split(";\\s*\\n")) {
++            StringBuilder sb = new StringBuilder();
++            for (String line : seg.split("\n")) {
++                String t = line.strip();
++                if (!t.isEmpty() && !t.startsWith("--")) {
++                    sb.append(line).append("\n");
++                }
++            }
++            String s = sb.toString().strip();
++            if (!s.isEmpty()) {
++                segments.add(s);
++            }
++        }
++        return segments;
++    }
++
++    @Test
++    @DisplayName("DDL 每条语句独占一行：按 sql-exec.sh 的 ;\\n 切分后任一段不含同行第二处分号")
++    void everyStatementIsOnItsOwnLine() throws Exception {
++        Path p = repoRoot().resolve(REL);
++        assertTrue(Files.exists(p), "缺 DDL 脚本: " + REL);
++        String ddl = Files.readString(p, StandardCharsets.UTF_8);
++        List<String> segments = executableSegments(ddl);
++        assertTrue(segments.size() >= 3, "切分段数异常偏少（" + segments.size() + "）");
++        List<String> bad = new ArrayList<>();
++        for (String seg : segments) {
++            if (seg.contains(";")) {
++                bad.add(seg.replace("\n", " ⏎ ").strip());
++            }
++        }
++        assertEquals(List.of(), bad, "以下切分段仍含同行分号: " + bad);
++    }
++
++    @Test
++    @DisplayName("表结构：iot_alarm_record 三类告警 + 状态/审计四件套 + 唯一键 + 复合索引")
++    void alarmTableShape() throws Exception {
++        String ddl = Files.readString(repoRoot().resolve(REL), StandardCharsets.UTF_8);
++        assertTrue(ddl.contains("CREATE TABLE IF NOT EXISTS `iot_alarm_record`"), "缺告警记录表 DDL");
++        for (String col : new String[]{"`id`", "`tenant_id`", "`alarm_type`", "`object_type`", "`object_code`",
++                "`alarm_level`", "`title`", "`detail`", "`status`", "`handler_id`", "`handle_note`",
++                "`occurred_at`", "`confirmed_at`", "`handled_at`", "`created_time`",
++                "`create_time`", "`create_by`", "`update_time`", "`update_by`", "`deleted`"}) {
++            assertTrue(ddl.contains(col), "缺字段: " + col);
++        }
++        for (String type : new String[]{"GATEWAY_OFFLINE", "DATA_TIMEOUT", "GW_CACHE_BACKLOG"}) {
++            assertTrue(ddl.contains(type), "缺告警类型说明: " + type);
++        }
++        assertTrue(ddl.contains("UNIQUE KEY `uk_alarm_dedup`"), "缺唯一键去重");
++        assertTrue(ddl.contains("`idx_tenant_status_time`"), "缺 (tenant_id,status,occurred_at) 索引");
++        assertTrue(ddl.contains("`idx_tenant_type`"), "缺 (tenant_id,alarm_type) 索引");
++    }
++
++    @Test
++    @DisplayName("菜单种子：172 挂 110 系统监控、组件 monitor/alarm/index、权限 iot:instance:query + 超管授权")
++    void menuSeedRegistered() throws Exception {
++        String ddl = Files.readString(repoRoot().resolve(REL), StandardCharsets.UTF_8);
++        assertTrue(ddl.contains("INSERT INTO `sys_menu`"), "缺 sys_menu 菜单种子");
++        assertTrue(ddl.contains("172, 110, 1"), "菜单 id=172 须挂 110 系统监控");
++        assertTrue(ddl.contains("'monitor/alarm/index'"), "缺组件路径");
++        assertTrue(ddl.contains("'iot:instance:query'"), "权限沿用 iot:instance:query");
++        assertTrue(ddl.contains("WHERE NOT EXISTS"), "菜单种子须幂等");
++        assertTrue(ddl.contains("INSERT INTO `sys_role_menu`"), "缺超管授权段");
++    }
++}
+diff --git a/frontend/src/api/monitor/alarm-api.ts b/frontend/src/api/monitor/alarm-api.ts
+new file mode 100644
+index 0000000..062bd27
+--- /dev/null
++++ b/frontend/src/api/monitor/alarm-api.ts
+@@ -0,0 +1,61 @@
++/*
++ * TASK-0062：系统事件告警管理面端点封装（已登录态 axios）。
++ *
++ * 仅调 D3 管理面端点：
++ * - GET  /api/v1/iot/alarm/list?status=&type=&from=&to=&pageNum=&pageSize=
++ * - POST /api/v1/iot/alarm/{id}/confirm
++ * - POST /api/v1/iot/alarm/{id}/handle?note=
++ *
++ * 安全红线：本页**不持有 appKey/secret、不直连 /openapi/v1/** HMAC、不自造代理**；
++ * tenant 由后端会话强制注入，前端不传也不接受 tenant 参数（跨租户明细 403）。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++import { getRequest, postParamRequest, postRequest } from '/@/lib/axios';
++import type { AlarmRowVO } from '/@/views/monitor/alarm/helper';
++
++/** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
++interface ResultEnvelope<T> {
++  code: number;
++  message?: string;
++  data: T;
++}
++
++/** 后端 AlarmListVO */
++export interface AlarmListVO {
++  rows: AlarmRowVO[];
++  total: number;
++}
++
++export interface AlarmListQuery {
++  status?: number;
++  type?: string;
++  from?: number;
++  to?: number;
++  pageNum?: number;
++  pageSize?: number;
++}
++
++const asArray = <T>(value: T[] | null | undefined): T[] => (Array.isArray(value) ? value : []);
++
++export const alarmApi = {
++  /** 告警分页列表（跨租户 403 由后端拒绝/裁剪，前端不暴露越权入口） */
++  async list(query: AlarmListQuery): Promise<AlarmListVO> {
++    const res: ResultEnvelope<AlarmListVO> = await getRequest('/api/v1/iot/alarm/list', query);
++    const data = res?.data;
++    return { rows: asArray(data?.rows), total: typeof data?.total === 'number' ? data.total : 0 };
++  },
++
++  /** 确认告警（0→1；非法跃迁 409、跨租户 403） */
++  async confirm(id: number): Promise<number> {
++    const res: ResultEnvelope<number> = await postRequest(`/api/v1/iot/alarm/${id}/confirm`, undefined);
++    return res?.data ?? 0;
++  },
++
++  /** 处理告警（0/1→2；note 必填留痕；非法跃迁 409、跨租户 403） */
++  async handle(id: number, note: string): Promise<number> {
++    const res: ResultEnvelope<number> = await postParamRequest(`/api/v1/iot/alarm/${id}/handle`, { note });
++    return res?.data ?? 0;
++  },
++};
+diff --git a/frontend/src/views/monitor/alarm/helper.ts b/frontend/src/views/monitor/alarm/helper.ts
+new file mode 100644
+index 0000000..8a59147
+--- /dev/null
++++ b/frontend/src/views/monitor/alarm/helper.ts
+@@ -0,0 +1,88 @@
++/*
++ * TASK-0062：系统事件告警列表页公共纯函数与类型（可单测，不依赖组件环境）。
++ *
++ * 边界：仅三类系统事件（GATEWAY_OFFLINE/DATA_TIMEOUT/GW_CACHE_BACKLOG）；业务阈值告警
++ * 事件化/通知矩阵/升级策略归三期，阈值一期只驱动展示标红（ADR-0013 增补 6）。
++ * 空态纪律：无告警一律 a-empty/空列表，不造假数据。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++
++/** 三类系统事件告警类型（与后端 AlarmType 对齐） */
++export const ALARM_TYPES = ['GATEWAY_OFFLINE', 'DATA_TIMEOUT', 'GW_CACHE_BACKLOG'] as const;
++export type AlarmType = (typeof ALARM_TYPES)[number];
++
++export const ALARM_TYPE_LABELS: Record<AlarmType, string> = {
++  GATEWAY_OFFLINE: '网关离线',
++  DATA_TIMEOUT: '数据超时未达',
++  GW_CACHE_BACKLOG: '网关缓存积压',
++};
++
++/** 三态状态（与后端 AlarmStatus 对齐） */
++export const ALARM_STATUS = { PENDING: 0, CONFIRMED: 1, HANDLED: 2 } as const;
++export type AlarmStatusValue = (typeof ALARM_STATUS)[keyof typeof ALARM_STATUS];
++
++export const ALARM_STATUS_LABELS: Record<number, string> = {
++  0: '待确认',
++  1: '已确认',
++  2: '已处理',
++};
++
++/** 告警行（对齐后端 AlarmListVO.Row；tenant 由后端会话注入，前端不持有 tenant 字段） */
++export interface AlarmRowVO {
++  id: number;
++  type: AlarmType | string;
++  objectType?: string | null;
++  objectCode?: string | null;
++  level?: string | null;
++  title?: string | null;
++  detail?: string | null;
++  status: AlarmStatusValue | number;
++  statusText?: string | null;
++  handlerId?: number | null;
++  handleNote?: string | null;
++  occurredAt?: number | null;
++  confirmedAt?: number | null;
++  handledAt?: number | null;
++  createdTime?: number | null;
++}
++
++/** 展示用状态标签颜色（待确认红/已确认橙/已处理绿） */
++export function alarmStatusColor(status?: number | null): string {
++  if (status === ALARM_STATUS.PENDING) return 'red';
++  if (status === ALARM_STATUS.CONFIRMED) return 'orange';
++  if (status === ALARM_STATUS.HANDLED) return 'green';
++  return 'default';
++}
++
++/** 展示用级别颜色（ERROR 红；WARN 橙；阈值类一期只标红不告警——本页仅系统事件） */
++export function alarmLevelColor(level?: string | null): string {
++  if (level === 'ERROR') return 'red';
++  if (level === 'WARN') return 'orange';
++  return 'default';
++}
++
++/** 类型中文标签（未知值原样返回，不伪造） */
++export function alarmTypeLabel(type?: string | null): string {
++  if (!type) return '-';
++  return ALARM_TYPE_LABELS[type as AlarmType] || type;
++}
++
++/** 毫秒时间戳 → yyyy-MM-dd HH:mm:ss（前端只格式化，不改后端语义） */
++export function formatAlarmTime(ms?: number | null): string {
++  if (ms == null || !Number.isFinite(ms)) return '-';
++  const d = new Date(ms);
++  if (Number.isNaN(d.getTime())) return '-';
++  const pad = (n: number) => String(n).padStart(2, '0');
++  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
++}
++
++/** 操作列可用性：待确认可确认；待确认/已确认可处理；已处理两者皆禁用 */
++export function canConfirm(status?: number | null): boolean {
++  return status === ALARM_STATUS.PENDING;
++}
++
++export function canHandle(status?: number | null): boolean {
++  return status === ALARM_STATUS.PENDING || status === ALARM_STATUS.CONFIRMED;
++}
+diff --git a/frontend/src/views/monitor/alarm/index.vue b/frontend/src/views/monitor/alarm/index.vue
+new file mode 100644
+index 0000000..b06bc4b
+--- /dev/null
++++ b/frontend/src/views/monitor/alarm/index.vue
+@@ -0,0 +1,245 @@
++<!--
++  * 系统事件告警列表页（TASK-0062）
++  *
++  * 仅系统事件三类（网关离线/数据超时/网关缓存积压）；业务阈值/通知矩阵/升级策略归三期。
++  * 筛选（状态/类型/时间）+ 列表（标题/级别/对象/时间/状态）+ 确认/处理（备注输入）。
++  *
++  * 安全红线：只调 /api/v1/iot/alarm/** 管理面端点（已登录态 axios），
++  * 不持有 appKey/secret、不直连 openapi HMAC、不自造代理；tenant 由后端会话注入。
++  * v-privilege 沿用 iot:instance:query；跨租户 403 由后端裁剪，前端不暴露越权入口。
++  *
++  * @Author: dowei
++  * @Date: 2026-11-24
++-->
++<template>
++  <a-card size="small" :bordered="false" :hoverable="true" v-privilege="'iot:instance:query'">
++    <template #title>系统事件告警</template>
++    <template #extra>
++      <a-button size="small" :loading="loading" @click="loadList">
++        <template #icon><ReloadOutlined /></template>
++        刷新
++      </a-button>
++    </template>
++
++    <a-form layout="inline" class="ot-alarm-filter">
++      <a-form-item label="状态">
++        <a-select v-model:value="query.status" allowClear placeholder="全部" style="width: 120px">
++          <a-select-option :value="0">待确认</a-select-option>
++          <a-select-option :value="1">已确认</a-select-option>
++          <a-select-option :value="2">已处理</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="类型">
++        <a-select v-model:value="query.type" allowClear placeholder="全部" style="width: 160px">
++          <a-select-option v-for="type in ALARM_TYPES" :key="type" :value="type">
++            {{ ALARM_TYPE_LABELS[type] }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="发生时间">
++        <a-range-picker v-model:value="timeRange" :show-time="true" />
++      </a-form-item>
++      <a-form-item>
++        <a-button type="primary" :loading="loading" @click="onSearch">查询</a-button>
++        <a-button style="margin-left: 8px" @click="onReset">重置</a-button>
++      </a-form-item>
++    </a-form>
++
++    <a-table
++      size="small"
++      :dataSource="rows"
++      :columns="columns"
++      bordered
++      rowKey="id"
++      :loading="loading"
++      :pagination="pagination"
++      :locale="{ emptyText: '暂无系统事件告警（无事件源时诚实空态，不造假数据）' }"
++      @change="onTableChange"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'title'">
++          <span>{{ record.title || '-' }}</span>
++        </template>
++        <template v-else-if="column.dataIndex === 'type'">
++          <a-tag :color="alarmTypeColor(record.type)">{{ alarmTypeLabel(record.type) }}</a-tag>
++        </template>
++        <template v-else-if="column.dataIndex === 'level'">
++          <a-tag :color="alarmLevelColor(record.level)">{{ record.level || '-' }}</a-tag>
++        </template>
++        <template v-else-if="column.dataIndex === 'objectCode'">
++          <span>{{ record.objectCode || '-' }}</span>
++        </template>
++        <template v-else-if="column.dataIndex === 'occurredAt'">
++          <span>{{ formatAlarmTime(record.occurredAt) }}</span>
++        </template>
++        <template v-else-if="column.dataIndex === 'status'">
++          <a-tag :color="alarmStatusColor(record.status)">{{ record.statusText || ALARM_STATUS_LABELS[record.status] || '-' }}</a-tag>
++        </template>
++        <template v-else-if="column.dataIndex === 'action'">
++          <a v-if="canConfirm(record.status)" @click="onConfirm(record)">确认</a>
++          <a v-if="canHandle(record.status)" @click="openHandle(record)" style="margin-left: 8px">处理</a>
++          <span v-if="!canConfirm(record.status) && !canHandle(record.status)">-</span>
++        </template>
++      </template>
++    </a-table>
++
++    <a-modal v-model:open="handleModalOpen" title="处理告警" :confirmLoading="handleLoading" @ok="submitHandle" @cancel="handleModalOpen = false">
++      <p>告警：{{ handleTarget?.title || '-' }}（{{ handleTarget?.objectCode || '-' }}）</p>
++      <a-form-item label="处理备注" required>
++        <a-textarea v-model:value="handleNote" :rows="3" placeholder="请填写处理备注（留痕必填）" />
++      </a-form-item>
++    </a-modal>
++  </a-card>
++</template>
++
++<script setup lang="ts">
++  import { onMounted, reactive, ref } from 'vue';
++  import type { TableColumnsType } from 'ant-design-vue';
++  import type { Dayjs } from 'dayjs';
++  import { ReloadOutlined } from '@ant-design/icons-vue';
++  import { message } from 'ant-design-vue';
++  import { alarmApi } from '/@/api/monitor/alarm-api';
++  import {
++    ALARM_TYPES,
++    ALARM_TYPE_LABELS,
++    ALARM_STATUS_LABELS,
++    alarmStatusColor,
++    alarmLevelColor,
++    alarmTypeLabel,
++    formatAlarmTime,
++    canConfirm,
++    canHandle,
++    type AlarmRowVO,
++  } from '/@/views/monitor/alarm/helper';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  /** 类型标签配色：离线红/超时橙/积压橙（仅系统事件） */
++  function alarmTypeColor(type?: string | null): string {
++    if (type === 'GATEWAY_OFFLINE') return 'red';
++    if (type === 'DATA_TIMEOUT') return 'orange';
++    if (type === 'GW_CACHE_BACKLOG') return 'orange';
++    return 'default';
++  }
++
++  const loading = ref(false);
++  const handleLoading = ref(false);
++  const handleModalOpen = ref(false);
++  const handleTarget = ref<AlarmRowVO | null>(null);
++  const handleNote = ref('');
++  const rows = ref<AlarmRowVO[]>([]);
++  const total = ref(0);
++  const timeRange = ref<Dayjs[]>([]);
++
++  const query = reactive<{ status?: number; type?: string; pageNum: number; pageSize: number }>({
++    status: undefined,
++    type: undefined,
++    pageNum: 1,
++    pageSize: 20,
++  });
++
++  const columns: TableColumnsType = [
++    { title: '标题', dataIndex: 'title', ellipsis: true },
++    { title: '类型', dataIndex: 'type', width: 140 },
++    { title: '级别', dataIndex: 'level', width: 90 },
++    { title: '对象', dataIndex: 'objectCode', ellipsis: true },
++    { title: '发生时间', dataIndex: 'occurredAt', width: 170 },
++    { title: '状态', dataIndex: 'status', width: 100 },
++    { title: '操作', dataIndex: 'action', width: 120 },
++  ];
++
++  const pagination = reactive({
++    current: 1,
++    pageSize: 20,
++    total: 0,
++    showSizeChanger: true,
++    showTotal: (t: number) => `共 ${t} 条`,
++  });
++
++  async function loadList() {
++    loading.value = true;
++    try {
++      const [start, end] = timeRange.value.length === 2 ? timeRange.value : [];
++      const res = await alarmApi.list({
++        status: query.status,
++        type: query.type,
++        from: start ? start.valueOf() : undefined,
++        to: end ? end.valueOf() : undefined,
++        pageNum: query.pageNum,
++        pageSize: query.pageSize,
++      });
++      rows.value = res.rows;
++      total.value = res.total;
++      pagination.total = res.total;
++      pagination.current = query.pageNum;
++      pagination.pageSize = query.pageSize;
++    } catch (e) {
++      rows.value = [];
++      total.value = 0;
++      pagination.total = 0;
++      otSentry.captureError(e);
++    } finally {
++      loading.value = false;
++    }
++  }
++
++  function onSearch() {
++    query.pageNum = 1;
++    loadList();
++  }
++
++  function onReset() {
++    query.status = undefined;
++    query.type = undefined;
++    query.pageNum = 1;
++    timeRange.value = [];
++    loadList();
++  }
++
++  function onTableChange(pag: { current?: number; pageSize?: number }) {
++    query.pageNum = pag.current ?? 1;
++    query.pageSize = pag.pageSize ?? 20;
++    loadList();
++  }
++
++  async function onConfirm(record: AlarmRowVO) {
++    try {
++      await alarmApi.confirm(record.id);
++      message.success('已确认');
++      loadList();
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  function openHandle(record: AlarmRowVO) {
++    handleTarget.value = record;
++    handleNote.value = '';
++    handleModalOpen.value = true;
++  }
++
++  async function submitHandle() {
++    if (!handleTarget.value || !handleNote.value.trim()) {
++      message.warning('请填写处理备注');
++      return;
++    }
++    handleLoading.value = true;
++    try {
++      await alarmApi.handle(handleTarget.value.id, handleNote.value.trim());
++      message.success('已处理');
++      handleModalOpen.value = false;
++      loadList();
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      handleLoading.value = false;
++    }
++  }
++
++  onMounted(loadList);
++</script>
++
++<style lang="less" scoped>
++  .ot-alarm-filter {
++    margin-bottom: 12px;
++  }
++</style>
+diff --git a/frontend/tests/unit/monitor/alarm-helper.spec.ts b/frontend/tests/unit/monitor/alarm-helper.spec.ts
+new file mode 100644
+index 0000000..73785e3
+--- /dev/null
++++ b/frontend/tests/unit/monitor/alarm-helper.spec.ts
+@@ -0,0 +1,53 @@
++/*
++ * TASK-0062：告警列表页 helper 契约——三类系统事件、状态流转守卫、空态、展示配色。
++ *
++ * @Author: dowei
++ * @Date: 2026-11-24
++ */
++import { describe, expect, it } from 'vitest';
++import {
++  ALARM_TYPES,
++  ALARM_STATUS_LABELS,
++  alarmStatusColor,
++  alarmLevelColor,
++  alarmTypeLabel,
++  formatAlarmTime,
++  canConfirm,
++  canHandle,
++  type AlarmType,
++} from '/@/views/monitor/alarm/helper';
++
++describe('TASK-0062 告警列表 helper', () => {
++  it('仅三类系统事件类型（业务阈值不在一期）', () => {
++    const types: AlarmType[] = [...ALARM_TYPES];
++    expect(types).toEqual(['GATEWAY_OFFLINE', 'DATA_TIMEOUT', 'GW_CACHE_BACKLOG']);
++    expect(types).not.toContain('THRESHOLD');
++  });
++
++  it('三态状态标签与配色', () => {
++    expect(ALARM_STATUS_LABELS[0]).toBe('待确认');
++    expect(ALARM_STATUS_LABELS[1]).toBe('已确认');
++    expect(ALARM_STATUS_LABELS[2]).toBe('已处理');
++    expect(alarmStatusColor(0)).toBe('red');
++    expect(alarmStatusColor(1)).toBe('orange');
++    expect(alarmStatusColor(2)).toBe('green');
++    expect(alarmLevelColor('ERROR')).toBe('red');
++    expect(alarmLevelColor('WARN')).toBe('orange');
++  });
++
++  it('操作可用性：待确认可确认/处理，已确认只可处理，已处理两者皆禁（与后端 409 同口径）', () => {
++    expect(canConfirm(0)).toBe(true);
++    expect(canConfirm(1)).toBe(false);
++    expect(canHandle(0)).toBe(true);
++    expect(canHandle(1)).toBe(true);
++    expect(canHandle(2)).toBe(false);
++  });
++
++  it('时间/类型格式化：空值占位不造假', () => {
++    expect(formatAlarmTime(null)).toBe('-');
++    expect(formatAlarmTime(undefined)).toBe('-');
++    expect(alarmTypeLabel(null)).toBe('-');
++    expect(alarmTypeLabel('GATEWAY_OFFLINE')).toBe('网关离线');
++    expect(alarmTypeLabel('CUSTOM')).toBe('CUSTOM');
++  });
++});
+diff --git a/resources/sql/upgrade/20261124_iot_alarm.sql b/resources/sql/upgrade/20261124_iot_alarm.sql
+new file mode 100644
+index 0000000..8d4c9f6
+--- /dev/null
++++ b/resources/sql/upgrade/20261124_iot_alarm.sql
+@@ -0,0 +1,74 @@
++-- ============================================================
++-- TASK-0062：IoT 系统事件告警记录表 + 站内提醒出口表 + 告警列表页菜单种子
++--   依据：ADR-0013 增补 6（系统事件告警最小闭环边界）、REQ-0031（运维监控与平台业务巡检）、
++--         TASK-0062 brief D1/D4（告警记录表定版，补上游修订⑩空缺）。
++-- ============================================================
++-- 重要声明（brief 契约）：
++--   1) 本脚本由 Agent **只产出、不在用户库执行**（用户 MySQL phpStudy 8.0.12@3307）。
++--      由部署方按环境自行执行，每条语句经 backend/scripts/sql-exec.sh 单独一次调用。
++--   2) 该通道按「;\n」切分，故每条语句必须独占一行（含 INSERT ... SELECT ... WHERE NOT EXISTS
++--      不换行内再带分号），同行多语句会 SQLERROR。
++--   3) iot_alarm_record **套审计四件套**（create_time/create_by/update_time/update_by/deleted）——
++--      告警确认/处理需留操作人（REQ-0031 验收 5），与 0061 巡检结果表（系统级无操作员，不套）不同；
++--      本域走 JdbcTemplate 显式写列（工程无全局 MetaObjectHandler，不依赖 MP 自动填充）。
++--   4) 幂等：CREATE TABLE IF NOT EXISTS + INSERT ... WHERE NOT EXISTS 判存，可重复执行无副作用；
++--      告警去重靠 uk_alarm_dedup(tenant_id, alarm_type, object_code, occurred_at)。
++--   5) 仅系统事件三类（GATEWAY_OFFLINE/DATA_TIMEOUT/GW_CACHE_BACKLOG）；业务阈值告警/通知矩阵/
++--      升级策略归三期不做；阈值一期只驱动展示标红。
++-- ============================================================
++
++-- ① 系统事件告警记录表
++CREATE TABLE IF NOT EXISTS `iot_alarm_record` (
++  `id`            bigint       NOT NULL AUTO_INCREMENT COMMENT '主键 ID',
++  `tenant_id`     bigint       NOT NULL                COMMENT '租户 ID（会话强制注入，跨租户 403）',
++  `alarm_type`    varchar(32)  NOT NULL                COMMENT '告警类型：GATEWAY_OFFLINE 网关异常离线 / DATA_TIMEOUT 数据超时未达 / GW_CACHE_BACKLOG 网关缓存积压（仅系统事件，ADR-0013 增补 6）',
++  `object_type`   varchar(32)  NOT NULL                COMMENT '对象类型：GATEWAY 网关 / INSTANCE 实例（DATA_TIMEOUT 按 full_key 逐项）',
++  `object_code`   varchar(96)  NOT NULL                COMMENT '对象编码：gateway_code 或 full_key',
++  `alarm_level`   varchar(16)  NOT NULL                COMMENT '级别：WARN 警告（离线/缓存积压）/ ERROR 错误（停算类）',
++  `title`         varchar(256) NOT NULL                COMMENT '告警标题（如“网关离线”）',
++  `detail`        varchar(1000) DEFAULT NULL          COMMENT '原因/上下文（文本或 JSON；含 reason + gatewayId + occurredAt）',
++  `status`        tinyint      NOT NULL DEFAULT 0      COMMENT '状态：0 待确认 1 已确认 2 已处理',
++  `handler_id`    bigint       DEFAULT NULL            COMMENT '处理人 ID（登录用户，确认/处理留痕）',
++  `handle_note`   varchar(500) DEFAULT NULL            COMMENT '处理备注（处理时必填）',
++  `occurred_at`   datetime     NOT NULL                COMMENT '事件发生时间（告警去重键之一）',
++  `confirmed_at`  datetime     DEFAULT NULL            COMMENT '确认时间（0→1 写入）',
++  `handled_at`    datetime     DEFAULT NULL            COMMENT '处理时间（→2 写入）',
++  `create_time`   datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（审计四件套）',
++  `created_time`  datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间（D1 字段口径；与 create_time 同值，兼容既有查询习惯）',
++  `create_by`     bigint       DEFAULT NULL            COMMENT '创建人（系统事件生成=0，审计四件套）',
++  `update_time`   datetime     DEFAULT NULL            COMMENT '更新时间（审计四件套）',
++  `update_by`     bigint       DEFAULT NULL            COMMENT '更新人（确认/处理=当前登录用户，审计四件套）',
++  `deleted`       tinyint      NOT NULL DEFAULT 0      COMMENT '删除标记（审计四件套）',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_alarm_dedup` (`tenant_id`, `alarm_type`, `object_code`, `occurred_at`),
++  KEY `idx_tenant_status_time` (`tenant_id`, `status`, `occurred_at`),
++  KEY `idx_tenant_type` (`tenant_id`, `alarm_type`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='IoT 系统事件告警记录（TASK-0062；确认/处理留痕，唯一键去重）';
++
++-- ② 站内提醒出口表（独立轻量表，不污染 sys_notice 公告表；一期只落站内不外发邮件/企微）
++CREATE TABLE IF NOT EXISTS `iot_alarm_notice` (
++  `id`          bigint       NOT NULL AUTO_INCREMENT COMMENT '主键 ID',
++  `tenant_id`   bigint       NOT NULL                COMMENT '租户 ID（会话/事件强制注入）',
++  `alarm_id`    bigint       NOT NULL                COMMENT '关联 iot_alarm_record.id',
++  `alarm_type`  varchar(32)  NOT NULL                COMMENT '告警类型（与告警记录同源）',
++  `title`       varchar(256) NOT NULL                COMMENT '提醒标题',
++  `target_role` varchar(64)  NOT NULL                COMMENT '目标角色（ot.alarm.notice-target-role，默认 platform_admin）',
++  `read_status` tinyint      NOT NULL DEFAULT 0      COMMENT '已读：0 未读 1 已读',
++  `create_time` datetime     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '提醒落库时间',
++  PRIMARY KEY (`id`),
++  KEY `idx_tenant_role_read` (`tenant_id`, `target_role`, `read_status`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='IoT 告警站内提醒出口（TASK-0062；独立表不污染公告，不外发）';
++
++-- ③ 菜单种子：挂 110「系统监控」下，id=172（0061 占用 171；权限沿用 iot:instance:query）
++INSERT INTO `sys_menu` (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`) SELECT 172, 110, 1, 'IoT告警列表', 2, '/monitor/alarm', 'monitor/alarm/index', NULL, 'iot:instance:query', 'AlertOutlined', 9, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0 WHERE NOT EXISTS (SELECT 1 FROM `sys_menu` WHERE `id` = 172);
++
++-- ④ 超管 role_id=1 授权（普通角色零反向授权，界面按需分配；仿 0061 幂等写法）
++INSERT INTO `sys_role_menu` (`role_id`, `menu_id`) SELECT 1, 172 WHERE NOT EXISTS (SELECT 1 FROM `sys_role_menu` WHERE `role_id` = 1 AND `menu_id` = 172);
++
++-- ============================================================
++-- 执行后核对（每条单独一次调用，sql-exec.sh）：
++--   SHOW CREATE TABLE `iot_alarm_record`;
++--   SHOW CREATE TABLE `iot_alarm_notice`;
++--   SELECT id, parent_id, perms FROM sys_menu WHERE id = 172;  -- 期望 110 / iot:instance:query
++--   SELECT * FROM sys_role_menu WHERE menu_id = 172;          -- 期望 (1,172)
++-- ============================================================

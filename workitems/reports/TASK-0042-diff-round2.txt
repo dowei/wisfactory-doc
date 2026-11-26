@@ -1,0 +1,69 @@
+diff --git a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+index f410fef..e0cc557 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
++++ b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+@@ -222,16 +222,21 @@ public final class DualTriggerExecutor {
+     }
+ 
+     /**
+-     * DELTA 公式求值：从 DELTA(arg) 提取入参 key 与当前样本，交原生算子差分。
+-     * 支持「DELTA(x)」纯调用与「DELTA(x) 作为更大表达式的一部分」——本期能源计量预置为纯调用
+-     * （多算子/嵌套组合的真 Aviator 归 FEAT-0012）。质量码随差分结果透传，不打假 0。
++     * DELTA 公式求值（I-1 修订轮，fail-closed）：**只接受纯 {@code DELTA(key)} 单形态**
++     * （允许首尾空白）。复合表达式（如 {@code DELTA(x)/3600}、{@code 2*DELTA(x)}）虽被 0040
++     * 校验器接受，但本期不解析——多算子/嵌套组合归 FEAT-0012 表达式引擎；若此处正则只取首个
++     * DELTA(x) 就 success，会丢弃后缀运算、静默算成原始差分（违背 REQ-0019「用量÷周期时长=
++     * 平均流量」与 CONV-02「不写假值」）。故严格 {@link java.util.regex.Matcher#matches()} 全串
++     * 匹配，非纯形态抛异常由单节点失败隔离（sample=null、不发假 0）。
+      */
+     private CalcResult evaluateDeltaFormula(String key, String formula, GraphNode node,
+                                             DependencyGraph graph, long ts) {
+         java.util.regex.Matcher m = java.util.regex.Pattern
+-                .compile("DELTA\\s*\\(\\s*([A-Za-z_][\\w.]*)\\s*\\)").matcher(formula);
+-        if (!m.find()) {
+-            throw new IllegalStateException("DELTA 公式形态不支持: " + formula);
++                .compile("DELTA\\s*\\(\\s*([A-Za-z_][\\w.]*)\\s*\\)")
++                .matcher(formula.trim());
++        if (!m.matches()) {
++            throw new IllegalStateException("DELTA 公式形态不支持（仅接受纯 DELTA(key)，复合表达式归"
++                    + " FEAT-0012 表达式引擎）: " + formula);
+         }
+         String argKey = m.group(1);
+         ValueSample current = store.get(argKey);
+diff --git a/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java b/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java
+index b97e7b0..8d232dc 100644
+--- a/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java
+@@ -80,6 +80,32 @@ class OperatorIntegrationContractTest {
+         assertTrue(r.error().contains("0042") || r.error().contains("算子"));
+     }
+ 
++    @Test
++    void compositeDeltaExpressionFailsClosedNotSilentlyWrongValue() {
++        // I-1（修订轮，评审必修）：公式 DELTA(x)/3600 已被 0040 校验器接受（REQ-0019「用量÷周期
++        // 时长=平均流量」），旧实现 evaluateDeltaFormula 正则只取首个 DELTA(x) 就 success，丢弃
++        // /3600，静默算成原始差分（无质量码）——违背 REQ-0019 + CONV-02 不写假值。复合形态归
++        // FEAT-0012 表达式引擎，本期在范围修正为 fail-closed：隔离失败、不发假值。
++        for (String composite : java.util.List.of(
++                "DELTA(EQ1.METER.V)/3600",       // 带后缀运算（评审点名形态）
++                "2*DELTA(EQ1.METER.V)",          // 带前缀运算
++                "DELTA(EQ1.METER.V)+1")) {       // 带后缀加运算
++            DataItem flow = formula(1, "EQ1.FLOW.V", composite);
++            DependencyGraph g = graph(flow, "EQ1.METER.V");
++            ValueStore store = new ValueStore();
++            store.put("EQ1.METER.V", 105.0, 2000L);
++            DualTriggerExecutor ex = new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
++                    new ResultSink.InMemoryResultSink(), new RollupOperator(), new OperatorEvaluator());
++            List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 2000L), g);
++            CalcResult r = out.stream().filter(x -> x.fullKey().equals("EQ1.FLOW.V")).findFirst().orElseThrow();
++            assertFalse(r.isSuccess(), "复合 DELTA 表达式须隔离失败（不发假值）: " + composite);
++            assertNull(r.sample(), "失败结果无样本、不写假 0: " + composite);
++            assertNotNull(r.error());
++            assertTrue(r.error().contains("DELTA") || r.error().contains("形态"),
++                    "失败原因指向 DELTA 形态不支持: " + composite + " error=" + r.error());
++        }
++    }
++
+     @Test
+     void handWrittenIntegralIsRejectedByWhitelist() {
+         // ADR-0010：INTEGRAL 不开放手写——白名单拒绝（即使执行器注入了算子桥）

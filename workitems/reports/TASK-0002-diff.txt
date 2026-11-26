@@ -1,0 +1,2541 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java
+index 69ce68b..66e7ba5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java
+@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm;
+ import net.otlab.admin.module.iot.service.SysTenantService;
+ import net.otlab.core.annotation.OperateLog;
+ import net.otlab.core.constant.BusinessType;
+@@ -18,7 +19,7 @@ import java.util.List;
+ import java.util.stream.Collectors;
+ 
+ /**
+- * 租户管理控制器（TASK-0001）
++ * 租户管理控制器（TASK-0001 / TASK-0002）
+  *
+  * <p>路径扁平化 /tenant；权限前缀 iot:tenant:*（不沿用 system:* 惯例）；
+  * 配额字段（pointQuota/storageQuotaGb/expireTime）随新增/编辑接口下发，不单设权限点。
+@@ -89,4 +90,19 @@ public class SysTenantController {
+         tenantService.deleteTenantByIds(idList);
+         return Result.success();
+     }
++
++    /**
++     * 初始化租户管理员（TASK-0002，brief 裁决 4）：REQ-0001 验收 1
++     * 「运营方新建租户并初始化管理员后，该管理员可登录且只见本租户数据」要求此流程存在。
++     * tenant_id 强制取路径租户 id 而非会话租户（管理面例外，路径即授权范围）；
++     * 仅运营方可用（权限点已控），目标租户必须存在且 status=1。
++     */
++    @OperateLog(title = "租户", businessType = BusinessType.INSERT)
++    @Operation(summary = "初始化租户管理员")
++    @PostMapping("/{id}/init-admin")
++    @SaCheckPermission("iot:tenant:admin")
++    public Result<Long> initTenantAdmin(@PathVariable("id") Long id,
++                                        @Valid @RequestBody TenantAdminCreateForm form) {
++        return Result.success(tenantService.initTenantAdmin(id, form));
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/TenantAdminCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/TenantAdminCreateForm.java
+new file mode 100644
+index 0000000..85de82b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/dto/TenantAdminCreateForm.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 初始化租户管理员请求表单（TASK-0002）
++ *
++ * <p>POST /tenant/{id}/init-admin——运营方新建租户后初始化管理员（REQ-0001 验收 1）。
++ * password 与 /user 创建口径一致：前端 SM4 密文；tenant_id 不在表单里——
++ * 强制取路径租户 id（管理面例外，路径即授权范围），禁止前端传参指定（REQ-0001 核心规则）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Data
++@Schema(description = "初始化租户管理员表单")
++public class TenantAdminCreateForm {
++
++    @NotBlank(message = "用户名不能为空")
++    @Size(max = 50, message = "用户名长度不能超过 50")
++    @Schema(description = "管理员用户名（租户内唯一，与库内已有同名用户并存按 (tenant_id, username) 隔离）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String username;
++
++    @NotBlank(message = "昵称不能为空")
++    @Size(max = 50, message = "昵称长度不能超过 50")
++    @Schema(description = "昵称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String nickname;
++
++    @NotBlank(message = "密码不能为空")
++    @Schema(description = "初始密码（前端 SM4 密文，与 /user 创建口径一致）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String password;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+index 9e11681..6117445 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+@@ -3,6 +3,7 @@ package net.otlab.admin.module.iot.service;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.IService;
+ import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm;
+ 
+ import java.util.List;
+ 
+@@ -23,4 +24,26 @@ public interface SysTenantService extends IService<SysTenant> {
+     boolean updateTenantStatus(Long id, Integer status);
+ 
+     boolean deleteTenantByIds(List<Long> ids);
++
++    /**
++     * 按编码查询启用中的租户——登录链路「先定租户」专用（TASK-0002 / ADR-0011 TD-0040）。
++     *
++     * @param tenantCode 租户编码
++     * @return 编码匹配且 status=1 的租户；不存在、已禁用或已删除一律返回 null
++     */
++    SysTenant selectEnabledByCode(String tenantCode);
++
++    /**
++     * 运营方初始化租户管理员——POST /tenant/{id}/init-admin（TASK-0002，REQ-0001 验收 1）。
++     *
++     * <p>目标租户必须存在且 status=1；tenant_id 强制取路径租户 id 而非会话租户
++     * （管理面例外，路径即授权范围）；(tenant_id, username) 唯一，重复报 4002；
++     * 自动供给租户管理员角色（每租户一个，role_code 按租户号派生）并绑定到新管理员，
++     * 保证初始化后该管理员可登录且只见本租户数据。
++     *
++     * @param tenantId 路径租户 ID
++     * @param form     管理员表单（username/nickname/password，password 为前端 SM4 密文）
++     * @return 新管理员用户 ID
++     */
++    Long initTenantAdmin(Long tenantId, TenantAdminCreateForm form);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+index fa9fc0d..d7bd7e4 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+@@ -4,11 +4,24 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm;
+ import net.otlab.admin.module.iot.mapper.SysTenantMapper;
+ import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.system.entity.SysMenu;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysRoleMenu;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.mapper.SysMenuMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMenuMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import net.otlab.admin.module.system.service.SysUserService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+@@ -16,19 +29,55 @@ import org.springframework.transaction.annotation.Transactional;
+ import java.util.List;
+ 
+ /**
+- * 租户服务实现类（TASK-0001）
++ * 租户服务实现类（TASK-0001 / TASK-0002）
+  *
+  * <p>编码唯一性双道闸：先对活跃行（@TableLogic 过滤 deleted=0）预检，友好报 4002；
+  * 再捕获 {@link DuplicateKeyException} 兜底——uk_tenant_code 是物理唯一索引，
+  * 逻辑删不释放编码，兜底覆盖「已删除行仍占用编码」场景（删除后编码不复用，
+  * 详细设计 §1.1 既定纪律）。
+  *
++ * <p>TASK-0002 新增 init-admin：目标租户必须存在且 status=1；tenant_id 强制取路径租户
++ * 而非会话租户（管理面例外，路径即授权范围）；(tenant_id, username) 双道闸——
++ * 精确预检走 SysUserMapper 旁路计数（会话态下白名单表查询被插件追加会话租户条件，
++ * 跨租户预检必须显式旁路），兜底由 SysUserServiceImpl.insertTenantUser 捕获
++ * DuplicateKeyException 映射 4002。
++ *
+  * @author dowei
+  * @date 2026-11-21
+  */
+ @Service
+ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant> implements SysTenantService {
+ 
++    /** 租户管理员角色编码前缀：uk_role_code 全局唯一，按租户号派生保证每租户一个（TASK-0002） */
++    private static final String TENANT_ADMIN_ROLE_CODE_PREFIX = "tenant_admin_";
++
++    /** 租户管理员角色名 */
++    private static final String TENANT_ADMIN_ROLE_NAME = "租户管理员";
++
++    /** 租户管理页面行 id（sys_menu 4001）——租户管理员角色不授予租户管理子树 */
++    private static final long TENANT_MANAGE_MENU_ID = 4001L;
++
++    /** 运营方专属权限前缀——租户管理员角色一律不授予（建租户/改配额/初始化管理员是运营方职能） */
++    private static final String OPERATOR_PERMS_PREFIX = "iot:tenant:";
++
++    @Autowired
++    private SysUserMapper userMapper;
++
++    @Autowired
++    private SysUserRoleMapper userRoleMapper;
++
++    @Autowired
++    private SysRoleMapper roleMapper;
++
++    @Autowired
++    private SysRoleMenuMapper roleMenuMapper;
++
++    @Autowired
++    private SysMenuMapper menuMapper;
++
++    @Autowired
++    private SysUserService userService;
++
+     @Override
+     public Page<SysTenant> selectTenantList(Page<SysTenant> page, SysTenant tenant) {
+         LambdaQueryWrapper<SysTenant> wrapper = new LambdaQueryWrapper<>();
+@@ -114,6 +163,108 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+         return this.removeByIds(ids);
+     }
+ 
++    @Override
++    public SysTenant selectEnabledByCode(String tenantCode) {
++        // 登录链路「先定租户」（TASK-0002 / ADR-0011 TD-0040）。sys_tenant 不在多租户插件
++        // 白名单内（租户主数据平台级），任何会话态下都不被注入租户条件；deleted 由 @TableLogic 过滤。
++        LambdaQueryWrapper<SysTenant> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(SysTenant::getTenantCode, tenantCode);
++        SysTenant tenant = this.getOne(wrapper, false);
++        if (tenant == null || tenant.getStatus() == null || tenant.getStatus() != 1) {
++            return null;
++        }
++        return tenant;
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public Long initTenantAdmin(Long tenantId, TenantAdminCreateForm form) {
++        // 目标租户必须存在且 status=1（brief 裁决 4：越权防护——目标租户存在性校验即授权范围校验）
++        SysTenant tenant = this.getById(tenantId);
++        if (tenant == null || tenant.getStatus() == null || tenant.getStatus() != 1) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "目标租户不存在或已禁用");
++        }
++        // 供给租户管理员角色（复用/创建），保证初始化后管理员可登录且只见本租户数据（REQ-0001 验收 1）
++        SysRole adminRole = ensureTenantAdminRole(tenantId);
++        // (tenant_id, username) 精确预检：旁路计数（会话态下白名单表查询被插件追加会话租户条件，
++        // 直接 lambda 查询跨租户必然漏检）——重复报 4002
++        if (userMapper.countByTenantAndUsername(tenantId, form.getUsername()) > 0) {
++            throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "用户名已存在: " + form.getUsername());
++        }
++        // 复用现有用户创建管线（SysUserService.insertTenantUser）：tenant_id 强制取路径租户而非会话租户，
++        // 撞 uk_tenant_username 兜底亦映射 4002
++        SysUser user = new SysUser();
++        user.setUsername(form.getUsername());
++        user.setNickname(form.getNickname());
++        user.setPassword(form.getPassword());
++        user.setStatus(1);
++        user.setUserType(1);
++        userService.insertTenantUser(user, tenantId);
++        // 绑定租户管理员角色（关联行 tenant_id=路径租户，非会话租户）
++        SysUserRole userRole = new SysUserRole();
++        userRole.setUserId(user.getId());
++        userRole.setRoleId(adminRole.getId());
++        userRole.setTenantId(tenantId);
++        userRoleMapper.insert(userRole);
++        return user.getId();
++    }
++
++    /**
++     * 供给租户管理员角色：每租户一个，role_code 按租户号派生（uk_role_code 全局唯一，
++     * 详细设计 §0.4「租户管理员用角色表达，不扩 user_type 枚举」）。
++     * 角色存在则复用；不存在则创建并授予<b>除租户管理子树外</b>的全部菜单——
++     * sys_menu 平台级各租户共用，租户内可见数据由多租户插件按会话租户隔离（菜单授权与
++     * 数据隔离正交）；但「租户管理」页（sys_menu 4001）与其全部 iot:tenant:* 按钮行
++     * （建租户/改配额/启停/初始化管理员）是运营方职能，不授予——否则租户管理员可直调
++     * init-admin 等运营方端点，越权防护（operator 直调 → 403）失效。
++     */
++    private SysRole ensureTenantAdminRole(Long tenantId) {
++        String roleCode = TENANT_ADMIN_ROLE_CODE_PREFIX + tenantId;
++        // 旁路查询（会话租户≠路径租户时，直接查询会被插件追加会话租户条件必然查空 → 重复撞 uk_role_code）
++        SysRole existing = roleMapper.selectByTenantAndCode(tenantId, roleCode);
++        if (existing != null) {
++            return existing;
++        }
++        SysRole role = new SysRole();
++        role.setRoleName(TENANT_ADMIN_ROLE_NAME);
++        role.setRoleCode(roleCode);
++        role.setDataScope(1); // 租户内全部数据（多租户插件已按租户收敛，ALL 即本租户全部）
++        role.setStatus(1);
++        role.setTenantId(tenantId);
++        try {
++            roleMapper.insert(role);
++        } catch (DuplicateKeyException e) {
++            // 并发初始化撞 uk_role_code：复用既有行
++            existing = roleMapper.selectByTenantAndCode(tenantId, roleCode);
++            if (existing == null) {
++                throw e;
++            }
++            return existing;
++        }
++        // 授予菜单（平台级 sys_menu 不分租户；授权行 tenant_id=路径租户），排除租户管理子树
++        List<SysMenu> menus = menuMapper.selectList(new LambdaQueryWrapper<>());
++        for (SysMenu menu : menus) {
++            if (isOperatorOnlyMenu(menu)) {
++                continue;
++            }
++            SysRoleMenu roleMenu = new SysRoleMenu();
++            roleMenu.setRoleId(role.getId());
++            roleMenu.setMenuId(menu.getId());
++            roleMenu.setTenantId(tenantId);
++            roleMenuMapper.insert(roleMenu);
++        }
++        return role;
++    }
++
++    /** 租户管理页面行与其全部 iot:tenant:* 按钮行归运营方专属，租户管理员不授予 */
++    private boolean isOperatorOnlyMenu(SysMenu menu) {
++        if (menu.getId() != null && menu.getId() == TENANT_MANAGE_MENU_ID) {
++            return true;
++        }
++        return menu.getPerms() != null && menu.getPerms().startsWith(OPERATOR_PERMS_PREFIX);
++    }
++
+     private BusinessException duplicateCode(String tenantCode) {
+         return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "租户编码已存在: " + tenantCode);
+     }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/controller/LoginController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/controller/LoginController.java
+index 6e8cadb..1f9effd 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/controller/LoginController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/controller/LoginController.java
+@@ -1,6 +1,7 @@
+ package net.otlab.admin.module.system.controller;
+ 
+ import cn.dev33.satoken.stp.StpUtil;
++import cn.hutool.core.util.StrUtil;
+ import cn.hutool.crypto.SmUtil;
+ import cn.hutool.crypto.digest.BCrypt;
+ import cn.hutool.crypto.symmetric.SM4;
+@@ -8,6 +9,8 @@ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.validation.Valid;
+ import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.service.SysTenantService;
+ import net.otlab.admin.module.system.entity.SysUser;
+ import net.otlab.admin.module.system.entity.dto.CaptchaVO;
+ import net.otlab.admin.module.system.entity.dto.LoginDTO;
+@@ -24,6 +27,8 @@ import net.otlab.core.constant.CacheConstants;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.module.redis.RedisService;
+ import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.core.env.Environment;
+@@ -37,7 +42,12 @@ import java.util.concurrent.TimeUnit;
+ 
+ /**
+  * 登录控制器
+- * 
++ *
++ * <p>登录先定租户再查用户（TASK-0002 / ADR-0011 TD-0040 定版）：显式 tenantCode 优先，
++ * 缺省走配置 ot.tenant.default-code（私有化包注入默认租户后用户无感）；租户不存在或
++ * status=0 拒绝登录；用户查询显式带 (tenant_id, username)；登录成功后 Sa-Token 会话
++ * 写入 tenant_id / tenant_code，后续链路统一从会话取。
++ *
+  * @author dowei
+  * @date 2026-06-10
+  */
+@@ -50,6 +60,10 @@ public class LoginController {
+     @Value("${sm4.key}")
+     private String sm4Key;
+ 
++    /** 登录缺省租户编码（ot.tenant.default-code，缺省 default；私有化包经该配置注入默认租户） */
++    @Value("${ot.tenant.default-code:default}")
++    private String defaultTenantCode;
++
+     @Autowired
+     protected SysUserService userService;
+ 
+@@ -62,16 +76,37 @@ public class LoginController {
+     @Autowired
+     protected LoginLogService loginLogService;
+ 
++    @Autowired
++    protected SysTenantService tenantService;
++
+     @Autowired
+     private Environment environment;
+ 
++    /**
++     * 登录先定租户（TASK-0002 / ADR-0011 TD-0040）：显式 tenantCode 优先，缺省走配置默认编码；
++     * 按编码查 sys_tenant（interceptor 白名单外，无注入干扰）——不存在或 status=0 一律拒绝。
++     */
++    private SysTenant resolveLoginTenant(LoginDTO loginDTO) {
++        String tenantCode = StrUtil.isNotBlank(loginDTO.getTenantCode())
++                ? loginDTO.getTenantCode().trim()
++                : defaultTenantCode;
++        SysTenant tenant = tenantService.selectEnabledByCode(tenantCode);
++        if (tenant == null) {
++            // 不区分「不存在」与「已禁用」的对外文案（brief 裁决 2，不新增枚举）
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户不存在或已禁用");
++        }
++        return tenant;
++    }
++
+     @OperateLog(title = "用户登录", businessType = BusinessType.OTHER)
+     @Operation(summary = "用户登录")
+     @PostMapping("/login")
+     @Anonymous
+     @RepeatSubmit(interval = 1000)
+     public Result<LoginVO> login(@Valid @RequestBody LoginDTO loginDTO) {
+-        SysUser user = userService.selectUserByUsername(loginDTO.getUsername());
++        // 登录先定租户再查用户（TASK-0002）
++        SysTenant tenant = resolveLoginTenant(loginDTO);
++        SysUser user = userService.selectUserByTenantAndUsername(tenant.getId(), loginDTO.getUsername());
+         if (user == null) {
+             loginLogService.recordLoginLog(null, null, loginDTO.getUsername(), 1, 0, "用户不存在");
+             // 对外统一提示，避免暴露用户名是否存在（可枚举）
+@@ -132,6 +167,9 @@ public class LoginController {
+         StpUtil.login(user.getId());
+         StpUtil.getSession().set("username", user.getUsername());
+         StpUtil.getSession().set("nickname", user.getNickname());
++        // 会话写入租户（TASK-0002）：后续链路（多租户插件 / 服务层覆盖 / 权限查询）统一从会话取
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_ID, tenant.getId());
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_CODE, tenant.getTenantCode());
+         loginLogService.recordLoginLog(user.getId(), user.getUserType(), user.getUsername(), 1, 1, null);
+ 
+         LoginVO loginVO = new LoginVO();
+@@ -217,15 +255,17 @@ public class LoginController {
+             throw new BusinessException("auth.testLoginDevOnly");
+         }
+         log.warn("使用测试登录接口，用户名: {}", loginDTO.getUsername());
+-        
+-        SysUser user = userService.selectUserByUsername(loginDTO.getUsername());
++
++        // 登录先定租户再查用户（与正式登录同口径，TASK-0002）
++        SysTenant tenant = resolveLoginTenant(loginDTO);
++        SysUser user = userService.selectUserByTenantAndUsername(tenant.getId(), loginDTO.getUsername());
+         if (user == null) {
+             throw new BusinessException("auth.loginFailed");
+         }
+         if (user.getStatus() != 1) {
+             throw new BusinessException("auth.accountDisabled");
+         }
+-        
++
+         // 直接使用明文密码校验（不需要SM4解密）
+         if (!BCrypt.checkpw(loginDTO.getPassword(), user.getPassword())) {
+             loginFailService.recordLoginFail(user.getId(), user.getUserType(), user.getUsername());
+@@ -238,6 +278,9 @@ public class LoginController {
+         StpUtil.login(user.getId());
+         StpUtil.getSession().set("username", user.getUsername());
+         StpUtil.getSession().set("nickname", user.getNickname());
++        // 会话写入租户（TASK-0002）：与正式登录同口径
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_ID, tenant.getId());
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_CODE, tenant.getTenantCode());
+         loginLogService.recordLoginLog(user.getId(), user.getUserType(), user.getUsername(), 1, 1, null);
+ 
+         LoginVO loginVO = new LoginVO();
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysConfig.java
+index cb3cdcd..7fe6bbc 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysConfig.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysConfig.java
+@@ -29,6 +29,8 @@ public class SysConfig extends BaseEntity {
+     @Schema(description = "参数主键")
+     private Long id;
+ 
++    /** 租户ID（可空预留：空=平台级，非空=租户级覆盖，一期不启用也不过滤，TASK-0002） */
++    private Long tenantId;
+     @NotBlank(message = "{system.config.nameBlank}")
+     @Size(max = 100, message = "{system.config.nameTooLong}")
+     @Schema(description = "参数名称", requiredMode = Schema.RequiredMode.REQUIRED)
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDept.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDept.java
+index 0fcee80..4c8015b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDept.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDept.java
+@@ -22,6 +22,8 @@ public class SysDept extends BaseEntity {
+     @TableId(type = IdType.AUTO)
+     private Long id;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；部门树按租户隔离，ancestors 路径不变，TASK-0002） */
++    private Long tenantId;
+     /** 父部门ID */
+     private Long parentId;
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDict.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDict.java
+index 8831b3d..f34fa6b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDict.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysDict.java
+@@ -30,6 +30,8 @@ public class SysDict extends BaseEntity {
+     @Schema(description = "字典主键")
+     private Long id;
+ 
++    /** 租户ID（可空预留：空=平台级，非空=租户级覆盖，一期不启用也不过滤，TASK-0002） */
++    private Long tenantId;
+     @NotBlank(message = "{system.dict.nameBlank}")
+     @Size(max = 100, message = "{system.dict.nameTooLong}")
+     @Schema(description = "字典名称", requiredMode = Schema.RequiredMode.REQUIRED)
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRole.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRole.java
+index c8307ab..1539239 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRole.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRole.java
+@@ -21,6 +21,8 @@ public class SysRole extends BaseEntity {
+     @TableId(type = IdType.AUTO)
+     private Long id;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；推荐直接加字段、查询条件简单不易串租户，TASK-0002） */
++    private Long tenantId;
+     /** 角色名称 */
+     private String roleName;
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleDept.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleDept.java
+index 95b3e43..dc423f6 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleDept.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleDept.java
+@@ -15,6 +15,8 @@ public class SysRoleDept {
+     /** 角色ID */
+     private Long roleId;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；init-admin 场景取路径租户，TASK-0002） */
++    private Long tenantId;
+     /** 部门ID */
+     private Long deptId;
+ }
+\ No newline at end of file
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleMenu.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleMenu.java
+index 5203a51..9d9c5a9 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleMenu.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysRoleMenu.java
+@@ -15,6 +15,8 @@ public class SysRoleMenu {
+     /** 角色ID */
+     private Long roleId;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；init-admin 场景取路径租户，TASK-0002） */
++    private Long tenantId;
+     /** 菜单ID */
+     private Long menuId;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUser.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUser.java
+index 2e5e178..1ef2120 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUser.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUser.java
+@@ -33,6 +33,9 @@ public class SysUser extends BaseEntity {
+     @TableId(type = IdType.AUTO)
+     private Long id;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；唯一约束 (tenant_id, username)，TASK-0002） */
++    private Long tenantId;
++
+     /** 用户名 */
+     private String username;
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUserRole.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUserRole.java
+index 7c6578c..171db02 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUserRole.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysUserRole.java
+@@ -15,6 +15,8 @@ public class SysUserRole {
+     /** 用户ID */
+     private Long userId;
+ 
++    /** 租户ID（登录态/调用上下文注入，禁前端传参；init-admin 场景取路径租户，TASK-0002） */
++    private Long tenantId;
+     /** 角色ID */
+     private Long roleId;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/dto/LoginDTO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/dto/LoginDTO.java
+index 7f0eeee..329b863 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/dto/LoginDTO.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/dto/LoginDTO.java
+@@ -20,4 +20,11 @@ public class LoginDTO {
+     private String captcha;
+ 
+     private String uuid;
++
++    /**
++     * 租户编码（可选，TASK-0002 / ADR-0011 TD-0040 定版）：
++     * 显式传入优先；缺省走配置 ot.tenant.default-code（私有化包注入默认租户后用户无感）。
++     * 按编码查 sys_tenant：不存在或 status=0 → 拒绝登录。
++     */
++    private String tenantCode;
+ }
+\ No newline at end of file
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysRoleMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysRoleMapper.java
+index 6820354..760381e 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysRoleMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysRoleMapper.java
+@@ -1,15 +1,29 @@
+ package net.otlab.admin.module.system.mapper;
+ 
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+ import net.otlab.admin.module.system.entity.SysRole;
+ import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
+ 
+ /**
+  * 角色数据访问层
+- * 
++ *
+  * @author dowei
+- * @date 2026-06-10
++ * @date 2026-06-12
+  */
+ @Mapper
+ public interface SysRoleMapper extends BaseMapper<SysRole> {
+-}
+\ No newline at end of file
++
++    /**
++     * 按 (tenant_id, role_code) 显式查询角色——init-admin 供给租户管理员角色用（TASK-0002）。
++     *
++     * <p>必须旁路多租户插件：运营方（会话租户=1）为租户 A 供给角色时，会话态下 sys_role
++     * 查询会被插件追加 {@code tenant_id=1}，永远看不到租户 A 的角色，导致每次 init-admin
++     * 都重复建角色并撞 uk_role_code；旁路后以路径租户显式条件查询。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT * FROM sys_role WHERE tenant_id = #{tenantId} AND role_code = #{roleCode} AND deleted = 0")
++    SysRole selectByTenantAndCode(@Param("tenantId") Long tenantId, @Param("roleCode") String roleCode);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysUserMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysUserMapper.java
+index c5f21a9..57ce780 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysUserMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/mapper/SysUserMapper.java
+@@ -1,15 +1,40 @@
+ package net.otlab.admin.module.system.mapper;
+ 
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+ import net.otlab.admin.module.system.entity.SysUser;
+ import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
+ 
+ /**
+  * 用户数据访问层
+- * 
++ *
+  * @author dowei
+  * @date 2026-06-10
+  */
+ @Mapper
+ public interface SysUserMapper extends BaseMapper<SysUser> {
+-}
+\ No newline at end of file
++
++    /**
++     * 按 (tenant_id, username) 显式查询用户——登录链路专用（TASK-0002）。
++     *
++     * <p>必须旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}）：
++     * 登录上下文无会话固然不会注入，但「已登录用户重登另一租户」时请求头仍携带旧 token，
++     * 会话租户会被插件追加进 WHERE（{@code tenant_id=<旧租户>}），导致跨租户重登必然查空；
++     * 旁路后由本方法显式 (tenant_id, username) 条件保证语义（brief 裁决 2：服务层显式条件）。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT * FROM sys_user WHERE tenant_id = #{tenantId} AND username = #{username} AND deleted = 0")
++    SysUser selectByTenantAndUsername(@Param("tenantId") Long tenantId, @Param("username") String username);
++
++    /**
++     * 按 (tenant_id, username) 精确计数——init-admin 重复预检与同名两租户并存判定（TASK-0002）。
++     *
++     * <p>必须旁路多租户插件：会话态下白名单表查询会被追加会话租户条件
++     * （{@code tenant_id=<会话租户>}），跨租户精确预检必然漏检；旁路后以路径租户显式计数。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT COUNT(*) FROM sys_user WHERE tenant_id = #{tenantId} AND username = #{username} AND deleted = 0")
++    int countByTenantAndUsername(@Param("tenantId") Long tenantId, @Param("username") String username);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/SysUserService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/SysUserService.java
+index 422c6dd..3f4265a 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/SysUserService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/SysUserService.java
+@@ -34,15 +34,41 @@ public interface SysUserService extends IService<SysUser> {
+      * @return 导出结果：successCount / failCount / failMessages
+      */
+     Map<String, Object> importUsers(List<SysUser> users);
+-    
++
+     SysUser selectUserByUsername(String username);
+-    
++
++    /**
++     * 按 (tenant_id, username) 显式查询用户——登录链路专用（TASK-0002）。
++     *
++     * <p>登录上下文无会话时多租户插件不注入，但「已登录重登另一租户」时请求头仍携带旧 token，
++     * 会话租户会被插件追加进 WHERE——本方法经 SysUserMapper 旁路方法显式带 (tenant_id, username)
++     * 条件查询，保证跨租户重登语义正确（ADR-0011 / TD-0040）。
++     *
++     * @param tenantId 已解析的租户 ID（登录先定租户再查用户）
++     * @param username 用户名
++     * @return 用户（不存在返回 null）
++     */
++    SysUser selectUserByTenantAndUsername(Long tenantId, String username);
++
+     boolean insertUser(SysUser user);
+-    
++
++    /**
++     * 以指定租户新建用户——运营方 init-admin 专用（TASK-0002 管理面例外）。
++     *
++     * <p>tenant_id 强制取调用方给定的路径租户 id 而非会话租户（路径即授权范围）；
++     * 密码管线（SM4 解密/明文长度校验/BCrypt/加密指纹列）与 {@link #insertUser(SysUser)} 完全一致；
++     * 撞 (tenant_id, username) 唯一索引兜底映射业务码 4002（REQ-0001 验收 2）。
++     *
++     * @param user     用户实体（username/nickname/password 必填；password 为前端 SM4 密文）
++     * @param tenantId 路径租户 ID
++     * @return 是否创建成功
++     */
++    boolean insertTenantUser(SysUser user, Long tenantId);
++
+     boolean updateUser(SysUser user);
+-    
++
+     boolean deleteUserById(Long userId);
+-    
++
+     /**
+      * 修改密码
+      *
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysConfigServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysConfigServiceImpl.java
+index c0c8043..e3ef9c4 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysConfigServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysConfigServiceImpl.java
+@@ -42,6 +42,8 @@ public class SysConfigServiceImpl extends ServiceImpl<SysConfigMapper, SysConfig
+ 
+     @Override
+     public boolean insertConfig(SysConfig config) {
++        // 一期不启用租户级覆盖（TASK-0002）：tenant_id 仅预留列，写侧一律平台级（置空不落请求值）
++        config.setTenantId(null);
+         // 校验参数键名唯一
+         LambdaQueryWrapper<SysConfig> wrapper = new LambdaQueryWrapper<>();
+         wrapper.eq(SysConfig::getConfigKey, config.getConfigKey());
+@@ -58,6 +60,8 @@ public class SysConfigServiceImpl extends ServiceImpl<SysConfigMapper, SysConfig
+ 
+     @Override
+     public boolean updateConfig(SysConfig config) {
++        // 一期不启用租户级覆盖（TASK-0002）：tenant_id 仅预留列，写侧一律平台级（置空不落请求值）
++        config.setTenantId(null);
+         // 校验参数键名唯一
+         LambdaQueryWrapper<SysConfig> wrapper = new LambdaQueryWrapper<>();
+         wrapper.eq(SysConfig::getConfigKey, config.getConfigKey())
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
+index 330661e..3711cdb 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDeptServiceImpl.java
+@@ -9,6 +9,7 @@ import net.otlab.admin.module.system.mapper.SysDeptMapper;
+ import net.otlab.admin.module.system.mapper.SysUserMapper;
+ import net.otlab.admin.module.system.service.SysDeptService;
+ import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.SqlLikeUtils;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.stereotype.Service;
+@@ -73,6 +74,8 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+ 
+     @Override
+     public boolean insertDept(SysDept dept) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）
++        dept.setTenantId(TenantContext.getTenantId());
+         // 服务端维护祖级列表：数据权限「本部门及下属」按 ancestors 匹配（DataScopeServiceImpl.selectChildDeptIds），
+         // 前端传值不可信，漏传即静默失效（BUG-0059）
+         dept.setAncestors(resolveAncestors(dept.getParentId()));
+@@ -82,6 +85,9 @@ public class SysDeptServiceImpl extends ServiceImpl<SysDeptMapper, SysDept> impl
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean updateDept(SysDept dept) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）；
++        // 与多租户插件的 WHERE 租户条件叠加：跨租户 UPDATE 既匹配不到行、SET 也不可能改写他租户
++        dept.setTenantId(TenantContext.getTenantId());
+         SysDept old = this.getById(dept.getId());
+         if (old == null) {
+             throw new BusinessException("system.dept.notFound");
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDictServiceImpl.java
+index bd7c4dc..4a12216 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDictServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysDictServiceImpl.java
+@@ -45,6 +45,8 @@ public class SysDictServiceImpl extends ServiceImpl<SysDictMapper, SysDict> impl
+ 
+     @Override
+     public boolean insertDict(SysDict dict) {
++        // 一期不启用租户级覆盖（TASK-0002）：tenant_id 仅预留列，写侧一律平台级（置空不落请求值）
++        dict.setTenantId(null);
+         // 校验字典编码唯一
+         LambdaQueryWrapper<SysDict> codeWrapper = new LambdaQueryWrapper<>();
+         codeWrapper.eq(SysDict::getDictCode, dict.getDictCode());
+@@ -67,6 +69,8 @@ public class SysDictServiceImpl extends ServiceImpl<SysDictMapper, SysDict> impl
+ 
+     @Override
+     public boolean updateDict(SysDict dict) {
++        // 一期不启用租户级覆盖（TASK-0002）：tenant_id 仅预留列，写侧一律平台级（置空不落请求值）
++        dict.setTenantId(null);
+         // 校验字典编码唯一
+         LambdaQueryWrapper<SysDict> codeWrapper = new LambdaQueryWrapper<>();
+         codeWrapper.eq(SysDict::getDictCode, dict.getDictCode())
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
+index e5ec181..bb70381 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysRoleServiceImpl.java
+@@ -28,6 +28,7 @@ import net.otlab.admin.module.system.service.SysRoleService;
+ import net.otlab.admin.module.system.service.SysDeptService;
+ import net.otlab.core.constant.DataScopeEnum;
+ import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.SqlLikeUtils;
+ import org.apache.commons.lang3.math.NumberUtils;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -84,6 +85,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean insertRole(SysRole role, List<Long> menuIds, List<Long> deptIds) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）
++        role.setTenantId(TenantContext.getTenantId());
+         // 检查角色编码是否存在
+         LambdaQueryWrapper<SysRole> wrapper = new LambdaQueryWrapper<>();
+         wrapper.eq(SysRole::getRoleCode, role.getRoleCode());
+@@ -118,6 +121,9 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean updateRole(SysRole role, List<Long> menuIds, List<Long> deptIds) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）；
++        // 与多租户插件的 WHERE 租户条件叠加：跨租户 UPDATE 既匹配不到行、SET 也不可能改写他租户
++        role.setTenantId(TenantContext.getTenantId());
+         // 检查角色编码是否存在
+         LambdaQueryWrapper<SysRole> wrapper = new LambdaQueryWrapper<>();
+         wrapper.eq(SysRole::getRoleCode, role.getRoleCode())
+@@ -300,6 +306,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+             SysRoleMenu roleMenu = new SysRoleMenu();
+             roleMenu.setRoleId(roleId);
+             roleMenu.setMenuId(menuId);
++            // 关联行 tenant_id 从会话注入（sys_role_menu 租户白名单表，TASK-0002）
++            roleMenu.setTenantId(TenantContext.getTenantId());
+             roleMenuList.add(roleMenu);
+         }
+         for (SysRoleMenu roleMenu : roleMenuList) {
+@@ -316,6 +324,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+             SysRoleDept roleDept = new SysRoleDept();
+             roleDept.setRoleId(roleId);
+             roleDept.setDeptId(deptId);
++            // 关联行 tenant_id 从会话注入（sys_role_dept 租户白名单表，TASK-0002）
++            roleDept.setTenantId(TenantContext.getTenantId());
+             roleDeptList.add(roleDept);
+         }
+         for (SysRoleDept roleDept : roleDeptList) {
+@@ -391,6 +401,8 @@ public class SysRoleServiceImpl extends ServiceImpl<SysRoleMapper, SysRole> impl
+                 SysUserRole userRole = new SysUserRole();
+                 userRole.setUserId(userId);
+                 userRole.setRoleId(roleId);
++                // 关联行 tenant_id 从会话注入（sys_user_role 租户白名单表，TASK-0002）
++                userRole.setTenantId(TenantContext.getTenantId());
+                 userRoleMapper.insert(userRole);
+             }
+         }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
+index cf5c379..edcc3b7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/service/impl/SysUserServiceImpl.java
+@@ -37,7 +37,9 @@ import org.springframework.dao.DuplicateKeyException;
+ import net.otlab.core.constant.Constant;
+ import net.otlab.core.constant.DataScopeEnum;
+ import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
+ import net.otlab.core.security.CryptoIndex;
++import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.SecurityUtils;
+ import net.otlab.core.utils.SqlLikeUtils;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -112,6 +114,8 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+                 if (this.count(wrapper) > 0) {
+                     throw new BusinessException("system.user.nameExists");
+                 }
++                // 导入行 tenant_id 由服务层从会话覆盖，不信任请求行（REQ-0001 核心规则，TASK-0002）
++                user.setTenantId(TenantContext.getTenantId());
+                 // 导入用户统一使用默认密码
+                 user.setPassword(BCrypt.hashpw(Constant.DEFAULT_PASSWORD));
+                 if (user.getStatus() == null) {
+@@ -273,31 +277,68 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+         return this.getOne(wrapper);
+     }
+ 
++    @Override
++    public SysUser selectUserByTenantAndUsername(Long tenantId, String username) {
++        // 登录链路显式 (tenant_id, username) 查询（TASK-0002）：
++        // 走 SysUserMapper 旁路方法（@InterceptorIgnore(tenantLine)）——「已登录重登另一租户」时
++        // 请求头携带旧 token，会话租户会被插件追加进 WHERE，直接 lambda 查询必然查空
++        return baseMapper.selectByTenantAndUsername(tenantId, username);
++    }
++
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean insertUser(SysUser user) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）
++        user.setTenantId(TenantContext.getTenantId());
++        // 会话态下该预检被插件追加租户条件 = 本租户内查重
+         LambdaQueryWrapper<SysUser> wrapper = new LambdaQueryWrapper<>();
+         wrapper.eq(SysUser::getUsername, user.getUsername());
+         if (this.count(wrapper) > 0) {
+             throw new BusinessException("system.user.nameExists");
+         }
+-        // SM4 解密前端传来的加密密码，再用 BCrypt 加密存储
+-        String plainPassword = decryptSm4(user.getPassword());
+-        validatePlainPassword(plainPassword);
+-        user.setPassword(BCrypt.hashpw(plainPassword));
+-        stripMaskedSensitiveFields(user);
+-        fillCryptoIndex(user);
++        prepareUserForInsert(user);
+         try {
+             return this.save(user);
+         } catch (DuplicateKeyException e) {
+-            // 撞 uk_username 的典型场景：与已逻辑删除的同名用户冲突（上方查重被 deleted=0 过滤罩住，BUG-0059）
++            // 撞 uk_tenant_username 的典型场景：与已逻辑删除的同名用户冲突（上方查重被 deleted=0 过滤罩住，BUG-0059）
+             throw new BusinessException("system.user.nameExists");
+         }
+     }
+ 
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean insertTenantUser(SysUser user, Long tenantId) {
++        // init-admin 管理面例外（TASK-0002 裁决 4）：tenant_id 强制取路径租户 id 而非会话租户，
++        // 路径即授权范围；请求体携带的 tenantId 同样被覆盖
++        user.setTenantId(tenantId);
++        prepareUserForInsert(user);
++        try {
++            return this.save(user);
++        } catch (DuplicateKeyException e) {
++            // 精确预检在 SysTenantServiceImpl.initTenantAdmin（旁路计数，会话态下跨租户预检被插件
++            // 追加会话租户条件必然漏检）；此处兜底覆盖并发与跨租户同名的 (tenant_id, username) 冲突 → 4002
++            throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "用户名已存在: " + user.getUsername());
++        }
++    }
++
++    /**
++     * 用户落库前统一管线：SM4 解密前端密文 → 明文长度校验 → BCrypt 存储 →
++     * 脱敏值剥离 → 加密指纹列维护（insertUser / insertTenantUser 共用）
++     */
++    private void prepareUserForInsert(SysUser user) {
++        String plainPassword = decryptSm4(user.getPassword());
++        validatePlainPassword(plainPassword);
++        user.setPassword(BCrypt.hashpw(plainPassword));
++        stripMaskedSensitiveFields(user);
++        fillCryptoIndex(user);
++    }
++
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean updateUser(SysUser user) {
++        // tenant_id 由服务层从会话覆盖，不信任请求体（REQ-0001 核心规则，TASK-0002）；
++        // 与多租户插件的 WHERE 租户条件叠加：跨租户 UPDATE 既匹配不到行、SET 也不可能改写他租户
++        user.setTenantId(TenantContext.getTenantId());
+         // username 变更时查重（排除自身；查重被逻辑删除过滤罩住时由下方 DuplicateKey 兜底，BUG-0059）
+         if (StrUtil.isNotBlank(user.getUsername())) {
+             LambdaQueryWrapper<SysUser> wrapper = new LambdaQueryWrapper<>();
+@@ -438,6 +479,8 @@ public class SysUserServiceImpl extends ServiceImpl<SysUserMapper, SysUser> impl
+             SysUserRole userRole = new SysUserRole();
+             userRole.setUserId(userId);
+             userRole.setRoleId(roleId);
++            // 关联行 tenant_id 从会话注入（sys_user_role 租户白名单表，TASK-0002）
++            userRole.setTenantId(TenantContext.getTenantId());
+             userRoleMapper.insert(userRole);
+         }
+         log.info("用户角色分配完成，userId: {}, 保留: {}, 新增: {}, 移除: {}", userId, targetIds.size() - toAdd.size(), toAdd.size(), toRemove.size());
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index fcc8639..33e4f04 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -23,6 +23,8 @@ ot:
+     login-fail:
+       max-count: 5        # 连续登录失败最大次数，达到后锁定账号
+       lock-minutes: 10    # 锁定时长（分钟）
++  tenant:
++    default-code: ${OT_TENANT_DEFAULT_CODE:default}   # 登录缺省租户编码（TASK-0002 / TD-0040）：登录请求显式 tenantCode 优先，缺省走此值；私有化单租户包注入默认租户后用户无感（01_base 种子约定 default 租户 id=1）
+   crypto:
+     data-key: ${CRYPTO_DATA_KEY:otlab-data260930}    # 敏感数据存储加密密钥（SM4-128，16 字节）；与 sm4.key（登录传输密钥）独立不复用；dev 默认值，生产必须经环境变量 CRYPTO_DATA_KEY 注入；更换需重跑存量迁移
+     index-key: ${CRYPTO_INDEX_KEY:otlab-idx-260930}   # 检索索引 HMAC 密钥（16 字节）；更换需全量重建索引列；生产经 CRYPTO_INDEX_KEY 注入
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java
+index 800862c..5a97e17 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java
+@@ -26,6 +26,7 @@ import java.util.Map;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+@@ -272,4 +273,60 @@ class SysTenantControllerTest {
+ 
+         verify(tenantService).deleteTenantByIds(java.util.List.of(1L, 2L));
+     }
++
++    // ---------- 初始化租户管理员端点（TASK-0002，brief 裁决 4） ----------
++
++    @Test
++    @DisplayName("init-admin 权限注解 - @SaCheckPermission(iot:tenant:admin) + @OperateLog")
++    void testInitAdminPermissionAnnotation() throws Exception {
++        Method method = SysTenantController.class
++                .getMethod("initTenantAdmin", Long.class, net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm.class);
++        assertEquals("iot:tenant:admin", method.getAnnotation(SaCheckPermission.class).value()[0]);
++        assertNotNull(method.getAnnotation(OperateLog.class), "init-admin 缺少 @OperateLog");
++    }
++
++    @Test
++    @DisplayName("init-admin - POST /tenant/{id}/init-admin 透传路径租户与表单，返回用户ID")
++    void testInitAdmin_Success() throws Exception {
++        when(tenantService.initTenantAdmin(eq(10L), any()))
++                .thenReturn(99L);
++
++        mockMvc.perform(post("/tenant/{id}/init-admin", 10L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(Map.of(
++                                "username", "operator",
++                                "nickname", "租户管理员",
++                                "password", "ciphertext"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(99));
++
++        verify(tenantService).initTenantAdmin(eq(10L), any());
++    }
++
++    @Test
++    @DisplayName("init-admin - 参数校验：username/password 缺失返回业务码 400")
++    void testInitAdmin_BlankFields_ParamError() throws Exception {
++        mockMvc.perform(post("/tenant/{id}/init-admin", 10L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(Map.of("nickname", "缺字段"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(tenantService, org.mockito.Mockito.never()).initTenantAdmin(any(), any());
++    }
++
++    @Test
++    @DisplayName("init-admin - 服务层拒绝透传（租户禁用 400 / 重复 4002）")
++    void testInitAdmin_ServiceRejectionPassthrough() throws Exception {
++        when(tenantService.initTenantAdmin(eq(10L), any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "目标租户不存在或已禁用"));
++
++        mockMvc.perform(post("/tenant/{id}/init-admin", 10L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(Map.of(
++                                "username", "operator", "nickname", "n", "password", "c"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java
+new file mode 100644
+index 0000000..2dd84cf
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantInitAdminTest.java
+@@ -0,0 +1,304 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.entity.dto.TenantAdminCreateForm;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.system.entity.SysMenu;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysRoleMenu;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.mapper.SysMenuMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMenuMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import net.otlab.admin.module.system.service.SysUserService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 运营方初始化租户管理员端点服务层单元测试（TASK-0002）
++ *
++ * <p>POST /tenant/{id}/init-admin（权限点 iot:tenant:admin）：目标租户必须存在且 status=1；
++ * 复用现有用户创建管线，tenant_id 强制取路径租户 id 而非会话租户（管理面例外，路径即授权范围）；
++ * (tenant_id, username) 唯一，重复报 4002；同时自动供给租户管理员角色
++ * （REQ-0001 验收 1「初始化管理员后，该管理员可登录且只见本租户数据」要求管理员可用）。
++ *
++ * <p>预检用 @InterceptorIgnore(tenantLine) 旁路查询：会话态下白名单表查询会被拦截器追加
++ * 会话租户条件，跨租户精确预检必须显式旁路（登录链路同理）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysTenantInitAdminTest {
++
++    private static final String SM4_CIPHER = "c0a80101cipher"; // SM4 密文占位（密码管线归 SysUserService）
++
++    @Mock
++    private SysTenantMapper baseMapper;
++
++    @Mock
++    private SysUserMapper userMapper;
++
++    @Mock
++    private SysUserRoleMapper userRoleMapper;
++
++    @Mock
++    private SysRoleMapper roleMapper;
++
++    @Mock
++    private SysRoleMenuMapper roleMenuMapper;
++
++    @Mock
++    private SysMenuMapper menuMapper;
++
++    @Mock
++    private SysUserService userService;
++
++    private SysTenantServiceImpl tenantService;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysTenant.class);
++        TableInfoHelper.initTableInfo(assistant, SysUser.class);
++        TableInfoHelper.initTableInfo(assistant, SysRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysRoleMenu.class);
++        TableInfoHelper.initTableInfo(assistant, SysUserRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysMenu.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantService = new SysTenantServiceImpl();
++        ReflectionTestUtils.setField(tenantService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(tenantService, "userMapper", userMapper);
++        ReflectionTestUtils.setField(tenantService, "userRoleMapper", userRoleMapper);
++        ReflectionTestUtils.setField(tenantService, "roleMapper", roleMapper);
++        ReflectionTestUtils.setField(tenantService, "roleMenuMapper", roleMenuMapper);
++        ReflectionTestUtils.setField(tenantService, "menuMapper", menuMapper);
++        ReflectionTestUtils.setField(tenantService, "userService", userService);
++        // 运营方 admin 登录态（会话租户 1）——init-admin 的 tenant_id 必须来自路径而非会话
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login(1L);
++        StpUtil.getSession().set("tenant_id", 1L);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        // 先注销再清上下文：logout 需要 Sa-Token 上下文（顺序颠倒会抛"上下文尚未初始化"）
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++        mocks.close();
++    }
++
++    private SysTenant activeTenant(long id, String code) {
++        SysTenant tenant = new SysTenant();
++        tenant.setId(id);
++        tenant.setTenantCode(code);
++        tenant.setTenantName("租户" + code);
++        tenant.setStatus(1);
++        return tenant;
++    }
++
++    private TenantAdminCreateForm form() {
++        TenantAdminCreateForm form = new TenantAdminCreateForm();
++        form.setUsername("operator");
++        form.setNickname("租户管理员");
++        form.setPassword(SM4_CIPHER);
++        return form;
++    }
++
++    private void stubCreatedUser(long userId) {
++        when(userService.insertTenantUser(any(SysUser.class), anyLong()))
++                .thenAnswer(inv -> {
++                    SysUser u = inv.getArgument(0);
++                    u.setId(userId);
++                    return true;
++                });
++    }
++
++    @Test
++    @DisplayName("init-admin - 目标租户不存在（或已删除）拒绝：400 且不触用户链路")
++    void testInitAdmin_TenantNotFoundRejected() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> tenantService.initTenantAdmin(99L, form()));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getDefaultMessage().contains("不存在或已禁用"));
++        verify(userService, never()).insertTenantUser(any(), anyLong());
++        verify(userRoleMapper, never()).insert(any(SysUserRole.class));
++    }
++
++    @Test
++    @DisplayName("init-admin - 目标租户已禁用（status=0）拒绝：400")
++    void testInitAdmin_TenantDisabledRejected() {
++        SysTenant disabled = activeTenant(10L, "tenantA");
++        disabled.setStatus(0);
++        when(baseMapper.selectById(10L)).thenReturn(disabled);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> tenantService.initTenantAdmin(10L, form()));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(userService, never()).insertTenantUser(any(), anyLong());
++    }
++
++    @Test
++    @DisplayName("init-admin - (tenant_id, username) 预检命中报 4002（旁路查询按路径租户精确计数，不触用户创建）")
++    void testInitAdmin_DuplicatePreCheck4002() {
++        when(baseMapper.selectById(10L)).thenReturn(activeTenant(10L, "tenantA"));
++        when(roleMapper.selectByTenantAndCode(10L, "tenant_admin_10")).thenReturn(null);
++        when(roleMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(55L);
++            return 1;
++        });
++        when(menuMapper.selectList(any())).thenReturn(List.of());
++        when(userMapper.countByTenantAndUsername(10L, "operator")).thenReturn(1);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> tenantService.initTenantAdmin(10L, form()));
++
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode(), "重复报 4002（brief 裁决 4）");
++        assertEquals(4002, e.getCode());
++        verify(userService, never()).insertTenantUser(any(), anyLong());
++    }
++
++    @Test
++    @DisplayName("init-admin - 成功：tenant_id 强制路径租户、自动供给租户管理员角色并绑定（会话租户 1 不掺入）")
++    void testInitAdmin_SuccessProvisionsRoleAndUser() {
++        when(baseMapper.selectById(10L)).thenReturn(activeTenant(10L, "tenantA"));
++        // 会话租户 1 下不存在该租户的角色（旁路查询按路径租户）→ 自动创建
++        when(roleMapper.selectByTenantAndCode(10L, "tenant_admin_10")).thenReturn(null);
++        when(roleMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(55L);
++            return 1;
++        });
++        SysMenu m1 = new SysMenu();
++        m1.setId(1001L);
++        SysMenu m2 = new SysMenu();
++        m2.setId(1002L);
++        m2.setPerms("system:user:list");
++        SysMenu tenantPage = new SysMenu();
++        tenantPage.setId(4001L); // 租户管理页面行（perms 为空，按 id 排除）
++        SysMenu tenantButton = new SysMenu();
++        tenantButton.setId(4002L);
++        tenantButton.setPerms("iot:tenant:list"); // iot:tenant:* 按钮行（按权限前缀排除）
++        SysMenu initAdminButton = new SysMenu();
++        initAdminButton.setId(4017L);
++        initAdminButton.setPerms("iot:tenant:admin");
++        when(menuMapper.selectList(any())).thenReturn(List.of(m1, m2, tenantPage, tenantButton, initAdminButton));
++        when(userMapper.countByTenantAndUsername(10L, "operator")).thenReturn(0);
++        stubCreatedUser(99L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        Long userId = tenantService.initTenantAdmin(10L, form());
++
++        assertEquals(99L, userId);
++        // 用户：路径租户 10（不是会话租户 1），表单三字段透传给用户创建管线
++        ArgumentCaptor<SysUser> userCaptor = ArgumentCaptor.captor();
++        verify(userService).insertTenantUser(userCaptor.capture(), eq(10L));
++        SysUser created = userCaptor.getValue();
++        assertEquals("operator", created.getUsername());
++        assertEquals("租户管理员", created.getNickname());
++        assertEquals(SM4_CIPHER, created.getPassword());
++        assertEquals(1, created.getStatus());
++        // 角色：role_code 按租户号派生（uk_role_code 全局唯一），tenant_id=路径租户
++        ArgumentCaptor<SysRole> roleCaptor = ArgumentCaptor.captor();
++        verify(roleMapper).insert(roleCaptor.capture());
++        assertEquals("tenant_admin_10", roleCaptor.getValue().getRoleCode());
++        assertEquals("租户管理员", roleCaptor.getValue().getRoleName());
++        assertEquals(10L, roleCaptor.getValue().getTenantId());
++        // 菜单授权行：tenant_id=路径租户（非会话租户）；租户管理子树（4001 页面 + iot:tenant:* 按钮）
++        // 不授予——租户管理员不得管理他租户/建租户，否则越权防护（operator 直调 init-admin → 403）失效
++        ArgumentCaptor<SysRoleMenu> rmCaptor = ArgumentCaptor.captor();
++        verify(roleMenuMapper, times(2)).insert(rmCaptor.capture());
++        assertEquals(List.of(1001L, 1002L), rmCaptor.getAllValues().stream().map(SysRoleMenu::getMenuId).toList());
++        rmCaptor.getAllValues().forEach(rm -> assertEquals(10L, rm.getTenantId()));
++        // 用户-角色绑定行：tenant_id=路径租户
++        ArgumentCaptor<SysUserRole> urCaptor = ArgumentCaptor.captor();
++        verify(userRoleMapper).insert(urCaptor.capture());
++        assertEquals(99L, urCaptor.getValue().getUserId());
++        assertEquals(55L, urCaptor.getValue().getRoleId());
++        assertEquals(10L, urCaptor.getValue().getTenantId());
++    }
++
++    @Test
++    @DisplayName("init-admin - 同名两租户并存：预检按 (tenant_id, username) 精确计数，租户 A 的同名行不影响租户 B")
++    void testInitAdmin_SameUsernameCoexistsAcrossTenants() {
++        when(baseMapper.selectById(20L)).thenReturn(activeTenant(20L, "tenantB"));
++        when(roleMapper.selectByTenantAndCode(20L, "tenant_admin_20")).thenReturn(null);
++        when(roleMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(66L);
++            return 1;
++        });
++        when(menuMapper.selectList(any())).thenReturn(List.of());
++        // 租户 A 已有同名 operator（库里 (10,operator)），租户 B 计数仍为 0——旁路预检按租户隔离
++        when(userMapper.countByTenantAndUsername(20L, "operator")).thenReturn(0);
++        stubCreatedUser(100L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        Long userId = tenantService.initTenantAdmin(20L, form());
++
++        assertEquals(100L, userId);
++        verify(userMapper).countByTenantAndUsername(20L, "operator");
++        verify(userService).insertTenantUser(any(SysUser.class), eq(20L));
++    }
++
++    @Test
++    @DisplayName("init-admin - 租户管理员角色已存在时复用（不重复建角色/授权）")
++    void testInitAdmin_ReuseExistingTenantAdminRole() {
++        when(baseMapper.selectById(10L)).thenReturn(activeTenant(10L, "tenantA"));
++        SysRole existingRole = new SysRole();
++        existingRole.setId(55L);
++        existingRole.setRoleCode("tenant_admin_10");
++        existingRole.setTenantId(10L);
++        when(roleMapper.selectByTenantAndCode(10L, "tenant_admin_10")).thenReturn(existingRole);
++        when(userMapper.countByTenantAndUsername(10L, "operator")).thenReturn(0);
++        stubCreatedUser(101L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        Long userId = tenantService.initTenantAdmin(10L, form());
++
++        assertEquals(101L, userId);
++        verify(roleMapper, never()).insert(any(SysRole.class));
++        verify(roleMenuMapper, never()).insert(any(SysRoleMenu.class));
++        ArgumentCaptor<SysUserRole> urCaptor = ArgumentCaptor.captor();
++        verify(userRoleMapper).insert(urCaptor.capture());
++        assertEquals(55L, urCaptor.getValue().getRoleId());
++        assertEquals(10L, urCaptor.getValue().getTenantId());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/controller/LoginControllerTenantTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/controller/LoginControllerTenantTest.java
+new file mode 100644
+index 0000000..9112de7
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/controller/LoginControllerTenantTest.java
+@@ -0,0 +1,273 @@
++package net.otlab.admin.module.system.controller;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import cn.hutool.crypto.SmUtil;
++import cn.hutool.crypto.digest.BCrypt;
++import cn.hutool.crypto.symmetric.SM4;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.dto.LoginDTO;
++import net.otlab.admin.module.system.service.LoginFailService;
++import net.otlab.admin.module.system.service.LoginLogService;
++import net.otlab.admin.module.system.service.SysUserService;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.module.redis.RedisService;
++import net.otlab.core.tenant.TenantContext;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.core.env.Environment;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.nio.charset.StandardCharsets;
++import java.util.Base64;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.doNothing;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 登录租户注入单元测试（TASK-0002，ADR-0011 / TD-0040 定版口径）
++ *
++ * <p>登录先定租户再查用户：显式 tenantCode 优先，缺省取配置 ot.tenant.default-code；
++ * 租户不存在或 status=0 一律拒绝登录（BusinessException 400「租户不存在或已禁用」）；
++ * 用户查询显式带 (tenant_id, username)（登录上下文无会话，interceptor 不生效，服务层显式条件）；
++ * 登录成功后 Sa-Token 会话写入 tenant_id / tenant_code，后续链路统一从会话取。
++ *
++ * <p>Sa-Token 会话与令牌经 SaTokenContextMockUtil 模拟（sa-token 1.45 内置 mock 上下文），
++ * 不加载 Spring 上下文。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class LoginControllerTenantTest {
++
++    @Mock
++    private SysUserService userService;
++
++    @Mock
++    private RedisService redisService;
++
++    @Mock
++    private LoginFailService loginFailService;
++
++    @Mock
++    private LoginLogService loginLogService;
++
++    @Mock
++    private SysTenantService tenantService;
++
++    @Mock
++    private Environment environment;
++
++    private LoginController loginController;
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        loginController = new LoginController();
++        ReflectionTestUtils.setField(loginController, "userService", userService);
++        ReflectionTestUtils.setField(loginController, "redisService", redisService);
++        ReflectionTestUtils.setField(loginController, "loginFailService", loginFailService);
++        ReflectionTestUtils.setField(loginController, "loginLogService", loginLogService);
++        ReflectionTestUtils.setField(loginController, "tenantService", tenantService);
++        ReflectionTestUtils.setField(loginController, "environment", environment);
++        ReflectionTestUtils.setField(loginController, "sm4Key", "otlab_260829____");
++        ReflectionTestUtils.setField(loginController, "defaultTenantCode", "default");
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(loginController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++        when(environment.getActiveProfiles()).thenReturn(new String[]{"dev"});
++        doNothing().when(loginLogService).recordLoginLog(any(), any(), anyString(), anyInt(), anyInt(), any());
++        doNothing().when(loginFailService).checkLocked(any());
++        doNothing().when(loginFailService).clearLoginFail(any());
++    }
++
++    @AfterEach
++    void clearContext() {
++        // 先注销再清上下文：logout 需要 Sa-Token 上下文；部分用例在循环内已自行清理，
++        // 此时上下文已不在，logout 抛上下文异常按已清理忽略
++        try {
++            StpUtil.logout();
++        } catch (Exception ignored) {
++            // 上下文已清，无需处理
++        }
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    private SysTenant activeTenant(long id, String code) {
++        SysTenant tenant = new SysTenant();
++        tenant.setId(id);
++        tenant.setTenantCode(code);
++        tenant.setTenantName("租户" + code);
++        tenant.setStatus(1);
++        return tenant;
++    }
++
++    /** BCrypt 口径的用户（明文密码 password123） */
++    private SysUser bcryptUser(long id, String username, long tenantId) {
++        SysUser user = new SysUser();
++        user.setId(id);
++        user.setUsername(username);
++        user.setNickname("操作员");
++        user.setStatus(1);
++        user.setUserType(1);
++        user.setTenantId(tenantId);
++        user.setPassword(BCrypt.hashpw("password123"));
++        return user;
++    }
++
++    private String body(LoginDTO dto) throws Exception {
++        return objectMapper.writeValueAsString(dto);
++    }
++
++    private LoginDTO dto(String username, String tenantCode) {
++        LoginDTO dto = new LoginDTO();
++        dto.setUsername(username);
++        dto.setPassword("password123");
++        dto.setTenantCode(tenantCode);
++        return dto;
++    }
++
++    @Test
++    @DisplayName("测试登录 - 显式 tenantCode A/B 各自命中：用户查询显式带 (tenant_id, username)，会话写入租户")
++    void testLoginTest_ExplicitTenantCodeEachTenantHitsOwnUser() throws Exception {
++        SysUser userA = bcryptUser(11L, "operator", 10L);
++        SysUser userB = bcryptUser(22L, "operator", 20L);
++        when(tenantService.selectEnabledByCode("tenantA")).thenReturn(activeTenant(10L, "tenantA"));
++        when(tenantService.selectEnabledByCode("tenantB")).thenReturn(activeTenant(20L, "tenantB"));
++        when(userService.selectUserByTenantAndUsername(10L, "operator")).thenReturn(userA);
++        when(userService.selectUserByTenantAndUsername(20L, "operator")).thenReturn(userB);
++
++        for (String[] tc : new String[][]{{"tenantA", "10"}, {"tenantB", "20"}}) {
++            SaTokenContextMockUtil.setMockContext();
++            StpUtil.logout();
++            mockMvc.perform(post("/auth/login/test").contentType(MediaType.APPLICATION_JSON)
++                            .content(body(dto("operator", tc[0]))))
++                    .andExpect(status().isOk())
++                    .andExpect(jsonPath("$.code").value(200))
++                    .andExpect(jsonPath("$.data.username").value("operator"));
++            // 用户查询显式带租户条件（登录上下文无会话，服务层显式 (tenant_id, username)）
++            verify(userService).selectUserByTenantAndUsername(eq(Long.parseLong(tc[1])), eq("operator"));
++            // 登录成功：Sa-Token 会话写入 tenant_id（与 tenant_code），后续链路统一从会话取
++            assertEquals(Long.parseLong(tc[1]), TenantContext.getTenantId());
++            assertEquals(tc[0], TenantContext.getTenantCode());
++            StpUtil.logout();
++            SaTokenContextMockUtil.clearContext();
++        }
++    }
++
++    @Test
++    @DisplayName("测试登录 - tenantCode 缺省走配置 ot.tenant.default-code（私有化包注入默认租户后用户无感）")
++    void testLoginTest_BlankTenantCodeFallsBackToDefaultCode() throws Exception {
++        when(tenantService.selectEnabledByCode("default")).thenReturn(activeTenant(1L, "default"));
++        when(userService.selectUserByTenantAndUsername(1L, "admin")).thenReturn(bcryptUser(1L, "admin", 1L));
++
++        SaTokenContextMockUtil.setMockContext();
++        mockMvc.perform(post("/auth/login/test").contentType(MediaType.APPLICATION_JSON)
++                        .content(body(dto("admin", null))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(tenantService).selectEnabledByCode("default");
++        verify(userService).selectUserByTenantAndUsername(1L, "admin");
++        assertEquals(1L, TenantContext.getTenantId());
++    }
++
++    @Test
++    @DisplayName("登录 - 租户不存在拒绝：400 租户不存在或已禁用")
++    void testLogin_TenantNotFoundRejected() throws Exception {
++        when(tenantService.selectEnabledByCode("ghost")).thenReturn(null);
++
++        SaTokenContextMockUtil.setMockContext();
++        mockMvc.perform(post("/auth/login").contentType(MediaType.APPLICATION_JSON)
++                        .content(body(dto("admin", "ghost"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400))
++                .andExpect(jsonPath("$.message").value("租户不存在或已禁用"));
++        // 租户先于用户校验：不得触发任何用户查询
++        verify(userService, org.mockito.Mockito.never()).selectUserByTenantAndUsername(anyLong(), anyString());
++    }
++
++    @Test
++    @DisplayName("登录 - 租户已禁用（status=0）拒绝：400 租户不存在或已禁用（TC-0001 步骤 2 禁用口径）")
++    void testLogin_TenantDisabledRejected() throws Exception {
++        // selectEnabledByCode 仅放行 status=1，禁用租户返回 null
++        when(tenantService.selectEnabledByCode("tenantA")).thenReturn(null);
++
++        SaTokenContextMockUtil.setMockContext();
++        mockMvc.perform(post("/auth/login").contentType(MediaType.APPLICATION_JSON)
++                        .content(body(dto("operator", "tenantA"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400))
++                .andExpect(jsonPath("$.message").value("租户不存在或已禁用"));
++    }
++
++    @Test
++    @DisplayName("登录 - 显式租户下用户不存在：统一登录失败提示（不暴露用户名可枚举性）")
++    void testLogin_UserNotFoundInTenantRejected() throws Exception {
++        when(tenantService.selectEnabledByCode("tenantA")).thenReturn(activeTenant(10L, "tenantA"));
++        when(userService.selectUserByTenantAndUsername(10L, "operator")).thenReturn(null);
++
++        SaTokenContextMockUtil.setMockContext();
++        mockMvc.perform(post("/auth/login").contentType(MediaType.APPLICATION_JSON)
++                        .content(body(dto("operator", "tenantA"))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(500));
++        verify(loginLogService).recordLoginLog(isNull(), isNull(), eq("operator"), eq(1), eq(0), any());
++    }
++
++    @Test
++    @DisplayName("登录（正式口）- 验证码 + SM4 全流程：显式租户命中且会话写入租户")
++    void testLogin_FullFlowWritesTenantSession() throws Exception {
++        when(tenantService.selectEnabledByCode("tenantB")).thenReturn(activeTenant(20L, "tenantB"));
++        when(userService.selectUserByTenantAndUsername(20L, "operator"))
++                .thenReturn(bcryptUser(22L, "operator", 20L));
++        when(redisService.getCacheObject(anyString())).thenReturn("x7k2");
++        when(redisService.deleteObject(anyString())).thenReturn(true);
++
++        // 前端口径密文：SM4(json 引号包裹明文) -> hex -> base64
++        SM4 sm4 = SmUtil.sm4("otlab_260829____".getBytes(StandardCharsets.UTF_8));
++        String hex = sm4.encryptHex("\"password123\"");
++        String passwordCipher = Base64.getEncoder().encodeToString(hex.getBytes(StandardCharsets.UTF_8));
++
++        LoginDTO dto = dto("operator", "tenantB");
++        dto.setPassword(passwordCipher);
++        dto.setCaptcha("x7k2");
++        dto.setUuid("uuid-1");
++
++        SaTokenContextMockUtil.setMockContext();
++        mockMvc.perform(post("/auth/login").contentType(MediaType.APPLICATION_JSON)
++                        .content(body(dto)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.userId").value(22));
++        assertEquals(20L, TenantContext.getTenantId());
++        assertEquals("tenantB", TenantContext.getTenantCode());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java
+new file mode 100644
+index 0000000..9e6b401
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysDeptRoleTenantInjectionTest.java
+@@ -0,0 +1,260 @@
++package net.otlab.admin.module.system.service.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysRoleDept;
++import net.otlab.admin.module.system.entity.SysRoleMenu;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.admin.module.system.mapper.SysRoleDeptMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysRoleMenuMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 部门/角色写路径 tenant_id 服务层注入单元测试（TASK-0002）
++ *
++ * <p>REQ-0001 核心规则：tenant_id 由登录态/调用上下文注入，禁止前端传参指定——
++ * dept/role 写接口的实体字段 tenant_id 一律由服务层从会话覆盖，不信任请求体；
++ * 角色菜单/角色部门/用户角色关联行（sys_role_menu/sys_role_dept/sys_user_role，
++ * 均为租户白名单表）写入时同步从会话注入租户。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysDeptRoleTenantInjectionTest {
++
++    @Mock
++    private SysDeptMapper deptBaseMapper;
++
++    @Mock
++    private SysUserMapper userMapper;
++
++    @Mock
++    private SysRoleMapper roleBaseMapper;
++
++    @Mock
++    private SysRoleMenuMapper roleMenuMapper;
++
++    @Mock
++    private SysRoleDeptMapper roleDeptMapper;
++
++    @Mock
++    private SysUserRoleMapper userRoleMapper;
++
++    private SysDeptServiceImpl deptService;
++    private SysRoleServiceImpl roleService;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysDept.class);
++        TableInfoHelper.initTableInfo(assistant, SysRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysRoleMenu.class);
++        TableInfoHelper.initTableInfo(assistant, SysRoleDept.class);
++        TableInfoHelper.initTableInfo(assistant, SysUserRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysUser.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        deptService = new SysDeptServiceImpl();
++        ReflectionTestUtils.setField(deptService, "baseMapper", deptBaseMapper);
++        ReflectionTestUtils.setField(deptService, "userMapper", userMapper);
++        roleService = new SysRoleServiceImpl();
++        ReflectionTestUtils.setField(roleService, "baseMapper", roleBaseMapper);
++        ReflectionTestUtils.setField(roleService, "roleMenuMapper", roleMenuMapper);
++        ReflectionTestUtils.setField(roleService, "roleDeptMapper", roleDeptMapper);
++        ReflectionTestUtils.setField(roleService, "userRoleMapper", userRoleMapper);
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login(1L);
++        StpUtil.getSession().set("tenant_id", 5L);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        // 先注销再清上下文：logout 需要 Sa-Token 上下文（顺序颠倒会抛"上下文尚未初始化"）
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("新增部门 - 请求体携带 tenant_id=9 被覆盖为会话租户 5")
++    void testInsertDept_OverridesRequestTenantIdWithSessionTenant() {
++        when(deptBaseMapper.insert(any(SysDept.class))).thenReturn(1);
++
++        SysDept form = new SysDept();
++        form.setParentId(0L);
++        form.setDeptName("车间A");
++        form.setAncestors("0");
++        form.setTenantId(9L);
++
++        assertTrue(deptService.insertDept(form));
++
++        ArgumentCaptor<SysDept> captor = ArgumentCaptor.captor();
++        verify(deptBaseMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "tenant_id 必须由服务层从会话覆盖，不信任请求体");
++    }
++
++    @Test
++    @DisplayName("修改部门 - 请求体携带 tenant_id=9 被覆盖为会话租户 5")
++    void testUpdateDept_OverridesRequestTenantIdWithSessionTenant() {
++        SysDept old = new SysDept();
++        old.setId(31L);
++        old.setParentId(0L);
++        old.setAncestors("0");
++        when(deptBaseMapper.selectById(31L)).thenReturn(old);
++        when(deptBaseMapper.updateById(any(SysDept.class))).thenReturn(1);
++
++        SysDept form = new SysDept();
++        form.setId(31L);
++        form.setDeptName("车间A改");
++        form.setTenantId(9L);
++
++        assertTrue(deptService.updateDept(form));
++
++        ArgumentCaptor<SysDept> captor = ArgumentCaptor.captor();
++        verify(deptBaseMapper).updateById(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "更新实体 tenant_id 同样以会话值为准");
++    }
++
++    @Test
++    @DisplayName("新增角色 - 请求体携带 tenant_id=9 被覆盖为会话租户 5")
++    void testInsertRole_OverridesRequestTenantIdWithSessionTenant() {
++        when(roleBaseMapper.selectCount(any())).thenReturn(0L);
++        when(roleBaseMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(8L);
++            return 1;
++        });
++
++        SysRole form = new SysRole();
++        form.setRoleName("操作员");
++        form.setRoleCode("operator_role");
++        form.setTenantId(9L);
++
++        assertTrue(roleService.insertRole(form, null, null));
++
++        ArgumentCaptor<SysRole> captor = ArgumentCaptor.captor();
++        verify(roleBaseMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "tenant_id 必须由服务层从会话覆盖，不信任请求体");
++    }
++
++    @Test
++    @DisplayName("新增角色 - 菜单关联行 tenant_id 取会话租户（sys_role_menu 白名单表写入隔离）")
++    void testInsertRole_GrantsMenuRelationsWithSessionTenant() {
++        when(roleBaseMapper.selectCount(any())).thenReturn(0L);
++        when(roleBaseMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(8L);
++            return 1;
++        });
++        when(roleMenuMapper.insert(any(SysRoleMenu.class))).thenReturn(1);
++
++        SysRole form = new SysRole();
++        form.setRoleName("操作员");
++        form.setRoleCode("operator_role");
++
++        assertTrue(roleService.insertRole(form, List.of(1001L, 1002L), null));
++
++        ArgumentCaptor<SysRoleMenu> captor = ArgumentCaptor.captor();
++        verify(roleMenuMapper, org.mockito.Mockito.times(2)).insert(captor.capture());
++        for (SysRoleMenu rm : captor.getAllValues()) {
++            assertEquals(5L, rm.getTenantId(), "角色菜单关联行 tenant_id 由服务层从会话注入");
++            assertEquals(8L, rm.getRoleId());
++        }
++    }
++
++    @Test
++    @DisplayName("自定义数据权限 - 角色部门关联行 tenant_id 取会话租户（sys_role_dept 白名单表写入隔离）")
++    void testInsertRole_GrantsDeptRelationsWithSessionTenant() {
++        when(roleBaseMapper.selectCount(any())).thenReturn(0L);
++        when(roleBaseMapper.insert(any(SysRole.class))).thenAnswer(inv -> {
++            inv.getArgument(0, SysRole.class).setId(8L);
++            return 1;
++        });
++        when(roleDeptMapper.insert(any(SysRoleDept.class))).thenReturn(1);
++
++        SysRole form = new SysRole();
++        form.setRoleName("车间角色");
++        form.setRoleCode("workshop_role");
++        form.setDataScope(5); // 自定义 → 写角色部门关联
++
++        assertTrue(roleService.insertRole(form, null, List.of(31L, 32L)));
++
++        ArgumentCaptor<SysRoleDept> captor = ArgumentCaptor.captor();
++        verify(roleDeptMapper, org.mockito.Mockito.times(2)).insert(captor.capture());
++        for (SysRoleDept rd : captor.getAllValues()) {
++            assertEquals(5L, rd.getTenantId(), "角色部门关联行 tenant_id 由服务层从会话注入");
++            assertEquals(8L, rd.getRoleId());
++        }
++    }
++
++    @Test
++    @DisplayName("角色加用户 - 用户角色关联行 tenant_id 取会话租户（sys_user_role 白名单表写入隔离）")
++    void testAddUsersToRole_InsertsRelationRowsWithSessionTenant() {
++        SysRole role = new SysRole();
++        role.setId(8L);
++        when(roleBaseMapper.selectById(8L)).thenReturn(role);
++        when(userRoleMapper.selectCount(any())).thenReturn(0L);
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        net.otlab.admin.module.system.entity.dto.RoleUserUpdateForm updateForm =
++                new net.otlab.admin.module.system.entity.dto.RoleUserUpdateForm();
++        updateForm.setRoleId(8L);
++        updateForm.setUserIds(List.of(77L));
++
++        roleService.addUsersToRole(updateForm);
++
++        ArgumentCaptor<SysUserRole> captor = ArgumentCaptor.captor();
++        verify(userRoleMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "用户角色关联行 tenant_id 由服务层从会话注入");
++        assertEquals(77L, captor.getValue().getUserId());
++        assertEquals(8L, captor.getValue().getRoleId());
++    }
++
++    @Test
++    @DisplayName("修改角色 - 请求体携带 tenant_id=9 被覆盖为会话租户 5")
++    void testUpdateRole_OverridesRequestTenantIdWithSessionTenant() {
++        when(roleBaseMapper.selectCount(any())).thenReturn(0L);
++        when(roleBaseMapper.updateById(any(SysRole.class))).thenReturn(1);
++
++        SysRole form = new SysRole();
++        form.setId(8L);
++        form.setRoleName("操作员改");
++        form.setRoleCode("operator_role");
++        form.setTenantId(9L);
++
++        assertTrue(roleService.updateRole(form, null, null));
++
++        ArgumentCaptor<SysRole> captor = ArgumentCaptor.captor();
++        verify(roleBaseMapper).updateById(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "更新实体 tenant_id 同样以会话值为准");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java
+new file mode 100644
+index 0000000..72aee87
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/service/impl/SysUserTenantInjectionTest.java
+@@ -0,0 +1,238 @@
++package net.otlab.admin.module.system.service.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import cn.hutool.crypto.SmUtil;
++import cn.hutool.crypto.symmetric.SM4;
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.system.entity.SysRole;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.SysUserRole;
++import net.otlab.admin.module.system.mapper.SysRoleMapper;
++import net.otlab.admin.module.system.mapper.SysUserMapper;
++import net.otlab.admin.module.system.mapper.SysUserRoleMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.charset.StandardCharsets;
++import java.util.Base64;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 用户写路径 tenant_id 服务层注入单元测试（TASK-0002）
++ *
++ * <p>REQ-0001 核心规则：tenant_id 由登录态/调用上下文注入，禁止前端传参指定——
++ * user 写接口的实体字段 tenant_id 一律由服务层从会话覆盖，不信任请求体；
++ * 唯一例外是运营方 init-admin（tenant_id 强制取路径租户 id 而非会话租户，管理面例外，
++ * 路径即授权范围，随本任务新增 insertTenantUser 交付）。
++ *
++ * <p>Sa-Token mock 上下文模拟「会话已写租户」的登录态（sa-token 1.45 内置 mock）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysUserTenantInjectionTest {
++
++    private static final String SM4_KEY = "otlab_260829____";
++
++    @Mock
++    private SysUserMapper baseMapper;
++
++    @Mock
++    private SysUserRoleMapper userRoleMapper;
++
++    @Mock
++    private SysRoleMapper roleMapper;
++
++    private SysUserServiceImpl userService;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, SysUser.class);
++        TableInfoHelper.initTableInfo(assistant, SysUserRole.class);
++        TableInfoHelper.initTableInfo(assistant, SysRole.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        userService = spy(new SysUserServiceImpl());
++        ReflectionTestUtils.setField(userService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(userService, "userRoleMapper", userRoleMapper);
++        ReflectionTestUtils.setField(userService, "roleMapper", roleMapper);
++        ReflectionTestUtils.setField(userService, "sm4Key", SM4_KEY);
++        SaTokenContextMockUtil.setMockContext();
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        // 先注销再清上下文：logout 需要 Sa-Token 上下文（顺序颠倒会抛"上下文尚未初始化"）
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++        mocks.close();
++    }
++
++    /** 登录并写会话租户（模拟登录链路成功后的 Sa-Token 会话注入） */
++    private void loginWithTenant(long tenantId) {
++        StpUtil.login(1L);
++        StpUtil.getSession().set("tenant_id", tenantId);
++    }
++
++    /** 与 LoginController 同口径的前端密码密文：SM4(json 引号包裹明文) -> hex -> base64 */
++    private String cipherPassword(String plain) {
++        SM4 sm4 = SmUtil.sm4(SM4_KEY.getBytes(StandardCharsets.UTF_8));
++        String hex = sm4.encryptHex("\"" + plain + "\"");
++        return Base64.getEncoder().encodeToString(hex.getBytes(StandardCharsets.UTF_8));
++    }
++
++    @Test
++    @DisplayName("新增用户 - 请求体携带 tenant_id=9 被覆盖为会话租户 5（禁前端传参指定）")
++    void testInsertUser_OverridesRequestTenantIdWithSessionTenant() {
++        loginWithTenant(5L);
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysUser.class))).thenReturn(1);
++
++        SysUser form = new SysUser();
++        form.setUsername("operator");
++        form.setPassword(cipherPassword("Password123"));
++        form.setTenantId(9L); // 恶意/误传的请求体租户
++
++        assertTrue(userService.insertUser(form));
++
++        ArgumentCaptor<SysUser> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "tenant_id 必须由服务层从会话覆盖，不信任请求体");
++    }
++
++    @Test
++    @DisplayName("修改用户 - 请求体携带 tenant_id=9 被覆盖为会话租户 5")
++    void testUpdateUser_OverridesRequestTenantIdWithSessionTenant() {
++        loginWithTenant(5L);
++        doReturn(true).when(userService).updateById(any(SysUser.class));
++
++        SysUser form = new SysUser();
++        form.setId(77L);
++        form.setNickname("改昵称");
++        form.setTenantId(9L);
++
++        assertTrue(userService.updateUser(form));
++
++        ArgumentCaptor<SysUser> captor = ArgumentCaptor.captor();
++        verify(userService).updateById(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "更新实体 tenant_id 同样以会话值为准");
++    }
++
++    @Test
++    @DisplayName("init-admin 例外 - insertTenantUser 强制取路径租户 7（非会话租户 1）")
++    void testInsertTenantUser_ForcesPathVariableTenantId() {
++        loginWithTenant(1L); // 运营方 admin 会话租户为 default=1
++        when(baseMapper.insert(any(SysUser.class))).thenReturn(1);
++
++        SysUser form = new SysUser();
++        form.setUsername("operator");
++        form.setPassword(cipherPassword("Password123"));
++        form.setTenantId(9L); // 请求体值同样不被信任
++
++        assertTrue(userService.insertTenantUser(form, 7L));
++
++        ArgumentCaptor<SysUser> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(7L, captor.getValue().getTenantId(), "init-admin 的 tenant_id 强制取路径租户 id");
++        assertEquals(7L, form.getTenantId());
++    }
++
++    @Test
++    @DisplayName("init-admin 例外 - 同租户同名撞 (tenant_id, username) 唯一索引兜底报 4002")
++    void testInsertTenantUser_DuplicateMapsTo4002() {
++        loginWithTenant(1L);
++        // 精确预检（init-admin 层旁路查询）放行后，落库撞 uk_tenant_username 兜底
++        when(baseMapper.insert(any(SysUser.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '7-operator' for key 'uk_tenant_username'"));
++
++        SysUser form = new SysUser();
++        form.setUsername("operator");
++        form.setPassword(cipherPassword("Password123"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> userService.insertTenantUser(form, 7L));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode(), "init-admin 重复报 4002");
++        assertEquals(4002, e.getCode());
++    }
++
++    @Test
++    @DisplayName("按租户+用户名显式查询 - 委派 @InterceptorIgnore(tenantLine) 旁路方法（登录链路显式条件）")
++    void testSelectUserByTenantAndUsername_DelegatesToBypassMapper() {
++        SysUser expected = new SysUser();
++        expected.setId(11L);
++        when(baseMapper.selectByTenantAndUsername(10L, "operator")).thenReturn(expected);
++
++        SysUser actual = userService.selectUserByTenantAndUsername(10L, "operator");
++
++        assertEquals(11L, actual.getId());
++        verify(baseMapper).selectByTenantAndUsername(10L, "operator");
++    }
++
++    @Test
++    @DisplayName("批量导入 - 每行 tenant_id 由服务层从会话覆盖（请求行携带 tenant_id=9 被覆盖为 5）")
++    void testImportUsers_OverridesRowTenantIdWithSessionTenant() {
++        loginWithTenant(5L);
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysUser.class))).thenReturn(1);
++
++        SysUser row = new SysUser();
++        row.setUsername("imported1");
++        row.setTenantId(9L);
++        row.setPassword(null); // 导入统一默认密码
++
++        userService.importUsers(List.of(row));
++
++        ArgumentCaptor<SysUser> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "导入行 tenant_id 必须以会话租户覆盖");
++    }
++
++    @Test
++    @DisplayName("分配角色 - 新增用户角色关联行 tenant_id 取会话租户（sys_user_role 白名单表写入隔离）")
++    void testUpdateUserRoles_InsertsRelationRowsWithSessionTenant() {
++        loginWithTenant(5L);
++        SysUser existing = new SysUser();
++        existing.setId(77L);
++        when(baseMapper.selectById(77L)).thenReturn(existing);
++        when(roleMapper.selectCount(any())).thenReturn(1L);
++        when(userRoleMapper.selectList(any())).thenReturn(List.of());
++        when(userRoleMapper.insert(any(SysUserRole.class))).thenReturn(1);
++
++        userService.updateUserRoles(77L, List.of(3L));
++
++        ArgumentCaptor<SysUserRole> captor = ArgumentCaptor.captor();
++        verify(userRoleMapper).insert(captor.capture());
++        assertEquals(5L, captor.getValue().getTenantId(), "关联行 tenant_id 由服务层从会话注入");
++        assertEquals(77L, captor.getValue().getUserId());
++        assertEquals(3L, captor.getValue().getRoleId());
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java b/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
+index 833b9fb..e7f72c1 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/config/MybatisPlusConfig.java
+@@ -5,8 +5,10 @@ import com.baomidou.mybatisplus.core.config.GlobalConfig;
+ import com.baomidou.mybatisplus.core.handlers.MetaObjectHandler;
+ import com.baomidou.mybatisplus.extension.plugins.MybatisPlusInterceptor;
+ import com.baomidou.mybatisplus.extension.plugins.inner.PaginationInnerInterceptor;
++import com.baomidou.mybatisplus.extension.plugins.inner.TenantLineInnerInterceptor;
+ import com.baomidou.mybatisplus.spring.MybatisSqlSessionFactoryBean;
+ import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.core.tenant.OtTenantLineHandler;
+ import org.apache.ibatis.reflection.MetaObject;
+ import org.mybatis.spring.annotation.MapperScan;
+ import org.springframework.context.annotation.Bean;
+@@ -30,6 +32,9 @@ public class MybatisPlusConfig implements MetaObjectHandler {
+     @Bean
+     public MybatisPlusInterceptor mybatisPlusInterceptor() {
+         MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
++        // 多租户插件（TASK-0002）：白名单式 TenantLineHandler（OtTenantLineHandler，fail-closed）。
++        // 官方建议顺序：租户/动态表名等「单次改造 SQL」的插件在前，分页等在后。
++        interceptor.addInnerInterceptor(new TenantLineInnerInterceptor(new OtTenantLineHandler()));
+         interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+         return interceptor;
+     }
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/tenant/OtTenantLineHandler.java b/backend/ot-core/src/main/java/net/otlab/core/tenant/OtTenantLineHandler.java
+new file mode 100644
+index 0000000..e2e70ba
+--- /dev/null
++++ b/backend/ot-core/src/main/java/net/otlab/core/tenant/OtTenantLineHandler.java
+@@ -0,0 +1,83 @@
++package net.otlab.core.tenant;
++
++import com.baomidou.mybatisplus.extension.plugins.handler.TenantLineHandler;
++import net.sf.jsqlparser.expression.Expression;
++import net.sf.jsqlparser.expression.LongValue;
++
++import java.util.Set;
++
++/**
++ * 多租户 TenantLineHandler——白名单式过滤（fail-closed），TASK-0002 硬约束。
++ *
++ * <p>允许清单内（且会话有租户）的表由 MyBatis-Plus TenantLineInnerInterceptor 自动追加
++ * {@code tenant_id = <会话租户>}（SELECT/UPDATE/DELETE 追加 WHERE 条件，INSERT 补列）；
++ * <b>清单外的表一律忽略</b>——绝不能用黑名单式（排除法）实现：漏登记一张表就全库污染。
++ * 当前允许清单（详细设计 §0.3 改造三）：
++ * <ul>
++ * <li>sys_user / sys_dept / sys_role / sys_role_dept / sys_user_role / sys_role_menu</li>
++ * <li>iot_ 前缀业务表（未来任务交付时自动纳入，无需改本类）</li>
++ * </ul>
++ * 其余全部框架表（sys_tenant / sys_menu / sys_module / sys_dict / sys_config / sys_file /
++ * 日志表 / survey_ / wechat_ 等）以及平台级表一律忽略——sys_tenant 本身是租户主数据，
++ * sys_menu/sys_module 平台级各租户共用，sys_dict/sys_config 一期仅预留列不启用覆盖。
++ *
++ * <p>无租户上下文（未登录 / 登录中 / 存量旧会话 / 非Web线程）时对所有表忽略：
++ * MyBatis-Plus 3.5.17 的插件在 getTenantId() 返回 null 时会生成 {@code tenant_id = NULL}
++ * （匹配不到任何行），因此「跳过注入」必须经 ignoreTable 短路实现——登录路径显式
++ * (tenant_id, username) 查询正是在该口径下成立（brief 裁决 3）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public class OtTenantLineHandler implements TenantLineHandler {
++
++    /**
++     * 租户白名单表（小写）。新表进清单 = 显式扩清单（fail-closed 的代价），
++     * iot_ 前缀业务表经前缀规则自动纳入。
++     */
++    private static final Set<String> TENANT_TABLES = Set.of(
++            "sys_user",
++            "sys_dept",
++            "sys_role",
++            "sys_role_dept",
++            "sys_user_role",
++            "sys_role_menu");
++
++    /** iot 业务表前缀：全部按租户表处理（详细设计 §0.3 改造二，全部 iot_ 表第一业务字段即 tenant_id） */
++    private static final String IOT_TABLE_PREFIX = "iot_";
++
++    @Override
++    public Expression getTenantId() {
++        Long tenantId = TenantContext.getTenantId();
++        // ignoreTable 已保证只有「会话有租户」的表才会走到这里；防御性兜底返回恒假语义的空值
++        // 不应出现——直接断言口径：null 视为无上下文（理论上不可达）
++        if (tenantId == null) {
++            return null;
++        }
++        return new LongValue(tenantId);
++    }
++
++    @Override
++    public boolean ignoreTable(String tableName) {
++        // 1) 先判白名单（快路径，不触 Sa-Token）：清单外一律忽略
++        String normalized = normalize(tableName);
++        boolean tenantTable = TENANT_TABLES.contains(normalized) || normalized.startsWith(IOT_TABLE_PREFIX);
++        if (!tenantTable) {
++            return true;
++        }
++        // 2) 再判会话：无租户上下文（登录/匿名/旧会话/异步线程）跳过注入
++        return TenantContext.getTenantId() == null;
++    }
++
++    /**
++     * 表名归一：去反引号/双引号、转小写——JSqlParser 保留 SQL 原样写法，
++     * XML/注解 SQL 中的 `sys_user` 与 SYS_USER 都要能命中清单。
++     */
++    private String normalize(String tableName) {
++        if (tableName == null) {
++            return "";
++        }
++        String t = tableName.replace("`", "").replace("\"", "").trim();
++        return t.toLowerCase();
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/tenant/TenantContext.java b/backend/ot-core/src/main/java/net/otlab/core/tenant/TenantContext.java
+new file mode 100644
+index 0000000..8a55691
+--- /dev/null
++++ b/backend/ot-core/src/main/java/net/otlab/core/tenant/TenantContext.java
+@@ -0,0 +1,70 @@
++package net.otlab.core.tenant;
++
++import cn.dev33.satoken.stp.StpUtil;
++
++/**
++ * 租户上下文工具（TASK-0002）
++ *
++ * <p>登录成功后由 LoginController 把 tenant_id / tenant_code 写入 Sa-Token 会话；
++ * 本工具是全链路读取租户的唯一入口：
++ * <ul>
++ * <li>{@link OtTenantLineHandler}——MyBatis-Plus 多租户插件按会话租户给白名单表追加条件；</li>
++ * <li>user/dept/role 等写接口——服务层从会话覆盖实体 tenant_id，禁止信任前端传参（REQ-0001 核心规则）。</li>
++ * </ul>
++ *
++ * <p>返回 null 的合法场景（调用方必须按「无租户上下文」处理，不得当作越权漏洞）：
++ * 未登录 / 登录上下文（登录查询本身无会话）/ 存量旧会话（升级前签发，未写 tenant_id）/
++ * 非 Web 上下文（异步线程、启动 Runner）。上述场景下多租户插件对所有表跳过注入，
++ * 这是登录路径显式 (tenant_id, username) 查询能成立的前提。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public final class TenantContext {
++
++    /** Sa-Token 会话键：租户 ID（Long） */
++    public static final String SESSION_KEY_TENANT_ID = "tenant_id";
++
++    /** Sa-Token 会话键：租户编码（String） */
++    public static final String SESSION_KEY_TENANT_CODE = "tenant_code";
++
++    private TenantContext() {
++    }
++
++    /**
++     * 当前会话租户 ID；无登录态 / 会话未写租户 / 非 Web 上下文返回 null
++     */
++    public static Long getTenantId() {
++        try {
++            if (!StpUtil.isLogin()) {
++                return null;
++            }
++            Object value = StpUtil.getSession().get(SESSION_KEY_TENANT_ID);
++            if (value instanceof Number number) {
++                return number.longValue();
++            }
++            if (value instanceof String text && !text.isBlank()) {
++                return Long.valueOf(text);
++            }
++            return null;
++        } catch (Exception e) {
++            // 非 Web 上下文（Sa-Token 无法取 Request）等场景：按无租户上下文处理
++            return null;
++        }
++    }
++
++    /**
++     * 当前会话租户编码；无租户上下文返回 null
++     */
++    public static String getTenantCode() {
++        try {
++            if (!StpUtil.isLogin()) {
++                return null;
++            }
++            Object value = StpUtil.getSession().get(SESSION_KEY_TENANT_CODE);
++            return value instanceof String text ? text : null;
++        } catch (Exception e) {
++            return null;
++        }
++    }
++}
+diff --git a/backend/ot-core/src/test/java/net/otlab/core/tenant/OtTenantLineHandlerTest.java b/backend/ot-core/src/test/java/net/otlab/core/tenant/OtTenantLineHandlerTest.java
+new file mode 100644
+index 0000000..c338350
+--- /dev/null
++++ b/backend/ot-core/src/test/java/net/otlab/core/tenant/OtTenantLineHandlerTest.java
+@@ -0,0 +1,137 @@
++package net.otlab.core.tenant;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.sf.jsqlparser.expression.Expression;
++import net.sf.jsqlparser.expression.LongValue;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 多租户 TenantLineHandler 单元测试（TASK-0002）
++ *
++ * <p>白名单式过滤（fail-closed）是硬约束：不在租户清单内的表一律忽略——
++ * 黑名单式（排除法）漏一张表就全库污染。当前允许清单：sys_user / sys_dept / sys_role /
++ * sys_role_dept / sys_user_role / sys_role_menu + iot_ 前缀业务表；
++ * 其余全部框架表（sys_tenant/sys_menu/sys_module/sys_dict/sys_config/sys_file/
++ * 日志/survey_/wechat_ 等）一律忽略。
++ *
++ * <p>无会话（登录/匿名上下文）时对所有表忽略——登录路径须显式 (tenant_id, username)
++ * 查询，插件不得追加条件。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class OtTenantLineHandlerTest {
++
++    private final OtTenantLineHandler handler = new OtTenantLineHandler();
++
++    @AfterEach
++    void clearContext() {
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    /** 用 Sa-Token mock 上下文模拟「已登录、会话已写入租户」的请求线程 */
++    private void loginWithTenant(long tenantId, String tenantCode) {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login(1L);
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_ID, tenantId);
++        StpUtil.getSession().set(TenantContext.SESSION_KEY_TENANT_CODE, tenantCode);
++    }
++
++    @Test
++    @DisplayName("有会话租户 - 白名单六表不忽略（注入 tenant 条件）")
++    void testWhitelistTablesNotIgnored() {
++        loginWithTenant(5L, "acme");
++        for (String table : new String[]{"sys_user", "sys_dept", "sys_role",
++                "sys_role_dept", "sys_user_role", "sys_role_menu"}) {
++            assertFalse(handler.ignoreTable(table), "白名单表 " + table + " 应注入租户条件");
++        }
++    }
++
++    @Test
++    @DisplayName("有会话租户 - iot_ 前缀业务表不忽略（未来任务交付时自动纳入）")
++    void testIotPrefixTablesNotIgnored() {
++        loginWithTenant(5L, "acme");
++        assertFalse(handler.ignoreTable("iot_point"));
++        assertFalse(handler.ignoreTable("iot_data_item"));
++    }
++
++    @Test
++    @DisplayName("有会话租户 - 非白名单表一律忽略（fail-closed，黑名单式漏表即全库污染）")
++    void testNonWhitelistTablesIgnored() {
++        loginWithTenant(5L, "acme");
++        for (String table : new String[]{"sys_tenant", "sys_menu", "sys_module", "sys_dict",
++                "sys_config", "sys_dict_data", "sys_file", "sys_operate_log", "sys_login_log",
++                "sys_notice", "sys_position", "sys_job", "sys_user_ui_config",
++                "survey_form", "survey_form_data", "wechat_mp_fan", "some_future_table"}) {
++            assertTrue(handler.ignoreTable(table), "非白名单表 " + table + " 必须忽略（不注入租户条件）");
++        }
++    }
++
++    @Test
++    @DisplayName("有会话租户 - 表名反引号/大小写归一（JSqlParser 保留 SQL 原样写法）")
++    void testTableNameNormalization() {
++        loginWithTenant(5L, "acme");
++        assertFalse(handler.ignoreTable("`sys_user`"), "反引号包裹的白名单表应识别");
++        assertFalse(handler.ignoreTable("SYS_USER"), "大小写不敏感");
++        assertTrue(handler.ignoreTable("`sys_menu`"), "反引号包裹的非白名单表同样忽略");
++    }
++
++    @Test
++    @DisplayName("有会话租户 - getTenantId 返回会话租户值；TenantContext 可取编码")
++    void testGetTenantIdFromSession() {
++        loginWithTenant(5L, "acme");
++        Expression tenantId = handler.getTenantId();
++        assertTrue(tenantId instanceof LongValue);
++        assertEquals(5L, ((LongValue) tenantId).getValue());
++        assertEquals(5L, TenantContext.getTenantId());
++        assertEquals("acme", TenantContext.getTenantCode());
++    }
++
++    @Test
++    @DisplayName("无会话（登录/匿名上下文）- 对所有表忽略，插件跳过追加条件；getTenantId 返回 null")
++    void testNoSessionIgnoresAllTables() {
++        // 关键前提：登录路径显式 (tenant_id, username) 查询不受插件干扰
++        SaTokenContextMockUtil.setMockContext();
++        for (String table : new String[]{"sys_user", "sys_dept", "sys_role", "iot_point",
++                "sys_tenant", "sys_menu", "survey_form"}) {
++            assertTrue(handler.ignoreTable(table), "无会话时表 " + table + " 必须忽略");
++        }
++        assertNull(TenantContext.getTenantId());
++        assertNull(TenantContext.getTenantCode());
++        assertNull(handler.getTenantId());
++    }
++
++    @Test
++    @DisplayName("非 Web 上下文（异步线程等）- 取租户不抛异常，按无会话处理")
++    void testNonWebContextReturnsNull() {
++        // 不设任何上下文，直接调用（Sa-Token 非Web上下文行为）
++        assertNull(TenantContext.getTenantId());
++        assertTrue(handler.ignoreTable("sys_user"), "非Web上下文按无会话处理，白名单表也忽略");
++    }
++
++    @Test
++    @DisplayName("已登录但会话未写租户（存量旧会话）- 按无租户上下文处理，全表忽略")
++    void testLoggedInWithoutTenantInSession() {
++        SaTokenContextMockUtil.setMockContext();
++        // 按 loginId 注销，清掉其他用例留下的同号会话（sa-token 内存 Dao 在同一 JVM 内共享；
++        // 无 token 的上下文里 StpUtil.logout() 是 no-op，删不掉已有会话）
++        StpUtil.logout(1L);
++        StpUtil.login(1L);
++        assertNull(TenantContext.getTenantId(), "会话无 tenant_id 时返回 null");
++        assertTrue(handler.ignoreTable("sys_user"), "存量旧会话（升级前登录）按无租户处理，不注入条件");
++    }
++
++    @Test
++    @DisplayName("getTenantIdColumn - 默认列名 tenant_id")
++    void testTenantIdColumn() {
++        assertEquals("tenant_id", handler.getTenantIdColumn());
++    }
++}
+diff --git a/resources/sql/upgrade/20261121_tenant_id_columns.sql b/resources/sql/upgrade/20261121_tenant_id_columns.sql
+new file mode 100644
+index 0000000..7fa5654
+--- /dev/null
++++ b/resources/sql/upgrade/20261121_tenant_id_columns.sql
+@@ -0,0 +1,63 @@
++-- ============================================================
++-- 存量库升级脚本：sys_ 核心表补 tenant_id（TASK-0002 / FEAT-0001 / REQ-0001）
++--
++-- 用途（详细设计 V1.1 §0.3「改造三：云端模式下 sys_ 核心表补 tenant_id」逐字口径）：
++--   1) sys_user / sys_dept / sys_role / sys_role_dept / sys_user_role / sys_role_menu
++--      各加 tenant_id bigint NOT NULL DEFAULT 1——存量行回填 default 租户 id=1
++--      （NOT NULL DEFAULT 1 兼顾存量兼容：ALTER 后存量行自动为 1，行为与单租户系统无异）；
++--   2) sys_user 唯一约束改 (tenant_id, username)：删旧 uk_username（01_base.sql 实际索引名），
++--      建 uk_tenant_username——同一用户名可在不同租户下并存（REQ-0001 验收 2）；
++--   3) sys_dict / sys_config 加 tenant_id bigint NULL——仅预留列（空=平台级，非空=租户级覆盖，
++--      一期不启用覆盖也不过滤，见 TASK-0002 brief 裁决 3）；
++--   4) 不加外键（框架全库无外键风格，详细设计 §0.3）。
++--   5) sys_menu 登记「初始化租户管理员」按钮权限点 iot:tenant:admin（id=4017，
++--      TASK-0055 已占 4008-4016，本脚本顺延取号）并授予超级管理员 role_id=1。
++--
++-- 适用环境：
++--   已执行 01_base.sql + 02_survey.sql（+ 03_wechat.sql）与 20261121_sys_tenant.sql 的存量库
++--   及全新库均可直接执行（sys_tenant 由前一脚本建表）。
++--
++-- 幂等口径：
++--   列/索引以 information_schema 判存，存在则跳过（MySQL 8.0 无 ADD COLUMN IF NOT EXISTS 语法，
++--   用条件化存储过程实现；菜单行 INSERT IGNORE）。重复执行不报错、不重复加列、不重复建索引。
++--   可安全重复执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块——存储过程体内的分号必须写在一行内（不得行尾出现），
++--   故 CREATE PROCEDURE 全部压缩为单行；语句前不得挂 -- 注释行（执行器逐行剥除 -- 行，
++--   说明文字全部集中在本头部与文件尾）。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++DROP PROCEDURE IF EXISTS ot_tn_addcol;
++CREATE PROCEDURE ot_tn_addcol(IN tn VARCHAR(64), IN cn VARCHAR(64), IN ddl VARCHAR(1000)) BEGIN DECLARE n INT DEFAULT 0; SELECT COUNT(*) INTO n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = tn AND COLUMN_NAME = cn; IF n = 0 THEN SET @s = ddl; PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st; END IF; END;
++CALL ot_tn_addcol('sys_user', 'tenant_id', 'ALTER TABLE `sys_user` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（登录态/调用上下文注入，禁前端传参；详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_dept', 'tenant_id', 'ALTER TABLE `sys_dept` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（ancestors 路径不变，部门树按租户隔离；详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_role', 'tenant_id', 'ALTER TABLE `sys_role` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（推荐直接加字段，查询条件简单不易串租户；详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_role_dept', 'tenant_id', 'ALTER TABLE `sys_role_dept` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_user_role', 'tenant_id', 'ALTER TABLE `sys_user_role` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_role_menu', 'tenant_id', 'ALTER TABLE `sys_role_menu` ADD COLUMN `tenant_id` bigint NOT NULL DEFAULT 1 COMMENT ''租户ID（详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_dict', 'tenant_id', 'ALTER TABLE `sys_dict` ADD COLUMN `tenant_id` bigint NULL DEFAULT NULL COMMENT ''租户ID（可空预留：空=平台级，非空=租户级覆盖，一期不启用；详细设计 §0.3）''');
++CALL ot_tn_addcol('sys_config', 'tenant_id', 'ALTER TABLE `sys_config` ADD COLUMN `tenant_id` bigint NULL DEFAULT NULL COMMENT ''租户ID（可空预留：空=平台级，非空=租户级覆盖，一期不启用；详细设计 §0.3）''');
++DROP PROCEDURE IF EXISTS ot_tn_addcol;
++
++DROP PROCEDURE IF EXISTS ot_tn_swapuk;
++CREATE PROCEDURE ot_tn_swapuk() BEGIN DECLARE n INT DEFAULT 0; SELECT COUNT(*) INTO n FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_user' AND INDEX_NAME = 'uk_username'; IF n > 0 THEN ALTER TABLE `sys_user` DROP INDEX `uk_username`; END IF; SET n = 0; SELECT COUNT(*) INTO n FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_user' AND INDEX_NAME = 'uk_tenant_username'; IF n = 0 THEN ALTER TABLE `sys_user` ADD UNIQUE KEY `uk_tenant_username` (`tenant_id`, `username`); END IF; END;
++CALL ot_tn_swapuk();
++DROP PROCEDURE IF EXISTS ot_tn_swapuk;
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4017, 4001, 4, '初始化租户管理员', 3, NULL, NULL, NULL, 'iot:tenant:admin', NULL, 7, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4017);
++
++-- ============================================================
++-- 执行后核对（验收 2）：
++--   SHOW CREATE TABLE sys_user   （uk_tenant_username 在位、uk_username 已删、tenant_id NOT NULL DEFAULT 1）
++--   SELECT tenant_id, COUNT(*) FROM sys_user GROUP BY tenant_id   （存量行应全部 tenant_id=1）
++--   SELECT id, menu_name, perms FROM sys_menu WHERE id = 4017     （iot:tenant:admin 登记行）
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id = 4017
++-- ============================================================

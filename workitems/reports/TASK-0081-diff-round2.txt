@@ -1,0 +1,141 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java
+index 329f0ef..9dfe094 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java
+@@ -150,9 +150,16 @@ public class IotUpgradeApplyServiceImpl implements IotUpgradeApplyService {
+                 .map(TemplateChangeEntry::getObjectKey)
+                 .distinct().collect(Collectors.toList());
+         if (!addedCodes.isEmpty()) {
+-            dataItemService.regenerateForInstance(instance.getId());
+-            actions.add("新增项补插: " + String.join(",", addedCodes) + "（0013 生成范式）");
+-            rowUpdated = true;
++            int inserted = dataItemService.regenerateForInstance(instance.getId());
++            // 修订轮 m-2：以实际补插行数决定逐台结果——占用跳过（含逻辑删行永久占键）时
++            // regenerate 返回 0，不得报「补插成功/rowUpdated=true」的失真留痕
++            if (inserted > 0) {
++                actions.add("新增项补插: " + String.join(",", addedCodes) + "（0013 生成范式，实际 " + inserted + " 行）");
++                rowUpdated = true;
++            } else {
++                actions.add("新增项占用跳过未补插: " + String.join(",", addedCodes)
++                        + "（键已占用含逻辑删行，regenerate 返回 0）");
++            }
+         }
+ 
+         // 6) 对象级 REMOVED（T3）：逻辑删停用（保留历史行自身，键永久占用）
+@@ -248,10 +255,12 @@ public class IotUpgradeApplyServiceImpl implements IotUpgradeApplyService {
+                     }
+                 }
+                 case "defaultCalcPeriod" -> {
+-                    Integer oldSeconds = safeMapPeriod(text(oldItem, field));
+-                    Integer newSeconds = safeMapPeriod(text(newItem, field));
++                    Integer oldSeconds = safeMapPeriod(text(oldItem, field)); // 旧默认坏码宽容（不阻断历史升级）
++                    // 新默认坏码 fail-closed（修订轮 I-1）：与 0013 生成链 mapCalcPeriod 同纪律——
++                    // 非法周期码直接抛异常整批回滚，禁止静默写 0 降级为「到达驱动」造成语义漂移
++                    Integer newSeconds = requireMapPeriod(text(newItem, field));
+                     if (row.getCalcPeriod() == null || row.getCalcPeriod().equals(oldSeconds)) {
+-                        patch.setCalcPeriod(newSeconds == null ? 0 : newSeconds);
++                        patch.setCalcPeriod(newSeconds);
+                         anyWrite = true;
+                         actions.add(code + " 计算周期继承新默认: " + newSeconds + "s");
+                     }
+@@ -526,10 +535,19 @@ public class IotUpgradeApplyServiceImpl implements IotUpgradeApplyService {
+         try {
+             return IotDataItemServiceImpl.mapCalcPeriod(period);
+         } catch (RuntimeException e) {
+-            return null; // 坏周期码——不误判为覆盖，留待新默认重写修正
++            return null; // 旧默认坏码宽容——不误判为覆盖，不阻断历史升级（修订轮 I-1）
+         }
+     }
+ 
++    /**
++     * 新默认周期换算（修订轮 I-1 fail-closed）：非法码直接抛异常——由调用方 confirm 的
++     * @Transactional 整批回滚。与 0013 生成链 {@code mapCalcPeriod} 同纪律：禁止把「配了
++     * 周期却被当成到达驱动(0)」的语义漂移静默写入实例行。
++     */
++    private Integer requireMapPeriod(String period) {
++        return IotDataItemServiceImpl.mapCalcPeriod(period);
++    }
++
+     private boolean isBlank(String s) {
+         return s == null || s.isBlank();
+     }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java
+index 57aeb95..253058a 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java
+@@ -182,6 +182,47 @@ class IotUpgradeApplyServiceImplTest {
+                 "calc_period 应写新默认 HOUR→3600（经 mapCalcPeriod 换算比对）");
+     }
+ 
++    @Test
++    @DisplayName("I-1 修订轮：新默认 calcPeriod 非法码（WEEKLY）→ 抛异常整批回滚（与 0013 fail-closed 对齐，禁止静默写 0）")
++    void t2NewDefaultCalcPeriodBadCodeFailsClosed() {
++        // 旧默认 MINUTE（合法），新默认 WEEKLY（非法）——模板 @Size(max=16) 无格式校验可入库
++        mockVersionContent(v2ContentWithPeriod("{SELF.ELEC}/100", "MINUTE"),
++                v3ContentWithPeriod("{SELF.ELEC}/100", "WEEKLY"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100");
++        loadRate.setCalcPeriod(60); // 等于旧默认 MINUTE 展开 → 未覆盖分支，将写新默认
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++
++        RuntimeException e = assertThrows(RuntimeException.class,
++                () -> service.applyToVersion(inst, TARGET),
++                "新默认周期坏码必须抛异常（整批回滚），不得静默写 0 降级为到达驱动");
++        assertTrue(e.getMessage().contains("计算周期") || e.getMessage().contains("WEEKLY"),
++                "异常文案应指向坏码根因: " + e.getMessage());
++        verify(dataItemMapper, never()).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("I-1 修订轮：旧默认 calcPeriod 非法码宽容（不阻断历史升级）——实例值与新默认相等时保留不写")
++    void t2OldDefaultCalcPeriodBadCodeTolerant() {
++        // 旧默认 WEEKLY（历史坏码，宽容），新默认 HOUR（合法）——实例已是 3600（新默认值）
++        mockVersionContent(v2ContentWithPeriod("{SELF.ELEC}/100", "WEEKLY"),
++                v3ContentWithPeriod("{SELF.ELEC}/100", "HOUR"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100");
++        loadRate.setCalcPeriod(3600); // 用户已覆盖为新默认值——旧默认坏码不应误判为覆盖而重写
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        // 旧默认坏码 → safeMapPeriod=null → 实例值 3600 != null → 视为已覆盖保留（宽容：不阻断也不误写）
++        assertTrue(result.getDiff().stream().anyMatch(e -> "defaultCalcPeriod".equals(e.getField())));
++        verify(dataItemMapper, never()).update(isNull(), any());
++    }
++
+     @Test
+     @DisplayName("T2 null→1 兜底：旧默认 sourceType=null 落 1 → 实例值 1 视为未覆盖；新默认改 2 → 写 2")
+     void t2SourceTypeNullFallback() {
+@@ -225,6 +266,27 @@ class IotUpgradeApplyServiceImplTest {
+         verify(dataItemService).regenerateForInstance(inst.getId());
+     }
+ 
++    @Test
++    @DisplayName("m-2 修订轮：T1 补插 regenerate 返回 0（占用跳过）→ rowUpdated=false 且动作文案如实（不误报补插成功）")
++    void t1InsertOccupiedSkippedNoFalseSuccess() {
++        mockVersionContent(v2Content("{SELF.ELEC}/100"),
++                v3ContentWithNewItem("{SELF.ELEC}/100", "POWER", "{SELF.ELEC}*2"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++        when(dataItemService.regenerateForInstance(inst.getId())).thenReturn(0); // 逻辑删行占键，实际补插 0 行
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertFalse(result.isRowUpdated(), "regenerate 返回 0——无实际行变更，不误报成功");
++        assertTrue(result.getActions().stream().anyMatch(a -> a.contains("POWER")
++                && (a.contains("占用跳过") || a.contains("未补插"))),
++                "动作文案应如实反映占用跳过: " + result.getActions());
++        verify(dataItemService).regenerateForInstance(inst.getId());
++    }
++
+     // ---------- T3 逻辑删 + 结构迁移 ----------
+ 
+     @Test

@@ -1,0 +1,737 @@
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index 1764a30..558bc11 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -44,7 +44,8 @@
+ // iot:pt:{tenant}:{code}、写穿透、失败不阻塞落库、未命中回源 TDengine 最近值；未配置
+ // 降级为内存假实现）；新值事件=Redis Pub/Sub 发射侧（channel iot:newvalue:{tenant}，
+ // 写成功后发射——消费对接归 0040s）；网关状态（LWT）=EventStatusSink（ADR-0010 兑现：
+-// 只发 iot:gwstatus:{tenant} 事件，不直写状态 Redis）。
++// 只发 iot:gwstatus:{tenant} 事件，不直写状态 Redis；修订轮 I1——有界异步交接，
++// broker 分发回调内零网络调用）。
+ // 边界注记（ADR-0009 TD-0048）：人工补录/修正走管理面接口，ingest 不提供人工补录入口。
+ //
+ // 优雅停机：SIGTERM/SIGINT → HTTP Server 排空（Shutdown）→ 取消流水线/消费源/对账
+@@ -252,7 +253,12 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 		}
+ 		ptCache = cache.NewRedisPointCache(redisOpts, backfill)
+ 		evPub = event.NewRedisPublisher(redisOpts)
+-		logger.Printf("ingestd: Redis 点位缓存已装配 addr=%s db=%d（键 iot:pt:{tenant}:{code}，写穿透/失败不阻塞落库/未命中回源）+ 新值事件发射侧", cfg.RedisAddr, cfg.RedisDB)
++		if backfill != nil {
++			logger.Printf("ingestd: Redis 点位缓存已装配 addr=%s db=%d（键 iot:pt:{tenant}:{code}，写穿透/失败不阻塞落库/未命中回源 TDengine 最近值）+ 新值事件发射侧", cfg.RedisAddr, cfg.RedisDB)
++		} else {
++			// 修订轮 M4：TDengine 真执行器未配置时回源源不可用——日志与装配事实一致。
++			logger.Printf("ingestd: Redis 点位缓存已装配 addr=%s db=%d（键 iot:pt:{tenant}:{code}，写穿透/失败不阻塞落库；回源不可用——INGEST_TDENGINE_BASE_URL 未配置）+ 新值事件发射侧", cfg.RedisAddr, cfg.RedisDB)
++		}
+ 	} else {
+ 		ptCache = cache.NewMemoryPointCache() // 内存假实现（Redis 未配置的降级形态）
+ 		logger.Print("ingestd: INGEST_REDIS_ADDR 未配置——内存点位缓存（回源/事件发射不可用，可选装配面）")
+@@ -283,9 +289,12 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	if cfg.MQTTBroker != "" {
+ 		// 状态/LWT 出口（ADR-0010 兑现：Redis 配置时事件化——只发 iot:gwstatus:{tenant}
+ 		// 事件、不直写状态 Redis；未配置保持 0027 默认计数+日志形态）。
++		// 修订轮 I1：有界异步交接（NewEventStatusSink 启动发射 goroutine，ctx=pctx 停机
++		// 即退）——broker 分发回调内零网络调用（评审 I1：paho 有序分发 + 同步 PUBLISH
++		// 在 Redis 半死时阻塞分发循环与 QoS1 Ack）。
+ 		var statusSink mqttsource.StatusSink
+ 		if rp, ok := evPub.(*event.RedisPublisher); ok && rp != nil {
+-			statusSink = &mqttsource.EventStatusSink{Pub: rp, Logger: logger}
++			statusSink = mqttsource.NewEventStatusSink(pctx, rp, mqttsource.EventStatusSinkOptions{Logger: logger})
+ 		}
+ 		consumer := mqttsource.NewConsumer(port, mqttsource.Options{StatusSink: statusSink})
+ 		deps.Consumer = consumer
+diff --git a/ingest/cmd/ingestd/wiring29_test.go b/ingest/cmd/ingestd/wiring29_test.go
+index aac0cd3..a2d94da 100644
+--- a/ingest/cmd/ingestd/wiring29_test.go
++++ b/ingest/cmd/ingestd/wiring29_test.go
+@@ -254,11 +254,13 @@ func TestIngestdRealExecutorCacheEventsWiring(t *testing.T) {
+ 	}
+ 
+ 	// 合法点上报后立即取消 ctx（未到 200ms flush 定时）→ run 走停机排空路径落库。
++	// W_M01 同点位双 ts（攒批合并载体）+ W_M02 单行（批内单行合法对照）。
+ 	out := wireReport(t, base, "WIRE29-B1",
+ 		fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":42.5,"quality":0}`, time.Now().UnixMilli()-1000),
++		fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":43.5,"quality":0}`, time.Now().UnixMilli()-900),
+ 		fmt.Sprintf(`{"pointCode":"W_M02","ts":%d,"value":7,"quality":0}`, time.Now().UnixMilli()-1000))
+-	if num(out, "accepted") != 2 {
+-		t.Fatalf("report = %v, want accepted=2", out)
++	if num(out, "accepted") != 3 {
++		t.Fatalf("report = %v, want accepted=3", out)
+ 	}
+ 	cancel()
+ 	select {
+@@ -290,9 +292,23 @@ func TestIngestdRealExecutorCacheEventsWiring(t *testing.T) {
+ 			t.Errorf("INSERT 形态缺失 %q\nreceived:\n%s", want, joined)
+ 		}
+ 	}
++	// 断言 1b（修订轮 M1 真护栏）：VALUES 元组数 = ")(" 连接子计数+1（InsertPointSQL 产物
++	// 形态 `VALUES (..)(..)`）。W_M01 三元组=装载探针 1 行 + B1 双行同批合并单条 INSERT
++	// （多 VALUES 攒批实证——穿过真 run() 装配的端到端锁；探针成功行与 B1 同在 200ms
++	// flush 窗口内，合并确定性成立）；W_M02 单元组（批内单行合法，非逐条写指「无逐点
++	// 语句」而非「禁止单元组 INSERT」）。原断言（VALUES 计数恒等式）对任何单条 INSERT
++	// 恒假，为无效护栏——真形态锁仍在 0073 既有契约测试（零改动）。
+ 	for _, s := range inserts {
+-		if strings.Count(s, "VALUES (") != strings.Count(s, ") VALUES (")+1 && strings.Count(s, "(") < 2 {
+-			t.Errorf("INSERT 非多 VALUES 攒批形态: %s", s)
++		tuples := strings.Count(s, ")(") + 1
++		switch {
++		case strings.HasPrefix(s, "INSERT INTO iot_group_5fa.W_5fM01 "):
++			if tuples < 2 {
++				t.Errorf("W_M01 INSERT 元组数 = %d, want ≥2（多行同批合并单条 INSERT）: %s", tuples, s)
++			}
++		case strings.HasPrefix(s, "INSERT INTO iot_group_5fa.W_5fM02 "):
++			if tuples != 1 {
++				t.Errorf("W_M02 INSERT 元组数 = %d, want 1（单行单元组）: %s", tuples, s)
++			}
+ 		}
+ 	}
+ 
+diff --git a/ingest/internal/cache/redis.go b/ingest/internal/cache/redis.go
+index 19576b5..9daa5bb 100644
+--- a/ingest/internal/cache/redis.go
++++ b/ingest/internal/cache/redis.go
+@@ -44,6 +44,15 @@ type RedisOptions struct {
+ const (
+ 	defaultRedisDialTimeout = 3 * time.Second
+ 	defaultRedisCmdTimeout  = 3 * time.Second
++
++	// maxRESPBulkLen bulk 长度上限（修订轮 M3 防御：受损/恶意响应的长度声明不得触发
++	// 巨量分配——点位缓存值/事件 payload 均为 KB 级，1 MiB 上限含足量余量）。
++	maxRESPBulkLen = 1 << 20
++	// maxRESPArrayLen 数组长度上限（本客户端命令面无数组消费场景——订阅回执不适用；
++	// 防御性拒绝畸形声明）。
++	maxRESPArrayLen = 1024
++	// maxReplyLineLen 单回复行上限（行缓冲有界——配合 bulk 校验覆盖全部解析面）。
++	maxReplyLineLen = 1 << 20
+ )
+ 
+ // RedisClient 极简 RESP2 客户端（string 命令面：SET/GET/PUBLISH/PING/AUTH/SELECT）。
+@@ -233,6 +242,9 @@ func readRESPReply(br *bufio.Reader) (any, error) {
+ 		if n == -1 {
+ 			return nil, nil
+ 		}
++		if n > maxRESPBulkLen {
++			return nil, fmt.Errorf("cache: redis bulk 长度超上限（%d > %d，受损/恶意响应防御——断连）", n, maxRESPBulkLen)
++		}
+ 		body := make([]byte, n+2)
+ 		if _, err := ioReadFull(br, body); err != nil {
+ 			return nil, err
+@@ -243,6 +255,9 @@ func readRESPReply(br *bufio.Reader) (any, error) {
+ 		if err != nil || n < -1 {
+ 			return nil, fmt.Errorf("cache: redis 数组长度非法 %q", line)
+ 		}
++		if n > maxRESPArrayLen {
++			return nil, fmt.Errorf("cache: redis 数组长度超上限（%d > %d，受损/恶意响应防御——断连）", n, maxRESPArrayLen)
++		}
+ 		out := make([]any, 0, max(n, 0))
+ 		for i := 0; i < n; i++ {
+ 			r, err := readRESPReply(br)
+@@ -258,15 +273,26 @@ func readRESPReply(br *bufio.Reader) (any, error) {
+ }
+ 
+ func readReplyLine(br *bufio.Reader) ([]byte, error) {
+-	line, err := br.ReadString('\n')
+-	if err != nil {
+-		return nil, fmt.Errorf("cache: redis 读行失败: %w", err)
++	var acc []byte
++	for {
++		chunk, err := br.ReadSlice('\n')
++		if len(acc)+len(chunk) > maxReplyLineLen {
++			return nil, fmt.Errorf("cache: redis 回复行超上限（>%d，受损/恶意响应防御——断连）", maxReplyLineLen)
++		}
++		acc = append(acc, chunk...)
++		if err == bufio.ErrBufferFull {
++			continue // 行未完且未超限，继续读
++		}
++		if err != nil {
++			return nil, fmt.Errorf("cache: redis 读行失败: %w", err)
++		}
++		break
+ 	}
+ 	// 去掉 \r\n（容忍只有 \n 的非规范服务端）。
+-	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
+-		line = line[:len(line)-1]
++	for len(acc) > 0 && (acc[len(acc)-1] == '\n' || acc[len(acc)-1] == '\r') {
++		acc = acc[:len(acc)-1]
+ 	}
+-	return []byte(line), nil
++	return acc, nil
+ }
+ 
+ func ioReadFull(br *bufio.Reader, buf []byte) (int, error) {
+diff --git a/ingest/internal/cache/redis_contract_test.go b/ingest/internal/cache/redis_contract_test.go
+index a05f8ea..0f1ad2b 100644
+--- a/ingest/internal/cache/redis_contract_test.go
++++ b/ingest/internal/cache/redis_contract_test.go
+@@ -1,6 +1,7 @@
+ package cache_test
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -512,3 +513,70 @@ func TestContractRedisClientBadAddrFailsFast(t *testing.T) {
+ 		t.Fatal("不可达地址 Ping error = nil, want 快速失败")
+ 	}
+ }
++
++// ---- 修订轮 M3：RESP 长度上限防御（受损/恶意响应不得触发巨量分配）----
++
++// rawReplyServer 原始回放假服务：连接建立后原样下发 reply 字节（构造畸形 RESP 用）。
++func rawReplyServer(t *testing.T, reply []byte) string {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("原始假服务监听失败: %v", err)
++	}
++	go func() {
++		conn, err := ln.Accept()
++		if err != nil {
++			return
++		}
++		// 等客户端命令到达后再回放（保持时序自然）。
++		buf := make([]byte, 512)
++		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
++		_, _ = conn.Read(buf)
++		_ = conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
++		_, _ = conn.Write(reply)
++		io.Copy(io.Discard, conn) // 保持连接至客户端断开
++		conn.Close()
++	}()
++	t.Cleanup(func() { _ = ln.Close() })
++	return ln.Addr().String()
++}
++
++func TestContractRedisClientRejectsOversizedBulk(t *testing.T) {
++	addr := rawReplyServer(t, []byte("$9999999999\r\n"))
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: addr, DB: 1})
++	defer c.Close()
++	_, err := c.Do(context.Background(), "PING")
++	if err == nil {
++		t.Fatal("超长 bulk 声明未拒绝（make(n) 巨量分配风险）")
++	}
++	if !strings.Contains(err.Error(), "超上限") {
++		t.Errorf("err = %v, want 含「超上限」防御口径", err)
++	}
++}
++
++func TestContractRedisClientRejectsOversizedArray(t *testing.T) {
++	addr := rawReplyServer(t, []byte("*9999999999\r\n"))
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: addr, DB: 1})
++	defer c.Close()
++	_, err := c.Do(context.Background(), "PING")
++	if err == nil {
++		t.Fatal("超长数组声明未拒绝")
++	}
++	if !strings.Contains(err.Error(), "超上限") {
++		t.Errorf("err = %v, want 含「超上限」防御口径", err)
++	}
++}
++
++func TestContractRedisClientRejectsOversizedLine(t *testing.T) {
++	big := bytes.Repeat([]byte("x"), 4<<20) // 4 MiB 行（> 上限 1 MiB）
++	addr := rawReplyServer(t, append(append([]byte("+"), big...), '\r', '\n'))
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: addr, DB: 1})
++	defer c.Close()
++	_, err := c.Do(context.Background(), "PING")
++	if err == nil {
++		t.Fatal("超长回复行未拒绝（无界行缓冲风险）")
++	}
++	if !strings.Contains(err.Error(), "超上限") {
++		t.Errorf("err = %v, want 含「超上限」防御口径", err)
++	}
++}
+diff --git a/ingest/internal/mqttsource/status_event.go b/ingest/internal/mqttsource/status_event.go
+index d882ec1..0742c0c 100644
+--- a/ingest/internal/mqttsource/status_event.go
++++ b/ingest/internal/mqttsource/status_event.go
+@@ -1,61 +1,140 @@
+-// ADR-0010 兑现（TASK-0029 决策 3）：LWT/status 消息按流水线既有分发照旧——data 信封
+-// 进数据流水线、status 信封进本出口（0027 分发形态零改动）；离线语义只发网关状态事件、
+-// 不直写状态 Redis（「按写入方划分」纪律——接入服务不成为状态的第二写入方，最终状态由
+-// 计算引擎按状态判定优先级链裁决落 Redis，消费对接归 0040s）。
++// ADR-0010 兑现（TASK-0029 决策 3；修订轮 I1 改有界异步发射）：LWT/status 消息按流水线
++// 既有分发照旧——data 信封进数据流水线、status 信封进本出口（0027 分发形态零改动）；
++// 离线语义只发网关状态事件、不直写状态 Redis（「按写入方划分」纪律——接入服务不成为
++// 状态的第二写入方，最终状态由计算引擎按状态判定优先级链裁决落 Redis，消费对接归 0040s）。
+ // channel iot:gwstatus:{tenant}、payload {tenant,gateway,graceful,status,ts}（发射侧
+ // 拟定形态，见 internal/event）。
++//
++// 队头约束（修订轮 I1，评审实证 paho.mqtt.golang v1.5.1 router.go：默认 Order=true
++// 单 goroutine 串行调用 handler、handler 返回后才 Ack）：OnStatus 在 broker 分发回调内
++// 执行——同步 Redis PUBLISH 在 Redis 半死（TCP 可达不响应）时单条阻塞分发循环 ~9s
++// （建连 3s+握手 3s+命令 3s），后续数据消息投递与 QoS1 Ack 全部排队、多网关按 9s×N
++// 放大。故本出口为**有界异步交接**：OnStatus 只做非阻塞入队（满则丢弃+计数，绝不阻塞
++// 路由），独立 goroutine 逐条发射（每条带短超时 ctx，发射失败 fail-soft WARN——异常在
++// 异步面内消化，不影响路由）。事件为尽力面：状态判定的权威输入不依赖发射必达，pending
++// 队列在停机时丢弃（broker 重投/幂等兜底语义不适用状态载荷）。
+ package mqttsource
+ 
+ import (
+ 	"context"
+ 	"log"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/event"
+ )
+ 
+-// EventStatusSink 状态信封出口的事件化实现（StatusSink 零改动替换——0027 默认计数+日志
+-// 形态的发射侧升级）：每个 status/LWT 报文发射一条网关状态事件（心跳/LWT/正常下线同为
+-// 状态判定输入），保留计数与日志语义。发射失败 fail-soft WARN（不 panic、不阻塞路由）。
+-type EventStatusSink struct {
+-	// Pub 网关状态事件发射器（Redis 未配置时不得装配本出口——用默认计数+日志形态）。
+-	Pub event.GatewayStatusPublisher
++// DefaultStatusQueueDepth 状态事件交接队列默认深度。
++const DefaultStatusQueueDepth = 256
++
++// DefaultStatusPublishTimeout 单条状态事件发射默认超时（worker 面防御——Redis 客户端
++// 自身 3s 命令超时之外的双保险；发射 goroutine 独立，超时只丢弃该条不阻塞路由）。
++const DefaultStatusPublishTimeout = 3 * time.Second
++
++// statusDropWarnEvery 丢弃告警采样（首次 + 每 N 条；与死信/纠偏采样口径同族）。
++const statusDropWarnEvery = 100
++
++// EventStatusSinkOptions 构造选项（零值取默认）。
++type EventStatusSinkOptions struct {
+ 	// Logger 日志；nil → log.Default()。
+ 	Logger *log.Logger
++	// QueueDepth 有界交接队列深度（满则丢弃+计数）。<=0 → DefaultStatusQueueDepth。
++	QueueDepth int
++	// PublishTimeout worker 单条发射超时。<=0 → DefaultStatusPublishTimeout。
++	PublishTimeout time.Duration
+ 	// Now 接收时刻（事件 ts）；nil → time.Now。测试注入冻结时钟。
+ 	Now func() time.Time
+ }
+ 
+-// OnStatus 实现 StatusSink：计数 + 日志 + 网关状态事件发射（ADR-0010——只发事件，
+-// 不直写状态 Redis）。
+-func (s *EventStatusSink) OnStatus(env StatusEnvelope) {
+-	nowFn := s.Now
+-	if nowFn == nil {
+-		nowFn = time.Now
++// EventStatusSink 状态信封出口的事件化实现（StatusSink 零改动替换——0027 默认计数+日志
++// 形态的发射侧升级）：每个 status/LWT 报文发射一条网关状态事件（心跳/LWT/正常下线同为
++// 状态判定输入），保留计数与日志语义。发射经有界异步交接（I1——分发回调零网络调用）。
++type EventStatusSink struct {
++	pub     event.GatewayStatusPublisher
++	logger  *log.Logger
++	now     func() time.Time
++	pubTTL  time.Duration
++	ch      chan event.GatewayStatusEvent
++	done    chan struct{}
++	dropped atomic.Int64
++}
++
++// NewEventStatusSink 构造并启动发射 goroutine（ctx 取消即退出——pending 丢弃）。
++func NewEventStatusSink(ctx context.Context, pub event.GatewayStatusPublisher, opts EventStatusSinkOptions) *EventStatusSink {
++	if opts.QueueDepth <= 0 {
++		opts.QueueDepth = DefaultStatusQueueDepth
++	}
++	if opts.PublishTimeout <= 0 {
++		opts.PublishTimeout = DefaultStatusPublishTimeout
++	}
++	s := &EventStatusSink{
++		pub:    pub,
++		logger: opts.Logger,
++		now:    opts.Now,
++		pubTTL: opts.PublishTimeout,
++		ch:     make(chan event.GatewayStatusEvent, opts.QueueDepth),
++		done:   make(chan struct{}),
++	}
++	if s.logger == nil {
++		s.logger = log.Default()
++	}
++	if s.now == nil {
++		s.now = time.Now
+ 	}
++	go s.loop(ctx)
++	return s
++}
++
++// Done 发射 goroutine 退出信号（ctx 取消后关闭——停机面观测）。
++func (s *EventStatusSink) Done() <-chan struct{} { return s.done }
++
++// Dropped 满队丢弃计数（可观测：丢弃=尽力面语义的一部分，运维监控挂点）。
++func (s *EventStatusSink) Dropped() int64 { return s.dropped.Load() }
++
++// OnStatus 实现 StatusSink：计数 + 日志 + **非阻塞入队**（I1——分发回调内零网络调用；
++// 满队丢弃+计数，绝不阻塞路由）。事件 ts 取入队（接收）时刻。
++func (s *EventStatusSink) OnStatus(env StatusEnvelope) {
+ 	ev := event.GatewayStatusEvent{
+ 		Tenant:   env.Tenant,
+ 		Gateway:  env.Gateway,
+ 		Graceful: env.Graceful,
+ 		Status:   env.Status,
+-		Ts:       nowFn().UnixMilli(),
++		Ts:       s.now().UnixMilli(),
+ 	}
+-	if err := s.Pub.PublishGatewayStatus(context.Background(), ev); err != nil {
+-		s.logger().Printf("mqttsource: 网关状态事件发射失败（fail-soft，不阻塞路由）tenant=%s gateway=%s: %v",
+-			env.Tenant, env.Gateway, err)
++	select {
++	case s.ch <- ev:
++	default:
++		n := s.dropped.Add(1)
++		if n == 1 || n%statusDropWarnEvery == 0 {
++			s.logger.Printf("mqttsource: 状态事件交接队列满（尽力面丢弃，不阻塞路由）tenant=%s gateway=%s dropped=%d",
++				env.Tenant, env.Gateway, n)
++		}
+ 	}
+ 	// 计数与日志语义照 0027 默认出口（路由计数由 Consumer.route 承担，此处只记语义行）。
+ 	if env.Graceful {
+-		s.logger().Printf("mqttsource: 网关正常下线（graceful——事件已发射）tenant=%s gateway=%s", env.Tenant, env.Gateway)
++		s.logger.Printf("mqttsource: 网关正常下线（graceful——事件交接发射）tenant=%s gateway=%s", env.Tenant, env.Gateway)
+ 		return
+ 	}
+-	s.logger().Printf("mqttsource: 网关状态上报（心跳/LWT——ADR-0010 只发事件不直写状态 Redis）tenant=%s gateway=%s status=%q",
++	s.logger.Printf("mqttsource: 网关状态上报（心跳/LWT——ADR-0010 只发事件不直写状态 Redis）tenant=%s gateway=%s status=%q",
+ 		env.Tenant, env.Gateway, env.Status)
+ }
+ 
+-func (s *EventStatusSink) logger() *log.Logger {
+-	if s.Logger != nil {
+-		return s.Logger
++// loop 发射 goroutine：逐条带短超时发射；ctx 取消退出（pending 丢弃——尽力面语义）；
++// 发射失败 fail-soft WARN（异常在异步面内消化，不影响路由）。
++func (s *EventStatusSink) loop(ctx context.Context) {
++	defer close(s.done)
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case ev := <-s.ch:
++			pctx, cancel := context.WithTimeout(context.Background(), s.pubTTL)
++			err := s.pub.PublishGatewayStatus(pctx, ev)
++			cancel()
++			if err != nil {
++				s.logger.Printf("mqttsource: 网关状态事件发射失败（fail-soft，异步面内消化）tenant=%s gateway=%s: %v",
++					ev.Tenant, ev.Gateway, err)
++			}
++		}
+ 	}
+-	return log.Default()
+ }
+diff --git a/ingest/internal/mqttsource/status_event_contract_test.go b/ingest/internal/mqttsource/status_event_contract_test.go
+index 38f93ce..fe5ad7e 100644
+--- a/ingest/internal/mqttsource/status_event_contract_test.go
++++ b/ingest/internal/mqttsource/status_event_contract_test.go
+@@ -5,50 +5,78 @@ import (
+ 	"errors"
+ 	"log"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/event"
+ )
+ 
+-// TASK-0029 ADR-0010 兑现契约测试（brief 决策 3）：LWT/status 消息按流水线既有分发
+-// （data→数据流水线、status→StatusSink——0027 形态不变）；离线语义只发网关状态事件、
+-// 不直写状态 Redis（「按写入方划分」——接入服务不成为状态的第二写入方，最终状态由
+-// 计算引擎按状态判定优先级链裁决，消费对接归 0040s）。
++// TASK-0029 修订轮（I1）：EventStatusSink 有界异步发射契约测试。
++//
++// 评审 I1（paho.mqtt.golang v1.5.1 router.go matchAndDispatch 实证：默认 Order=true
++// 单 goroutine 串行调用 handler、handler 返回后才 Ack）——OnStatus 若在分发回调内
++// 同步 Redis PUBLISH，Redis 半死时单条状态消息阻塞分发循环 ~9s、QoS1 Ack 排队、
++// 多网关 9s×N 放大。修订语义：OnStatus 只做**有界队列非阻塞入队**（满则丢弃+计数），
++// 独立 goroutine 承担发射（逐条带短超时 ctx）——分发回调零网络调用。
++// 计数/日志语义保留；ADR-0010 口径不变（只发事件、不直写状态 Redis）。
+ 
+ type fakeGatewayStatusPub struct {
+-	calls []event.GatewayStatusEvent
+-	err   error
++	mu      sync.Mutex
++	calls   []event.GatewayStatusEvent
++	err     error
++	block   chan struct{} // 非 nil：publish 阻塞直至关闭（慢发布者/半死 Redis 模拟）
++	entered chan struct{} // 每次 publish 进入时发信号（确定性编排用）
+ }
+ 
+ func (f *fakeGatewayStatusPub) PublishGatewayStatus(_ context.Context, ev event.GatewayStatusEvent) error {
+-	if f.err != nil {
+-		return f.err
+-	}
++	f.mu.Lock()
+ 	f.calls = append(f.calls, ev)
+-	return nil
++	f.mu.Unlock()
++	if f.entered != nil {
++		select {
++		case f.entered <- struct{}{}:
++		case <-time.After(time.Second):
++		}
++	}
++	if f.block != nil {
++		<-f.block
++	}
++	return f.err
+ }
+ 
+-func statusSinkHarness(pub event.GatewayStatusPublisher) *EventStatusSink {
+-	return &EventStatusSink{
+-		Pub:    pub,
++func (f *fakeGatewayStatusPub) count() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return len(f.calls)
++}
++
++func statusSinkHarness(ctx context.Context, pub event.GatewayStatusPublisher, mutate func(*EventStatusSinkOptions)) *EventStatusSink {
++	opts := EventStatusSinkOptions{
+ 		Logger: log.New(&strings.Builder{}, "", 0),                        // 测试静音
+ 		Now:    func() time.Time { return time.UnixMilli(1795212000000) }, // 冻结时钟
+ 	}
++	if mutate != nil {
++		mutate(&opts)
++	}
++	return NewEventStatusSink(ctx, pub, opts)
++}
++
++func sampleEnv() StatusEnvelope {
++	return parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"offline"}`))
+ }
+ 
+ // 契约依据：LWT（异常断开——graceful=false）→ 网关状态事件发射，graceful=false 逐字承载。
+ func TestContractStatusSinkLWTEmitsGatewayStatusEvent(t *testing.T) {
+ 	pub := &fakeGatewayStatusPub{}
+-	sink := statusSinkHarness(pub)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, nil)
+ 
+-	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"offline"}`))
+-	sink.OnStatus(env)
++	sink.OnStatus(sampleEnv())
++	waitFor(t, "LWT 事件异步发射", func() bool { return pub.count() == 1 })
+ 
+-	if len(pub.calls) != 1 {
+-		t.Fatalf("状态事件发射数 = %d, want 1", len(pub.calls))
+-	}
+-	ev := pub.calls[0]
++	ev := snapshotCall(pub, 0)
+ 	if ev.Tenant != "default" || ev.Gateway != "GW_01" {
+ 		t.Errorf("事件租户/网关 = %s/%s, want default/GW_01", ev.Tenant, ev.Gateway)
+ 	}
+@@ -56,20 +84,21 @@ func TestContractStatusSinkLWTEmitsGatewayStatusEvent(t *testing.T) {
+ 		t.Error("LWT 事件 graceful = true, want false（异常断开语义）")
+ 	}
+ 	if ev.Ts != 1795212000000 {
+-		t.Errorf("事件 ts = %d, want 接收时刻 1795212000000", ev.Ts)
++		t.Errorf("事件 ts = %d, want 接收时刻 1795212000000（OnStatus 入队时刻承载）", ev.Ts)
+ 	}
+ }
+ 
+ // 契约依据：正常下线（graceful:true）同样只发事件（状态判定输入面统一走事件链）。
+ func TestContractStatusSinkGracefulEmitsEventWithFlag(t *testing.T) {
+ 	pub := &fakeGatewayStatusPub{}
+-	sink := statusSinkHarness(pub)
+-
+-	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"graceful":true,"status":"offline"}`))
+-	sink.OnStatus(env)
+-
+-	if len(pub.calls) != 1 || !pub.calls[0].Graceful {
+-		t.Fatalf("事件 = %+v, want 恰 1 条且 graceful=true", pub.calls)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, nil)
++
++	sink.OnStatus(parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"graceful":true,"status":"offline"}`)))
++	waitFor(t, "graceful 事件异步发射", func() bool { return pub.count() == 1 })
++	if !snapshotCall(pub, 0).Graceful {
++		t.Fatal("事件 graceful = false, want true")
+ 	}
+ }
+ 
+@@ -77,30 +106,108 @@ func TestContractStatusSinkGracefulEmitsEventWithFlag(t *testing.T) {
+ // 由消费方结合 status 键区分语义；发射侧不臆造状态语义）。
+ func TestContractStatusSinkHeartbeatEmitsEvent(t *testing.T) {
+ 	pub := &fakeGatewayStatusPub{}
+-	sink := statusSinkHarness(pub)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, nil)
++
++	sink.OnStatus(parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"online"}`)))
++	waitFor(t, "心跳事件异步发射", func() bool { return pub.count() == 1 })
++	if snapshotCall(pub, 0).Status != "online" {
++		t.Errorf("status = %q, want online（载荷原样承载）", snapshotCall(pub, 0).Status)
++	}
++}
+ 
+-	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"online"}`))
+-	sink.OnStatus(env)
++// 契约依据（I1 核心非阻塞断言）：慢发布者（Redis 半死——publish 长阻塞）下 OnStatus
++// 必须立即返回（paho 有序分发回调内零网络调用），事件经独立发射 goroutine 最终送达。
++// 同步实现在本测必红（OnStatus 阻塞 ≥ 单次 publish 时长）。
++func TestContractStatusSinkOnStatusNonBlockingUnderSlowPublisher(t *testing.T) {
++	pub := &fakeGatewayStatusPub{block: make(chan struct{})}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, nil)
++
++	start := time.Now()
++	for i := 0; i < 3; i++ {
++		sink.OnStatus(sampleEnv())
++	}
++	elapsed := time.Since(start)
++	if elapsed > 100*time.Millisecond {
++		t.Fatalf("3 条 OnStatus 累计耗时 %v, want <100ms（分发回调内零阻塞——同步 PUBLISH 即队头）", elapsed)
++	}
++	close(pub.block) // 放行发射 goroutine
++	waitFor(t, "3 条事件经发射 goroutine 送达", func() bool { return pub.count() == 3 })
++}
+ 
+-	if len(pub.calls) != 1 {
+-		t.Fatalf("事件发射数 = %d, want 1（心跳同入事件链）", len(pub.calls))
++// 契约依据：有界队列满→丢弃+计数（发射为尽力面——状态判定权威输入不依赖发射必达；
++// 丢弃计数可观测，满队绝不阻塞路由，丢弃语义对齐事件「无订阅者=丢弃」的尽力面口径）。
++func TestContractStatusSinkQueueFullDropsAndCounts(t *testing.T) {
++	pub := &fakeGatewayStatusPub{block: make(chan struct{}), entered: make(chan struct{}, 8)}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, func(o *EventStatusSinkOptions) { o.QueueDepth = 1 })
++
++	sink.OnStatus(sampleEnv()) // #1 入队
++	<-pub.entered              // 等 worker 取走 #1 并阻塞在 publish（队列已空）
++	sink.OnStatus(sampleEnv()) // #2 入队（占满深度 1）
++	start := time.Now()
++	sink.OnStatus(sampleEnv()) // #3 满队 → 丢弃+计数，仍须立即返回
++	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
++		t.Fatalf("满队 OnStatus 耗时 %v, want <50ms（满队丢弃不阻塞路由）", elapsed)
+ 	}
+-	if pub.calls[0].Status != "online" {
+-		t.Errorf("status = %q, want online（载荷原样承载）", pub.calls[0].Status)
++	if got := sink.Dropped(); got != 1 {
++		t.Errorf("Dropped = %d, want 1", got)
+ 	}
++	close(pub.block)
++	waitFor(t, "在途/已入队事件送达（2 条）", func() bool { return pub.count() == 2 })
+ }
+ 
+-// 契约依据：ADR-0010 结构性断言——发射失败 fail-soft WARN，不直写任何状态存储
+-// （EventStatusSink 无 PointCache/状态写依赖；发射失败不 panic、不阻塞路由）。
++// 契约依据：发射失败 fail-soft WARN——异步面内消化（计数+日志），不 panic、不影响路由；
++// OnStatus 侧永不因下游失败阻塞。
+ func TestContractStatusSinkPublishFailureFailSoft(t *testing.T) {
+ 	pub := &fakeGatewayStatusPub{err: errors.New("redis down")}
+-	sink := statusSinkHarness(pub)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	sink := statusSinkHarness(ctx, pub, nil)
++
++	sink.OnStatus(sampleEnv()) // 不得 panic、立即返回
++	waitFor(t, "失败发射被 worker 消费", func() bool { return pub.count() == 1 })
++	if sink.Dropped() != 0 {
++		t.Errorf("Dropped = %d, want 0（发射失败≠入队丢弃——失败在 worker 面 WARN）", sink.Dropped())
++	}
++}
++
++// 契约依据：ctx 取消 → 发射 goroutine 退出（停机面：pending 队列丢弃——状态事件尽力面，
++// 丢弃即可接受），Done 通道可观测。
++func TestContractStatusSinkWorkerExitsOnContextCancel(t *testing.T) {
++	pub := &fakeGatewayStatusPub{}
++	ctx, cancel := context.WithCancel(context.Background())
++	sink := statusSinkHarness(ctx, pub, nil)
++
++	sink.OnStatus(sampleEnv())
++	cancel()
++	select {
++	case <-sink.Done():
++	case <-time.After(2 * time.Second):
++		t.Fatal("ctx 取消后发射 goroutine 未退出")
++	}
++}
++
++func snapshotCall(pub *fakeGatewayStatusPub, i int) event.GatewayStatusEvent {
++	pub.mu.Lock()
++	defer pub.mu.Unlock()
++	return pub.calls[i]
++}
+ 
+-	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"offline"}`))
+-	sink.OnStatus(env) // 不得 panic
+-	if len(pub.calls) != 0 {
+-		t.Errorf("失败发射被计入成功 = %d, want 0", len(pub.calls))
++func waitFor(t *testing.T, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
+ 	}
++	t.Fatalf("等待超时: %s", what)
+ }
+ 
+ // 编译期锁定：EventStatusSink 是既有 StatusSink 出口的零改动替换实现（0027 分发形态不变）。
+diff --git a/ingest/internal/tdengine/rest.go b/ingest/internal/tdengine/rest.go
+index f21d0ec..5d2fd37 100644
+--- a/ingest/internal/tdengine/rest.go
++++ b/ingest/internal/tdengine/rest.go
+@@ -19,9 +19,10 @@ import (
+ // 本实现以 httptest 假服务锁请求形态（全限定名 / Basic 认证 / 读超时 / 环境级失败口径）。
+ //
+ // TD-0053 实测教训（192.168.31.145，TDengine 3.4.3.9，2026-11-22 会话）：
+-//   - REST /rest/sql/<db> 库上下文返回 9750——禁用库上下文路径，SQL 内一律全限定表名
+-//     （db.child USING db.stable，InsertPointSQL 已落实）或 USE 多语句（EnsureSchema，
+-//     复用附录 B DDL 构造器）；
++//   - REST /rest/sql/<db> 库上下文返回 9750——禁用库上下文路径，SQL 内一律**全限定表名**
++//     （db.child USING db.stable，InsertPointSQL 已落实；建表见 QualifiedCreateStableSQLs）。
++//     修订轮 M2 补充实测（TASK-0029 §4.1）：多语句信封（含「USE 多语句」旧 EnsureSchema
++//     形态）被真库**静默空操作**（code=0 affected=0）——USE 多语句路径已废止，勿回退；
+ //   - DDL 响应延迟可达秒级以上——读超时配置化，默认 30s；
+ //   - fd 不足时 code 24 Too many open files / 918 Database in creating status——
+ //     环境级失败 fail-soft：识别 + WARN + 重试计数（由流水线写失败重排承担），不炸管道。
+diff --git a/ingest/internal/tdengine/tdengine.go b/ingest/internal/tdengine/tdengine.go
+index b149465..c2c6f73 100644
+--- a/ingest/internal/tdengine/tdengine.go
++++ b/ingest/internal/tdengine/tdengine.go
+@@ -196,10 +196,10 @@ func CreateDatabaseSQL(tenantCode string) string {
+ 	return fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s KEEP 1825d DURATION 10d BUFFER 256;", DBName(tenantCode))
+ }
+ 
+-// UseSQL 附录 B 的 USE 语句（按租户参数化）。
+-func UseSQL(tenantCode string) string {
+-	return "USE " + DBName(tenantCode) + ";"
+-}
++// UseSQL 已删除（修订轮 M2）：REST 无状态连接下 USE 语境不可跨请求（9750 教训），
++// 多语句信封（含 USE 多语句）被 3.4.3.9 真库静默空操作（TASK-0029 §4.1 live 实测）——
++// 附录 B 的 USE 行仅存在于契约原文语境（交互式会话），程序化建表走
++// QualifiedCreateStableSQLs 全限定形态，不再产出 USE 语句。
+ 
+ // CreateStableSQL 附录 B 四张超级表 DDL（语句逐字，仅随 USE 语境落库；顺序与附录 B 一致）。
+ func CreateStableSQL(_ string) []string {
+diff --git a/ingest/internal/tdengine/tdengine_contract_test.go b/ingest/internal/tdengine/tdengine_contract_test.go
+index a13b4fb..0b4936c 100644
+--- a/ingest/internal/tdengine/tdengine_contract_test.go
++++ b/ingest/internal/tdengine/tdengine_contract_test.go
+@@ -102,6 +102,9 @@ func TestContractInsertShapeStateAndKindMapping(t *testing.T) {
+ // 库名映射说明：附录 B 示例租户 group_a 的字面库名为 iot_group_a；BUG-0002 修复裁决
+ // （租户域与点位域同口径单射映射）使含下划线的租户编码转义为 group_5fa，库名经
+ // DBName 映射（无下划线租户编码仍恒等，如 groupa → iot_groupa），偏离已在报告声明。
++// 修订轮 M2：附录 B 的 USE 行不再由代码产出（REST 无状态连接 USE 语境不可跨请求
++// +多语句信封真库静默空操作——UseSQL 已删；程序化建表走 QualifiedCreateStableSQLs
++// 全限定形态，其断言见 rest_contract_test）——本测保留建库+四表 DDL 的逐字锁。
+ func TestContractSuperTableDefinitionsMatchAppendixB(t *testing.T) {
+ 	if got := tdengine.DBName("groupa"); got != "iot_groupa" {
+ 		t.Errorf("无下划线租户编码应恒等映射: DBName(groupa) = %q, want iot_groupa", got)
+@@ -109,13 +112,12 @@ func TestContractSuperTableDefinitionsMatchAppendixB(t *testing.T) {
+ 	db := tdengine.DBName("group_a")
+ 	contract := []string{
+ 		"CREATE DATABASE IF NOT EXISTS " + db + " KEEP 1825d DURATION 10d BUFFER 256;",
+-		"USE " + db + ";",
+ 		"CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
+ 		"CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
+ 		"CREATE STABLE IF NOT EXISTS st_item_value (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT);",
+ 		"CREATE STABLE IF NOT EXISTS st_metric_value (ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE) TAGS (tenant_id BIGINT, metric_code BINARY(96), instance_code BINARY(96), period BINARY(8));",
+ 	}
+-	got := append([]string{tdengine.CreateDatabaseSQL("group_a"), tdengine.UseSQL("group_a")},
++	got := append([]string{tdengine.CreateDatabaseSQL("group_a")},
+ 		tdengine.CreateStableSQL("group_a")...)
+ 	if len(got) != len(contract) {
+ 		t.Fatalf("DDL 语句数 = %d, want %d", len(got), len(contract))

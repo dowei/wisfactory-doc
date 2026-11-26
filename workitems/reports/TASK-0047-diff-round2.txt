@@ -1,0 +1,688 @@
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index b4ced37..eb17dd8 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -225,16 +225,28 @@ public class CalcEngineApplication {
+         return runtime;
+     }
+ 
++    /**
++     * TASK-0047 修订 F-02：CalcStateStore DI 缝——默认内存实现，0063 换 JDBC 时只需
++     * 用 profile/配置替换本 Bean（@Primary 或 @ConditionalOnProperty），CalcTaskManager/
++     * CalcStatusController 消费侧零代码改动。
++     */
++    @Bean
++    public net.otlab.calc.state.CalcStateStore calcStateStore() {
++        return new net.otlab.calc.state.InMemoryCalcStateStore();
++    }
++
+     /**
+      * TASK-0047 手动补算异步任务管理器（recalculate-enabled=true 才装配；照 0040/0041 既有零回归纪律）。
+      *
+      * <p>计算函数接 MetricRuntime.recomputeWindow（复用 0046 doCompute + 拓扑级联 + MANUAL 留痕）；
+-     * 成功/失败驱动 CalcStateMachine 维护 iot_calc_state 内存态（0063 换 JDBC 零改动）。
+-     * 线程池/有界队列参数由 env 注入（分区隔离：补算与在线执行器不同池）。
++     * 成功/失败驱动 CalcStateMachine 维护 iot_calc_state（store 由 Bean 注入，0063 零改动替换）。
++     * <b>修订 F-01</b>：env 滞后阈值真正传入状态机；<b>修订 F-03</b>：租户从请求上下文取，
++     * 生产代码零冒烟字面量。
+      */
+     @Bean
+     public net.otlab.calc.task.CalcTaskManager calcTaskManager(
+             @org.springframework.lang.Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
++            net.otlab.calc.state.CalcStateStore calcStateStore,
+             CalcProperties properties) {
+         if (!properties.isRecalculateEnabled()) {
+             return null;
+@@ -253,7 +265,8 @@ public class CalcEngineApplication {
+                         return false;
+                     }
+                     try {
+-                        boolean ok = metricRuntime.recomputeWindow("t47-live", item.fullKey(),
++                        // F-03：租户取上下文（请求 tenant），生产代码零字面量
++                        boolean ok = metricRuntime.recomputeWindow(ctx.tenant(), item.fullKey(),
+                                 item.periodStart(), item.periodEnd(), ctx.triggerType(), ctx.taskId());
+                         if (ok) {
+                             ctx.stateMachine().onSuccess(ctx.tenantId(), item.fullKey(),
+@@ -269,11 +282,9 @@ public class CalcEngineApplication {
+                                 e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                         return false;
+                     }
+-                }, threshold, workers, capacity);
+-        // 覆盖滞后阈值（构造用默认 15min，env 可配；状态机内部独立持有）
+-        if (lagMs != 15L * 60L * 1000L) {
+-            log.info("[CALC] 计算状态滞后阈值 env={}ms（代码内默认为 15min）", lagMs);
+-        }
++                }, calcStateStore, threshold, lagMs, workers, capacity);
++        log.info("[CALC] 手动补算异步任务已启用（独立线程池 + 有界队列；阈值={}、滞后阈值={}ms）",
++                threshold, lagMs);
+         return mgr;
+     }
+ 
+@@ -329,8 +340,8 @@ public class CalcEngineApplication {
+             }
+             if (calcTaskManager != null) {
+                 calcTaskManager.start();
+-                log.info("[CALC] 手动补算异步任务已启用（独立线程池 + 有界队列；阈值={}）",
+-                        properties.getCalcErrorStopThreshold());
++                log.info("[CALC] 手动补算后台线程池已启动（独立线程池 + 有界队列；滞后阈值={}ms，管理器装配见上行）",
++                        calcTaskManager.lagThresholdMs());
+             }
+         };
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java b/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java
+index 63222dd..1390ea7 100644
+--- a/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java
++++ b/calc/src/main/java/net/otlab/calc/state/CalcStatusVo.java
+@@ -14,13 +14,20 @@ import java.util.Map;
+  */
+ public record CalcStatusVo(long tenantId, String fullKey, long lastCalcTime, long watermark,
+                            int calcStatus, String calcStatusText, int errorCount,
+-                           long lagMillis, String lastError, boolean stopped) {
++                           long lagMillis, boolean lagging, String lastError, boolean stopped) {
+ 
+-    /** 由状态行 + 当前时刻构造（滞后=now-watermark，无水位=0） */
++    /**
++     * 由状态行 + 当前时刻 + <b>滞后阈值</b>构造。
++     *
++     * <p>lagMillis=now-watermark（无水位=0）；lagging=滞后是否超阈值（阈值入参真正生效——
++     * 旧实现该参数从未被引用，修订 F-01）。calc_status 由生产路径 evaluateLag 按同一阈值写入状态机。
++     */
+     public static CalcStatusVo from(CalcState s, long lagThresholdMs, long nowMillis) {
+         long lag = s.watermark() > 0 ? Math.max(0L, nowMillis - s.watermark()) : 0L;
++        boolean lagging = s.watermark() > 0 && lag > Math.max(0L, lagThresholdMs);
+         return new CalcStatusVo(s.tenantId(), s.fullKey(), s.lastCalcTime(), s.watermark(),
+-                s.calcStatus(), s.calcStatusText(), s.errorCount(), lag, s.lastError(), s.stopped());
++                s.calcStatus(), s.calcStatusText(), s.errorCount(), lag, lagging,
++                s.lastError(), s.stopped());
+     }
+ 
+     /** 供 JSON 序列化的有序 Map（0061 只读消费） */
+@@ -34,6 +41,7 @@ public record CalcStatusVo(long tenantId, String fullKey, long lastCalcTime, lon
+         m.put("calcStatusText", calcStatusText);
+         m.put("errorCount", errorCount);
+         m.put("lagMillis", lagMillis);
++        m.put("lagging", lagging);
+         m.put("lastError", lastError);
+         m.put("stopped", stopped);
+         return m;
+diff --git a/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java b/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java
+index 1b7427e..255eb1d 100644
+--- a/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java
++++ b/calc/src/main/java/net/otlab/calc/task/CalcTaskManager.java
+@@ -10,7 +10,6 @@ import net.otlab.calc.state.CalcStateStore;
+ import net.otlab.calc.state.InMemoryCalcStateStore;
+ 
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+@@ -19,7 +18,6 @@ import java.util.Set;
+ import java.util.concurrent.ArrayBlockingQueue;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.RejectedExecutionException;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -47,9 +45,13 @@ public final class CalcTaskManager {
+     /** 单个重算项（补算窗口） */
+     public record RecalcItem(String fullKey, long periodStart, long periodEnd) {}
+ 
+-    /** 计算上下文（生产实现接 MetricRuntime.doCompute；本缝照 0041/0046 假实现范式） */
++    /**
++     * 计算上下文（生产实现接 MetricRuntime.doCompute；本缝照 0041/0046 假实现范式）。
++     * tenant 字符串 = 请求提交的租户编码；tenantId = 由租户编码确定性映射的数值 id
++     * （单租户形态缺省 1，0063 落库时由真实租户表映射替换）。
++     */
+     public record RecalcContext(String taskId, String triggerType, boolean isRecalc,
+-                                long tenantId, CalcStateMachine stateMachine) {}
++                                String tenant, long tenantId, CalcStateMachine stateMachine) {}
+ 
+     /** 计算函数：返回 true=成功、false=业务失败（error 由 stateMachine.lastError 或调用方记录） */
+     public interface RecalcItemFn {
+@@ -60,36 +62,58 @@ public final class CalcTaskManager {
+     private final CalcStateStore stateStore;
+     private final CalcStateMachine stateMachine;
+     private final int errorStopThreshold;
++    private final long lagThresholdMs;
+     private final int workers;
+     private final int queueCapacity;
+     private final AtomicLong seq = new AtomicLong();
+     private final Map<String, CalcTask> tasks = new ConcurrentHashMap<>();
++    /** 租户编码 → tenantId（确定性映射，状态存储键隔离；0063 落库时由真实租户表替换映射缝） */
++    private final Map<String, Long> tenantIds = new ConcurrentHashMap<>();
++    private final AtomicLong tenantIdSeq = new AtomicLong(1L);
+     private final AtomicLong rejected = new AtomicLong();
+     private volatile ExecutorService pool;
+ 
+     public CalcTaskManager(RecalcItemFn compute) {
+-        this(compute, 5, 5, 2, 64);
++        this(compute, new InMemoryCalcStateStore(), 5, 5L * 60L * 1000L, 2, 64);
+     }
+ 
+     public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold) {
+-        this(compute, errorStopThreshold, 5, 2, 64);
++        this(compute, new InMemoryCalcStateStore(), errorStopThreshold,
++                5L * 60L * 1000L, 2, 64);
+     }
+ 
+     public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold,
+                            int workers, int queueCapacity) {
+-        this(compute, errorStopThreshold, 5L * 60L * 1000L, workers, queueCapacity);
++        this(compute, new InMemoryCalcStateStore(), errorStopThreshold,
++                5L * 60L * 1000L, workers, queueCapacity);
+     }
+ 
+     public CalcTaskManager(RecalcItemFn compute, int errorStopThreshold,
+                            long lagThresholdMs, int workers, int queueCapacity) {
++        this(compute, new InMemoryCalcStateStore(), errorStopThreshold,
++                lagThresholdMs, workers, queueCapacity);
++    }
++
++    /**
++     * 完整注入构造（0063 换 JDBC store 零代码改动：传不同 CalcStateStore 实现即可）。
++     */
++    public CalcTaskManager(RecalcItemFn compute, CalcStateStore stateStore, int errorStopThreshold,
++                           long lagThresholdMs, int workers, int queueCapacity) {
+         this.compute = compute;
+         this.errorStopThreshold = errorStopThreshold;
+-        this.stateStore = new InMemoryCalcStateStore();
++        this.lagThresholdMs = lagThresholdMs;
++        this.stateStore = stateStore;
+         this.stateMachine = new CalcStateMachine(stateStore, errorStopThreshold, lagThresholdMs);
+         this.workers = Math.max(1, workers);
+         this.queueCapacity = Math.max(1, queueCapacity);
+     }
+ 
++    /** 请求 tenant（字符串）→ tenantId：首次出现分配稳定 id，同租户复用（分区隔离的键） */
++    public long tenantIdOf(String tenant) {
++        String key = tenant == null || tenant.isBlank() ? "default" : tenant;
++        return tenantIds.computeIfAbsent(key, k -> tenantIdSeq.getAndIncrement());
++    }
++
+     public void start() {
+         if (pool != null) {
+             return;
+@@ -141,10 +165,11 @@ public final class CalcTaskManager {
+     /** 带依赖图（节点→其上游依赖集）的提交：按 0040 拓扑序执行（下级先算） */
+     public String submit(String tenant, List<String> fullKeys, long startTime, long endTime,
+                          String triggerType, Map<String, Set<String>> dependencies) {
+-        String taskId = triggerType + "-" + tenant + "-"
++        String effTenant = tenant == null || tenant.isBlank() ? "default" : tenant;
++        String taskId = triggerType + "-" + effTenant + "-"
+                 + String.format("%06d", seq.incrementAndGet());
+         int total = fullKeys == null ? 0 : fullKeys.size();
+-        tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
++        tasks.put(taskId, new CalcTask(taskId, triggerType, effTenant,
+                 CalcTask.Status.QUEUED, total, 0, 0, List.of()));
+         List<String> ordered = topoOrder(fullKeys, dependencies);
+         List<RecalcItem> items = new ArrayList<>();
+@@ -154,7 +179,7 @@ public final class CalcTaskManager {
+         // 子树隔离：依赖图（节点→上游）——某节点停算时沿下游传播（仅拓扑序内的节点）
+         Map<String, Set<String>> effectiveDeps = dependencies == null ? Map.of() : dependencies;
+         try {
+-            pool.execute(() -> run(taskId, tenant, triggerType, items, effectiveDeps));
++            pool.execute(() -> run(taskId, effTenant, triggerType, items, effectiveDeps));
+         } catch (RejectedExecutionException e) {
+             rejected.incrementAndGet();
+             tasks.remove(taskId);
+@@ -198,8 +223,8 @@ public final class CalcTaskManager {
+                      Map<String, Set<String>> dependencies) {
+         tasks.put(taskId, new CalcTask(taskId, triggerType, tenant,
+                 CalcTask.Status.RUNNING, items.size(), 0, 0, List.of()));
+-        long tenantId = 1L; // 单租户形态（tenant_id 默认 1；0063 落库时由装配注入真实 id）
+-        RecalcContext ctx = new RecalcContext(taskId, triggerType, true, tenantId, stateMachine);
++        long tenantId = tenantIdOf(tenant); // 租户编码→id（分区隔离；无字面量）
++        RecalcContext ctx = new RecalcContext(taskId, triggerType, true, tenant, tenantId, stateMachine);
+         int done = 0;
+         int failed = 0;
+         List<CalcTask.ItemResult> results = new ArrayList<>();
+@@ -267,11 +292,33 @@ public final class CalcTaskManager {
+         return null;
+     }
+ 
+-    /** 进度查询（§3.4 task/{taskId}）；不存在返回 null */
++    /** 进度查询（内部用/测试用；生产路径须用 tenant-aware 版本防跨租户读） */
+     public CalcTask getTask(String taskId) {
+         return tasks.get(taskId);
+     }
+ 
++    /** 进度查询（§3.4 task/{taskId}）：仅当 task 归属该 tenant 时返回，否则 null（拒绝跨租户读） */
++    public CalcTask getTask(String tenant, String taskId) {
++        CalcTask t = tasks.get(taskId);
++        if (t == null) {
++            return null;
++        }
++        String effTenant = tenant == null || tenant.isBlank() ? "default" : tenant;
++        return effTenant.equals(t.tenant()) ? t : null;
++    }
++
++    /**
++     * 状态查询路径（§3.4 status）：按 env 滞后阈值调用 evaluateLag，产生 calc_status=2。
++     * 生产 CalcStatusController 读状态前调本方法（F-01：旧实现零调用，状态 2 永不产生）。
++     */
++    public net.otlab.calc.state.CalcState evaluateLag(long tenantId, String fullKey, long nowMillis) {
++        return stateMachine.evaluateLag(tenantId, fullKey, nowMillis);
++    }
++
++    public long lagThresholdMs() {
++        return lagThresholdMs;
++    }
++
+     /** 状态页数据源：当前全部任务进度快照（只读） */
+     public List<CalcTask> allTasks() {
+         return List.copyOf(tasks.values());
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java b/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java
+index 92484e4..c8bad85 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcRecalculateController.java
+@@ -81,15 +81,18 @@ public class CalcRecalculateController {
+         return ResponseEntity.ok(body);
+     }
+ 
+-    /** §3.4 task/{taskId}：进度 + 逐项结果（逐项 MANUAL 留痕可查） */
++    /** §3.4 task/{taskId}：进度 + 逐项结果；tenant 必填校验归属，跨租户读拒绝（F-03） */
+     @GetMapping("/calc/v1/task/{taskId}")
+-    public ResponseEntity<Map<String, Object>> task(@PathVariable String taskId) {
++    public ResponseEntity<Map<String, Object>> task(
++            @PathVariable String taskId,
++            @org.springframework.web.bind.annotation.RequestParam(required = false) String tenant) {
+         if (taskManager == null) {
+             return ResponseEntity.ok(Map.of("ok", false, "error", "recalculate-enabled=false"));
+         }
+-        CalcTask t = taskManager.getTask(taskId);
++        CalcTask t = taskManager.getTask(tenant, taskId);
+         if (t == null) {
+-            return ResponseEntity.status(404).body(Map.of("ok", false, "error", "task 不存在: " + taskId));
++            return ResponseEntity.status(404).body(Map.of("ok", false,
++                    "error", "task 不存在或不属于该 tenant: " + taskId));
+         }
+         Map<String, Object> body = new LinkedHashMap<>();
+         body.put("ok", true);
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index 7b8ecc6..0c91a0a 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -34,12 +34,14 @@ public class CalcStatusController {
+     private final net.otlab.calc.storage.StorageRuntime storageRuntime;
+     private final net.otlab.calc.metric.MetricRuntime metricRuntime;
+     private final net.otlab.calc.task.CalcTaskManager calcTaskManager;
++    private final long lagThresholdMs;
+ 
+     public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
+                                 ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime,
+                                 @Nullable net.otlab.calc.storage.StorageRuntime storageRuntime,
+                                 @Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
+-                                @Nullable net.otlab.calc.task.CalcTaskManager calcTaskManager) {
++                                @Nullable net.otlab.calc.task.CalcTaskManager calcTaskManager,
++                                @Nullable net.otlab.calc.config.CalcProperties properties) {
+         this.holder = holder;
+         this.reconciler = reconciler;
+         this.executorRuntime = executorRuntime;
+@@ -47,12 +49,17 @@ public class CalcStatusController {
+         this.storageRuntime = storageRuntime;
+         this.metricRuntime = metricRuntime;
+         this.calcTaskManager = calcTaskManager;
++        this.lagThresholdMs = properties == null || properties.getCalcLagThresholdMs() == null
++                ? 15L * 60L * 1000L : properties.getCalcLagThresholdMs();
+     }
+ 
+     @GetMapping("/calc/v1/status")
+     public Map<String, Object> status(@org.springframework.lang.Nullable
+                                       @org.springframework.web.bind.annotation.RequestParam(required = false)
+-                                      String fullKey) {
++                                      String fullKey,
++                                      @org.springframework.lang.Nullable
++                                      @org.springframework.web.bind.annotation.RequestParam(required = false)
++                                      String tenant) {
+         Map<String, Object> view = new LinkedHashMap<>();
+         GraphHolderSnapshot snap = GraphHolderSnapshot.of(holder);
+         view.put("status", snap.applied == null ? "empty" : "running");
+@@ -98,19 +105,27 @@ public class CalcStatusController {
+             calcState.put("enabled", true);
+             java.util.List<Map<String, Object>> rows = new java.util.ArrayList<>();
+             long now = System.currentTimeMillis();
+-            long tenantId = 1L; // 单租户形态（0063 落库时由装配注入真实 id）
++            String effTenant = tenant == null || tenant.isBlank() ? "default" : tenant;
++            long tenantId = calcTaskManager.tenantIdOf(effTenant);
++            calcState.put("tenant", effTenant);
++            calcState.put("tenantId", tenantId);
++            // F-01：状态查询前按 env 阈值 evaluateLag → calc_status=2 在生产链路真正产生
+             if (fullKey != null && !fullKey.isBlank()) {
+-                net.otlab.calc.state.CalcState s = calcTaskManager.stateStore().get(tenantId, fullKey);
+-                if (s != null) {
+-                    rows.add(net.otlab.calc.state.CalcStatusVo.from(s, 15L * 60L * 1000L, now).toMap());
++                net.otlab.calc.state.CalcState evaluated = calcTaskManager.evaluateLag(tenantId, fullKey, now);
++                if (evaluated != null) {
++                    rows.add(net.otlab.calc.state.CalcStatusVo.from(evaluated, lagThresholdMs, now).toMap());
+                 }
+             } else {
+-                for (net.otlab.calc.state.CalcState s : calcTaskManager.stateStore().all()) {
+-                    rows.add(net.otlab.calc.state.CalcStatusVo.from(s, 15L * 60L * 1000L, now).toMap());
++                for (net.otlab.calc.state.CalcState s : calcTaskManager.stateStore().byTenant(tenantId)) {
++                    net.otlab.calc.state.CalcState evaluated =
++                            calcTaskManager.evaluateLag(tenantId, s.fullKey(), now);
++                    rows.add(net.otlab.calc.state.CalcStatusVo.from(
++                            evaluated == null ? s : evaluated, lagThresholdMs, now).toMap());
+                 }
+             }
+             calcState.put("states", rows);
+             calcState.put("recentTasks", calcTaskManager.allTasks().stream()
++                    .filter(t -> effTenant.equals(t.tenant())) // F-03：任务列表按租户隔离
+                     .map(net.otlab.calc.task.CalcTaskProgressVo::from)
+                     .map(net.otlab.calc.task.CalcTaskProgressVo::toMap).toList());
+             view.put("calcState", calcState);
+diff --git a/calc/src/test/java/net/otlab/calc/state/CalcStateStoreReplaceabilityContractTest.java b/calc/src/test/java/net/otlab/calc/state/CalcStateStoreReplaceabilityContractTest.java
+new file mode 100644
+index 0000000..68a31fb
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/state/CalcStateStoreReplaceabilityContractTest.java
+@@ -0,0 +1,82 @@
++package net.otlab.calc.state;
++
++import org.junit.jupiter.api.DynamicTest;
++import org.junit.jupiter.api.TestFactory;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++
++/**
++ * TASK-0047 修订轮 F-02：CalcStateStore「0063 换 JDBC 零代码改动替换」实证。
++ *
++ * <p>同一套契约以 {@link TestFactory} 动态测试跑在<b>两种实现</b>上：生产默认内存实现 +
++ * 测试替身（模拟 0063 JDBC 实现，只实现接口、不改任何生产代码）。若契约测试对实现类型有依赖
++ * （直接 new 内存实现），本测试对替身必红——证明「零改动替换」成立。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcStateStoreReplaceabilityContractTest {
++
++    /** 0063 JDBC 实现替身：只用接口 API，内部换存储结构（模拟数据库行映射），生产代码零改动。 */
++    static final class JdbcLikeStateStore implements CalcStateStore {
++        private final Map<String, CalcState> rows = new ConcurrentHashMap<>();
++        private static String k(long t, String f) { return t + "|" + f; }
++        @Override public CalcState get(long tenantId, String fullKey) { return rows.get(k(tenantId, fullKey)); }
++        @Override public void upsert(CalcState s) { rows.put(k(s.tenantId(), s.fullKey()), s); }
++        @Override public List<CalcState> byTenant(long tenantId) {
++            String p = tenantId + "|";
++            return rows.entrySet().stream().filter(e -> e.getKey().startsWith(p))
++                    .map(Map.Entry::getValue)
++                    .sorted(java.util.Comparator.comparing(CalcState::fullKey)).toList();
++        }
++        @Override public List<CalcState> all() {
++            return rows.values().stream()
++                    .sorted(java.util.Comparator.comparingLong(CalcState::tenantId)
++                            .thenComparing(CalcState::fullKey)).toList();
++        }
++    }
++
++    private interface StoreFactory {
++        String name();
++        CalcStateStore create();
++    }
++
++    @TestFactory
++    List<DynamicTest> sameContractRunsOnAnyImplementationWithoutProductionChange() {
++        List<StoreFactory> factories = List.of(
++                new StoreFactory() {
++                    public String name() { return "InMemoryCalcStateStore(默认)"; }
++                    public CalcStateStore create() { return new InMemoryCalcStateStore(); }
++                },
++                new StoreFactory() {
++                    public String name() { return "JdbcLikeStateStore(0063替身)"; }
++                    public CalcStateStore create() { return new JdbcLikeStateStore(); }
++                });
++
++        List<DynamicTest> tests = new ArrayList<>();
++        for (StoreFactory factory : factories) {
++            String prefix = factory.name() + ": ";
++            tests.add(DynamicTest.dynamicTest(prefix + "upsert/get 与租户隔离", () -> {
++                CalcStateStore store = factory.create();
++                assertNull(store.get(1L, "T.A"));
++                store.upsert(CalcState.of(1L, "T.A").build());
++                assertEquals(1, store.get(1L, "T.A").calcStatus());
++                assertNull(store.get(2L, "T.A"), "租户隔离");
++            }));
++            tests.add(DynamicTest.dynamicTest(prefix + "同 uk 覆盖不追加", () -> {
++                CalcStateStore store = factory.create();
++                store.upsert(CalcState.of(1L, "T.A").build());
++                store.upsert(CalcState.of(1L, "T.A").calcStatus(3).errorCount(5).build());
++                assertEquals(3, store.get(1L, "T.A").calcStatus());
++                assertEquals(1, store.all().size());
++            }));
++        }
++        return tests;
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java b/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java
+index 313dcd8..08928db 100644
+--- a/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/state/CalcStatusViewContractTest.java
+@@ -78,4 +78,17 @@ class CalcStatusViewContractTest {
+         assertTrue(map.containsKey("errorCount"));
+         assertTrue(map.containsKey("lagMillis"));
+     }
++
++    @Test
++    void statusVoConsumesLagThresholdForLaggingFlag() {
++        CalcState s = CalcState.of(1L, "T.A").watermark(1000L).calcStatus(1).build();
++        // lag=now-watermark=1500-1000=500ms
++        CalcStatusVo below = CalcStatusVo.from(s, 1000L, 1500L); // 阈值 1000ms → 未滞后
++        assertFalse(below.lagging(), "lag 500ms < 阈值 1000ms → 未滞后");
++        assertEquals(500L, below.lagMillis());
++        CalcStatusVo above = CalcStatusVo.from(s, 200L, 1500L);  // 阈值 200ms → 滞后
++        assertTrue(above.lagging(), "lag 500ms > 阈值 200ms → 滞后（阈值入参真正生效，旧实现死参数必红）");
++        Map<String, Object> map = above.toMap();
++        assertEquals(true, map.get("lagging"), "滞后布尔供 0061 状态页直接渲染");
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java b/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java
+index 0fb32b3..50ab70c 100644
+--- a/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/task/CalcTaskManagerContractTest.java
+@@ -220,4 +220,48 @@ class CalcTaskManagerContractTest {
+             mgr.stop();
+         }
+     }
++
++    @Test
++    void injectedStateStoreIsUsedByManagerAndMachine() throws Exception {
++        net.otlab.calc.state.CalcStateStore store =
++                new net.otlab.calc.state.InMemoryCalcStateStore();
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            ctx.stateMachine().onSuccess(ctx.tenantId(), item.fullKey(),
++                    item.periodStart(), item.periodEnd());
++            return true;
++        }, store, 5, 200L, 2, 8); // 注入 store + env 滞后阈值 200ms
++        assertNotNull(mgr.stateStore(), "状态存储可注入（0063 换 JDBC 零改动）");
++        mgr.start();
++        try {
++            String tid = mgr.submit("tenantA", List.of("M.A"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, tid);
++            assertNotNull(store.get(mgr.tenantIdOf("tenantA"), "M.A"),
++                    "计算写入落在注入的 store 上（非 manager 内部硬编码实例）");
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void statusPathAppliesLagThresholdEnvAndProducesCalcStatus2() throws Exception {
++        net.otlab.calc.state.CalcStateStore store =
++                new net.otlab.calc.state.InMemoryCalcStateStore();
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            ctx.stateMachine().onSuccess(ctx.tenantId(), item.fullKey(),
++                    item.periodStart(), item.periodEnd());
++            return true;
++        }, store, 5, 200L, 2, 8); // 阈值 200ms
++        mgr.start();
++        try {
++            String tid = mgr.submit("tenantA", List.of("M.A"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, tid);
++            long tenantId = mgr.tenantIdOf("tenantA");
++            // 状态查询路径调用 evaluateLag（生产缝）：watermark=200，now=700 → lag=500ms > 200ms
++            net.otlab.calc.state.CalcState state = mgr.evaluateLag(tenantId, "M.A", 700L);
++            assertEquals(2, state.calcStatus(),
++                    "生产状态查询按 env 阈值 200ms 判滞后2（旧实现零调用 evaluateLag 必红）");
++        } finally {
++            mgr.stop();
++        }
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/task/CalcTenantIsolationContractTest.java b/calc/src/test/java/net/otlab/calc/task/CalcTenantIsolationContractTest.java
+new file mode 100644
+index 0000000..6e22271
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/task/CalcTenantIsolationContractTest.java
+@@ -0,0 +1,105 @@
++package net.otlab.calc.task;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0047 修订轮 F-03：租户维度贯穿生产路径（REQ-0023 分区隔离）——
++ * 请求的 tenant 必须贯穿 submit → RecalcContext → 计算/状态；跨租户查 task 必须被拒绝。
++ *
++ * <p>对旧实现必红：旧代码 RecalcContext 无 tenant 字段、CalcTaskManager 无 tenant-aware getTask、
++ * run() 把 tenantId 写死 1L（无租户维度）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcTenantIsolationContractTest {
++
++    private static void awaitDone(CalcTaskManager mgr, String taskId) throws Exception {
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (System.nanoTime() < deadline) {
++            CalcTask t = mgr.getTask(taskId);
++            if (t != null && t.status() != CalcTask.Status.RUNNING
++                    && t.status() != CalcTask.Status.QUEUED) {
++                return;
++            }
++            Thread.sleep(5);
++        }
++        throw new AssertionError("task 未在 5s 内完成: " + taskId);
++    }
++
++    @Test
++    void requestTenantFlowsIntoComputeContextAndTaskOwnership() throws Exception {
++        List<String> seen = java.util.Collections.synchronizedList(new ArrayList<>());
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            seen.add(ctx.tenant() + "#" + ctx.tenantId());
++            return true;
++        });
++        mgr.start();
++        try {
++            String tA = mgr.submit("tenantA", List.of("M.A"), 100L, 200L, "MANUAL");
++            String tB = mgr.submit("tenantB", List.of("M.A"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, tA);
++            awaitDone(mgr, tB);
++            assertEquals(2, seen.size());
++            assertTrue(seen.stream().anyMatch(s -> s.startsWith("tenantA#")),
++                    "计算上下文携带请求 tenant（非字面量）: " + seen);
++            assertTrue(seen.stream().anyMatch(s -> s.startsWith("tenantB#")), "租户 B 同样独立: " + seen);
++            String idA = seen.stream().filter(s -> s.startsWith("tenantA#")).findFirst().orElseThrow();
++            String idB = seen.stream().filter(s -> s.startsWith("tenantB#")).findFirst().orElseThrow();
++            assertNotEquals(idA, idB, "不同租户解析到不同 tenantId（状态存储键隔离）");
++
++            assertEquals("tenantA", mgr.getTask("tenantA", tA).tenant(), "taskId 归属=提交租户");
++            assertEquals("tenantB", mgr.getTask("tenantB", tB).tenant());
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void crossTenantTaskQueryIsRejected() throws Exception {
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> true);
++        mgr.start();
++        try {
++            String taskA = mgr.submit("tenantA", List.of("M.A"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, taskA);
++            assertNotNull(mgr.getTask("tenantA", taskA), "本租户可查");
++            assertNull(mgr.getTask("tenantB", taskA), "跨租户查 task 拒绝/空");
++            assertNull(mgr.getTask("default", taskA), "默认租户亦不可查他租户 task");
++        } finally {
++            mgr.stop();
++        }
++    }
++
++    @Test
++    void sameFullKeyUnderTwoTenantsHasIndependentCalcState() throws Exception {
++        CalcTaskManager mgr = new CalcTaskManager((item, ctx) -> {
++            ctx.stateMachine().onFailure(ctx.tenantId(), item.fullKey(),
++                    item.periodStart(), ctx.taskId(), "boom");
++            return false;
++        }, 1); // 阈值=1：失败即停算
++        mgr.start();
++        try {
++            String tA = mgr.submit("tenantA", List.of("M.SAME"), 100L, 200L, "MANUAL");
++            awaitDone(mgr, tA);
++            long idA = mgr.tenantIdOf("tenantA");
++            long idB = mgr.tenantIdOf("tenantB");
++            assertTrue(mgr.isStopped(idA, "M.SAME"), "租户 A 停算");
++            assertFalse(mgr.isStopped(idB, "M.SAME"), "租户 B 无状态（未登记）");
++            assertEquals(1, mgr.stateStore().byTenant(idA).size());
++            assertTrue(mgr.stateStore().byTenant(idB).isEmpty(), "状态存储按租户隔离");
++        } finally {
++            mgr.stop();
++        }
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java b/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java
+index ff76c21..482ddd3 100644
+--- a/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java
++++ b/calc/src/test/java/net/otlab/calc/web/CalcRecalculateControllerTest.java
+@@ -74,10 +74,10 @@ class CalcRecalculateControllerTest {
+         String taskId = extractTaskId(resp.body());
+         assertTrue(taskId.startsWith("MANUAL-t47http-"), resp.body());
+ 
+-        // 轮询 task 进度到终态（HTTP 层）
++        // 轮询 task 进度到终态（HTTP 层；须带 tenant 校验归属）
+         String taskBody = null;
+         for (int i = 0; i < 100; i++) {
+-            HttpResponse<String> taskResp = get("/calc/v1/task/" + taskId);
++            HttpResponse<String> taskResp = get("/calc/v1/task/" + taskId + "?tenant=t47http");
+             assertEquals(200, taskResp.statusCode(), taskResp.body());
+             taskBody = taskResp.body();
+             if (taskBody.contains("COMPLETED") || taskBody.contains("FAILED")) {
+@@ -89,15 +89,18 @@ class CalcRecalculateControllerTest {
+         assertTrue(taskBody.contains("\"total\":1"), taskBody);
+         assertTrue(taskBody.contains("M.A"), "逐项结果含 fullKey: " + taskBody);
+ 
++        // F-03：跨租户查他租户 task → 404（租户隔离）
++        assertEquals(404, get("/calc/v1/task/" + taskId + "?tenant=otherTenant").statusCode());
+         // 不存在 task → 404
+-        assertEquals(404, get("/calc/v1/task/NOT-EXIST").statusCode());
++        assertEquals(404, get("/calc/v1/task/NOT-EXIST?tenant=t47http").statusCode());
+ 
+-        // status 只读数据源（calcState 段；recalculate-enabled=true 下 enabled=true）
+-        HttpResponse<String> status = get("/calc/v1/status?fullKey=M.A");
++        // status 只读数据源（calcState 段；按租户过滤）
++        HttpResponse<String> status = get("/calc/v1/status?fullKey=M.A&tenant=t47http");
+         assertEquals(200, status.statusCode(), status.body());
+         assertTrue(status.body().contains("\"calcState\""), status.body());
+         assertTrue(status.body().contains("\"enabled\":true"), status.body());
+         assertTrue(status.body().contains("\"states\""), status.body());
++        assertTrue(status.body().contains("\"tenant\":\"t47http\""), "status 标注租户维度: " + status.body());
+     }
+ 
+     private static String extractTaskId(String json) {

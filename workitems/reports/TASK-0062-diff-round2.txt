@@ -1,0 +1,202 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java
+index 145ab56..85ed050 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/entity/AlarmRecord.java
+@@ -6,8 +6,9 @@ import java.sql.Timestamp;
+  * TASK-0062 D1：告警记录行（iot_alarm_record）。
+  *
+  * <p><b>审计四件套</b>：显式列 create_time/create_by/update_time/update_by/deleted（与 BaseEntity
+- * 口径一致，但本域走 JdbcTemplate——工程无全局 MetaObjectHandler，MP @TableField(fill=) 不会
+- * 真正自动填充；显式写列确保确认/处理留痕真实落库，REQ-0031 验收 5）。与巡检结果表
++ * 口径一致；本域走 JdbcTemplate 原生 SQL、不经过 MP mapper，故显式写审计列——框架的
++ * MetaObjectHandler（ot-core MybatisPlusConfig）仅对 MP mapper 生效，对本域不适用）。
++ * 显式写列确保确认/处理留痕真实落库（REQ-0031 验收 5）。与巡检结果表
+  * （系统级无操作员，不套审计）不同——告警需确认/处理留操作人。
+  *
+  * @author dowei
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java
+index 158caeb..c64c150 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/alarm/store/AlarmStore.java
+@@ -20,8 +20,9 @@ import java.util.List;
+  * detail/update_time/update_by，<b>不改 status/handler_id/confirm/handle 时间</b>（不把已确认
+  * 告警打回待确认）。H2 MySQL 模式与 MySQL 8 的 {@code ON DUPLICATE KEY UPDATE} 语义一致。
+  *
+- * <p><b>审计留痕</b>：显式写 create_time/create_by/update_time/update_by（无全局 MetaObjectHandler，
+- * 不依赖 MP 自动填充），确认/处理另写 handler_id + confirmed_at/handled_at + handle_note。
++ * <p><b>审计留痕</b>：显式写 create_time/create_by/update_time/update_by——本域走 JdbcTemplate
++ * 原生 SQL、不经过 MP mapper，框架的 MetaObjectHandler（ot-core MybatisPlusConfig）仅对 MP mapper
++ * 生效，对本域不适用；确认/处理另写 handler_id + confirmed_at/handled_at + handle_note。
+  *
+  * @author dowei
+  * @date 2026-11-24
+@@ -70,22 +71,35 @@ public class AlarmStore {
+ 
+     /**
+      * 生成/重复事件 upsert：唯一键命中只刷新 detail/level/update_time/update_by，状态字段原样保留。
++     * <p><b>主键回填（修订轮 C-1）</b>：写入后按唯一键
++     * (tenant_id, alarm_type, object_code, occurred_at) 查回 id 并 {@code a.setId(id)}——新增/命中
++     * 两条路径都拿到真实主键，供后续 notifier 写 iot_alarm_notice.alarm_id（NOT NULL）。
++     * create_time 与 created_time 显式同写 {@code now}，两列同值不分裂（附带核查项）。
+      *
+-     * @return 影响行数（1=新增，2=命中刷新；H2 MySQL 模式 update 计 1）
++     * @return 影响行数（1=新增，H2 MySQL 模式命中刷新也计 1）
+      */
+     public int upsert(AlarmRecord a) {
+         Timestamp now = new Timestamp(System.currentTimeMillis());
+         Long createBy = a.getCreateBy() == null ? 0L : a.getCreateBy();
+-        return jdbc.update(
++        int updated = jdbc.update(
+                 "INSERT INTO iot_alarm_record "
+                 + "(tenant_id, alarm_type, object_type, object_code, alarm_level, title, detail, status, "
+-                + " occurred_at, create_time, create_by, update_time, update_by, deleted) "
+-                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0) "
++                + " occurred_at, create_time, created_time, create_by, update_time, update_by, deleted) "
++                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0) "
+                 + "ON DUPLICATE KEY UPDATE detail=VALUES(detail), alarm_level=VALUES(alarm_level), "
+                 + "update_time=VALUES(update_time), update_by=VALUES(update_by)",
+                 a.getTenantId(), a.getType(), a.getObjectType(), a.getObjectCode(), a.getLevel(),
+                 a.getTitle(), a.getDetail(), a.getStatus() == null ? 0 : a.getStatus(), a.getOccurredAt(),
+-                now, createBy, now, createBy);
++                now, now, createBy, now, createBy);
++        // 按唯一键查回 id（新增/命中均命中同一行）——确保 notify 时 record.getId() 非 null 且指向刚写的记录
++        Long id = jdbc.queryForObject(
++                "SELECT id FROM iot_alarm_record WHERE tenant_id=? AND alarm_type=? AND object_code=? "
++                + "AND occurred_at=? AND deleted=0",
++                Long.class, a.getTenantId(), a.getType(), a.getObjectCode(), a.getOccurredAt());
++        if (id != null) {
++            a.setId(id);
++        }
++        return updated;
+     }
+ 
+     /** 分页列表：tenant 显式隔离 + status/type/时间窗可选过滤，按 occurred_at desc,id desc 排序 */
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmGenerationEndToEndTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmGenerationEndToEndTest.java
+new file mode 100644
+index 0000000..8f76d07
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/alarm/service/impl/AlarmGenerationEndToEndTest.java
+@@ -0,0 +1,123 @@
++package net.otlab.admin.module.iot.alarm.service.impl;
++
++import net.otlab.admin.module.iot.alarm.store.AlarmStore;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.time.LocalDateTime;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0062 修订轮 C-1：真链路端到端契约——生成告警 → 主键回填 → 站内提醒落库。
++ *
++ * <p>复现首评 Critical：旧版 AlarmStore.upsert() 用 jdbc.update 不回填自增主键，record.getId()
++ * 保持 null → AlarmNoticeOutboxNotifier 写 iot_alarm_notice.alarm_id（NOT NULL）必然失败且被
++ * fail-soft 吞掉。本测试**不手工 setId**，走真实生成入口（raiseGatewayOffline → createAndNotify →
++ * upsert + notifier），断言：iot_alarm_record 1 行 + iot_alarm_notice 1 行且 alarm_id 指向主记录。
++ * 旧版必红（notice 0 行），修后绿。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class AlarmGenerationEndToEndTest {
++
++    private JdbcTemplate jdbc;
++    private AlarmStore store;
++    private AlarmRecordServiceImpl service;
++    private AlarmNoticeOutboxNotifier notifier;
++
++    @BeforeEach
++    void setUp() {
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:alarm_e2e_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_alarm_record ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "alarm_type VARCHAR(32) NOT NULL, object_type VARCHAR(32) NOT NULL, "
++                + "object_code VARCHAR(96) NOT NULL, alarm_level VARCHAR(16) NOT NULL, "
++                + "title VARCHAR(256) NOT NULL, detail VARCHAR(1000), "
++                + "status TINYINT NOT NULL DEFAULT 0, handler_id BIGINT, handle_note VARCHAR(500), "
++                + "occurred_at TIMESTAMP NOT NULL, confirmed_at TIMESTAMP, handled_at TIMESTAMP, "
++                + "create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, create_by BIGINT, "
++                + "created_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
++                + "update_time TIMESTAMP, update_by BIGINT, deleted INT NOT NULL DEFAULT 0, "
++                + "CONSTRAINT uk_alarm UNIQUE (tenant_id, alarm_type, object_code, occurred_at))");
++        jdbc.execute("CREATE TABLE iot_alarm_notice ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT NOT NULL, "
++                + "alarm_id BIGINT NOT NULL, alarm_type VARCHAR(32) NOT NULL, title VARCHAR(256) NOT NULL, "
++                + "target_role VARCHAR(64) NOT NULL, read_status TINYINT NOT NULL DEFAULT 0, "
++                + "create_time TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
++        store = new AlarmStore(jdbc);
++        notifier = new AlarmNoticeOutboxNotifier(jdbc, "platform_admin");
++        service = new AlarmRecordServiceImpl(store, notifier);
++    }
++
++    @AfterEach
++    void tearDown() {
++        jdbc.execute("DROP TABLE iot_alarm_notice");
++        jdbc.execute("DROP TABLE iot_alarm_record");
++    }
++
++    @Test
++    @DisplayName("真链路：网关离线生成 → 告警 1 行 + 站内提醒 1 行且 alarm_id 指向主记录（不手工 setId）")
++    void gatewayOfflineGeneratesAlarmAndNoticeWithRealId() {
++        LocalDateTime occurred = LocalDateTime.of(2026, 11, 24, 10, 0);
++        service.raiseGatewayOffline(7L, 1L, "TIMEOUT", occurred);
++
++        // 主记录落库
++        assertEquals(1, count("iot_alarm_record"));
++        Long alarmId = jdbc.queryForObject("SELECT id FROM iot_alarm_record", Long.class);
++        assertNotNull(alarmId);
++
++        // 站内提醒真落库（旧版因 id=null 违反 alarm_id NOT NULL → 0 行，必红）
++        assertEquals(1, count("iot_alarm_notice"),
++                "生成告警必须真写一条站内提醒（REQ-0031 验收 3 / TC-0020 步骤 4）");
++        Long noticeAlarmId = jdbc.queryForObject("SELECT alarm_id FROM iot_alarm_notice", Long.class);
++        assertEquals(alarmId, noticeAlarmId, "提醒 alarm_id 必须指向刚写的告警主记录");
++        String role = jdbc.queryForObject("SELECT target_role FROM iot_alarm_notice", String.class);
++        assertEquals("platform_admin", role);
++    }
++
++    @Test
++    @DisplayName("重复事件仍去重：第二次同键事件不产生第二条告警/提醒，且不回退已确认状态")
++    void duplicateEventStillDedupedAfterIdBackfill() {
++        LocalDateTime occurred = LocalDateTime.of(2026, 11, 24, 10, 0);
++        service.raiseGatewayOffline(7L, 1L, "TIMEOUT", occurred);
++        Long alarmId = jdbc.queryForObject("SELECT id FROM iot_alarm_record", Long.class);
++
++        // 确认后重复事件
++        jdbc.update("UPDATE iot_alarm_record SET status=1, confirmed_at=CURRENT_TIMESTAMP WHERE id=?", alarmId);
++        service.raiseGatewayOffline(7L, 1L, "TIMEOUT", occurred);
++
++        assertEquals(1, count("iot_alarm_record"), "唯一键去重不新增告警");
++        Integer status = jdbc.queryForObject("SELECT status FROM iot_alarm_record WHERE id=?", Integer.class, alarmId);
++        assertEquals(1, status, "重复事件不把已确认告警打回待确认");
++    }
++
++    @Test
++    @DisplayName("附带核查：create_time 与 created_time 两列同值、非 NULL（口径不分裂）")
++    void createdTimeMirrorsCreateTime() {
++        service.raiseGatewayOffline(7L, 1L, "TIMEOUT", LocalDateTime.of(2026, 11, 24, 10, 0));
++        java.sql.Timestamp create = jdbc.queryForObject("SELECT create_time FROM iot_alarm_record", java.sql.Timestamp.class);
++        java.sql.Timestamp created = jdbc.queryForObject("SELECT created_time FROM iot_alarm_record", java.sql.Timestamp.class);
++        assertNotNull(create);
++        assertNotNull(created);
++        assertEquals(create.getTime(), created.getTime(), "两列必须同值，不产生口径分裂");
++        assertTrue(created.getTime() > 0);
++    }
++
++    private int count(String table) {
++        Integer n = jdbc.queryForObject("SELECT COUNT(*) FROM " + table, Integer.class);
++        return n == null ? 0 : n;
++    }
++}

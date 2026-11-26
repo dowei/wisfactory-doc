@@ -1,0 +1,2836 @@
+commit 9e73d3e6e827510160595ae1be2cfb3bfbe0051c
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 16:07:50 2026 +0800
+
+    feat(iot): 数据项三类取值配置接口与引用边维护——bind/formula/rollup + 阈值入口 + 影响预览接线点（TASK-0036）
+    
+    - PUT /iot/item/bind（§3.1 行）：点位存在/同租户/启用校验，source_type=1 + point_id，取值方式互斥清退场字段，ref 重建 ref_type=2 点位边（先删后插，换绑覆盖旧边）
+    - PUT /iot/item/formula（§3.1 行）：校验链=0013 Expander 同口径语法（残留花括号/键长/展开长）+ 引用存在性 4001（SELF/PARENT/指回本父实例的绝对键；第三方绝对键维持 0013 不核存在）+ 函数白名单占位 4001（DELTA 可用 INTEGRAL 封闭）+ 循环依赖 DFS 4001 含环上项 id 列表（单实例/跨实例 PARENT 边同图覆盖）；裸键展开形态兼容受理
+    - PUT /iot/item/rollup（§3.1 行）：SUM/AVG（IotRollupRules 声明位：缺失打码 7/动态纳入），出边清空=汇总范围计算期动态展开口径
+    - PUT /iot/item/{itemId}/thresholds + /iot/dataitem/{itemId}/thresholds 别名：0014 覆盖写入另一入口（结果行四列配对语义一致）
+    - GET /iot/item/{itemId}/impact + /iot/dataitem/{itemId}/impact 别名：引用图反查（正向出向边/反向入向边双路匹配/指标空集占位——0057 编辑器接线点），对端按实例可见性裁边
+    - ref 物理删重建（uk_item_ref 不含 deleted 列，逻辑删占用键）；DataItemConfigChangedEvent 三类只发布不建监听
+    - effective-params 继承链扩展：source_type/formula/rollup_method/calc_period 三态纳入（brief 决策 3）
+    - 测试 +57（纯函数件 12 / 服务层 37 / 控制器 8）；全量 1923 例 0 失败 0 错误
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+index d69ee62..9b55882 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+@@ -3,8 +3,13 @@ package net.otlab.admin.module.iot.dataitem.controller;
+ import cn.dev33.satoken.annotation.SaCheckPermission;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemBindForm;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemFormulaForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemRollupForm;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
+ import net.otlab.core.annotation.OperateLog;
+@@ -22,20 +27,25 @@ import org.springframework.web.bind.annotation.RestController;
+ import java.util.List;
+ 
+ /**
+- * 实例数据项控制器（TASK-0013 清单/重生成 + TASK-0014 参数覆盖与继承链）
++ * 实例数据项控制器（TASK-0013 清单/重生成 + TASK-0014 参数覆盖与继承链 + TASK-0036
++ * 三类取值配置/阈值入口/影响预览）
+  *
+- * <p>路径命名空间 /iot/item（详细设计 §3.1 p22「按 instanceId 查实例数据项列表」）+
+- * 实例子资源路径（regenerate/params/effective-params 三入口挂
+- * /iot/instance/{instanceId}/items/**；控制器不设类级 @RequestMapping，各方法持全路径）。
+- * 权限：清单查询 iot:item:list、重生成 iot:item:add（brief：生成随实例创建由 iot:instance:add
+- * 触发不设独立权限点，重生成入口由 iot:item:add 覆盖）、参数覆盖 iot:item:edit（4039 复用）、
+- * 继承链读取 iot:item:query（4037 复用）——四权限点均为 sys_menu 4036-4040 既有行，
+- * TASK-0014 不新增菜单种子。remove 为预留行（绑定/删除接口归 0023/0015 等后续任务）。
++ * <p>路径命名空间 /iot/item（详细设计 §3.1 p22 数据项配置段：list/bind/formula/rollup 四行
++ * 直用 §3.1 实际行）+ 实例子资源路径（regenerate/params/effective-params 挂
++ * /iot/instance/{instanceId}/items/**）+ 数据项单键资源（thresholds/impact——brief 字面路径
++ * /iot/dataitem/** 作双路由别名，照 0023 /iot/point/status 别名范式，同 handler 不新增端点）。
++ * 控制器不设类级 @RequestMapping，各方法持全路径。
+  *
+- * <p>写路径数据权限防线在服务层（{@link IotDataItemService#regenerateForInstance} 与
+- * {@link IotDataItemService#overrideParams}：目标实例 ∈ 可见集，否则 403；读单实例资源
+- * {@link IotDataItemService#getEffectiveParams} 同口径 403）；清单查询按数据权限裁剪
+- * （不可见实例返回空清单，集合类语义）。
++ * <p>权限（sys_menu 4036-4040 既有五行，不新增种子）：清单 iot:item:list、重生成
++ * iot:item:add（0013 brief 裁决）、bind/formula/rollup/thresholds=iot:item:edit（4039 复用——
++ * 0013 升级脚本头注预登记「iot:item:edit PUT /iot/item/formula、/iot/item/rollup、
++ * /iot/item/bind」；§3.1 行的 iot:item:bind 权限码未在 sys_menu 登记，本批 resources/sql
++ * 不在改动范围，按预登记口径复用 edit，报告登记）、params 继承 0014 口径 iot:item:edit、
++ * effective-params/impact=iot:item:query（4037 复用）。remove 仍为预留行。
++ *
++ * <p>写路径数据权限防线在服务层（目标实例 ∈ 可见集，否则 403；读单实例资源
++ * effective-params/impact 同口径 403 含 createBy OR 分支）；清单查询按数据权限裁剪
++ * （不可见实例返回空清单，集合类语义）；impact 对端项按对端实例可见性裁边。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -74,11 +84,63 @@ public class IotDataItemController {
+         return Result.success();
+     }
+ 
+-    @Operation(summary = "实例参数有效值与继承来源（TASK-0014：实例值/模板默认/不判定三态逐字段标注）")
++    @Operation(summary = "实例参数有效值与继承来源（TASK-0014：实例值/模板默认/不判定三态逐字段标注；"
++            + "TASK-0036 扩展取值四要素 source_type/formula/rollup_method/calc_period）")
+     @GetMapping("/iot/instance/{instanceId}/items/{itemId}/effective-params")
+     @SaCheckPermission("iot:item:query")
+     public Result<IotItemEffectiveParamsVO> effectiveParams(@PathVariable("instanceId") Long instanceId,
+                                                             @PathVariable("itemId") Long itemId) {
+         return Result.success(dataItemService.getEffectiveParams(instanceId, itemId));
+     }
++
++    // ---------- TASK-0036：三类取值配置接口（§3.1 实际行） + 阈值入口 + 影响预览 ----------
++
++    @OperateLog(title = "实例数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "绑定点位（TASK-0036：source_type=1 写 point_id；点位存在/同租户/启用校验；"
++            + "绑定写 ref_type=2 点位边，换绑覆盖旧边）")
++    @PutMapping("/iot/item/bind")
++    @SaCheckPermission("iot:item:edit")
++    public Result<Void> bind(@Valid @RequestBody IotItemBindForm form) {
++        dataItemService.bindPoint(form.getInstanceId(), form.getItemId(), form.getPointId());
++        return Result.success();
++    }
++
++    @OperateLog(title = "实例数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "保存公式（TASK-0036：校验链=0013 同口径语法+引用存在性+循环依赖 4001 拒存；"
++            + "通过才落库并事务内先删后插重建 iot_data_item_ref）")
++    @PutMapping("/iot/item/formula")
++    @SaCheckPermission("iot:item:edit")
++    public Result<Void> formula(@Valid @RequestBody IotItemFormulaForm form) {
++        dataItemService.saveFormula(form.getInstanceId(), form.getItemId(), form.getFormula());
++        return Result.success();
++    }
++
++    @OperateLog(title = "实例数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "设置子级汇总（TASK-0036：source_type=3 + rollup_method SUM/AVG；"
++            + "汇总范围动态纳入子级，ref 不展开子级全量边）")
++    @PutMapping("/iot/item/rollup")
++    @SaCheckPermission("iot:item:edit")
++    public Result<Void> rollup(@Valid @RequestBody IotItemRollupForm form) {
++        dataItemService.saveRollup(form.getInstanceId(), form.getItemId(), form.getRollupMethod());
++        return Result.success();
++    }
++
++    @OperateLog(title = "实例数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "阈值四字段覆盖（TASK-0036：valid_min/max/alarm_low/high，结果行四列配对口径——"
++            + "0014 params 覆盖写入的另一入口，语义一致；数据项单键定位）")
++    @PutMapping({"/iot/item/{itemId}/thresholds", "/iot/dataitem/{itemId}/thresholds"})
++    @SaCheckPermission("iot:item:edit")
++    public Result<Void> thresholds(@PathVariable("itemId") Long itemId,
++                                   @RequestBody IotItemParamOverrideForm form) {
++        dataItemService.overrideThresholds(itemId, form);
++        return Result.success();
++    }
++
++    @Operation(summary = "影响预览（TASK-0036：引用图反查——正向出向边+反向入向边+指标空集占位；"
++            + "0057 公式编辑器接线点；数据权限裁剪仅可见实例的项）")
++    @GetMapping({"/iot/item/{itemId}/impact", "/iot/dataitem/{itemId}/impact"})
++    @SaCheckPermission("iot:item:query")
++    public Result<IotItemImpactVO> impact(@PathVariable("itemId") Long itemId) {
++        return Result.success(dataItemService.getItemImpact(itemId));
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/domain/IotRollupRules.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/domain/IotRollupRules.java
+new file mode 100644
+index 0000000..1ad281e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/domain/IotRollupRules.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.dataitem.domain;
++
++import java.util.Set;
++
++/**
++ * 子级汇总执行规则声明位（TASK-0036，brief 决策 4——「汇总项标识+子级范围规则存储 +
++ * 缺失打码 7 的配置声明位」）
++ *
++ * <p><b>口径边界（brief 明文，报告登记）</b>：汇总的计算行为（动态查找子级、聚合、缺失
++ * 处理的实际执行）归计算引擎 FEAT-0012——本类只是配置面声明位，把 REQ-0017/ADR-0009 的
++ * 硬规则收敛为常量契约供两侧引用，杜绝「缺数按 0 计入而不标记」（REQ-0017 核心规则）。
++ *
++ * <ul>
++ * <li><b>范围规则</b>：汇总范围=子级实例同名数据编码、enabled=1 的子级数据项；「参与上级
++ *     汇总」开关打开才纳入（REQ-0017 纳入口径 + ADR-0008 一档新增项默认不参与）。范围在
++ *     计算期动态查找（引用边在计算期展开，ref 不展开子级全量边——brief 决策 1），新增
++ *     子设备不改配置自动纳入。</li>
++ * <li><b>聚合方式</b>：一期 SUM/AVG（brief 决策 1 + iot_data_item.rollup_method DDL 注释）。</li>
++ * <li><b>缺失处理</b>：按已有子级计算并打「不完整」质量标记（REQ-0017 两策略的推荐款）；
++ *     标记=质量码 7「汇总不完整」（ADR-0009 TD-0021 枚举 0-10，CONV-02）。任何情况不出现
++ *     未标记的假 0（REQ-0017 验收 3）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class IotRollupRules {
++
++    /** 一期聚合方式白名单（brief 决策 1；REQ-0017 提及的 MAX/MIN 扩口随 FEAT-0012 一并放开） */
++    public static final Set<String> ALLOWED_METHODS = Set.of("SUM", "AVG");
++
++    /** 缺失子级质量标记=质量码 7「汇总不完整」（ADR-0009 TD-0021，CONV-02 冻结枚举） */
++    public static final int MISSING_SUBITEM_QUALITY_CODE = 7;
++
++    /** 缺失处理策略声明（REQ-0017 两策略的推荐款：按已有子级计算并打「不完整」标记） */
++    public static final String MISSING_POLICY = "PARTIAL_WITH_INCOMPLETE_MARK";
++
++    private IotRollupRules() {
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemBindForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemBindForm.java
+new file mode 100644
+index 0000000..b9ac78f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemBindForm.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 数据项绑定点位表单（TASK-0036，详细设计 §3.1 p22「PUT /iot/item/bind 绑定点位
++ * （source_type=1，写 point_id）」）
++ *
++ * <p>bind/formula/rollup 三接口统一走「instanceId + itemId」双键定位（清单接口按
++ * instanceId 列项、项 id 在清单行上——前端两次点击即齐备；不单用 itemId 定位是为把
++ * 实例存在性与数据权限防线锚在实例上，照 0014 overrideParams 防线口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "数据项绑定点位表单（TASK-0036：source_type=1，写 point_id + ref_type=2 点位边）")
++public class IotItemBindForm {
++
++    @NotNull(message = "实例ID不能为空")
++    @Schema(description = "实例ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long instanceId;
++
++    @NotNull(message = "数据项ID不能为空")
++    @Schema(description = "实例数据项ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long itemId;
++
++    @NotNull(message = "绑定点位ID不能为空")
++    @Schema(description = "绑定点位ID（一个数据项同一时刻只绑一个点位——REQ-0015；换绑覆盖旧边）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long pointId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java
+index 0b29aec..e6cbf32 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java
+@@ -12,11 +12,17 @@ import java.math.BigDecimal;
+  * （来源 INSTANCE）；否则→模板 default_ 同名值（来源 TEMPLATE）；再否则→null 不判定
+  * （来源 NONE）。逐字段携带 {@link IotParamSource} 供前端展示继承来源。
+  *
++ * <p>TASK-0036 扩展（brief 决策 3）：取值四要素 source_type/formula/rollup_method/calc_period
++ * 纳入同一继承链口径——实例行有值→INSTANCE（生成链自模板播种后即实例行值）、实例行空→
++ * 模板默认（formula 的模板默认为<b>模板态花括号公式</b>，与实例态裸键形态区分）、双空→NONE。
++ * 生成链对 source_type/calc_period 恒有值（兜底 1 / 周期换算 0），故该两字段实际恒 INSTANCE；
++ * formula/rollup_method 在绑定类项上为空，继承来源展示才是有效信息。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ @Data
+-@Schema(description = "实例参数有效值（逐字段区分继承来源 INSTANCE/TEMPLATE/NONE）")
++@Schema(description = "实例参数有效值（逐字段区分继承来源 INSTANCE/TEMPLATE/NONE；TASK-0036 扩展取值四要素）")
+ public class IotItemEffectiveParamsVO {
+ 
+     @Schema(description = "实例ID")
+@@ -54,4 +60,30 @@ public class IotItemEffectiveParamsVO {
+ 
+     @Schema(description = "告警高阈值来源")
+     private IotParamSource alarmHighSource;
++
++    // ---------- TASK-0036 扩展：取值四要素纳入继承链口径（brief 决策 3） ----------
++
++    @Schema(description = "取值方式：1 绑定 2 公式 3 汇总（继承链解析后的有效值；生成链兜底恒有值）")
++    private Integer sourceType;
++
++    @Schema(description = "取值方式来源")
++    private IotParamSource sourceTypeSource;
++
++    @Schema(description = "公式（继承链解析后的有效值；实例态=展开后裸键形态，模板默认=模板态花括号公式）")
++    private String formula;
++
++    @Schema(description = "公式来源")
++    private IotParamSource formulaSource;
++
++    @Schema(description = "汇总方式 SUM/AVG（继承链解析后的有效值）")
++    private String rollupMethod;
++
++    @Schema(description = "汇总方式来源")
++    private IotParamSource rollupMethodSource;
++
++    @Schema(description = "计算周期（秒，0=到达驱动；继承链解析后的有效值；生成链恒有值）")
++    private Integer calcPeriod;
++
++    @Schema(description = "计算周期来源")
++    private IotParamSource calcPeriodSource;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemFormulaForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemFormulaForm.java
+new file mode 100644
+index 0000000..eab852a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemFormulaForm.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 数据项公式保存表单（TASK-0036，详细设计 §3.1 p22「PUT /iot/item/formula 保存公式
++ * （校验通过才落库并重建 iot_data_item_ref）」）
++ *
++ * <p>formula 输入契约 = <b>花括号占位形态</b>（与模板公式同款：{@code {SELF.X}} /
++ * {@code {PARENT.X}} / {@code {绝对全键}}，0057 公式编辑器 insertToken 产出的 token 形态）；
++ * 服务层照 0013 RelativeRefExpander 同口径展开为该实例唯一键裸键形态落库。已为裸键展开
++ * 形态（无花括号、点分全键直书，§3.1 preview 示例形态）的输入兼容受理：点分全键按绝对键
++ * 引用提取入图与存在性核对。长度 ≤2000（bean validation 表态 + 服务层展开后复检，0013 口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "数据项公式保存表单（TASK-0036：校验链=0013 同口径语法+引用存在性+循环依赖 4001；"
++        + "通过才落库并事务内先删后插重建引用边）")
++public class IotItemFormulaForm {
++
++    @NotNull(message = "实例ID不能为空")
++    @Schema(description = "实例ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long instanceId;
++
++    @NotNull(message = "数据项ID不能为空")
++    @Schema(description = "实例数据项ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long itemId;
++
++    @NotBlank(message = "公式不能为空")
++    @Size(max = 2000, message = "公式长度不能超过 2000")
++    @Schema(description = "公式（花括号占位形态 {SELF.X}/{PARENT.X}/{绝对全键}；已展开裸键形态兼容受理；"
++            + "必填非空——清除公式经取值方式切换达成，本接口不做清除语义）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String formula;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactEdgeVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactEdgeVO.java
+new file mode 100644
+index 0000000..9f2ecf4
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactEdgeVO.java
+@@ -0,0 +1,59 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++/**
++ * 影响预览引用边行 VO（TASK-0036，GET /iot/item/{itemId}/impact——0057 公式编辑器
++ * 「影响预览」占位按钮的接线点）
++ *
++ * <p>「对端」语义按 direction 取一侧：OUT（正向出向边，本项引用了谁）时 peer=被引用项；
++ * IN（反向入向边，谁引用了本项——「受影响上级项」，REQ-0016 验收 3）时 peer=引用方项。
++ * 点位边（refType=2）peer 为点位编码（ref_full_key 存点位编码口径，iot_data_item_ref）。
++ *
++ * <p>数据权限裁剪：对端项所属实例不可见时该边整体不返回（不泄露不可见实例的项与配置面，
++ * 照清单接口集合类语义）；对端项无法解析（跨设备绝对引用指向未建/已删实例）保留
++ * refFullKey 原文、peer 项字段为空（引用原文本就随公式可见，不新增暴露面）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "影响预览引用边（对端项/点位字段按 direction 取一侧；不可见实例的对端边整体裁剪）")
++public class IotItemImpactEdgeVO {
++
++    @Schema(description = "方向：OUT 正向出向边（本项引用了谁）/ IN 反向入向边（谁引用了本项）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String direction;
++
++    @Schema(description = "引用类型：1 数据项 2 点位（iot_data_item_ref.ref_type）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer refType;
++
++    @Schema(description = "边登记的被引用全键（数据项边=full_key；点位边=点位编码，ref_full_key 原文）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String refFullKey;
++
++    // ---------- 对端项字段（refType=1 且对端项可解析、其实例可见时填充） ----------
++
++    @Schema(description = "对端数据项ID（ref_item_id 回填值；对端未建/已删时为空）")
++    private Long peerItemId;
++
++    @Schema(description = "对端数据项全键")
++    private String peerFullKey;
++
++    @Schema(description = "对端数据编码")
++    private String peerDataCode;
++
++    @Schema(description = "对端数据名称")
++    private String peerDataName;
++
++    @Schema(description = "对端项所属实例ID")
++    private Long peerInstanceId;
++
++    @Schema(description = "对端项所属实例编码")
++    private String peerInstanceCode;
++
++    @Schema(description = "对端项所属实例名称")
++    private String peerInstanceName;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactMetricVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactMetricVO.java
+new file mode 100644
+index 0000000..3c307b5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactMetricVO.java
+@@ -0,0 +1,28 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++/**
++ * 影响预览指标关联边占位 VO（TASK-0036）
++ *
++ * <p>本期 ref 图不含指标边——impact 响应的 metrics 恒为空集占位（brief 决策 6：指标引用边
++ * 归 0043/计算引擎链路登记，REQ-0016 验收 3「影响分析列出受影响上级项与指标清单」的指标
++ * 半边随其交付）。本类先冻结响应形态（指标识别三要素），0043 接线零结构变更。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "影响预览指标关联边（本期空集占位——指标引用边归 0043/计算引擎链路登记）")
++public class IotItemImpactMetricVO {
++
++    @Schema(description = "指标ID")
++    private Long metricId;
++
++    @Schema(description = "指标编码")
++    private String metricCode;
++
++    @Schema(description = "指标名称")
++    private String metricName;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactVO.java
+new file mode 100644
+index 0000000..f442f19
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemImpactVO.java
+@@ -0,0 +1,53 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 影响预览响应 VO（TASK-0036，GET /iot/item/{itemId}/impact——0057 公式编辑器「影响预览」
++ * 占位按钮的接线对象，brief 决策 6）
++ *
++ * <p>引用图反查三段：<b>正向</b>=本项引用了谁（ref 边出向，改本项公式时需要重核的依赖）；
++ * <b>反向</b>=谁引用了本项（ref 边入向——「受影响上级项」，REQ-0016 验收 3）；<b>指标关联</b>=
++ * 本期空集占位（ref 图不含指标边，归 0043/计算引擎链路登记）。响应含本项与对端的
++ * full_key/实例编码/名称，数据权限裁剪（仅可见实例的项，对端不可见即裁边）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "影响预览（引用图反查：正向出向边+反向入向边+指标边空集占位；数据权限裁剪）")
++public class IotItemImpactVO {
++
++    @Schema(description = "实例数据项ID")
++    private Long itemId;
++
++    @Schema(description = "所属实例ID")
++    private Long instanceId;
++
++    @Schema(description = "实例编码")
++    private String instanceCode;
++
++    @Schema(description = "实例名称")
++    private String instanceName;
++
++    @Schema(description = "数据编码")
++    private String dataCode;
++
++    @Schema(description = "数据名称")
++    private String dataName;
++
++    @Schema(description = "全键 = instance_code + \".\" + data_code")
++    private String fullKey;
++
++    @Schema(description = "正向出向边：本项引用了谁（公式引用的数据项/绑定的点位）")
++    private List<IotItemImpactEdgeVO> outgoing;
++
++    @Schema(description = "反向入向边：谁引用了本项（受影响上级项）")
++    private List<IotItemImpactEdgeVO> incoming;
++
++    @Schema(description = "指标关联边（本期恒空集占位——指标引用边归 0043/计算引擎链路登记）")
++    private List<IotItemImpactMetricVO> metrics;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemRollupForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemRollupForm.java
+new file mode 100644
+index 0000000..2901174
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemRollupForm.java
+@@ -0,0 +1,45 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Pattern;
++import lombok.Data;
++
++/**
++ * 数据项子级汇总配置表单（TASK-0036，详细设计 §3.1 p22「PUT /iot/item/rollup 设置子级汇总
++ * （source_type=3 + rollup_method）」）
++ *
++ * <p>rollup_method 口径 = <b>SUM/AVG</b>（brief 决策 1 + iot_data_item.rollup_method DDL
++ * 注释「汇总方式 SUM/AVG」）；REQ-0017 业务能力提及 SUM/AVG/MAX/MIN 四选一——MAX/MIN 为
++ * 上游设计留口，模板域 agg_method 已四值受理，实例侧执行接口按 brief 契约先收 SUM/AVG，
++ * MAX/MIN 扩口随 FEAT-0012 汇总计算语义一并放开（报告登记）。
++ *
++ * <p>汇总范围规则存储口径（brief 决策 1/4）：本接口落「汇总项标识（source_type=3）+
++ * 聚合方式（rollup_method）」，<b>不展开子级全量引用边</b>——汇总范围=子级同名数据编码、
++ * 「参与上级汇总」开关打开且已启用的子节点，计算期由计算引擎动态查找（REQ-0017 硬规则，
++ * 新增子设备不改配置自动纳入）；ref 先删后插重建后本项出边为空集。缺失打码 7 的配置
++ * 声明位落 {@code IotRollupRules}（质量码 7=汇总不完整，ADR-0009 TD-0021）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "数据项子级汇总配置表单（TASK-0036：source_type=3 + rollup_method；"
++        + "汇总范围动态纳入子级，ref 不展开子级全量边）")
++public class IotItemRollupForm {
++
++    @NotNull(message = "实例ID不能为空")
++    @Schema(description = "实例ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long instanceId;
++
++    @NotNull(message = "数据项ID不能为空")
++    @Schema(description = "实例数据项ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long itemId;
++
++    @NotBlank(message = "汇总方式不能为空")
++    @Pattern(regexp = "SUM|AVG", message = "汇总方式仅允许 SUM/AVG")
++    @Schema(description = "汇总方式 SUM/AVG（brief 契约；聚合对象=子级同名数据编码，计算期动态查找）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String rollupMethod;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/event/DataItemConfigChangedEvent.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/event/DataItemConfigChangedEvent.java
+new file mode 100644
+index 0000000..3b66c21
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/event/DataItemConfigChangedEvent.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.dataitem.event;
++
++/**
++ * 数据项配置变更领域事件（TASK-0036，brief 决策 7）
++ *
++ * <p>三类取值配置（绑定/公式/汇总）落库成功后经 Spring {@code ApplicationEventPublisher}
++ * 发布的应用事件——<b>照 0013 事件范式只发布不建监听器</b>（消费方=配置快照联动 FEAT-0008/
++ * TASK-0024 与计算引擎 FEAT-0012 未来接线，brief 口径：配置快照联动归 0024）。阈值四字段
++ * 变更不走本事件（0014 已有 PARAM 时间线钩子 {@code IotDataItemHistoryService#recordParamChange}
++ * 同事务留痕，事件面按 brief「三类配置变更」口径收敛）。
++ *
++ * <p>发布时机：配置落库与 ref 重建同事务内、写操作全部成功之后（与 0013
++ * {@link InstanceItemsGeneratedEvent} 同款——监听方须自行决定是否等事务提交）。
++ *
++ * @param itemId     目标实例数据项 id
++ * @param tenantId   会话租户 id
++ * @param changeType 变更类型（{@link ChangeType#BIND} / {@link ChangeType#FORMULA} /
++ *                   {@link ChangeType#ROLLUP}）
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record DataItemConfigChangedEvent(Long itemId, Long tenantId, ChangeType changeType) {
++
++    /** 变更类型（三类取值配置各一枚，与接口一一对应） */
++    public enum ChangeType {
++        /** 绑定点位（PUT /iot/item/bind） */
++        BIND,
++        /** 保存公式（PUT /iot/item/formula） */
++        FORMULA,
++        /** 设置子级汇总（PUT /iot/item/rollup） */
++        ROLLUP
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/mapper/IotDataItemRefMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/mapper/IotDataItemRefMapper.java
+index d929d20..aac7ea5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/mapper/IotDataItemRefMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/mapper/IotDataItemRefMapper.java
+@@ -1,8 +1,11 @@
+ package net.otlab.admin.module.iot.dataitem.mapper;
+ 
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import org.apache.ibatis.annotations.Delete;
+ import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
+ 
+ /**
+  * 公式引用关系数据访问层（TASK-0013）
+@@ -10,12 +13,34 @@ import org.apache.ibatis.annotations.Mapper;
+  * <p>iot_data_item_ref 为 iot_ 前缀表，多租户条件由 TASK-0002 TenantLineInnerInterceptor
+  * （OtTenantLineHandler 前缀规则）自动注入；@TableLogic 运行时过滤已删行。写入规则照详细
+  * 设计 §1.7 p15：「公式校验通过并保存时，事务内先删该 item_id 的旧边再批量插入新边」——
+- * 生成链按新项落边（新项无旧边，直接批量插入）；公式编辑接口的重建语义归 0015/公式编辑
+- * 任务。
++ * 生成链按新项落边（新项无旧边，直接批量插入）；公式编辑接口的重建语义（先删后插）由
++ * TASK-0036 交付（{@link #deleteByItemIdPhysical}）。
++ *
++ * <p><b>重建删除必须是物理删</b>（TASK-0036）：uk_item_ref (item_id, ref_full_key, ref_type)
++ * 不含 deleted 列——@TableLogic 的 UPDATE deleted=1 会让旧边继续占用键，同项重存同引用
++ * （换绑/清除后再配回）的 INSERT 必撞唯一索引；引用边为派生依赖图（不允许人工维护、无
++ * 独立历史语义——配置变更历史归 iot_data_item_time线/0014 时间线钩子），物理删即重建语义。
++ * 旁路多租户插件（照 IotDataItemMapper.selectOccupancyByInstance 范式）显式 tenant_id 条件，
++ * 会话租户由服务层传入（禁请求携带）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ @Mapper
+ public interface IotDataItemRefMapper extends BaseMapper<IotDataItemRef> {
++
++    /**
++     * 按 item_id 物理删除该数据项的全部引用边（ref_type 1/2 一起清——引用边整组随配置
++     * 重建，brief「校验通过落库并事务内重建 ref（先删后插）」/「换绑/清除清旧边」）。
++     *
++     * <p>@TableLogic 与本方法无关（原生 @Delete 不过逻辑删注入、绕过插件显式条件）；
++     * 调用方须在事务内先调本方法再批量插入新边（先删后插次序由服务层保证）。
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取）
++     * @param itemId   引用方数据项 id（已验会话租户归属）
++     * @return 删除行数（无旧边为 0）
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Delete("DELETE FROM iot_data_item_ref WHERE tenant_id = #{tenantId} AND item_id = #{itemId}")
++    int deleteByItemIdPhysical(@Param("tenantId") Long tenantId, @Param("itemId") Long itemId);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+index d3b00c8..747eb4f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+@@ -1,8 +1,10 @@
+ package net.otlab.admin.module.iot.dataitem.service;
+ 
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.event.DataItemConfigChangedEvent;
+ 
+ import java.util.List;
+ import java.util.Map;
+@@ -109,4 +111,98 @@ public interface IotDataItemService {
+      * @return 有效参数 VO（逐字段值+来源三态）
+      */
+     IotItemEffectiveParamsVO getEffectiveParams(Long instanceId, Long itemId);
++
++    // ---------- 三类取值配置接口（TASK-0036，详细设计 §3.1 p22 数据项配置段） ----------
++
++    /**
++     * 绑定点位（TASK-0036，PUT /iot/item/bind，§3.1「绑定点位（source_type=1，写 point_id）」，
++     * 权限 iot:item:edit——0013 升级脚本预登记口径，§3.1 行的 iot:item:bind 权限码未登记
++     * 见报告）。
++     *
++     * <p>校验链：实例存在 → 数据权限（写路径）→ 数据项归属 → point_id 必填 → 点位存在
++     * （含同租户——多租户插件注入条件，他租户点位同文案「不存在」不泄露）→ 点位 status=1
++     * （停用拒绑）。通过则落库：source_type=1 + point_id，取值方式互斥清退场字段
++     * （formula/rollup_method 写 NULL），事务内重建引用边（先物理删旧边后插——ref_type=2
++     * 点位边，ref_full_key=点位编码，ref_item_id=NULL；换绑覆盖旧边），发布
++     * {@link DataItemConfigChangedEvent}（BIND，只发布不建监听）。
++     *
++     * @param instanceId 实例 id（须为活跃行）
++     * @param itemId     实例数据项 id（须存在且属于该实例）
++     * @param pointId    点位 id（须为本租户活跃且启用点位）
++     */
++    void bindPoint(Long instanceId, Long itemId, Long pointId);
++
++    /**
++     * 保存公式（TASK-0036，PUT /iot/item/formula，§3.1「保存公式（校验通过才落库并重建
++     * iot_data_item_ref）」，权限 iot:item:edit）。
++     *
++     * <p>formula 必填非空（清除公式经取值方式切换达成，本接口不做清除语义）。校验链
++     * （全部通过才落库，任一失败拒存零写入）：
++     * <ol>
++     * <li>语法（0013 RelativeRefExpander 同口径）：{TOKEN} 字符集/SELF|PARENT 前缀白名单/
++     *     括号配平（展开终检残留花括号拒）/展开后长度 ≤2000/被引用全键 ≤180——PARAM_ERROR；</li>
++     * <li>引用存在性（4001 拒存）：SELF./PARENT./绝对键逐个核对——SELF 码 ∈ 本实例活跃项、
++     *     PARENT 码 ∈ 父实例活跃项（顶级实例 PARENT 引用仍 400，0013 文案）、绝对键指回
++     *     本实例/父实例时必须命中对应项集；指向其他实例的绝对键维持 0013 一期口径不核存在
++     *     （被引实例可能后建，ref_item_id 尽力回填）；</li>
++     * <li>一期函数白名单占位（4001）：ABS/ROUND/MAX/MIN/IF/DELTA/RATE 之外拒存、INTEGRAL
++     *     专门文案（真实 Aviator 语法校验归 FEAT-0012）；</li>
++     * <li>循环依赖检测（4001，brief 决策 8）：候选项新引用边替换旧边后 DFS 数据项依赖图
++     *     （单实例 SELF/绝对键闭环 + 跨实例 PARENT 边闭环同构覆盖），本项可达自身即拒存，
++     *     环上项 id 列表进文案。</li>
++     * </ol>
++     * 通过则落库：source_type=2 + 展开后裸键公式，point_id/rollup_method 写 NULL，事务内
++     * 重建引用边（先物理删旧边后插 ref_type=1 数据项边，换公式/清除清旧边），发布
++     * {@link DataItemConfigChangedEvent}（FORMULA）。
++     *
++     * @param instanceId 实例 id（须为活跃行）
++     * @param itemId     实例数据项 id（须存在且属于该实例）
++     * @param formula    公式（花括号占位形态；已展开裸键形态兼容受理——点分全键按绝对键提取）
++     */
++    void saveFormula(Long instanceId, Long itemId, String formula);
++
++    /**
++     * 设置子级汇总（TASK-0036，PUT /iot/item/rollup，§3.1「设置子级汇总（source_type=3 +
++     * rollup_method）」，权限 iot:item:edit）。
++     *
++     * <p>rollup_method 收 SUM/AVG（brief 契约，{@link net.otlab.admin.module.iot.dataitem.domain.IotRollupRules}
++     * 声明位）。汇总范围规则存储口径：落「汇总项标识 + 聚合方式」，<b>不展开子级全量引用边</b>
++     * （范围=子级同名数据编码 + 参与开关打开且启用，计算期由计算引擎动态查找——REQ-0017
++     * 硬规则，brief 决策 1/4）；事务内重建引用边（先物理删旧边后插空集——汇总项出边清空），
++     * 发布 {@link DataItemConfigChangedEvent}（ROLLUP）。
++     *
++     * @param instanceId   实例 id（须为活跃行）
++     * @param itemId       实例数据项 id（须存在且属于该实例）
++     * @param rollupMethod 汇总方式 SUM/AVG
++     */
++    void saveRollup(Long instanceId, Long itemId, String rollupMethod);
++
++    /**
++     * 阈值四字段覆盖（TASK-0036，PUT /iot/item/{itemId}/thresholds + brief 字面路径别名
++     * /iot/dataitem/{itemId}/thresholds，权限 iot:item:edit）。
++     *
++     * <p>0014 overrideParams 的另一入口（brief 决策 1：覆盖写实例行，「结果行四列」配对
++     * 口径语义一致）——数据项单键定位（itemId → 归属实例解析），四字段覆盖表单与配对校验
++     * 完全委托 {@link #overrideParams}。
++     *
++     * @param itemId 实例数据项 id（须存在）
++     * @param form   四字段覆盖表单（null=清除覆盖回归继承）
++     */
++    void overrideThresholds(Long itemId, IotItemParamOverrideForm form);
++
++    /**
++     * 影响预览（TASK-0036，GET /iot/item/{itemId}/impact + brief 字面路径别名
++     * /iot/dataitem/{itemId}/impact，权限 iot:item:query——0057 公式编辑器「影响预览」
++     * 占位按钮的接线点，brief 决策 6）。
++     *
++     * <p>引用图反查：正向=本项引用了谁（ref 边出向，点位边 refType=2 一并返回）；反向=
++     * 谁引用了本项（ref 边入向，ref_item_id 与 ref_full_key 双路匹配去重——受影响上级项）；
++     * 指标关联恒空集占位（ref 图不含指标边，归 0043/计算引擎链路登记）。数据权限裁剪：
++     * 本项所属实例不可见 403（照 0014 读口径）；对端项所属实例不可见时该边整体裁剪
++     * （不泄露不可见实例的项），对端项不可解析（未建/已删）保留 ref_full_key 原文、项字段空。
++     *
++     * @param itemId 实例数据项 id（须存在）
++     * @return 影响预览 VO（含本项身份、正向/反向边、指标空集占位）
++     */
++    IotItemImpactVO getItemImpact(Long itemId);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index 71ce287..9c5e64c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -5,19 +5,27 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactEdgeVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
+ import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
++import net.otlab.admin.module.iot.dataitem.domain.IotRollupRules;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.event.DataItemConfigChangedEvent;
+ import net.otlab.admin.module.iot.dataitem.event.InstanceItemsGeneratedEvent;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemHistoryService;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemParamChange;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
++import net.otlab.admin.module.iot.dataitem.service.support.FormulaCycleDetector;
++import net.otlab.admin.module.iot.dataitem.service.support.FormulaFunctionWhitelist;
+ import net.otlab.admin.module.iot.dataitem.service.support.RelativeRefExpander;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
+ import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
+ import net.otlab.admin.module.iot.template.entity.IotModelInstance;
+ import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
+@@ -36,6 +44,7 @@ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.math.BigDecimal;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.LinkedHashSet;
+@@ -121,9 +130,26 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     /** 被引用全键限长口径（与 iot_data_item_ref DDL ref_full_key varchar(180) 一致，修订轮 M-5） */
+     private static final int MAX_LEN_REF_FULL_KEY = 180;
+ 
+-    /** ref_type：1 数据项（本期生成只产此类型；2 点位随绑定动作写入，归 0023） */
++    /** ref_type：1 数据项（生成与公式配置产出） */
+     private static final int REF_TYPE_DATA_ITEM = 1;
+ 
++    /** ref_type：2 点位（绑定动作写入，ref_full_key 存点位编码——TASK-0036） */
++    private static final int REF_TYPE_POINT = 2;
++
++    /**
++     * 校验拒存错误码（TASK-0036：引用存在性/循环依赖/函数白名单——详细设计 §3.4 错误码分段
++     * 4001-4099「参数与校验」段首码；ot-core ResultCode 未设 4001 枚举，本域常量直用原始码，
++     * 不扩枚举不改 ot-core）
++     */
++    public static final int CODE_VALIDATION_REJECTED = 4001;
++
++    /** 取值方式：子级汇总（TASK-0036 rollup 接口） */
++    private static final int SOURCE_TYPE_ROLLUP = 3;
++
++    /** 已展开裸键形态的绝对全键引用（点分标识符；花括号形态由 RelativeRefExpander 先行收集） */
++    private static final java.util.regex.Pattern BARE_FULL_KEY = java.util.regex.Pattern.compile(
++            "(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)(?![A-Za-z0-9_.])");
++
+     /** 阈值列小数位上限（valid/alarm 四列 decimal(20,6)，TASK-0014 校验口径） */
+     private static final int MAX_SCALE_THRESHOLD = 6;
+ 
+@@ -148,6 +174,9 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     @Autowired
+     private IotDataItemRefMapper dataItemRefMapper;
+ 
++    @Autowired
++    private IotPointMapper pointMapper;
++
+     @Autowired
+     private DataPermService dataPermService;
+ 
+@@ -483,6 +512,18 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+                 item.getAlarmLow(), templateItem != null ? templateItem.getDefaultAlarmLow() : null);
+         applyEffective(vo::setAlarmHigh, vo::setAlarmHighSource,
+                 item.getAlarmHigh(), templateItem != null ? templateItem.getDefaultAlarmHigh() : null);
++        // TASK-0036（brief 决策 3）：取值四要素纳入同一继承链口径——实例行有值→INSTANCE、
++        // 实例行空→模板默认（formula 的模板默认为模板态花括号公式，与实例态裸键形态区分）、
++        // 双空→NONE。生成链对 source_type/calc_period 恒有值（兜底 1 / 周期换算 0），
++        // 该两字段实际恒 INSTANCE；formula/rollup_method 在绑定类项上为空才见 TEMPLATE/NONE
++        applyEffective(vo::setSourceType, vo::setSourceTypeSource,
++                item.getSourceType(), templateItem != null ? templateItem.getDefaultSourceType() : null);
++        applyEffective(vo::setFormula, vo::setFormulaSource,
++                item.getFormula(), templateItem != null ? templateItem.getDefaultFormula() : null);
++        applyEffective(vo::setRollupMethod, vo::setRollupMethodSource,
++                item.getRollupMethod(), templateItem != null ? templateItem.getAggMethod() : null);
++        applyEffective(vo::setCalcPeriod, vo::setCalcPeriodSource,
++                item.getCalcPeriod(), templateItem != null ? mapCalcPeriodQuiet(templateItem.getDefaultCalcPeriod()) : null);
+         return vo;
+     }
+ 
+@@ -503,6 +544,53 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+         sourceSetter.accept(IotParamSource.NONE);
+     }
+ 
++    /** Integer 版单字段继承链解析（TASK-0036：source_type/calc_period） */
++    private void applyEffective(Consumer<Integer> valueSetter,
++                                Consumer<IotParamSource> sourceSetter,
++                                Integer instanceValue, Integer templateDefault) {
++        if (instanceValue != null) {
++            valueSetter.accept(instanceValue);
++            sourceSetter.accept(IotParamSource.INSTANCE);
++            return;
++        }
++        if (templateDefault != null) {
++            valueSetter.accept(templateDefault);
++            sourceSetter.accept(IotParamSource.TEMPLATE);
++            return;
++        }
++        sourceSetter.accept(IotParamSource.NONE);
++    }
++
++    /** String 版单字段继承链解析（TASK-0036：formula/rollup_method） */
++    private void applyEffective(Consumer<String> valueSetter,
++                                Consumer<IotParamSource> sourceSetter,
++                                String instanceValue, String templateDefault) {
++        if (instanceValue != null) {
++            valueSetter.accept(instanceValue);
++            sourceSetter.accept(IotParamSource.INSTANCE);
++            return;
++        }
++        if (templateDefault != null) {
++            valueSetter.accept(templateDefault);
++            sourceSetter.accept(IotParamSource.TEMPLATE);
++            return;
++        }
++        sourceSetter.accept(IotParamSource.NONE);
++    }
++
++    /**
++     * 模板默认周期码 → 秒（读路径容错版）：继承链展示不因模板残留坏周期码而 500——
++     * 不可识别/超限折为 null（来源随之为 NONE，展示层表现为「模板默认不可用」）；
++     * 与生成链 {@link #mapCalcPeriod} 的 fail-closed 语义不同（写路径坏码必须整批失败）。
++     */
++    private static Integer mapCalcPeriodQuiet(String templatePeriod) {
++        try {
++            return mapCalcPeriod(templatePeriod);
++        } catch (BusinessException e) {
++            return null;
++        }
++    }
++
+     /**
+      * 四字段校验（fail-closed，PARAM_ERROR）：负值与小数位超 6、整数位超 14（decimal(20,6)
+      * 上限 9999999999.999999）拒绝；min&lt;=max 配对校验扩为「结果行四列」口径（TASK-0014
+@@ -573,6 +661,429 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+                     && instance.getCreateBy().equals(SecurityUtils.getUserId()));
+     }
+ 
++    // ---------- 三类取值配置接口与引用边维护（TASK-0036） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void bindPoint(Long instanceId, Long itemId, Long pointId) {
++        // 防线顺序照 0012 修订轮写路径范式：存在性 → 数据权限 → 归属 → 校验
++        requireInstance(instanceId);
++        requireDataPerm(instanceId, "无权操作该实例（数据权限不命中）");
++        IotDataItem item = requireItemOfInstance(instanceId, itemId);
++        if (pointId == null) {
++            throw paramError("绑定点位ID不能为空");
++        }
++        // 点位存在/同租户（多租户插件注入 tenant_id 条件——他租户点位同文案「不存在」不泄露）/
++        // status=1（REQ-0015 绑定规则；brief 决策 1）
++        IotPoint point = pointMapper.selectById(pointId);
++        if (point == null) {
++            throw paramError("绑定点位不存在或已删除: " + pointId);
++        }
++        if (point.getStatus() == null || point.getStatus() != 1) {
++            throw paramError("点位已停用，请先启用后再绑定: " + point.getPointCode());
++        }
++
++        // 落库：source_type=1 + point_id；取值方式互斥清退场字段（formula/rollup_method 写 NULL，
++        // 与公式/汇总接口的清退对称——实例行不残留跨取值方式的死配置，继承链读取口径干净）
++        LambdaUpdateWrapper<IotDataItem> updateWrapper = new LambdaUpdateWrapper<IotDataItem>()
++                .eq(IotDataItem::getId, item.getId())
++                .set(IotDataItem::getSourceType, SOURCE_TYPE_BIND)
++                .set(IotDataItem::getPointId, pointId)
++                .set(IotDataItem::getFormula, null)
++                .set(IotDataItem::getRollupMethod, null);
++        this.update(new IotDataItem(), updateWrapper);
++
++        // 引用边重建（先删后插，brief 决策 2）：ref_type=2 点位边，ref_full_key=点位编码
++        // （iot_data_item_ref 实体注释口径），ref_item_id=NULL（点位无数据项 id）；
++        // 换绑覆盖旧边=旧边（含换绑前的公式边/旧点位边）物理删后插新点位边
++        rebuildRefs(item.getId(), List.of(pointRefEdge(item.getId(), point.getPointCode())));
++
++        eventPublisher.publishEvent(new DataItemConfigChangedEvent(
++                item.getId(), TenantContext.getTenantId(), DataItemConfigChangedEvent.ChangeType.BIND));
++        log.info("实例数据项绑定完成: instanceId={}, itemId={}, fullKey={}, pointId={}, pointCode={}",
++                instanceId, itemId, item.getFullKey(), pointId, point.getPointCode());
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void saveFormula(Long instanceId, Long itemId, String formula) {
++        // 防线顺序照 0012 修订轮写路径范式：存在性 → 数据权限 → 归属 → 校验链
++        IotModelInstance instance = requireInstance(instanceId);
++        requireDataPerm(instanceId, "无权操作该实例（数据权限不命中）");
++        IotDataItem item = requireItemOfInstance(instanceId, itemId);
++        if (isBlank(formula)) {
++            throw paramError("公式不能为空");
++        }
++        String raw = formula.trim();
++
++        // ---------- 1) 语法校验（0013 RelativeRefExpander 同口径） ----------
++        // PARENT 引用 lazy 解析父实例：顶级实例出现 PARENT 引用=400（0013 文案口径）
++        IotModelInstance parent = null;
++        if (RelativeRefExpander.containsParentRef(raw)) {
++            parent = resolveParent(instance);
++        }
++        String parentInstanceCode = parent != null ? parent.getInstanceCode() : null;
++        RelativeRefExpander.Outcome outcome = RelativeRefExpander.expand(
++                raw, instance.getInstanceCode(), parentInstanceCode);
++        String expanded = outcome.expandedFormula();
++        // 展开终检（0013 修订轮 I-1 同口径）：展开后残留 { 或 } = 畸形/超纲 token（如
++        // { SELF.X } 带空格、{SELF.ELEC-X} 非法编码字符），不匹配展开与剥壳两个正则——坏公式拒存
++        if (expanded.indexOf('{') >= 0 || expanded.indexOf('}') >= 0) {
++            throw paramError("公式包含无法识别的引用 token（展开后残留花括号）: 示例 "
++                    + firstResidualToken(expanded));
++        }
++        // 已展开裸键形态兼容（brief 引用存在性「绝对键逐个核对」的自然延伸）：点分全键直书
++        // （§3.1 preview 示例形态）无花括号可剥——按绝对键提取入引用集，与花括号剥壳结果并集去重
++        LinkedHashSet<String> refs = new LinkedHashSet<>(outcome.resolvedRefs());
++        collectBareFullKeyRefs(expanded, refs);
++        // 被引用全键限长（0013 修订轮 M-5 同口径：ref_full_key varchar(180) 列宽）
++        for (String refFullKey : refs) {
++            if (refFullKey.length() > MAX_LEN_REF_FULL_KEY) {
++                throw paramError("公式引用的全键超长（上限 " + MAX_LEN_REF_FULL_KEY + "，实际 "
++                        + refFullKey.length() + "）: " + refFullKey + "（项 " + item.getDataCode() + "）");
++            }
++        }
++        // 展开后公式限长（0013 口径：formula varchar(2000)——展开会增长，落库前复检）
++        if (expanded.length() > MAX_LEN_FORMULA) {
++            throw paramError("展开后公式超长（上限 " + MAX_LEN_FORMULA + "）: 项 " + item.getDataCode());
++        }
++
++        // ---------- 2) 一期函数白名单占位（brief 决策 5；真 Aviator 语法归 FEAT-0012） ----------
++        String violation = FormulaFunctionWhitelist.findViolation(expanded);
++        if (violation != null) {
++            throw new BusinessException(CODE_VALIDATION_REJECTED, violation + "（项 " + item.getDataCode() + "）");
++        }
++
++        // ---------- 3) 引用存在性（brief 决策 1，4001 拒存） ----------
++        // 租户内项索引一次装入（存在性核对 + ref_item_id 回填 + 依赖图节点共用）；
++        // 多租户插件注入 tenant_id 条件即租户内收敛
++        List<IotDataItem> tenantItems = this.list(new LambdaQueryWrapper<IotDataItem>()
++                .select(IotDataItem::getId, IotDataItem::getInstanceId, IotDataItem::getDataCode,
++                        IotDataItem::getFullKey));
++        Map<String, Long> itemIdByFullKey = new HashMap<>();
++        tenantItems.forEach(i -> itemIdByFullKey.put(i.getFullKey(), i.getId()));
++        // SELF 码存在性：本实例活跃项编码集（含自身项——自引用语法合法，闭环交给循环检测拒）
++        Set<String> selfCodeSet = tenantItems.stream()
++                .filter(i -> instanceId.equals(i.getInstanceId()))
++                .map(IotDataItem::getDataCode)
++                .collect(Collectors.toSet());
++        for (String selfCode : outcome.selfCodes()) {
++            if (!selfCodeSet.contains(selfCode)) {
++                throw validation4001("公式引用的数据项不存在: SELF." + selfCode
++                        + "（实例 " + instance.getInstanceCode() + "，项 " + item.getDataCode() + "）");
++            }
++        }
++        // PARENT 码存在性：父实例活跃项编码集（父实例缺失已在展开期 400）
++        if (parent != null && !outcome.parentCodes().isEmpty()) {
++            final Long parentInstanceId = parent.getId();
++            Set<String> parentCodeSet = tenantItems.stream()
++                    .filter(i -> parentInstanceId.equals(i.getInstanceId()))
++                    .map(IotDataItem::getDataCode)
++                    .collect(Collectors.toSet());
++            for (String parentCode : outcome.parentCodes()) {
++                if (!parentCodeSet.contains(parentCode)) {
++                    throw validation4001("公式引用的父实例数据项不存在: PARENT." + parentCode
++                            + "（父实例 " + parent.getInstanceCode() + "，项 " + item.getDataCode() + "）");
++                }
++            }
++        }
++        // 绝对键存在性（brief 口径：核对本实例与父实例数据项）——指回本实例/父实例的绝对键
++        // 必须命中对应项集；指向其他实例的绝对键维持 0013 一期口径不核存在（被引实例可能
++        // 后建，ref_item_id 尽力回填）
++        for (String refFullKey : refs) {
++            boolean checked = false;
++            if (refFullKey.startsWith(instance.getInstanceCode() + ".")) {
++                checked = true;
++            } else if (parentInstanceCode != null && refFullKey.startsWith(parentInstanceCode + ".")) {
++                checked = true;
++            }
++            if (checked && !itemIdByFullKey.containsKey(refFullKey)) {
++                throw validation4001("公式引用的数据项不存在: " + refFullKey
++                        + "（项 " + item.getDataCode() + "）");
++            }
++        }
++
++        // ---------- 4) 循环依赖检测（brief 决策 8，DFS，4001 含环上项 id 列表） ----------
++        // 候选项新引用边（id 解析出的才可能成环）替换其 DB 旧边后 DFS 数据项依赖图——
++        // 单实例 SELF/绝对键闭环与跨实例 PARENT 边闭环在同一张图上同构覆盖
++        Set<Long> newTargetIds = new LinkedHashSet<>();
++        for (String refFullKey : refs) {
++            Long targetId = itemIdByFullKey.get(refFullKey);
++            if (targetId != null) {
++                newTargetIds.add(targetId);
++            }
++        }
++        Map<Long, Set<Long>> edges = new HashMap<>();
++        for (IotDataItemRef ref : dataItemRefMapper.selectList(new LambdaQueryWrapper<IotDataItemRef>()
++                .eq(IotDataItemRef::getRefType, REF_TYPE_DATA_ITEM))) {
++            if (ref.getItemId().equals(itemId)) {
++                continue;
++            }
++            Long targetId = ref.getRefItemId() != null
++                    ? ref.getRefItemId() : itemIdByFullKey.get(ref.getRefFullKey());
++            if (targetId != null) {
++                edges.computeIfAbsent(ref.getItemId(), k -> new LinkedHashSet<>()).add(targetId);
++            }
++        }
++        edges.put(itemId, newTargetIds);
++        List<Long> cycle = FormulaCycleDetector.findCycle(edges, itemId);
++        if (cycle != null) {
++            throw validation4001("循环依赖: 公式引用形成闭环，保存拒绝（环上数据项 id: " + cycle
++                    + "）——请调整引用关系后重试（项 " + item.getDataCode() + "）");
++        }
++
++        // ---------- 5) 落库 + ref 重建（先删后插）+ 事件 ----------
++        LambdaUpdateWrapper<IotDataItem> updateWrapper = new LambdaUpdateWrapper<IotDataItem>()
++                .eq(IotDataItem::getId, item.getId())
++                .set(IotDataItem::getSourceType, SOURCE_TYPE_FORMULA)
++                .set(IotDataItem::getPointId, null)
++                .set(IotDataItem::getRollupMethod, null)
++                .set(IotDataItem::getFormula, expanded);
++        this.update(new IotDataItem(), updateWrapper);
++        List<IotDataItemRef> refRows = new ArrayList<>(refs.size());
++        for (String refFullKey : refs) {
++            IotDataItemRef ref = new IotDataItemRef();
++            ref.setItemId(item.getId());
++            ref.setRefFullKey(refFullKey);
++            ref.setRefType(REF_TYPE_DATA_ITEM);
++            ref.setRefItemId(itemIdByFullKey.get(refFullKey));
++            refRows.add(ref);
++        }
++        rebuildRefs(item.getId(), refRows);
++
++        eventPublisher.publishEvent(new DataItemConfigChangedEvent(
++                item.getId(), TenantContext.getTenantId(), DataItemConfigChangedEvent.ChangeType.FORMULA));
++        log.info("实例数据项公式保存完成: instanceId={}, itemId={}, fullKey={}, refs={}, formula={}",
++                instanceId, itemId, item.getFullKey(), refs.size(), expanded);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void saveRollup(Long instanceId, Long itemId, String rollupMethod) {
++        // 防线顺序照 0012 修订轮写路径范式：存在性 → 数据权限 → 归属 → 校验
++        requireInstance(instanceId);
++        requireDataPerm(instanceId, "无权操作该实例（数据权限不命中）");
++        IotDataItem item = requireItemOfInstance(instanceId, itemId);
++        if (rollupMethod == null || !IotRollupRules.ALLOWED_METHODS.contains(rollupMethod)) {
++            throw paramError("汇总方式仅允许 SUM/AVG: " + rollupMethod);
++        }
++
++        // 落库：source_type=3 + rollup_method；取值方式互斥清退场字段（formula/point_id 写 NULL）。
++        // 汇总范围规则存储口径（brief 决策 1/4）：本行即「汇总项标识+范围规则」——范围=子级
++        // 同名数据编码、参与开关打开且启用的子节点，计算期由计算引擎动态查找（REQ-0017 硬规则），
++        // ref 不展开子级全量边（引用边在计算期展开）；缺失打码 7 声明位见 IotRollupRules
++        LambdaUpdateWrapper<IotDataItem> updateWrapper = new LambdaUpdateWrapper<IotDataItem>()
++                .eq(IotDataItem::getId, item.getId())
++                .set(IotDataItem::getSourceType, SOURCE_TYPE_ROLLUP)
++                .set(IotDataItem::getRollupMethod, rollupMethod)
++                .set(IotDataItem::getFormula, null)
++                .set(IotDataItem::getPointId, null);
++        this.update(new IotDataItem(), updateWrapper);
++
++        // 引用边重建（先删后插）：汇总项出边为空集——不落子级全量边（动态纳入口径），
++        // 旧公式/点位边随之清理（换绑/清除清旧边）
++        rebuildRefs(item.getId(), List.of());
++
++        eventPublisher.publishEvent(new DataItemConfigChangedEvent(
++                item.getId(), TenantContext.getTenantId(), DataItemConfigChangedEvent.ChangeType.ROLLUP));
++        log.info("实例数据项汇总配置完成: instanceId={}, itemId={}, fullKey={}, rollupMethod={}",
++                instanceId, itemId, item.getFullKey(), rollupMethod);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void overrideThresholds(Long itemId, IotItemParamOverrideForm form) {
++        // 0014 overrideParams 的另一入口（brief 决策 1）：数据项单键定位 → 归属实例解析后
++        // 完全委托——存在性/数据权限/归属/「结果行四列」配对校验/时间线钩子全同语义
++        IotDataItem item = baseMapper.selectById(itemId);
++        if (item == null) {
++            throw paramError("数据项不存在或已删除: " + itemId);
++        }
++        overrideParams(item.getInstanceId(), itemId, form);
++    }
++
++    @Override
++    public IotItemImpactVO getItemImpact(Long itemId) {
++        // 读单实例资源照 0014 effective-params 口径：存在性 → 数据权限 403（含 createBy OR 分支）
++        IotDataItem item = baseMapper.selectById(itemId);
++        if (item == null) {
++            throw paramError("数据项不存在或已删除: " + itemId);
++        }
++        IotModelInstance instance = modelInstanceMapper.selectById(item.getInstanceId());
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + item.getInstanceId());
++        }
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !isInstanceReadableByUser(scope, instance)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）");
++        }
++
++        // 正向出向边：本项引用了谁（数据项边 + 点位边一并返回）
++        List<IotDataItemRef> outRefs = dataItemRefMapper.selectList(new LambdaQueryWrapper<IotDataItemRef>()
++                .eq(IotDataItemRef::getItemId, itemId)
++                .orderByAsc(IotDataItemRef::getId));
++        // 反向入向边：谁引用了本项（ref_type=1 数据项边；ref_item_id 与 ref_full_key 双路
++        // 匹配——绝对键边 ref_item_id 可能 NULL，full_key 兜底；同一行两条件同中，SQL 单行无重复）
++        List<IotDataItemRef> inRefs = dataItemRefMapper.selectList(new LambdaQueryWrapper<IotDataItemRef>()
++                .eq(IotDataItemRef::getRefType, REF_TYPE_DATA_ITEM)
++                .and(w -> w.eq(IotDataItemRef::getRefItemId, itemId)
++                        .or().eq(IotDataItemRef::getRefFullKey, item.getFullKey()))
++                .orderByAsc(IotDataItemRef::getId));
++
++        // 对端项/实例批量解析（N+1 防：两条批查；对端实例不可见即裁边——不泄露不可见实例的项）
++        Set<Long> peerItemIds = new LinkedHashSet<>();
++        outRefs.forEach(r -> {
++            if (REF_TYPE_DATA_ITEM == r.getRefType() && r.getRefItemId() != null) {
++                peerItemIds.add(r.getRefItemId());
++            }
++        });
++        inRefs.forEach(r -> peerItemIds.add(r.getItemId()));
++        Map<Long, IotDataItem> peerItemById = peerItemIds.isEmpty() ? Map.of()
++                : this.list(new LambdaQueryWrapper<IotDataItem>()
++                        .in(IotDataItem::getId, peerItemIds)).stream()
++                        .collect(Collectors.toMap(IotDataItem::getId, i -> i));
++        // 出向边 ref_item_id 缺失时按 full_key 兜底解析（绝对键指向未建实例/已删项的场景）
++        Set<String> unresolvedKeys = outRefs.stream()
++                .filter(r -> REF_TYPE_DATA_ITEM == r.getRefType() && r.getRefItemId() == null)
++                .map(IotDataItemRef::getRefFullKey)
++                .collect(Collectors.toSet());
++        Map<String, IotDataItem> peerItemByKey = unresolvedKeys.isEmpty() ? Map.of()
++                : this.list(new LambdaQueryWrapper<IotDataItem>()
++                        .in(IotDataItem::getFullKey, unresolvedKeys)).stream()
++                        .collect(Collectors.toMap(IotDataItem::getFullKey, i -> i));
++        Set<Long> peerInstanceIds = new LinkedHashSet<>();
++        peerItemById.values().forEach(i -> peerInstanceIds.add(i.getInstanceId()));
++        peerItemByKey.values().forEach(i -> peerInstanceIds.add(i.getInstanceId()));
++        Map<Long, IotModelInstance> peerInstanceById = peerInstanceIds.isEmpty() ? Map.of()
++                : modelInstanceMapper.selectList(new LambdaQueryWrapper<IotModelInstance>()
++                        .in(IotModelInstance::getId, peerInstanceIds)).stream()
++                        .collect(Collectors.toMap(IotModelInstance::getId, i -> i));
++
++        IotItemImpactVO vo = new IotItemImpactVO();
++        vo.setItemId(item.getId());
++        vo.setInstanceId(instance.getId());
++        vo.setInstanceCode(instance.getInstanceCode());
++        vo.setInstanceName(instance.getInstanceName());
++        vo.setDataCode(item.getDataCode());
++        vo.setDataName(item.getDataName());
++        vo.setFullKey(item.getFullKey());
++        vo.setOutgoing(buildImpactEdges(outRefs, "OUT", itemId, item, scope,
++                peerItemById, peerItemByKey, peerInstanceById));
++        vo.setIncoming(buildImpactEdges(inRefs, "IN", itemId, item, scope,
++                peerItemById, peerItemByKey, peerInstanceById));
++        // 指标关联：本期 ref 图不含指标边——空集占位（brief 决策 6，指标边归 0043/计算引擎）
++        vo.setMetrics(List.of());
++        return vo;
++    }
++
++    /** 影响预览边装配：对端解析 + 实例可见性裁剪（对端项不可解析保留 ref_full_key 原文） */
++    private List<IotItemImpactEdgeVO> buildImpactEdges(List<IotDataItemRef> refs, String direction,
++                                                       Long selfItemId, IotDataItem selfItem, VisibleScope scope,
++                                                       Map<Long, IotDataItem> peerItemById,
++                                                       Map<String, IotDataItem> peerItemByKey,
++                                                       Map<Long, IotModelInstance> peerInstanceById) {
++        List<IotItemImpactEdgeVO> edges = new ArrayList<>(refs.size());
++        for (IotDataItemRef ref : refs) {
++            IotDataItem peerItem = REF_TYPE_DATA_ITEM == ref.getRefType()
++                    ? (ref.getRefItemId() != null
++                        ? peerItemById.get(ref.getRefItemId())
++                        : peerItemByKey.get(ref.getRefFullKey()))
++                    : null;
++            if ("IN".equals(direction)) {
++                // 入向边的对端=引用方（edge.item_id）；对端行缺失（已删项的残留边）不返回
++                peerItem = peerItemById.get(ref.getItemId());
++                if (peerItem == null) {
++                    continue;
++                }
++            }
++            IotModelInstance peerInstance = peerItem != null ? peerInstanceById.get(peerItem.getInstanceId()) : null;
++            // 数据权限裁剪：对端项所属实例不可见（或实例行缺失不可判）→ 该边整体不返回
++            if (peerItem != null && (peerInstance == null
++                    || (!scope.allTenant() && !isInstanceReadableByUser(scope, peerInstance)))) {
++                continue;
++            }
++            IotItemImpactEdgeVO edge = new IotItemImpactEdgeVO();
++            edge.setDirection(direction);
++            edge.setRefType(ref.getRefType());
++            edge.setRefFullKey(ref.getRefFullKey());
++            if (peerItem != null) {
++                edge.setPeerItemId(peerItem.getId());
++                edge.setPeerFullKey(peerItem.getFullKey());
++                edge.setPeerDataCode(peerItem.getDataCode());
++                edge.setPeerDataName(peerItem.getDataName());
++                edge.setPeerInstanceId(peerItem.getInstanceId());
++                if (peerInstance != null) {
++                    edge.setPeerInstanceCode(peerInstance.getInstanceCode());
++                    edge.setPeerInstanceName(peerInstance.getInstanceName());
++                }
++            }
++            edges.add(edge);
++        }
++        return edges;
++    }
++
++    /** 配置类写路径公共闸：实例存在性（防线第一步，归属/校验随后） */
++    private IotModelInstance requireInstance(Long instanceId) {
++        IotModelInstance instance = modelInstanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + instanceId);
++        }
++        return instance;
++    }
++
++    /** 配置类写路径公共闸：数据项存在且属于该实例（归属防线） */
++    private IotDataItem requireItemOfInstance(Long instanceId, Long itemId) {
++        IotDataItem item = baseMapper.selectById(itemId);
++        if (item == null || !instanceId.equals(item.getInstanceId())) {
++            throw paramError("数据项不存在或不属于该实例: " + itemId);
++        }
++        return item;
++    }
++
++    /**
++     * 引用边事务内重建（brief 决策 2 硬要求「先删后插」）：先物理删该 item_id 全部旧边
++     * （uk_item_ref 不含 deleted 列，逻辑删会让旧边继续占用键——见
++     * IotDataItemRefMapper#deleteByItemIdPhysical），再批量插入新边（换绑/清除清旧边由
++     * 「整组删除+新集插入」语义天然覆盖）。
++     */
++    private void rebuildRefs(Long itemId, List<IotDataItemRef> newRefs) {
++        dataItemRefMapper.deleteByItemIdPhysical(TenantContext.getTenantId(), itemId);
++        try {
++            for (IotDataItemRef ref : newRefs) {
++                ref.setTenantId(TenantContext.getTenantId());
++                dataItemRefMapper.insert(ref);
++            }
++        } catch (DuplicateKeyException e) {
++            throw duplicateItem4002("实例数据项引用边并发冲突，本次未入库，请重试（项 " + itemId + "）");
++        }
++    }
++
++    /** 点位引用边（ref_type=2，ref_full_key=点位编码——iot_data_item_ref 实体注释口径） */
++    private IotDataItemRef pointRefEdge(Long itemId, String pointCode) {
++        IotDataItemRef ref = new IotDataItemRef();
++        ref.setItemId(itemId);
++        ref.setRefFullKey(pointCode);
++        ref.setRefType(REF_TYPE_POINT);
++        ref.setRefItemId(null);
++        return ref;
++    }
++
++    /** 已展开裸键形态的点分全键引用收集（并入引用集去重；花括号形态已由 Expander 收集） */
++    private static void collectBareFullKeyRefs(String expandedFormula, LinkedHashSet<String> refs) {
++        if (expandedFormula == null || expandedFormula.isBlank()) {
++            return;
++        }
++        java.util.regex.Matcher matcher = BARE_FULL_KEY.matcher(expandedFormula);
++        while (matcher.find()) {
++            refs.add(matcher.group(1));
++        }
++    }
++
++    /** 校验拒存（4001，详细设计 §3.4「参数与校验」段——引用存在性/循环依赖/函数白名单） */
++    private BusinessException validation4001(String message) {
++        return new BusinessException(CODE_VALIDATION_REJECTED, message);
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 模板项 → 实例项实体（字段白名单构建，映射口径见类注释；公式由调用方展开后回填） */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetector.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetector.java
+new file mode 100644
+index 0000000..5f750c7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetector.java
+@@ -0,0 +1,76 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 公式引用图循环依赖检测器（TASK-0036，brief 决策 8——DFS 纯函数件）
++ *
++ * <p><b>检测范围（brief 口径）</b>：单实例内 SELF/绝对键闭环 + 跨实例 PARENT 边闭环。
++ * 两类环在依赖图上同构——保存/生成链把 SELF./PARENT./绝对键引用统一落为
++ * iot_data_item_ref（ref_type=1）数据项边（ref_item_id 尽力回填，跨设备绝对引用指向
++ * 未建实例时为 NULL——无目标即无环，DFS 跳过），故本检测器只看一张
++ * {@code 数据项 id → 被引用数据项 id 集} 的有向图，实例边界不特殊处理（跨实例 PARENT
++ * 边闭环天然覆盖）。
++ *
++ * <p><b>调用方语义（saveFormula）</b>：候选项的新引用边「替换」其 DB 旧边后做可达性
++ * DFS——从候选项出发沿边游走，回到候选项即成环，返回环上项 id 列表（从候选项起、按
++ * 引用方向排序、起点不重复收尾）；调用方把列表拼进 4001「循环依赖」文案。环在别处但
++ * 不可达候选（下游环）不拒存——本接口口径是「本项可达自身」（brief：重建 ref 边后 DFS
++ * 本项可达自身 → 4001）。
++ *
++ * <p>算法：onPath 栈 + 全局 done 集（探索完毕剪枝），最坏 O(V+E)；公式链深度受
++ * FEAT-0012 嵌套深度上限约束（一期 DFS 递归深度=引用链长度，量级为配置面小图）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class FormulaCycleDetector {
++
++    private FormulaCycleDetector() {
++    }
++
++    /**
++     * 从 start 出发沿 edges 游走，检测是否存在回到 start 的路径。
++     *
++     * @param edges 有向图（数据项 id → 被引用数据项 id 集；无出边的项可缺键）
++     * @param start 候选项 id（本次公式保存的目标项）
++     * @return 环上项 id 列表（[start, …] 按引用方向，start 不重复收尾）；无环返回 null
++     */
++    public static List<Long> findCycle(Map<Long, Set<Long>> edges, long start) {
++        Deque<Long> path = new ArrayDeque<>();
++        Set<Long> onPath = new HashSet<>();
++        Set<Long> done = new HashSet<>();
++        if (dfs(start, start, edges, path, onPath, done)) {
++            return new ArrayList<>(path);
++        }
++        return null;
++    }
++
++    /** DFS：path/onPath 为当前栈，done 为已探索无解节点（剪枝防重复子树） */
++    private static boolean dfs(long current, long start, Map<Long, Set<Long>> edges,
++                               Deque<Long> path, Set<Long> onPath, Set<Long> done) {
++        if (done.contains(current)) {
++            return false;
++        }
++        path.addLast(current);
++        onPath.add(current);
++        for (long next : edges.getOrDefault(current, Set.of())) {
++            if (next == start) {
++                return true;
++            }
++            if (!onPath.contains(next) && dfs(next, start, edges, path, onPath, done)) {
++                return true;
++            }
++        }
++        path.removeLast();
++        onPath.remove(current);
++        done.add(current);
++        return false;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelist.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelist.java
+new file mode 100644
+index 0000000..7b64ced
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelist.java
+@@ -0,0 +1,72 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import java.util.LinkedHashSet;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * 一期公式函数白名单占位校验器（TASK-0036，brief 决策 5）
++ *
++ * <p><b>占位口径</b>：真实 Aviator 语法校验（真语法树、嵌套深度、运算符合法性）归
++ * FEAT-0012 校验器（REQ-0016/TASK-0036 brief 明文）——本类只交付「函数名单常量 + 调用点
++ * 扫描占位」：从公式中提取 {@code 函数名(} 形态的调用点，白名单内放行、一期保留不开放的
++ * INTEGRAL 给专门文案、集合外拒绝。四则运算与数据项引用标识符（含点分全键）天然不匹配
++ * 调用点形态，不受影响。
++ *
++ * <p>函数集口径（REQ-0016 业务能力）：四则运算 + ABS/ROUND/MAX/MIN/IF/DELTA/RATE 一期
++ * 函数集，集合外拒绝保存；INTEGRAL 不开放为通用函数（REQ-0016 非目标；仅随 REQ-0019
++ * 能源计量预置公式提供——TD-0019/ADR-0010 换表口径的底层算子，本期登记为封闭函数）。
++ *
++ * <p>大小写敏感（Aviator 标识符本就区分大小写；REQ-0016 白名单一律大写形态）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class FormulaFunctionWhitelist {
++
++    /** 一期函数白名单（REQ-0016：四则运算之外显式列名的七函数） */
++    public static final Set<String> ALLOWED = Set.of("ABS", "ROUND", "MAX", "MIN", "IF", "DELTA", "RATE");
++
++    /** 一期封闭不开放函数（REQ-0016 非目标；仅随 REQ-0019 能源计量预置公式提供） */
++    public static final String CLOSED_INTEGRAL = "INTEGRAL";
++
++    /** 函数调用点形态：标识符紧跟左括号（容忍空白）；点分全键引用不含括号、天然不匹配 */
++    private static final Pattern FUNCTION_CALL = Pattern.compile("([A-Za-z_][A-Za-z0-9_]*)\\s*\\(");
++
++    private FormulaFunctionWhitelist() {
++    }
++
++    /**
++     * 扫描公式中的函数调用点，返回首个违规描述；无违规返回 null。
++     *
++     * <p>INTEGRAL 命中给专门文案（「一期不开放」语义，区别于普通集合外函数）；扫描按公式
++     * 出现序取首个违规，便于前端定位（占位校验器一期只报首个——完整 issues 定位随
++     * FEAT-0012 validate 接口交付）。
++     *
++     * @param formula 展开后（裸键形态）公式，可 null/空白（视为无函数调用，放行）
++     * @return 违规描述（含函数名与白名单/不开放语义）；无违规 null
++     */
++    public static String findViolation(String formula) {
++        if (formula == null || formula.isBlank()) {
++            return null;
++        }
++        // 逐调用点扫描（保序）：先命中先报——INTEGRAL 优先级按出现序，不做全局重排
++        LinkedHashSet<String> seen = new LinkedHashSet<>();
++        Matcher matcher = FUNCTION_CALL.matcher(formula);
++        while (matcher.find()) {
++            String name = matcher.group(1);
++            if (!seen.add(name)) {
++                continue;
++            }
++            if (CLOSED_INTEGRAL.equals(name)) {
++                return "公式函数 INTEGRAL 一期不开放（仅随 REQ-0019 能源计量预置公式提供），保存拒绝";
++            }
++            if (!ALLOWED.contains(name)) {
++                return "公式函数不在一期白名单: " + name + "（一期仅允许 ABS/ROUND/MAX/MIN/IF/DELTA/RATE，"
++                        + "真实语法校验归 FEAT-0012）";
++            }
++        }
++        return null;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+index 2386fb6..fc31ee0 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+@@ -2,6 +2,7 @@ package net.otlab.admin.module.iot.dataitem.controller;
+ 
+ import cn.dev33.satoken.annotation.SaCheckPermission;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
+ import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+@@ -16,6 +17,7 @@ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
+ import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
++import org.mockito.Mockito;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.http.MediaType;
+ import org.springframework.test.util.ReflectionTestUtils;
+@@ -31,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+@@ -291,4 +294,150 @@ class IotDataItemControllerTest {
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.code").value(403));
+     }
++
++    // ---------- TASK-0036：三类取值配置接口 + 阈值入口 + 影响预览 ----------
++
++    @Test
++    @DisplayName("权限注解（TASK-0036）- bind/formula/rollup/thresholds=iot:item:edit、impact=iot:item:query（均复用既有菜单行）")
++    void testConfigEndpointsPermissionAnnotations() throws Exception {
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("bind", net.otlab.admin.module.iot.dataitem.dto.IotItemBindForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("formula", net.otlab.admin.module.iot.dataitem.dto.IotItemFormulaForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("rollup", net.otlab.admin.module.iot.dataitem.dto.IotItemRollupForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("thresholds", Long.class, IotItemParamOverrideForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:query", IotDataItemController.class
++                .getMethod("impact", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解（TASK-0036）- bind/formula/rollup/thresholds 四写入口均 @OperateLog UPDATE")
++    void testConfigEndpointsOperateLogAnnotations() throws Exception {
++        Method bind = IotDataItemController.class
++                .getMethod("bind", net.otlab.admin.module.iot.dataitem.dto.IotItemBindForm.class);
++        Method formula = IotDataItemController.class
++                .getMethod("formula", net.otlab.admin.module.iot.dataitem.dto.IotItemFormulaForm.class);
++        Method rollup = IotDataItemController.class
++                .getMethod("rollup", net.otlab.admin.module.iot.dataitem.dto.IotItemRollupForm.class);
++        Method thresholds = IotDataItemController.class
++                .getMethod("thresholds", Long.class, IotItemParamOverrideForm.class);
++        for (Method method : new Method[] {bind, formula, rollup, thresholds}) {
++            OperateLog operateLog = method.getAnnotation(OperateLog.class);
++            assertNotNull(operateLog, () -> method.getName() + " 缺少 @OperateLog");
++            assertEquals(BusinessType.UPDATE, operateLog.businessType(),
++                    () -> method.getName() + " businessType 应为 UPDATE");
++        }
++    }
++
++    @Test
++    @DisplayName("绑定 - PUT /iot/item/bind 委派服务层（instanceId/itemId/pointId 三元透传）")
++    void testBind_Success() throws Exception {
++        mockMvc.perform(put("/iot/item/bind")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"pointId\":900}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(dataItemService).bindPoint(100L, 200L, 900L);
++    }
++
++    @Test
++    @DisplayName("绑定 - pointId 缺失被 @Valid 拒（PARAM_ERROR，服务层不触）")
++    void testBind_PointIdMissingRejected() throws Exception {
++        mockMvc.perform(put("/iot/item/bind")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(dataItemService, never()).bindPoint(any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("公式 - PUT /iot/item/formula 委派服务层；服务层 4001（循环依赖）透传")
++    void testFormula_SuccessAnd4001Passthrough() throws Exception {
++        mockMvc.perform(put("/iot/item/formula")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"formula\":\"{SELF.X}+1\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(dataItemService).saveFormula(100L, 200L, "{SELF.X}+1");
++
++        Mockito.doThrow(new BusinessException(4001, "循环依赖: 公式引用形成闭环，保存拒绝（环上数据项 id: [200, 201]）"))
++                .when(dataItemService).saveFormula(100L, 200L, "CYCLE");
++        mockMvc.perform(put("/iot/item/formula")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"formula\":\"CYCLE\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4001))
++                .andExpect(jsonPath("$.message").value(
++                        "循环依赖: 公式引用形成闭环，保存拒绝（环上数据项 id: [200, 201]）"));
++    }
++
++    @Test
++    @DisplayName("汇总 - PUT /iot/item/rollup 委派服务层（rollupMethod 透传）；集合外 400 透传")
++    void testRollup_SuccessAnd400Passthrough() throws Exception {
++        mockMvc.perform(put("/iot/item/rollup")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"rollupMethod\":\"SUM\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(dataItemService).saveRollup(100L, 200L, "SUM");
++
++        mockMvc.perform(put("/iot/item/rollup")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"rollupMethod\":\"MAX\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("阈值入口 - PUT /iot/item/{itemId}/thresholds 与 brief 字面路径别名 /iot/dataitem/{itemId}/thresholds 同 handler")
++    void testThresholds_BothRoutes() throws Exception {
++        for (String path : new String[] {"/iot/item/{itemId}/thresholds", "/iot/dataitem/{itemId}/thresholds"}) {
++            mockMvc.perform(put(path, 200L)
++                            .contentType(MediaType.APPLICATION_JSON)
++                            .content("{\"validMin\":5,\"validMax\":200,\"alarmLow\":2,\"alarmHigh\":150}"))
++                    .andExpect(status().isOk())
++                    .andExpect(jsonPath("$.code").value(200));
++        }
++        verify(dataItemService, Mockito.times(2)).overrideThresholds(Mockito.eq(200L), any());
++    }
++
++    @Test
++    @DisplayName("影响预览 - GET /iot/item/{itemId}/impact 与 /iot/dataitem/{itemId}/impact 别名返回 VO；403 透传")
++    void testImpact_BothRoutesAnd403Passthrough() throws Exception {
++        IotItemImpactVO vo = new IotItemImpactVO();
++        vo.setItemId(200L);
++        vo.setInstanceId(100L);
++        vo.setFullKey("F01.WS01.EQ001.ELEC_CONS");
++        vo.setOutgoing(List.of());
++        vo.setIncoming(List.of());
++        vo.setMetrics(List.of());
++        when(dataItemService.getItemImpact(200L)).thenReturn(vo);
++
++        for (String path : new String[] {"/iot/item/{itemId}/impact", "/iot/dataitem/{itemId}/impact"}) {
++            mockMvc.perform(get(path, 200L))
++                    .andExpect(status().isOk())
++                    .andExpect(jsonPath("$.code").value(200))
++                    .andExpect(jsonPath("$.data.itemId").value(200))
++                    .andExpect(jsonPath("$.data.metrics").isEmpty());
++        }
++        verify(dataItemService, Mockito.times(2)).getItemImpact(200L);
++
++        Mockito.doThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）"))
++                .when(dataItemService).getItemImpact(999L);
++        mockMvc.perform(get("/iot/item/{itemId}/impact", 999L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceConfigTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceConfigTest.java
+new file mode 100644
+index 0000000..b678ee6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceConfigTest.java
+@@ -0,0 +1,1000 @@
++package net.otlab.admin.module.iot.dataitem.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactEdgeVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.event.DataItemConfigChangedEvent;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemHistoryService;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Captor;
++import org.mockito.InOrder;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.Arrays;
++import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertAll;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.inOrder;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 三类取值配置接口 + 阈值入口 + 影响预览服务单元测试（TASK-0036）
++ *
++ * <p>standalone Mockito 范式（照 IotDataItemServiceImplTest / ParamOverrideTest）：Mapper 全
++ * mock 不触真实库；TenantContext/SecurityUtils 静态 mock。覆盖 brief 测试口径：绑定成功/
++ * 换绑覆盖/点位不存在拒；公式展开校验（引用不存在 4001/循环依赖 4001 含环列表/畸形 token
++ * 400/白名单占位 4001）/落库+ref 重建正确（先删后插 InOrder + 换绑清旧边）；rollup 汇总标识
++ * 存储（出边清空=动态纳入口径）；阈值入口委托（结果行四列配对在 overrideParams 既有测试）；impact
++ * 正反向+裁剪+指标空集；事件发布断言；继承链扩展四字段三态。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataItemServiceConfigTest {
++
++    private static final Long TENANT = 1L;
++    private static final Long INSTANCE_ID = 100L;
++    private static final Long PARENT_INSTANCE_ID = 50L;
++    private static final Long ITEM_ID = 200L;
++    private static final Long TARGET_ITEM_ID = 201L;
++    private static final Long PARENT_ITEM_ID = 301L;
++    private static final Long POINT_ID = 900L;
++    private static final String INSTANCE_CODE = "F01.WS01.EQ001";
++    private static final String PARENT_INSTANCE_CODE = "F01.WS01";
++    private static final String FULL_KEY = INSTANCE_CODE + ".ELEC_CONS";
++    private static final String TARGET_FULL_KEY = INSTANCE_CODE + ".ELEC_METER";
++    private static final String POINT_CODE = "P_METER_01";
++
++    @Mock
++    private IotDataItemMapper baseMapper;
++
++    @Mock
++    private IotDataItemRefMapper dataItemRefMapper;
++
++    @Mock
++    private IotModelInstanceMapper modelInstanceMapper;
++
++    @Mock
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Mock
++    private IotPointMapper pointMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private org.springframework.context.ApplicationEventPublisher eventPublisher;
++
++    @Mock
++    private IotDataItemHistoryService dataItemHistoryService;
++
++    @Captor
++    private ArgumentCaptor<Wrapper<IotDataItem>> updateWrapperCaptor;
++
++    @Captor
++    private ArgumentCaptor<IotDataItemRef> refCaptor;
++
++    @Captor
++    private ArgumentCaptor<DataItemConfigChangedEvent> eventCaptor;
++
++    private IotDataItemServiceImpl dataItemService;
++
++    private MockedStatic<TenantContext> tenantContext;
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemRef.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(7L);
++        dataItemService = new IotDataItemServiceImpl();
++        ReflectionTestUtils.setField(dataItemService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(dataItemService, "dataItemRefMapper", dataItemRefMapper);
++        ReflectionTestUtils.setField(dataItemService, "modelInstanceMapper", modelInstanceMapper);
++        ReflectionTestUtils.setField(dataItemService, "dataItemTemplateMapper", dataItemTemplateMapper);
++        ReflectionTestUtils.setField(dataItemService, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(dataItemService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(dataItemService, "eventPublisher", eventPublisher);
++        ReflectionTestUtils.setField(dataItemService, "dataItemHistoryService", dataItemHistoryService);
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.update(any(), any())).thenReturn(1);
++        when(dataItemRefMapper.insert(any(IotDataItemRef.class))).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotModelInstance instance(Long id, String code, Long parentId) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setTenantId(TENANT);
++        inst.setInstanceCode(code);
++        inst.setInstanceName("实例-" + code);
++        inst.setParentId(parentId == null ? 0L : parentId);
++        inst.setAncestors(parentId == null ? "0" : "0,1," + parentId);
++        inst.setNodeType(4);
++        inst.setTemplateId(10L);
++        inst.setStatus(1);
++        inst.setLocked(0);
++        return inst;
++    }
++
++    private IotDataItem item(Long id, Long instanceId, String dataCode, Integer sourceType) {
++        IotDataItem item = new IotDataItem();
++        item.setId(id);
++        item.setTenantId(TENANT);
++        item.setInstanceId(instanceId);
++        item.setDataCode(dataCode);
++        item.setFullKey(instanceCodeOf(instanceId) + "." + dataCode);
++        item.setSourceType(sourceType);
++        item.setEnabled(1);
++        item.setStatus(1);
++        item.setDeleted(0);
++        return item;
++    }
++
++    private String instanceCodeOf(Long instanceId) {
++        if (INSTANCE_ID.equals(instanceId)) {
++            return INSTANCE_CODE;
++        }
++        if (PARENT_INSTANCE_ID.equals(instanceId)) {
++            return PARENT_INSTANCE_CODE;
++        }
++        return "OTHER." + instanceId;
++    }
++
++    private IotDataItem candidate() {
++        // 候选项：既有覆盖状态（含 formula/rollup 残留，用于断言「取值方式互斥清退场字段」）
++        IotDataItem item = item(ITEM_ID, INSTANCE_ID, "ELEC_CONS", 2);
++        item.setFormula("OLD.FORMULA");
++        item.setRollupMethod("SUM");
++        item.setPointId(888L);
++        return item;
++    }
++
++    private IotPoint point(Long id, String code, int status) {
++        IotPoint point = new IotPoint();
++        point.setId(id);
++        point.setTenantId(TENANT);
++        point.setPointCode(code);
++        point.setPointName("点位-" + code);
++        point.setStatus(status);
++        return point;
++    }
++
++    private IotDataItemRef refEdge(Long itemId, String refFullKey, Integer refType, Long refItemId) {
++        IotDataItemRef ref = new IotDataItemRef();
++        ref.setItemId(itemId);
++        ref.setRefFullKey(refFullKey);
++        ref.setRefType(refType);
++        ref.setRefItemId(refItemId);
++        return ref;
++    }
++
++    private void stubTarget() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, null));
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(candidate());
++    }
++
++    private void stubParentInstance() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(
++                instance(INSTANCE_ID, INSTANCE_CODE, PARENT_INSTANCE_ID));
++        when(modelInstanceMapper.selectById(PARENT_INSTANCE_ID)).thenReturn(
++                instance(PARENT_INSTANCE_ID, PARENT_INSTANCE_CODE, 0L));
++    }
++
++    /** 租户内项索引（saveFormula 单次 this.list / impact 对端项批查共用夹具） */
++    private List<IotDataItem> tenantItems() {
++        return Arrays.asList(
++                item(ITEM_ID, INSTANCE_ID, "ELEC_CONS", 2),
++                item(TARGET_ITEM_ID, INSTANCE_ID, "ELEC_METER", 1),
++                item(PARENT_ITEM_ID, PARENT_INSTANCE_ID, "ELEC_CONS", 2));
++    }
++
++    // ---------- wrapper 断言辅助（照 ParamOverrideTest 范式） ----------
++
++    private LambdaUpdateWrapper<IotDataItem> capturedWrapper() {
++        LambdaUpdateWrapper<IotDataItem> uw = (LambdaUpdateWrapper<IotDataItem>) updateWrapperCaptor.getValue();
++        uw.getSqlSet();
++        uw.getSqlSegment();
++        return uw;
++    }
++
++    private List<String> capturedSetColumns() {
++        return Arrays.stream(capturedWrapper().getSqlSet().split(","))
++                .map(seg -> seg.substring(0, seg.indexOf('=')))
++                .toList();
++    }
++
++    private Object setParamValue(String column) {
++        LambdaUpdateWrapper<IotDataItem> uw = capturedWrapper();
++        for (String seg : uw.getSqlSet().split(",")) {
++            String col = seg.substring(0, seg.indexOf('='));
++            if (col.equals(column)) {
++                Matcher matcher = Pattern.compile("(MPGENVAL\\d+)").matcher(seg);
++                assertTrue(matcher.find(), () -> "sqlSet 段未含参数键: " + seg);
++                return uw.getParamNameValuePairs().get(matcher.group(1));
++            }
++        }
++        throw new AssertionError("sqlSet 中不存在列: " + column);
++    }
++
++    private DataItemConfigChangedEvent capturedEvent() {
++        verify(eventPublisher, times(1)).publishEvent(eventCaptor.capture());
++        return eventCaptor.getValue();
++    }
++
++    // ---------- 绑定接口 ----------
++
++    @Test
++    @DisplayName("绑定成功 - source_type=1 写 point_id、退场字段清 NULL；先删后插点位边；事件 BIND")
++    void testBind_Success() {
++        stubTarget();
++        when(pointMapper.selectById(POINT_ID)).thenReturn(point(POINT_ID, POINT_CODE, 1));
++
++        dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID);
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(List.of("source_type", "point_id", "formula", "rollup_method"), capturedSetColumns(),
++                "绑定=仅写取值方式四列（互斥清退场字段）");
++        assertAll("四列写入值",
++                () -> assertEquals(1, ((Number) setParamValue("source_type")).intValue()),
++                () -> assertEquals(POINT_ID, ((Number) setParamValue("point_id")).longValue()),
++                () -> assertNull(setParamValue("formula")),
++                () -> assertNull(setParamValue("rollup_method")));
++        // 先删后插：物理删旧边（换绑覆盖旧边）→ 插 ref_type=2 点位边（ref_full_key=点位编码）
++        InOrder order = inOrder(dataItemRefMapper);
++        order.verify(dataItemRefMapper).deleteByItemIdPhysical(TENANT, ITEM_ID);
++        order.verify(dataItemRefMapper).insert(refCaptor.capture());
++        IotDataItemRef edge = refCaptor.getValue();
++        assertAll("点位边内容",
++                () -> assertEquals(ITEM_ID, edge.getItemId()),
++                () -> assertEquals(POINT_CODE, edge.getRefFullKey()),
++                () -> assertEquals(2, edge.getRefType()),
++                () -> assertNull(edge.getRefItemId()),
++                () -> assertEquals(TENANT, edge.getTenantId()));
++        DataItemConfigChangedEvent event = capturedEvent();
++        assertEquals(ITEM_ID, event.itemId());
++        assertEquals(TENANT, event.tenantId());
++        assertEquals(DataItemConfigChangedEvent.ChangeType.BIND, event.changeType());
++    }
++
++    @Test
++    @DisplayName("换绑覆盖 - 原公式项（含旧数据项边）改绑点位：旧边整组物理删、仅新点位边在")
++    void testBind_RebindOverFormulaEdges() {
++        stubTarget();
++        when(pointMapper.selectById(POINT_ID)).thenReturn(point(POINT_ID, POINT_CODE, 1));
++        // 候选项原有公式引用边（DB 中在）——重建时一并清理
++        when(dataItemRefMapper.selectList(any())).thenReturn(
++                List.of(refEdge(ITEM_ID, TARGET_FULL_KEY, 1, TARGET_ITEM_ID)));
++
++        dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID);
++
++        verify(dataItemRefMapper, times(1)).deleteByItemIdPhysical(TENANT, ITEM_ID);
++        verify(dataItemRefMapper, times(1)).insert(any(IotDataItemRef.class));
++        verify(dataItemRefMapper).insert(refCaptor.capture());
++        assertEquals(2, refCaptor.getValue().getRefType(), "换绑后仅存点位边");
++    }
++
++    @Test
++    @DisplayName("绑定拒绝 - 点位不存在（含他租户点位同文案）400，零写入零边零事件")
++    void testBind_PointMissingRejected() {
++        stubTarget();
++        when(pointMapper.selectById(POINT_ID)).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("点位不存在"));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(any(), any());
++        verify(eventPublisher, never()).publishEvent(any());
++    }
++
++    @Test
++    @DisplayName("绑定拒绝 - 点位已停用（status=0）400")
++    void testBind_PointDisabledRejected() {
++        stubTarget();
++        when(pointMapper.selectById(POINT_ID)).thenReturn(point(POINT_ID, POINT_CODE, 0));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("已停用"));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(any(), any());
++    }
++
++    @Test
++    @DisplayName("绑定拒绝 - pointId 缺失 400（防线双保险：bean validation + 服务层）")
++    void testBind_PointIdNullRejected() {
++        stubTarget();
++        when(pointMapper.selectById(null)).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, null));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("点位ID不能为空"));
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("绑定防线 - 实例不存在 400 / 数据项归属他实例 400 / 数据权限不命中 403")
++    void testBind_Guards() {
++        // 实例不存在
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(null);
++        BusinessException ex1 = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex1.getCode());
++
++        // 数据权限 403（文案不泄露实例标识）
++        stubTarget();
++        when(dataPermService.resolve(any())).thenReturn(new VisibleScope(false, java.util.Set.of(4L),
++                java.util.Set.of(3L, 6L), false));
++        BusinessException ex2 = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex2.getCode());
++        assertTrue(!ex2.getMessage().contains(INSTANCE_CODE));
++
++        // 归属：数据项属于其他实例
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, 999L, "ELEC_CONS", 1));
++        BusinessException ex3 = assertThrows(BusinessException.class, () ->
++                dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex3.getCode());
++    }
++
++    // ---------- 公式接口：校验链通过路径 ----------
++
++    @Test
++    @DisplayName("公式成功 - SELF+绝对键混合：展开落库、退场字段清 NULL、ref 先删后插（ref_item_id 回填）、事件 FORMULA")
++    void testSaveFormula_SuccessMixedRefs() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID,
++                "{SELF.ELEC_METER} + {F01.WS01.EQ001.ELEC_METER}");
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(List.of("source_type", "point_id", "rollup_method", "formula"), capturedSetColumns());
++        assertAll("四列写入值",
++                () -> assertEquals(2, ((Number) setParamValue("source_type")).intValue()),
++                () -> assertNull(setParamValue("point_id")),
++                () -> assertNull(setParamValue("rollup_method")),
++                () -> assertEquals("F01.WS01.EQ001.ELEC_METER + F01.WS01.EQ001.ELEC_METER",
++                        setParamValue("formula"), "展开后裸键形态落库"));
++        // 同一引用去重为一条边；ref_item_id 尽力回填
++        verify(dataItemRefMapper, times(1)).deleteByItemIdPhysical(TENANT, ITEM_ID);
++        verify(dataItemRefMapper, times(1)).insert(refCaptor.capture());
++        IotDataItemRef edge = refCaptor.getValue();
++        assertAll("数据项边内容",
++                () -> assertEquals(ITEM_ID, edge.getItemId()),
++                () -> assertEquals(TARGET_FULL_KEY, edge.getRefFullKey()),
++                () -> assertEquals(1, edge.getRefType()),
++                () -> assertEquals(TARGET_ITEM_ID, edge.getRefItemId()));
++        assertEquals(DataItemConfigChangedEvent.ChangeType.FORMULA, capturedEvent().changeType());
++    }
++
++    @Test
++    @DisplayName("公式成功 - 先删后插次序（InOrder）：物理删在全部插入之前")
++    void testSaveFormula_DeleteBeforeInsertOrder() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC_METER} + 1");
++
++        InOrder order = inOrder(dataItemRefMapper);
++        order.verify(dataItemRefMapper).deleteByItemIdPhysical(TENANT, ITEM_ID);
++        order.verify(dataItemRefMapper, Mockito.atLeastOnce()).insert(any(IotDataItemRef.class));
++    }
++
++    @Test
++    @DisplayName("公式成功 - 裸键展开形态兼容受理：无花括号点分全键按绝对键提取入图")
++    void testSaveFormula_BareKeyFormAccepted() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "F01.WS01.EQ001.ELEC_METER + 1");
++
++        verify(dataItemRefMapper).insert(refCaptor.capture());
++        assertEquals(TARGET_FULL_KEY, refCaptor.getValue().getRefFullKey());
++        assertEquals(TARGET_ITEM_ID, refCaptor.getValue().getRefItemId());
++    }
++
++    @Test
++    @DisplayName("公式成功 - 跨设备绝对引用（第三方实例）不核存在（0013 一期口径），边 ref_item_id=NULL")
++    void testSaveFormula_ThirdInstanceRefUnchecked() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{F09.WS09.EQ099.SOMETHING} + 1");
++
++        verify(dataItemRefMapper).insert(refCaptor.capture());
++        assertEquals("F09.WS09.EQ099.SOMETHING", refCaptor.getValue().getRefFullKey());
++        assertNull(refCaptor.getValue().getRefItemId());
++    }
++
++    @Test
++    @DisplayName("公式成功 - PARENT 引用展开至父实例键，父项 ref_item_id 回填")
++    void testSaveFormula_ParentRefResolved() {
++        stubParentInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, "LOAD_RATE", 1));
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{PARENT.ELEC_CONS}");
++
++        verify(dataItemRefMapper).insert(refCaptor.capture());
++        assertEquals(PARENT_INSTANCE_CODE + ".ELEC_CONS", refCaptor.getValue().getRefFullKey());
++        assertEquals(PARENT_ITEM_ID, refCaptor.getValue().getRefItemId());
++    }
++
++    // ---------- 公式接口：校验链拒存路径 ----------
++
++    @Test
++    @DisplayName("公式拒存 - SELF 引用不存在 4001（零写入零边零事件）")
++    void testSaveFormula_SelfRefMissing4001() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.NOPE_X}"));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains("SELF.NOPE_X"));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(any(), any());
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++        verify(eventPublisher, never()).publishEvent(any());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - PARENT 引用不存在 4001（父实例在、父项缺）")
++    void testSaveFormula_ParentRefMissing4001() {
++        stubParentInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, "LOAD_RATE", 1));
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{PARENT.NOPE_X}"));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains("PARENT.NOPE_X"));
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - 顶级实例 PARENT 引用 400（0013 文案口径）")
++    void testSaveFormula_TopLevelParentRef400() {
++        stubTarget(); // parentId=0
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{PARENT.ELEC_CONS}"));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("顶级实例"));
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - 畸形 token（展开后残留花括号）400（0013 修订轮 I-1 同口径）")
++    void testSaveFormula_MalformedToken400() {
++        stubTarget();
++
++        BusinessException ex1 = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC-X}"));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex1.getCode());
++        assertTrue(ex1.getMessage().contains("残留花括号"));
++
++        BusinessException ex2 = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{ SELF.ELEC_METER }"));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex2.getCode());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - 展开后超长 400（raw ≤2000 展开翻倍场景，0013 口径）")
++    void testSaveFormula_ExpandedTooLong400() {
++        stubTarget();
++        StringBuilder raw = new StringBuilder();
++        for (int i = 0; i < 130; i++) {
++            if (i > 0) {
++                raw.append(" + ");
++            }
++            raw.append("{SELF.A}");
++        }
++        assertTrue(raw.length() <= 2000, "前置：raw ≤ 2000（实际 " + raw.length() + "）");
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, raw.toString()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("展开后公式超长"));
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - 被引用全键超 180 400（0013 修订轮 M-5 同口径）")
++    void testSaveFormula_RefKeyTooLong400() {
++        stubTarget();
++        String longKey = "{F01.WS01.EQ001." + "A".repeat(170) + "}";
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, longKey));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("全键超长"));
++    }
++
++    @Test
++    @DisplayName("公式拒存 - INTEGRAL 一期不开放 4001（专门文案）；集合外函数 FOO 4001")
++    void testSaveFormula_FunctionWhitelist4001() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++
++        BusinessException ex1 = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "INTEGRAL({SELF.ELEC_METER}, 3600)"));
++        assertEquals(4001, ex1.getCode());
++        assertTrue(ex1.getMessage().contains("不开放"));
++
++        BusinessException ex2 = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "FOO({SELF.ELEC_METER})"));
++        assertEquals(4002 + (-1), ex2.getCode(), "4001 校验拒存段");
++        assertTrue(ex2.getMessage().contains("白名单"));
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("公式拒存 - 引用不存在优先于循环检测（SELF 缺失即拒，不进 DFS）")
++    void testSaveFormula_ExistenceBeforeCycle() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.NOPE_X} + {SELF.ELEC_METER}"));
++        assertTrue(ex.getMessage().contains("SELF.NOPE_X"));
++        verify(dataItemRefMapper, never()).selectList(any());
++    }
++
++    // ---------- 公式接口：循环依赖 ----------
++
++    @Test
++    @DisplayName("循环依赖 - 自环（SELF 引自身码）4001，环列表=[自身 id]")
++    void testSaveFormula_SelfLoopCycle4001() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC_CONS}"));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains("循环依赖"), () -> "文案应含「循环依赖」: " + ex.getMessage());
++        assertTrue(ex.getMessage().contains(String.valueOf(ITEM_ID)),
++                () -> "环上项 id 列表应含自身 id: " + ex.getMessage());
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++    }
++
++    @Test
++    @DisplayName("循环依赖 - 两节点环（候选引用 ELEC_METER，DB 既有边 ELEC_METER→候选）4001 含两 id")
++    void testSaveFormula_TwoNodeCycle4001() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(
++                List.of(refEdge(TARGET_ITEM_ID, FULL_KEY, 1, ITEM_ID)));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC_METER}"));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains(String.valueOf(ITEM_ID)));
++        assertTrue(ex.getMessage().contains(String.valueOf(TARGET_ITEM_ID)));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(any(), any());
++        verify(eventPublisher, never()).publishEvent(any());
++    }
++
++    @Test
++    @DisplayName("循环依赖 - 跨实例 PARENT 边闭环（候选 PARENT 引用 + 父项绝对键指回）4001 含两 id")
++    void testSaveFormula_CrossInstanceParentCycle4001() {
++        stubParentInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, "LOAD_RATE", 1));
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        // 父实例 ELEC_CONS（id=301）公式绝对引用本实例 LOAD_RATE（候选）——DB 既有边
++        when(dataItemRefMapper.selectList(any())).thenReturn(
++                List.of(refEdge(PARENT_ITEM_ID, INSTANCE_CODE + ".LOAD_RATE", 1, ITEM_ID)));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{PARENT.ELEC_CONS}"));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains("循环依赖"));
++        assertTrue(ex.getMessage().contains(String.valueOf(ITEM_ID))
++                && ex.getMessage().contains(String.valueOf(PARENT_ITEM_ID)),
++                () -> "环上项 id 列表应含跨实例两项: " + ex.getMessage());
++    }
++
++    @Test
++    @DisplayName("循环依赖 - 旧边替换语义：候选旧边（将被重建）不参与 DFS，替换后无环即放行")
++    void testSaveFormula_OldEdgesReplacedNotDfsed() {
++        stubTarget();
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        // 候选旧边：→TARGET；且 TARGET 有边指回候选——若旧边参与 DFS 会误报环；
++        // 候选新边={SELF.ELEC_METER}→TARGET，TARGET→候选 同样成环——改为新边不回指：
++        // 旧边（候选→PARENT_ITEM）被替换，新边候选→TARGET，TARGET 无出边 → 无环
++        when(dataItemRefMapper.selectList(any())).thenReturn(
++                List.of(refEdge(ITEM_ID, PARENT_INSTANCE_CODE + ".ELEC_CONS", 1, PARENT_ITEM_ID)));
++
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC_METER}");
++
++        verify(baseMapper, times(1)).update(any(), any());
++    }
++
++    // ---------- 汇总接口 ----------
++
++    @Test
++    @DisplayName("汇总成功 - source_type=3 写 rollup_method、退场字段清 NULL；出边清空（动态纳入口径）；事件 ROLLUP")
++    void testSaveRollup_Success() {
++        stubTarget();
++        when(dataItemRefMapper.selectList(any())).thenReturn(
++                List.of(refEdge(ITEM_ID, TARGET_FULL_KEY, 1, TARGET_ITEM_ID)));
++
++        dataItemService.saveRollup(INSTANCE_ID, ITEM_ID, "SUM");
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(List.of("source_type", "rollup_method", "formula", "point_id"), capturedSetColumns());
++        assertAll("四列写入值",
++                () -> assertEquals(3, ((Number) setParamValue("source_type")).intValue()),
++                () -> assertEquals("SUM", setParamValue("rollup_method")),
++                () -> assertNull(setParamValue("formula")),
++                () -> assertNull(setParamValue("point_id")));
++        // 先删后插、插空集：汇总范围=计算期动态查找子级（ref 不展开子级全量边，brief 决策 1/4）
++        verify(dataItemRefMapper, times(1)).deleteByItemIdPhysical(TENANT, ITEM_ID);
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++        assertEquals(DataItemConfigChangedEvent.ChangeType.ROLLUP, capturedEvent().changeType());
++    }
++
++    @Test
++    @DisplayName("汇总成功 - AVG 受理")
++    void testSaveRollup_AvgAccepted() {
++        stubTarget();
++
++        dataItemService.saveRollup(INSTANCE_ID, ITEM_ID, "AVG");
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals("AVG", setParamValue("rollup_method"));
++    }
++
++    @Test
++    @DisplayName("汇总拒绝 - rollup_method 集合外（MAX/小写/空）400，零写入")
++    void testSaveRollup_InvalidMethodRejected() {
++        stubTarget();
++
++        for (String bad : new String[] {"MAX", "sum", ""}) {
++            BusinessException ex = assertThrows(BusinessException.class, () ->
++                    dataItemService.saveRollup(INSTANCE_ID, ITEM_ID, bad), () -> "method=" + bad);
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode(), () -> "method=" + bad);
++        }
++        BusinessException exNull = assertThrows(BusinessException.class, () ->
++                dataItemService.saveRollup(INSTANCE_ID, ITEM_ID, null));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), exNull.getCode());
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(any(), any());
++    }
++
++    // ---------- 阈值入口（0014 overrideParams 另一入口） ----------
++
++    @Test
++    @DisplayName("阈值入口 - 数据项单键定位解析归属实例后委托 overrideParams（覆盖生效+钩子被调）")
++    void testOverrideThresholds_DelegatesToOverrideParams() {
++        stubTarget();
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, 10L));
++
++        IotItemParamOverrideForm form = new IotItemParamOverrideForm();
++        form.setValidMin(new BigDecimal("5"));
++        form.setValidMax(new BigDecimal("200"));
++
++        dataItemService.overrideThresholds(ITEM_ID, form);
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(List.of("valid_min", "valid_max", "alarm_low", "alarm_high"), capturedSetColumns(),
++                "阈值覆盖=仅写实例行四列（0014 语义一致）");
++        verify(dataItemHistoryService, times(1)).recordParamChange(any());
++    }
++
++    @Test
++    @DisplayName("阈值入口 - 数据项不存在 400")
++    void testOverrideThresholds_ItemMissing400() {
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideThresholds(ITEM_ID, new IotItemParamOverrideForm()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    // ---------- 影响预览 ----------
++
++    @Test
++    @DisplayName("impact - 正向出向边（数据项边+点位边）+ 反向入向边 + 指标空集占位 + 本项身份齐备")
++    void testImpact_OutgoingIncomingAndMetricsEmpty() {
++        stubTarget();
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, null));
++        when(dataItemRefMapper.selectList(any()))
++                .thenReturn(List.of(
++                        refEdge(ITEM_ID, TARGET_FULL_KEY, 1, TARGET_ITEM_ID),
++                        refEdge(ITEM_ID, POINT_CODE, 2, null)))
++                .thenReturn(List.of(refEdge(ITEM_ID + 2, FULL_KEY, 1, ITEM_ID)));
++        IotDataItem peerOut = item(TARGET_ITEM_ID, INSTANCE_ID, "ELEC_METER", 1);
++        IotDataItem peerIn = item(ITEM_ID + 2, INSTANCE_ID, "LOAD_RATE", 2);
++        when(baseMapper.selectList(any())).thenReturn(List.of(peerOut, peerIn));
++        when(modelInstanceMapper.selectList(any())).thenReturn(List.of(instance(INSTANCE_ID, INSTANCE_CODE, null)));
++
++        IotItemImpactVO vo = dataItemService.getItemImpact(ITEM_ID);
++
++        assertAll("本项身份",
++                () -> assertEquals(ITEM_ID, vo.getItemId()),
++                () -> assertEquals(INSTANCE_ID, vo.getInstanceId()),
++                () -> assertEquals(INSTANCE_CODE, vo.getInstanceCode()),
++                () -> assertEquals("ELEC_CONS", vo.getDataCode()),
++                () -> assertEquals(FULL_KEY, vo.getFullKey()));
++        assertEquals(2, vo.getOutgoing().size(), "正向=公式引用的数据项边+绑定的点位边");
++        IotItemImpactEdgeVO outItemEdge = vo.getOutgoing().get(0);
++        assertAll("正向数据项边",
++                () -> assertEquals("OUT", outItemEdge.getDirection()),
++                () -> assertEquals(1, outItemEdge.getRefType()),
++                () -> assertEquals(TARGET_FULL_KEY, outItemEdge.getRefFullKey()),
++                () -> assertEquals(TARGET_ITEM_ID, outItemEdge.getPeerItemId()),
++                () -> assertEquals("ELEC_METER", outItemEdge.getPeerDataCode()));
++        IotItemImpactEdgeVO outPointEdge = vo.getOutgoing().get(1);
++        assertAll("正向点位边",
++                () -> assertEquals(2, outPointEdge.getRefType()),
++                () -> assertEquals(POINT_CODE, outPointEdge.getRefFullKey()),
++                () -> assertNull(outPointEdge.getPeerItemId()));
++        assertEquals(1, vo.getIncoming().size(), "反向=谁引用了本项（受影响上级项）");
++        IotItemImpactEdgeVO inEdge = vo.getIncoming().get(0);
++        assertAll("反向入向边",
++                () -> assertEquals("IN", inEdge.getDirection()),
++                () -> assertEquals(ITEM_ID + 2, inEdge.getPeerItemId()),
++                () -> assertEquals("LOAD_RATE", inEdge.getPeerDataCode()));
++        assertNotNull(vo.getMetrics());
++        assertTrue(vo.getMetrics().isEmpty(), "指标关联=本期空集占位（ref 图不含指标边，归 0043）");
++    }
++
++    @Test
++    @DisplayName("impact - 反向双路匹配（ref_item_id 命中 + ref_full_key 兜底命中）与自身行去重")
++    void testImpact_IncomingDualMatchDedup() {
++        stubTarget();
++        // 两行均指回本项：一行 ref_item_id 命中、一行 ref_item_id=NULL 仅 full_key 命中
++        when(dataItemRefMapper.selectList(any()))
++                .thenReturn(List.of())
++                .thenReturn(List.of(
++                        refEdge(ITEM_ID + 2, FULL_KEY, 1, ITEM_ID),
++                        refEdge(ITEM_ID + 3, FULL_KEY, 1, null)));
++        IotDataItem peerIn1 = item(ITEM_ID + 2, INSTANCE_ID, "LOAD_RATE", 2);
++        IotDataItem peerIn2 = item(ITEM_ID + 3, INSTANCE_ID, "SPARE", 2);
++        when(baseMapper.selectList(any()))
++                .thenReturn(List.of(peerIn1, peerIn2))
++                .thenReturn(List.of());
++        when(modelInstanceMapper.selectList(any())).thenReturn(List.of(instance(INSTANCE_ID, INSTANCE_CODE, null)));
++
++        IotItemImpactVO vo = dataItemService.getItemImpact(ITEM_ID);
++
++        assertEquals(2, vo.getIncoming().size(), "两行两条边（不同引用方各自一条）");
++        // ref_item_id 与 ref_full_key 同中一行时 SQL 单行不重复——单行场景由 SQL 语义保证
++        assertEquals(0, vo.getOutgoing().size());
++    }
++
++    @Test
++    @DisplayName("impact - 数据权限裁剪：对端项所属实例不可见 → 该边整体不返回（不泄露不可见实例）")
++    void testImpact_PeerInstanceInvisibleTrimmed() {
++        stubTarget();
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, java.util.Set.of(), java.util.Set.of(INSTANCE_ID), false));
++        when(dataItemRefMapper.selectList(any()))
++                .thenReturn(List.of(refEdge(ITEM_ID, TARGET_FULL_KEY, 1, TARGET_ITEM_ID)))
++                .thenReturn(List.of(refEdge(ITEM_ID + 2, FULL_KEY, 1, ITEM_ID)));
++        // 对端出边项=本实例（可见）；对端入边项=实例 101（不可见）
++        IotDataItem peerOut = item(TARGET_ITEM_ID, INSTANCE_ID, "ELEC_METER", 1);
++        IotDataItem peerIn = item(ITEM_ID + 2, 101L, "LOAD_RATE", 2);
++        when(baseMapper.selectList(any())).thenReturn(List.of(peerOut, peerIn));
++        when(modelInstanceMapper.selectList(any())).thenReturn(List.of(
++                instance(INSTANCE_ID, INSTANCE_CODE, null), instance(101L, "F02.WS09", null)));
++
++        IotItemImpactVO vo = dataItemService.getItemImpact(ITEM_ID);
++
++        assertEquals(1, vo.getOutgoing().size(), "可见对端的正向边保留");
++        assertEquals(0, vo.getIncoming().size(), "不可见实例的入向边整体裁剪");
++        // 403 文案/裁剪口径不泄露不可见实例编码
++        assertTrue(vo.toString().contains(INSTANCE_CODE));
++    }
++
++    @Test
++    @DisplayName("impact - 对端不可解析（绝对键指向未建实例）保留 ref_full_key 原文、项字段空")
++    void testImpact_UnresolvedPeerKeepsRawKey() {
++        stubTarget();
++        when(dataItemRefMapper.selectList(any()))
++                .thenReturn(List.of(refEdge(ITEM_ID, "F09.WS09.EQ099.SOMETHING", 1, null)))
++                .thenReturn(List.of());
++        when(baseMapper.selectList(any()))
++                .thenReturn(List.of())
++                .thenReturn(List.of());
++
++        IotItemImpactVO vo = dataItemService.getItemImpact(ITEM_ID);
++
++        assertEquals(1, vo.getOutgoing().size());
++        assertEquals("F09.WS09.EQ099.SOMETHING", vo.getOutgoing().get(0).getRefFullKey());
++        assertNull(vo.getOutgoing().get(0).getPeerItemId());
++    }
++
++    @Test
++    @DisplayName("impact - 防线：数据项不存在 400 / 受限用户读不可见实例 403（不泄露实例标识）")
++    void testImpact_Guards() {
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(null);
++        BusinessException ex1 = assertThrows(BusinessException.class, () -> dataItemService.getItemImpact(ITEM_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex1.getCode());
++
++        stubTarget();
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, java.util.Set.of(4L), java.util.Set.of(3L, 6L), false));
++        BusinessException ex2 = assertThrows(BusinessException.class, () -> dataItemService.getItemImpact(ITEM_ID));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex2.getCode());
++        assertTrue(!ex2.getMessage().contains(INSTANCE_CODE));
++        assertTrue(!ex2.getMessage().contains(String.valueOf(INSTANCE_ID)));
++    }
++
++    // ---------- 继承链扩展（brief 决策 3：取值四要素纳入 effective 口径） ----------
++
++    @Test
++    @DisplayName("继承链扩展 - 四要素三态混合：实例值→INSTANCE / 模板默认→TEMPLATE / 双空→NONE")
++    void testEffective_ValueTypeFieldsMixedSources() {
++        stubTarget();
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, 10L));
++        // 实例行：source_type=2（INSTANCE）、formula=null（→TEMPLATE）、rollup_method=null（→TEMPLATE）、
++        // calc_period=60（INSTANCE）
++        IotDataItem row = item(ITEM_ID, INSTANCE_ID, "ELEC_CONS", 2);
++        row.setCalcPeriod(60);
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(row);
++        IotDataItemTemplate templateItem = new IotDataItemTemplate();
++        templateItem.setId(300L);
++        templateItem.setTemplateId(10L);
++        templateItem.setDataCode("ELEC_CONS");
++        templateItem.setDefaultSourceType(3);
++        templateItem.setDefaultFormula("{SELF.ELEC_CONS}");
++        templateItem.setAggMethod("SUM");
++        templateItem.setDefaultCalcPeriod("HOUR");
++        when(dataItemTemplateMapper.selectOne(any())).thenReturn(templateItem);
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertAll("四要素三态",
++                () -> assertEquals(2, vo.getSourceType()),
++                () -> assertEquals(IotParamSource.INSTANCE, vo.getSourceTypeSource()),
++                () -> assertEquals("{SELF.ELEC_CONS}", vo.getFormula()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getFormulaSource()),
++                () -> assertEquals("SUM", vo.getRollupMethod()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getRollupMethodSource()),
++                () -> assertEquals(60, vo.getCalcPeriod()),
++                () -> assertEquals(IotParamSource.INSTANCE, vo.getCalcPeriodSource()));
++    }
++
++    @Test
++    @DisplayName("继承链扩展 - 双空→NONE（绑定类项 formula/rollup_method 无实例值且模板无默认）；坏周期码容错 NONE")
++    void testEffective_ValueTypeFieldsNone() {
++        stubTarget();
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, 10L));
++        IotDataItem row = item(ITEM_ID, INSTANCE_ID, "ELEC_CONS", 1);
++        row.setCalcPeriod(0);
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(row);
++        IotDataItemTemplate templateItem = new IotDataItemTemplate();
++        templateItem.setId(300L);
++        templateItem.setTemplateId(10L);
++        templateItem.setDataCode("ELEC_CONS");
++        templateItem.setDefaultCalcPeriod("WEEK");
++        when(dataItemTemplateMapper.selectOne(any())).thenReturn(templateItem);
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertAll("NONE 态与坏周期码容错（读路径不因模板残留坏码 500）",
++                () -> assertEquals(IotParamSource.NONE, vo.getFormulaSource()),
++                () -> assertNull(vo.getFormula()),
++                () -> assertEquals(IotParamSource.NONE, vo.getRollupMethodSource()),
++                () -> assertEquals(0, vo.getCalcPeriod()),
++                () -> assertEquals(IotParamSource.INSTANCE, vo.getCalcPeriodSource()));
++    }
++
++    // ---------- 公式空 formula 与事件 payload ----------
++
++    @Test
++    @DisplayName("公式拒存 - formula 空白 400（brief：formula 必填非空，清除经取值方式切换达成）")
++    void testSaveFormula_BlankRejected() {
++        stubTarget();
++        for (String blank : new String[] {"", "   "}) {
++            BusinessException ex = assertThrows(BusinessException.class, () ->
++                    dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, blank));
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        }
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("事件 payload - itemId/tenantId/变更类型三元齐备（三类各自类型）")
++    void testEventPayloadPerChangeType() {
++        stubTarget();
++        when(pointMapper.selectById(POINT_ID)).thenReturn(point(POINT_ID, POINT_CODE, 1));
++        dataItemService.bindPoint(INSTANCE_ID, ITEM_ID, POINT_ID);
++        assertEquals(DataItemConfigChangedEvent.ChangeType.BIND, capturedEvent().changeType());
++
++        Mockito.clearInvocations(eventPublisher);
++        when(baseMapper.selectList(any())).thenReturn(tenantItems());
++        when(dataItemRefMapper.selectList(any())).thenReturn(List.of());
++        dataItemService.saveFormula(INSTANCE_ID, ITEM_ID, "{SELF.ELEC_METER}");
++        DataItemConfigChangedEvent formulaEvent = capturedEvent();
++        assertEquals(ITEM_ID, formulaEvent.itemId());
++        assertEquals(TENANT, formulaEvent.tenantId());
++        assertEquals(DataItemConfigChangedEvent.ChangeType.FORMULA, formulaEvent.changeType());
++
++        Mockito.clearInvocations(eventPublisher);
++        dataItemService.saveRollup(INSTANCE_ID, ITEM_ID, "SUM");
++        assertEquals(DataItemConfigChangedEvent.ChangeType.ROLLUP, capturedEvent().changeType());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetectorTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetectorTest.java
+new file mode 100644
+index 0000000..889ca68
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaCycleDetectorTest.java
+@@ -0,0 +1,105 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 公式引用图循环依赖检测器单元测试（TASK-0036，brief 决策 8）
++ *
++ * <p>DFS 纯函数件：edges 语义 = 数据项 id → 被引用数据项 id 集（ref_item_id 尽力回填/
++ * full_key 解析后的同一张图）。环上项 id 列表进 4001 文案（调用方职责）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class FormulaCycleDetectorTest {
++
++    private static Map<Long, Set<Long>> edges(Object... pairs) {
++        Map<Long, Set<Long>> map = new HashMap<>();
++        for (int i = 0; i + 1 < pairs.length; i += 2) {
++            long from = (Long) pairs[i];
++            @SuppressWarnings("unchecked")
++            Set<Long> to = (Set<Long>) pairs[i + 1];
++            map.put(from, to);
++        }
++        return map;
++    }
++
++    @Test
++    @DisplayName("自环：候选项引用自身 → 环 [自身]")
++    void selfLoopDetected() {
++        List<Long> cycle = FormulaCycleDetector.findCycle(edges(200L, Set.of(200L)), 200L);
++        assertEquals(List.of(200L), cycle);
++    }
++
++    @Test
++    @DisplayName("两节点环：候选→A，A→候选（DB 既有边）→ 环 [候选, A]")
++    void twoNodeCycleDetected() {
++        List<Long> cycle = FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L), 201L, Set.of(200L)), 200L);
++        assertEquals(List.of(200L, 201L), cycle);
++    }
++
++    @Test
++    @DisplayName("三节点环（A→B→C→A，候选=A）")
++    void threeNodeCycleDetected() {
++        List<Long> cycle = FormulaCycleDetector.findCycle(
++                edges(1L, Set.of(2L), 2L, Set.of(3L), 3L, Set.of(1L)), 1L);
++        assertEquals(List.of(1L, 2L, 3L), cycle);
++    }
++
++    @Test
++    @DisplayName("无环：链式依赖 / 分叉 / 指向他项（不涉候选）均放行")
++    void acyclicPasses() {
++        assertNull(FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L), 201L, Set.of(202L), 202L, Set.of()), 200L));
++        assertNull(FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L, 202L), 201L, Set.of(203L), 202L, Set.of(203L)), 200L));
++        // 环在别处（5→6→5），候选 1 不可达该环 → 放行（候选自身不闭环即本接口口径）
++        assertNull(FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L), 201L, Set.of(),
++                        5L, Set.of(6L), 6L, Set.of(5L)), 200L));
++    }
++
++    @Test
++    @DisplayName("环外汇入不误报：候选→A→B→环(C↔D)，C/D 不可达候选 → 放行")
++    void downstreamCycleNotReachingCandidatePasses() {
++        assertNull(FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L), 201L, Set.of(202L),
++                        202L, Set.of(203L), 203L, Set.of(202L)), 200L));
++    }
++
++    @Test
++    @DisplayName("环可达候选即报：B→候选（两节点环）时即使候选还有其他出边也检出")
++    void cycleWithBranchingStillDetected() {
++        List<Long> cycle = FormulaCycleDetector.findCycle(
++                edges(200L, Set.of(201L, 205L), 201L, Set.of(200L)), 200L);
++        assertEquals(List.of(200L, 201L), cycle);
++    }
++
++    @Test
++    @DisplayName("入参为空图/无边候选 → 放行")
++    void emptyGraphPasses() {
++        assertNull(FormulaCycleDetector.findCycle(Map.of(), 200L));
++        assertNull(FormulaCycleDetector.findCycle(edges(200L, Set.of()), 200L));
++    }
++
++    @Test
++    @DisplayName("环列表从候选起、按引用方向排序（文案可读性）")
++    void cycleOrderStartsAtCandidate() {
++        List<Long> cycle = FormulaCycleDetector.findCycle(
++                edges(7L, Set.of(8L), 8L, Set.of(9L), 9L, Set.of(7L)), 7L);
++        assertEquals(7L, cycle.get(0), "环列表首项=候选项 id（4001 文案锚点）");
++        assertTrue(cycle.contains(8L) && cycle.contains(9L));
++        assertEquals(3, cycle.size(), "环上项不重复（起点不重复收尾）");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelistTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelistTest.java
+new file mode 100644
+index 0000000..78d68bf
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/FormulaFunctionWhitelistTest.java
+@@ -0,0 +1,56 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 一期函数白名单占位校验器单元测试（TASK-0036，brief 决策 5）
++ *
++ * <p>真实 Aviator 语法校验归 FEAT-0012（brief 口径）——本期只交付「函数名单常量 + 调用点
++ * 扫描占位」：白名单内放行、INTEGRAL 给专门文案（不开放语义）、集合外拒绝。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class FormulaFunctionWhitelistTest {
++
++    @Test
++    @DisplayName("白名单内函数放行（ABS/ROUND/MAX/MIN/IF/DELTA/RATE 各形态）")
++    void allowedFunctionsPass() {
++        assertNull(FormulaFunctionWhitelist.findViolation("ABS({SELF.X})"));
++        assertNull(FormulaFunctionWhitelist.findViolation("ROUND(F01.WS01.EQ001.ELEC_CONS, 2)"));
++        assertNull(FormulaFunctionWhitelist.findViolation("MAX(A, MIN(B, C))"));
++        assertNull(FormulaFunctionWhitelist.findViolation("IF(A > 0, DELTA(F01.X, 3600), RATE(F01.X, 60))"));
++        assertNull(FormulaFunctionWhitelist.findViolation("{SELF.X} * 0.85 + {F01.WS.Y}"));
++        assertNull(FormulaFunctionWhitelist.findViolation(null));
++        assertNull(FormulaFunctionWhitelist.findViolation("   "));
++    }
++
++    @Test
++    @DisplayName("INTEGRAL 专门文案（一期不开放，REQ-0016 非目标 / ADR-0010）")
++    void integralGetsSpecificMessage() {
++        String violation = FormulaFunctionWhitelist.findViolation("INTEGRAL({SELF.ELEC_METER}, 3600)");
++        assertEquals("INTEGRAL", FormulaFunctionWhitelist.CLOSED_INTEGRAL);
++        assertTrue(violation.contains("INTEGRAL"), () -> "文案应含 INTEGRAL: " + violation);
++        assertTrue(violation.contains("不开放"), () -> "文案应含「不开放」: " + violation);
++    }
++
++    @Test
++    @DisplayName("集合外函数拒绝（含函数名与白名单提示）")
++    void unknownFunctionRejected() {
++        String violation = FormulaFunctionWhitelist.findViolation("FOO({SELF.X}) + ABS({SELF.Y})");
++        assertTrue(violation.contains("FOO"), () -> "文案应含函数名: " + violation);
++        assertTrue(violation.contains("白名单"), () -> "文案应含「白名单」: " + violation);
++    }
++
++    @Test
++    @DisplayName("函数名单常量恰为一期七函数（REQ-0016：四则运算 + ABS/ROUND/MAX/MIN/IF/DELTA/RATE）")
++    void whitelistConstantMatchesPhaseOneSet() {
++        assertEquals(java.util.Set.of("ABS", "ROUND", "MAX", "MIN", "IF", "DELTA", "RATE"),
++                FormulaFunctionWhitelist.ALLOWED);
++    }
++}

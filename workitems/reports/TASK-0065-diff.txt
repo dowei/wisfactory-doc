@@ -1,0 +1,399 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+index 92592bf..a0fdbd5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/IotDataDictController.java
+@@ -164,6 +164,7 @@ public class IotDataDictController {
+      * 错误行清单下载：前端把导入回执 POST 回来，失败行渲染 xlsx（复用同一 Excel 组件）——
+      * 无状态设计，服务端不持久化回执；无失败行时返回仅含表头的清单。
+      */
++    @OperateLog(title = "数据字典", businessType = BusinessType.IMPORT)
+     @Operation(summary = "下载导入错误行清单（回执失败行 → xlsx，复用模板同款组件）")
+     @PostMapping("/import/error-report")
+     @SaCheckPermission("iot:dict:import")
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
+index 65bece7..e9554ae 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
+@@ -216,6 +216,7 @@ public class IotPointController {
+      * 错误行清单下载：前端把导入回执 POST 回来，失败行渲染 xlsx（复用同一 Excel 组件）——
+      * 无状态设计，服务端不持久化回执；无失败行时返回仅含表头的清单。
+      */
++    @OperateLog(title = "采集点位", businessType = BusinessType.IMPORT)
+     @Operation(summary = "下载导入错误行清单（回执失败行 → xlsx，复用模板同款组件）")
+     @PostMapping("/import/error-report")
+     @SaCheckPermission("iot:point:add")
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java
+new file mode 100644
+index 0000000..1bdc3f4
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java
+@@ -0,0 +1,209 @@
++package net.otlab.admin.module.iot.config;
++
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.config.BeanDefinition;
++import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
++import org.springframework.core.type.filter.AnnotationTypeFilter;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.PatchMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.annotation.Annotation;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0065 守卫测试：操作审计接线——管理面写端点 ⊆ @OperateLog 标注集（机械差集全局口径）。
++ *
++ * <p>照 TASK-0064 IotPermissionsCompleteGuardTest「全局注解 ⊆ 种子登记集」范式：
++ * 扫描 net.otlab.admin.module 下全部 @RestController，对每个 HTTP 写端点
++ * （POST/PUT/DELETE/PATCH，含类级 @RequestMapping）机械断言：
++ * <ul>
++ * <li><b>全局</b>：除内部令牌端点（/internal/v1/**）与对外数据端点（/openapi/v1/**）外，
++ *     所有管理面写端点必须挂 @OperateLog——缺一个即红（防回归）；</li>
++ * <li><b>接线锁定</b>：两处补接线端点（dict/point importErrorReport）的 @OperateLog
++ *     注解实态逐项锁定（title/businessType），删注解/改类型即红；</li>
++ * <li><b>凭据四类全量审计</b>（ADR-0006/0019）：写入/查看明文/吊销三动作全挂 + 列表不挂，
++ *     saveParam=false / saveResponse=false 敏感标志逐项断言（明文不进审计列）。</li>
++ * </ul>
++ *
++ * <p>排除口径（brief 决策 4）：内部令牌端点各有自己的审计链（0051 403 全量、
++ * iot_api_call_log），不挂管理面 sys_operate_log；对外 /openapi/v1/** 为只读数据端点。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class OperateLogCoverageGuardTest {
++
++    /**
++     * 全局口径扫描范围（brief 决策 4 高风险范围）：设计 §3.1/续/状态规则/调用方管理的
++     * 管理面写端点 = net.otlab.admin.module.iot.** 与 .openapi.** 控制器；
++     * survey/wechat/system 为框架其它业务域，各有独立审计约定，不属本任务设计接口表范围。
++     */
++    private static final List<String> AUDIT_PACKAGE_PREFIXES = Arrays.asList(
++            "net.otlab.admin.module.iot.", "net.otlab.admin.module.openapi.");
++
++    /** 排除前缀：内部令牌端点 / 对外数据端点（brief 决策 4，各有独立审计链） */
++    private static final List<String> EXCLUDED_PATH_PREFIXES = Arrays.asList("/internal/v1/", "/openapi/v1/");
++
++    @Test
++    @DisplayName("全局机械差集 - 管理面写端点全部挂 @OperateLog（内部/对外端点除外）——零缺失")
++    void allManagementWriteEndpointsAudited() throws Exception {
++        List<String> missing = new ArrayList<>();
++        List<String> audited = new ArrayList<>();
++        int controllers = 0;
++        ClassPathScanningCandidateComponentProvider scanner =
++                new ClassPathScanningCandidateComponentProvider(false);
++        scanner.addIncludeFilter(new AnnotationTypeFilter(RestController.class));
++        for (BeanDefinition bd : scanner.findCandidateComponents("net.otlab.admin.module")) {
++            Class<?> clazz = Class.forName(bd.getBeanClassName());
++            String cn = clazz.getName();
++            boolean inScope = false;
++            for (String prefix : AUDIT_PACKAGE_PREFIXES) {
++                if (cn.startsWith(prefix)) {
++                    inScope = true;
++                    break;
++                }
++            }
++            if (!inScope) {
++                continue;
++            }
++            controllers++;
++            String basePath = "";
++            RequestMapping classMapping = clazz.getAnnotation(RequestMapping.class);
++            if (classMapping != null && classMapping.value().length > 0) {
++                basePath = classMapping.value()[0];
++            }
++            for (Method method : clazz.getDeclaredMethods()) {
++                String verb = writeVerb(method);
++                if (verb == null) {
++                    continue;
++                }
++                String path = basePath + firstMappingPath(method);
++                if (isExcluded(path)) {
++                    continue;
++                }
++                String id = verb + " " + clazz.getSimpleName() + "#" + method.getName() + " " + path;
++                if (method.getAnnotation(OperateLog.class) == null) {
++                    missing.add(id);
++                } else {
++                    audited.add(id);
++                }
++            }
++        }
++        assertTrue(controllers >= 18, "iot/openapi 控制器扫描异常偏少（" + controllers + "），扫描基包或类路径不可信");
++        assertTrue(audited.size() >= 50, "已标注写端点异常偏少（" + audited.size() + "），扫描口径不可信");
++        assertEquals(Arrays.asList(), missing,
++                "以下管理面写端点缺 @OperateLog 接线（必须全部挂审计注解）：" + missing);
++    }
++
++    @Test
++    @DisplayName("接线锁定 - dict/point importErrorReport 两补线端点 @OperateLog 实态逐项锁定（businessType=IMPORT）")
++    void newlyWiredErrorReportEndpointsLocked() throws Exception {
++        assertAnnotated(
++                net.otlab.admin.module.iot.controller.IotDataDictController.class,
++                "importErrorReport", "数据字典", BusinessType.IMPORT);
++        assertAnnotated(
++                net.otlab.admin.module.iot.point.controller.IotPointController.class,
++                "importErrorReport", "采集点位", BusinessType.IMPORT);
++    }
++
++    @Test
++    @DisplayName("凭据四类全量审计（ADR-0006/0019）- 写入/查看明文/吊销全挂 @OperateLog + 敏感标志锁定")
++    void credentialFourActionsAudited() throws Exception {
++        Class<?> c = net.otlab.admin.module.iot.credential.controller.IotCredentialController.class;
++        // 写入：saveParam=false（明文入参不落审计列）
++        OperateLog write = uniqueMethod(c, "write").getAnnotation(OperateLog.class);
++        assertNotNull(write, "凭据写入缺 @OperateLog");
++        assertEquals(BusinessType.INSERT, write.businessType());
++        assertFalse(write.saveParam(), "凭据写入 saveParam 必须 false（明文不进 sys_operate_log.param）");
++        // 查看明文：saveResponse=false（明文响应不落审计列）
++        OperateLog view = uniqueMethod(c, "view").getAnnotation(OperateLog.class);
++        assertNotNull(view, "凭据查看明文缺 @OperateLog");
++        assertFalse(view.saveResponse(), "凭据查看 saveResponse 必须 false（明文不进 sys_operate_log.response）");
++        // 吊销：全量落（无敏感面）
++        OperateLog revoke = uniqueMethod(c, "revoke").getAnnotation(OperateLog.class);
++        assertNotNull(revoke, "凭据吊销缺 @OperateLog");
++        assertEquals(BusinessType.UPDATE, revoke.businessType());
++        // 列表：非生命周期动作，不挂（既有 0019 口径锁定，防误加导致噪声）
++        assertEquals(null, uniqueMethod(c, "list").getAnnotation(OperateLog.class),
++                "凭据列表只回掩码、非生命周期动作，按 0019 口径不挂 @OperateLog");
++    }
++
++    // ============================================================
++    // 工具
++    // ============================================================
++
++    /** 取方法上第一个写 HTTP 映射注解对应的动词；无写映射返回 null */
++    private static String writeVerb(Method method) {
++        Map<Class<? extends Annotation>, String> verbs = new LinkedHashMap<>();
++        verbs.put(PostMapping.class, "POST");
++        verbs.put(PutMapping.class, "PUT");
++        verbs.put(DeleteMapping.class, "DELETE");
++        verbs.put(PatchMapping.class, "PATCH");
++        for (Map.Entry<Class<? extends Annotation>, String> e : verbs.entrySet()) {
++            if (method.getAnnotation(e.getKey()) != null) {
++                return e.getValue();
++            }
++        }
++        return null;
++    }
++
++    /** 取方法首个 HTTP 映射注解的首个路径（用于排除前缀判定） */
++    private static String firstMappingPath(Method method) {
++        for (Annotation a : method.getAnnotations()) {
++            if (a instanceof PostMapping) return first(((PostMapping) a).value());
++            if (a instanceof PutMapping) return first(((PutMapping) a).value());
++            if (a instanceof DeleteMapping) return first(((DeleteMapping) a).value());
++            if (a instanceof PatchMapping) return first(((PatchMapping) a).value());
++        }
++        return "";
++    }
++
++    private static String first(String[] arr) {
++        return (arr != null && arr.length > 0) ? arr[0] : "";
++    }
++
++    private static boolean isExcluded(String path) {
++        for (String prefix : EXCLUDED_PATH_PREFIXES) {
++            if (path.startsWith(prefix)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /** 反射取唯一同名方法（防歧义） */
++    private static Method uniqueMethod(Class<?> clazz, String name) throws Exception {
++        List<Method> hits = new ArrayList<>();
++        for (Method m : clazz.getDeclaredMethods()) {
++            if (m.getName().equals(name)) {
++                hits.add(m);
++            }
++        }
++        assertEquals(1, hits.size(), clazz.getSimpleName() + "#" + name + " 必须恰一个方法（防歧义）");
++        return hits.get(0);
++    }
++
++    private static void assertAnnotated(Class<?> clazz, String methodName, String title, BusinessType type) throws Exception {
++        OperateLog log = uniqueMethod(clazz, methodName).getAnnotation(OperateLog.class);
++        assertNotNull(log, clazz.getSimpleName() + "#" + methodName + " 缺 @OperateLog 接线");
++        assertEquals(title, log.title(), clazz.getSimpleName() + "#" + methodName + " title 不符");
++        assertEquals(type, log.businessType(), clazz.getSimpleName() + "#" + methodName + " businessType 不符");
++    }
++}
+diff --git a/resources/scripts/audit-operatelog-coverage.py b/resources/scripts/audit-operatelog-coverage.py
+new file mode 100644
+index 0000000..56e9f46
+--- /dev/null
++++ b/resources/scripts/audit-operatelog-coverage.py
+@@ -0,0 +1,154 @@
++# -*- coding: utf-8 -*-
++"""TASK-0065 机械覆盖审计：iot/openapi 管理面写端点（POST/PUT/DELETE/PATCH）
++vs @OperateLog 标注集差集。照 0064 export-design-perms.py 范式（纯机械）。
++
++口径：
++  - 对每个 controller，按 'public Result' 等返回签名行定位方法，向前取注解窗口
++    （从上一方法体结束/成员声明到本签名行），识别 @OperateLog 与 HTTP 映射注解。
++  - 类级 @RequestMapping 前缀拼入路径。
++  - 写端点 = POST/PUT/DELETE/PATCH；只读 GET 不审（凭据明文 view 单列）。
++  - 内部令牌端点 /internal/v1/**、对外 /openapi/v1/** 不挂管理面操作日志（brief 决策4）。
++"""
++import re
++import sys
++from pathlib import Path
++
++ROOT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"D:/workspace/WisFactory")
++MOD = ROOT / "backend/ot-admin/src/main/java/net/otlab/admin/module"
++
++METHOD_SIG = re.compile(
++    r'^\s*public\s+(?:static\s+)?[\w<>,.\[\]\s?]+\s+(\w+)\s*\(')
++MAP = re.compile(r'@(Get|Post|Put|Delete|Patch)Mapping\b')
++PERM = re.compile(r'@SaCheckPermission\(\s*"([^"]+)"')
++OP = re.compile(r'@OperateLog\s*\(')
++
++
++def strip_comments(src):
++    out = []
++    i = 0
++    n = len(src)
++    ins = False
++    esc = False
++    while i < n:
++        c = src[i]
++        if ins:
++            out.append(c)
++            if esc:
++                esc = False
++            elif c == '\\':
++                esc = True
++            elif c == '"':
++                ins = False
++            i += 1
++            continue
++        if c == '"':
++            ins = True; out.append(c); i += 1; continue
++        if c == '/' and i+1 < n and src[i+1] == '/':
++            while i < n and src[i] != '\n':
++                i += 1
++            continue
++        if c == '/' and i+1 < n and src[i+1] == '*':
++            i += 2
++            while i+1 < n and not (src[i] == '*' and src[i+1] == '/'):
++                i += 1
++            i += 2
++            continue
++        out.append(c); i += 1
++    return ''.join(out)
++
++
++def analyze(path):
++    src = strip_comments(path.read_text(encoding='utf-8'))
++    bm = re.search(r'@RequestMapping\(\s*"([^"]+)"\s*\)', src)
++    base = bm.group(1) if bm else ''
++    lines = src.split('\n')
++    rows = []
++    # 定位所有方法签名行
++    sigs = [i for i, ln in enumerate(lines) if METHOD_SIG.match(ln)]
++    for i in sigs:
++        name = METHOD_SIG.match(lines[i]).group(1)
++        # 注解窗口：从上一签名行之后到本签名行（含）；不跨上一方法体（以 '}' 行截断）
++        start = 0
++        for j in range(i-1, -1, -1):
++            if METHOD_SIG.match(lines[j]):
++                break
++            if lines[j].strip() == '}':
++                start = j + 1
++                break
++        win = '\n'.join(lines[start:i+1])
++        maps = MAP.findall(win)
++        if not maps:
++            continue
++        verbs = [m.lower() for m in maps]
++        # 每个 mapping 的路径（取紧跟其后的第一个字符串字面量）
++        paths = []
++        for ln in win.split('\n'):
++            for m in MAP.finditer(ln):
++                tail = ln[m.end():]
++                pm = re.search(r'"([^"]*)"', tail)
++                paths.append(pm.group(1) if pm else '')
++        # 若一条 Mapping 注解跨行（多路径数组），把窗口内所有字符串补全
++        if len(paths) < len(verbs):
++            all_str = re.findall(r'"([^"]*)"', win)
++            # 去掉权限注解字符串
++            paths = [p for p in all_str if not p.startswith('iot:') and not p.startswith('openapi:')]
++        opm = OP.search(win)
++        flags = ''
++        if opm:
++            tail = win[opm.end()-1:opm.end()+220]
++            flags = ','.join(f for f in (
++                'saveParam=false' if re.search(r'saveParam\s*=\s*false', tail) else '',
++                'saveResponse=false' if re.search(r'saveResponse\s*=\s*false', tail) else '') if f)
++        rows.append({
++            'file': str(path.relative_to(ROOT)).replace('\\', '/'),
++            'class': path.stem,
++            'method': name,
++            'verbs': verbs,
++            'paths': paths,
++            'base': base,
++            'audited': bool(opm),
++            'flags': flags,
++            'perms': ','.join(PERM.findall(win)),
++        })
++    return rows
++
++
++def fmt_paths(r):
++    return '|'.join((r['base'] + p) for p in r['paths']) or '-'
++
++
++def main():
++    all_rows = []
++    for p in sorted(MOD.rglob('*Controller.java')):
++        s = str(p).replace('\\', '/')
++        if '/iot/' not in s and '/openapi/' not in s:
++            continue
++        all_rows.extend(analyze(p))
++    print("== iot/openapi 全端点审计实态 ==")
++    print(f"{'HTTP':7} {'AUD':4} {'FLAGS':26} {'CONTROLLER':32} {'METHOD':20} {'PATH':58} PERM")
++    for r in all_rows:
++        verbs = '/'.join(v.upper() for v in r['verbs'])
++        print(f"{verbs:7} {str(r['audited'])[0]:4} {r['flags']:26} {r['class']:32} {r['method']:20} {fmt_paths(r):58} {r['perms']}")
++    writes = [r for r in all_rows if any(v in ('post', 'put', 'delete', 'patch') for v in r['verbs'])]
++    missing = [r for r in writes if not r['audited']]
++    internal = [r for r in missing if any(p.startswith('/internal/v1/') for p in [r['base']+x for x in r['paths']]) or '/internal/' in r['base']]
++    real = [r for r in missing if r not in internal]
++    print()
++    print("== 缺 @OperateLog 的写端点（机械差集）==")
++    for r in missing:
++        print(f"{'/'.join(v.upper() for v in r['verbs']):7} {r['file']} {r['method']} {fmt_paths(r)} {r['perms']}")
++    print(f"\n写端点总数={len(writes)} 已标注={len(writes)-len(missing)} 缺标注={len(missing)}")
++    print(f"  其中内部令牌端点（brief 决策4 排除，各有独立审计链）={len(internal)}  管理面真实缺口={len(real)}")
++    print(f"\n零缺失终态裁决（管理面写端点，内部令牌端点除外）：{'零缺失 PASS' if not real else 'FAIL'}")
++    print()
++    print("== 管理面真实缺口 ==")
++    for r in real:
++        print(f"{r['file']} {r['method']} {fmt_paths(r)}")
++    print("\n== 凭据 GET 明文查看端点（ADR-0006）==")
++    for r in all_rows:
++        if 'credential' in r['file'] and r['method'] == 'view':
++            print(f"audited={r['audited']} flags={r['flags']} perms={r['perms']} path={fmt_paths(r)}")
++
++
++if __name__ == '__main__':
++    main()

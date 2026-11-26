@@ -1,0 +1,154 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index fd4c96f..7546595 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -213,6 +213,14 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+                             + "（token 缺失/过期/内容漂移——重新预览后携 confirmToken 发布）");
+         }
+ 
++        // TASK-0083 修订轮 F-1（brief 决策 1 纠正）：follow 前置到 assemble 之前——计算引擎
++        // 运行时只读落位快照、不读实例行；若 follow 在 assemble 之后，当期快照仍含跟随前旧值，
++        // T2「随发布生效」静默落空（applied 已推进、确认窗口关闭、无后续发布即永不生效）。
++        // 新顺序：确认门 → follow（推进未锁定实例行）→ assemble（读到新行）→ SHA/store →
++        // 版本落库 → publish_log/notify。网关 scope 与模板实例无关——不触发；任一实例失败
++        // 抛异常 → 本 @Transactional 整批回滚，不产生「版本已发布但实例未跟随」半态。
++        followUnlockedInstances(tenantId, scopeType);
++
+         // 组装（Schema v1.0.1）→ 终检（fail-closed）→ 确定性序列化 → SHA-256
+         ConfigSnapshot snapshot = assembler.assemble(tenantId, scopeType, scopeId, version);
+         String json = assembler.serialize(snapshot);
+@@ -262,19 +270,19 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         // 下发记录落行（TASK-0025）：版本落库后同事务派生目标落行（ack_status=0）+ 触发通知接缝
+         publishLogService.recordDispatch(row);
+ 
+-        // TASK-0083（二档政策）：发布事务内为未锁定滞后实例自动跟随（复用 0081 applyToVersion）。
+-        // 网关 scope 与模板实例无关——不触发；任一实例失败抛异常 → 本 @Transactional 整批回滚，
+-        // 不产生「版本已发布但实例未跟随」半态（brief 失败语义 / fail-closed）。
+-        followUnlockedInstances(tenantId, scopeType);
+-
+         return row;
+     }
+ 
+     /**
+      * TASK-0083 发布自动跟随（ADR-0008 二档政策 / REQ-0006 验收 1 / TC-0005 步骤 3）：
+-     * 计算域发布（scopeType=2）时，对租户内每个模板筛「locked=0 且 applied&lt;current」的滞后
+-     * 实例，逐台复用 0081 {@link IotUpgradeApplyService#applyToVersion} 对齐数据面 + 乐观锁推进
+-     * 簿记。含 {@link TemplateChangeTier#TIER_3} 条目的滞后实例跳过（T3 永不自动——0081 评审红线：
++     * <p><b>生效时序（修订轮 F-1）</b>：在 publish 中于 assemble <b>之前</b>调用——计算引擎运行时
++     * 只读落位快照（HttpSnapshotFetcher→SnapshotReconciler→DualTriggerExecutor），故当期发布
++     * 快照必须含跟随后的新行；follow 后置会使当期快照冻结旧值、T2「随发布生效」静默落空。
++     *
++     * <p><b>筛选口径</b>：同租户 + 引用目标模板 + locked=0 + status=1（启用中，与 0016 清单/
++     * 确认门一致——修订轮 F-2）+ applied&lt;current 的滞后实例，逐台复用 0081
++     * {@link IotUpgradeApplyService#applyToVersion} 对齐数据面 + 乐观锁推进簿记。含
++     * {@link TemplateChangeTier#TIER_3} 条目的滞后实例跳过（T3 永不自动——0081 评审红线：
+      * 自动跟随不得触碰含 T3 的滞后实例，仍走 0016 逐台确认）；锁定实例（locked=1）由筛选条件
+      * 排除，保持旧版本并留在 0016 清单。
+      *
+@@ -300,10 +308,14 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+             if (template.getId() == null || current == null) {
+                 continue;
+             }
+-            // 未锁定（locked=0）+ 滞后（applied<current）实例；租户条件由插件注入（同租户）
++            // 未锁定（locked=0）+ 启用中（status=1）+ 滞后（applied<current）实例；
++            // status=1 口径与 0016 待升级清单（IotInstanceUpgradeServiceImpl.selectUpgradeList）及
++            // 确认门（IotTemplateVersionServiceImpl.hasPendingTier2Confirm）一致——停用实例不跟随
++            // （修订轮 F-2）。租户条件由插件注入（同租户）。
+             List<IotModelInstance> lagging = instanceMapper.selectList(new LambdaQueryWrapper<IotModelInstance>()
+                     .eq(IotModelInstance::getTemplateId, template.getId())
+                     .eq(IotModelInstance::getLocked, 0)
++                    .eq(IotModelInstance::getStatus, 1)
+                     .lt(IotModelInstance::getAppliedTemplateVersion, current)
+                     .orderByAsc(IotModelInstance::getId));
+             if (lagging == null || lagging.isEmpty()) {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java
+index 11a638b..581b847 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishAutoFollowTest.java
+@@ -57,6 +57,7 @@ import java.util.Set;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyInt;
+ import static org.mockito.ArgumentMatchers.anyLong;
+@@ -114,6 +115,7 @@ class IotPublishAutoFollowTest {
+     @Mock private IotUpgradeApplyService upgradeApplyService;
+ 
+     private IotPublishServiceImpl publishService;
++    private SnapshotStorage storage;
+     private org.mockito.MockedStatic<TenantContext> tenantContext;
+     private org.mockito.MockedStatic<SecurityUtils> securityUtils;
+     private AutoCloseable mocks;
+@@ -147,7 +149,7 @@ class IotPublishAutoFollowTest {
+ 
+         PublishProperties properties = new PublishProperties();
+         properties.setStoragePath(tempDir.toString());
+-        SnapshotStorage storage = new SnapshotStorage(properties);
++        storage = new SnapshotStorage(properties);
+         PublishScopeGuard scopeGuard = new PublishScopeGuard(gatewayMapper, dataPermService);
+ 
+         publishService = new IotPublishServiceImpl();
+@@ -277,6 +279,61 @@ class IotPublishAutoFollowTest {
+         assertEquals(ResultCode.DUPLICATE_CODE.getCode(), ex.getCode());
+     }
+ 
++    // ---------- 修订轮 F-1：当期发布快照即含跟随后的新值（对旧时序必红） ----------
++
++    @Test
++    @DisplayName("F-1 - 当期发布快照即含跟随后新值：assemble 前完成 follow（calc 只读快照）")
++    void currentSnapshotContainsPostFollowValue() throws Exception {
++        // 可变数据项行：applyToVersion 桩把 /100 改写为 /1000（模拟 0081 写实例行）
++        IotDataItem item = new IotDataItem();
++        item.setId(501L);
++        item.setTenantId(TENANT);
++        item.setInstanceId(INSTANCE_ID);
++        item.setDataCode("LOAD_RATE");
++        item.setFullKey("F01.WS01.EQ201.LOAD_RATE");
++        item.setFormula("F01.WS01.EQ201.ELEC_CONS/100"); // 跟随前旧值
++        item.setSourceType(2);
++        item.setEnabled(1);
++        item.setStatus(1);
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(item));
++
++        stubFollowContext(t2Content(), t3FormulaContent());
++        when(instanceMapper.update(any(), any(LambdaUpdateWrapper.class))).thenReturn(1);
++        // 桩：applyToVersion 调用时改写数据项行公式（真实 0081 会写行；此处以同一对象模拟行变更可见性）
++        org.mockito.Mockito.doAnswer(inv -> {
++            item.setFormula("F01.WS01.EQ201.ELEC_CONS/1000"); // 跟随新值
++            return new TemplateUpgradeResultVO();
++        }).when(upgradeApplyService).applyToVersion(any(), anyInt());
++
++        IotConfigVersion row = publishService.publish(computeForm());
++
++        // 断言：当期发布快照落位文件内容即含跟随后新值 /1000（旧时序 assemble 在 follow 前 → 仍 /100 → 红）
++        byte[] bytes = storage.readBytes(row.getSnapshotUri());
++        String snapshotJson = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
++        assertTrue(snapshotJson.contains("F01.WS01.EQ201.ELEC_CONS/1000"),
++                "当期快照必须含跟随后新值 /1000（calc 运行时只读快照，T2 随发布生效）");
++        assertTrue(!snapshotJson.contains("F01.WS01.EQ201.ELEC_CONS/100\""),
++                "当期快照不得残留跟随前旧值 /100");
++    }
++
++    // ---------- 修订轮 F-2：follow 筛选含 status=1（与 0016 清单/确认门一致） ----------
++
++    @Test
++    @DisplayName("F-2 - follow 实例筛选含 status=1（与确认门/影响预览口径一致）")
++    void followFilterIncludesStatusEnabled() {
++        stubFollowContext(t2Content(), t3FormulaContent());
++        when(instanceMapper.update(any(), any(LambdaUpdateWrapper.class))).thenReturn(1);
++
++        publishService.publish(computeForm());
++
++        ArgumentCaptor<com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<IotModelInstance>> cap =
++                ArgumentCaptor.forClass(com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper.class);
++        verify(instanceMapper).selectList(cap.capture());
++        String sqlSegment = cap.getValue().getSqlSegment();
++        assertTrue(sqlSegment.contains("status") || cap.getValue().getParamNameValuePairs().containsValue(1),
++                "follow 实例筛选必须含 status=1（与 0016 清单/确认门口径一致）；实际 SQL=" + sqlSegment);
++    }
++
+     // ---------- 夹具 ----------
+ 
+     /**

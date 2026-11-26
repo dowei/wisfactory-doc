@@ -1,0 +1,1900 @@
+diff --git a/calc/README.md b/calc/README.md
+index 373794f..d0600e0 100644
+--- a/calc/README.md
++++ b/calc/README.md
+@@ -118,6 +118,16 @@ calc/
+ 
+ 契约测试 `StatusEvaluatorContractTest` / `StatusRuntimeContractTest` / `TdengineTraceWriterContractTest`；真 Redis 集成 `StatusRedisLiveTest` 由 `CALC_STATUS_REDIS_TEST_ADDR` env 门控（未配自动跳过）。
+ 
++## 原生算子与同构存储（TASK-0042）
++
++- **DELTA 算子**（`operator/DeltaOperator`）：差分=当前-上周期；回退打码（差值<0 不写负值、码 8）/换表 PARAM 边界分段（新表底数建基线、跨段不差分 ADR-0010）/溢出归零（超量程→0+码 1）/跨周期标记（间隔超容差→码 9 不冒充单周期流量）/坏样本保留上游码——五异常逐条契约锁定。原生实现、不走表达式引擎；DELTA 可在公式中直接引用（白名单），跨周期基线连续。
++- **INTEGRAL 算子**（`operator/IntegralOperator`）：按真实 ts 间隔梯形积分逐段累加；缺口不积分（质量非 0 的间隔跳过、计入完整度）；停机零增量（正常质量、流量=0→码 0）与断线（GapSkipped+质量码）严格区分。ADR-0010：**INTEGRAL 不开放手写**，仅随能源计量预置公式提供（`FormulaExpressionValidator` 白名单禁手写）。
++- **能源计量派生**（`operator/EnergyDerivation`）：绑累计点位→DELTA 派生流量、绑流量点位→INTEGRAL 派生累计；只改绑定方向即换向（正负号随方向），模板/数据项/汇总零改动；实例未填继承模板默认（与 0081 三方合并一致）。
++- **同构写**（`storage/`）：`HomogeneousResultSink` 接在执行器 ResultSink 后，把成功结果按 source_type 写 st_item_value（DIRECT/FORMULA/ROLLUP 同源同构）+ Redis 点位缓存 `iot:item:{tenant}:{fullKey}`；失败结果不写假 0；TDengine/Redis 单条写失败 WARN 不阻塞。
++  - `TdengineItemValueWriter`：逐语句 REST（0029 多语句信封静默空操作）、库名全限定、子表首写 USING TAGS；**full_key=instance_code+'.'+data_code 无 full: 前缀**（0049 F-02），六元组 tag 精确断言（tenant_id/full_key/instance_code/data_code/category/source_type）。
++  - 真机写入 + 读回因 TDengine REST 故障（TD-0053）列为环境恢复后补验条件，当前以注入式 SqlRunner 契约测试 + 记录式写口捕获 INSERT SQL 闭合形态。
++- 接入由 env 控制、默认关闭（0040/0041/0049 既有行为零回归）：`CALC_OPERATORS_ENABLED`、`CALC_HOMOGENEOUS_STORAGE_ENABLED`、`CALC_TENANT_ID`（默认 1）。契约测试 `DeltaOperatorContractTest` / `IntegralOperatorContractTest` / `EnergyDerivationContractTest` / `OperatorIntegrationContractTest` / `TdengineItemValueWriterContractTest` / `HomogeneousResultSinkContractTest`。
++
+ ## 构建与检查
+ 
+ ```bash
+@@ -131,8 +141,8 @@ JDK HttpServer 假端点）在接线时零改动替换。
+ 
+ ## 边界
+ 
+-- 执行器双触发/汇总算子（TASK-0041，本工程 executor/ 包）已交付；DELTA/INTEGRAL 算子（0042）、指标聚合（0045）、状态判定（0049）、iot_calc_log/state 写（0063）仍按各自边界归后续道。
+-- 本执行器不写 TDengine/MySQL 业务表：st_metric_value 归 0045、数据项结果表/Redis 缓存真实 Sink 归计算引擎后续；`ResultSink` 为实现替换缝，Metric 节点本执行器不计算（0045 边界）。
++- 执行器双触发/汇总算子（TASK-0041）、DELTA/INTEGRAL 原生算子与同构存储（TASK-0042，本工程 operator/ 与 storage/ 包）已交付；指标聚合（0045）、iot_calc_log/state 写（0063）仍按各自边界归后续道。
++- 本执行器不写 st_metric_value（0045）；数据项结果表 st_item_value / Redis 缓存真实 Sink 已由 0042 交付（`storage/HomogeneousResultSink`，记录式写口为默认，真 REST/Redis 注入缝在 `TdengineItemValueWriter`/`RedisItemValueCache`）；Metric 节点本执行器不计算（0045 边界）。
+ - `/calc/v1/status` 为观测口（无鉴权，内网面）；`/internal/v1/**` 是 §3.3/§3.4 契约
+   命名空间，本工程刻意不占用。
+ - 点位存在性不可校验：计算范围快照不装载点位/通道（派生规则 7）——refType=2 点位引用
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index f2dd0e6..8bcfa05 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -103,21 +103,51 @@ public class CalcEngineApplication {
+         return new net.otlab.calc.executor.ValueStore();
+     }
+ 
++    /**
++     * TASK-0042 存储运行时（operators-enabled / homogeneous-storage-enabled 任一为真时才装配）：
++     * 原生算子桥 + 同构写 ResultSink。记录式写口捕获 INSERT SQL（TDengine REST 故障期的契约断言面）。
++     */
++    @Bean
++    public net.otlab.calc.storage.StorageRuntime storageRuntime(CalcProperties properties) {
++        if (!properties.isOperatorsEnabled() && !properties.isHomogeneousStorageEnabled()) {
++            return null;
++        }
++        net.otlab.calc.operator.OperatorEvaluator operators = new net.otlab.calc.operator.OperatorEvaluator();
++        net.otlab.calc.storage.StorageRuntime.RecordingWriter recorder =
++                new net.otlab.calc.storage.StorageRuntime.RecordingWriter(properties.getTenant());
++        net.otlab.calc.storage.HomogeneousResultSink.ItemValueCache cache =
++                new net.otlab.calc.storage.RedisItemValueCache(properties.getRedisAddr(),
++                        properties.getRedisPassword(),
++                        properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase(),
++                        properties.getTenant());
++        return new net.otlab.calc.storage.StorageRuntime(operators,
++                properties.getTenantId() == null ? 1L : properties.getTenantId(),
++                properties.getTenant(), recorder, cache);
++    }
++
+     /** 双触发执行器运行时（TASK-0041；未显式启用时不启动后台线程） */
+     @Bean
+     public ExecutorRuntime executorRuntime(GraphHolder holder, CalcProperties properties,
+                                            @org.springframework.lang.Nullable StatusEvaluatorRuntime statusRuntime,
+-                                           net.otlab.calc.executor.ValueStore valueStore) {
++                                           net.otlab.calc.executor.ValueStore valueStore,
++                                           @org.springframework.lang.Nullable net.otlab.calc.storage.StorageRuntime storageRuntime) {
+         long tick = properties.getSchedulerTickSeconds() == null || properties.getSchedulerTickSeconds() < 1
+                 ? 1 : properties.getSchedulerTickSeconds();
+         // TASK-0049：status-enabled=true 时把执行器输出经状态判定桥接 Sink；否则零包装（0041 行为不变）
+         java.util.function.UnaryOperator<net.otlab.calc.executor.ResultSink> decorator =
+                 statusRuntime == null ? null : statusRuntime::bridgingSink;
++        // TASK-0042：原生算子桥 + 同构写 Sink（启用时）
++        net.otlab.calc.operator.OperatorEvaluator operators =
++                storageRuntime == null ? null : storageRuntime.operators();
++        java.util.function.UnaryOperator<net.otlab.calc.executor.ResultSink> storageDecorator = null;
++        if (storageRuntime != null && properties.isHomogeneousStorageEnabled()) {
++            storageDecorator = storageRuntime.sinkDecorator();
++        }
+         return new ExecutorRuntime(holder, properties.getTenant(),
+                 properties.getRedisAddr(), properties.getRedisPassword(),
+                 properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase(),
+                 tick, 5L * 60L * 1000L, 4096, decorator,
+-                statusRuntime == null ? null : valueStore);
++                statusRuntime == null ? null : valueStore, operators, storageDecorator);
+     }
+ 
+     /**
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 90acdb2..1aeb2f6 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -68,6 +68,39 @@ public class CalcProperties {
+     /** TDengine 密码（taosdata） */
+     private String tdenginePassword = "taosdata";
+ 
++    /** TASK-0042 原生算子桥总开关（默认 false——0040/0041/0049 既有行为零变化） */
++    private boolean operatorsEnabled = false;
++
++    /** TASK-0042 同构写 st_item_value + Redis 点位缓存总开关（默认 false——既有行为零变化） */
++    private boolean homogeneousStorageEnabled = false;
++
++    /** 租户 id（st_item_value 六元组 tag tenant_id；默认 1） */
++    private Long tenantId = 1L;
++
++    public Long getTenantId() {
++        return tenantId;
++    }
++
++    public void setTenantId(Long tenantId) {
++        this.tenantId = tenantId;
++    }
++
++    public boolean isOperatorsEnabled() {
++        return operatorsEnabled;
++    }
++
++    public void setOperatorsEnabled(boolean operatorsEnabled) {
++        this.operatorsEnabled = operatorsEnabled;
++    }
++
++    public boolean isHomogeneousStorageEnabled() {
++        return homogeneousStorageEnabled;
++    }
++
++    public void setHomogeneousStorageEnabled(boolean homogeneousStorageEnabled) {
++        this.homogeneousStorageEnabled = homogeneousStorageEnabled;
++    }
++
+     public String getBackendBaseUrl() {
+         return backendBaseUrl;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+index b0f71fd..23c1be8 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+@@ -24,18 +24,32 @@ public final class ArithmeticEvaluator {
+         Double resolve(String identifier);
+     }
+ 
++    /** 函数求值器（TASK-0042：DELTA 等原生算子注入缝；null=不开放函数调用，0041 既有行为） */
++    @FunctionalInterface
++    public interface FunctionResolver {
++        /** 求值单参函数；不支持的函数返回 null（由解析器抛 UnsupportedOperationException） */
++        Double resolve(String name, double arg);
++    }
++
+     private final String src;
+     private final Resolver resolver;
++    private final FunctionResolver functions;
+     private int pos;
+ 
+-    private ArithmeticEvaluator(String src, Resolver resolver) {
++    private ArithmeticEvaluator(String src, Resolver resolver, FunctionResolver functions) {
+         this.src = src;
+         this.resolver = resolver;
++        this.functions = functions;
+     }
+ 
+     /** 求值；任何解析/引用失败上抛 RuntimeException（由调用方隔离为单节点失败） */
+     public static double evaluate(String expression, Resolver resolver) {
+-        ArithmeticEvaluator e = new ArithmeticEvaluator(expression, resolver);
++        return evaluate(expression, resolver, null);
++    }
++
++    /** 求值（带函数求值器——TASK-0042 原生算子接入缝） */
++    public static double evaluate(String expression, Resolver resolver, FunctionResolver functions) {
++        ArithmeticEvaluator e = new ArithmeticEvaluator(expression, resolver, functions);
+         double result = e.parseTernary();
+         e.skipWs();
+         if (e.pos < e.src.length()) {
+@@ -199,8 +213,18 @@ public final class ArithmeticEvaluator {
+             }
+             String ident = src.substring(start, pos);
+             if (consume('(')) {
+-                throw new UnsupportedOperationException("内置算子/函数调用不在 0041 求值范围: " + ident
+-                        + "（DELTA/INTEGRAL 归 TASK-0042）");
++                if (functions == null) {
++                    throw new UnsupportedOperationException("内置算子/函数调用不在 0041 求值范围: " + ident
++                            + "（DELTA/INTEGRAL 归 TASK-0042）");
++                }
++                double arg = parseTernary();
++                skipWs();
++                expect(')');
++                Double result = functions.resolve(ident, arg);
++                if (result == null) {
++                    throw new UnsupportedOperationException("不支持的函数: " + ident);
++                }
++                return result;
+             }
+             Double value = resolver.resolve(ident);
+             if (value == null) {
+diff --git a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+index f41e7aa..f410fef 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
++++ b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+@@ -47,6 +47,8 @@ public final class DualTriggerExecutor {
+     private final WindowIdempotencyGuard guard;
+     private final ResultSink sink;
+     private final RollupOperator rollup;
++    /** TASK-0042 原生算子桥（DELTA/INTEGRAL）；null=0041 既有行为（函数调用隔离失败） */
++    private final net.otlab.calc.operator.OperatorEvaluator operators;
+     /** 最近一次执行的节点访问序（观测/契约测试断言拓扑顺序） */
+     private volatile List<String> lastVisitOrder = List.of();
+ 
+@@ -56,10 +58,17 @@ public final class DualTriggerExecutor {
+ 
+     public DualTriggerExecutor(ValueStore store, WindowIdempotencyGuard guard, ResultSink sink,
+                                RollupOperator rollup) {
++        this(store, guard, sink, rollup, null);
++    }
++
++    /** TASK-0042：注入原生算子桥（默认构造仍为 null——0041 既有行为零变化） */
++    public DualTriggerExecutor(ValueStore store, WindowIdempotencyGuard guard, ResultSink sink,
++                               RollupOperator rollup, net.otlab.calc.operator.OperatorEvaluator operators) {
+         this.store = store;
+         this.guard = guard;
+         this.sink = sink;
+         this.rollup = rollup;
++        this.operators = operators;
+     }
+ 
+     public ValueStore store() {
+@@ -180,10 +189,20 @@ public final class DualTriggerExecutor {
+                 if (formula == null || formula.isBlank()) {
+                     throw new IllegalStateException("公式项缺表达式");
+                 }
++                if (operators != null && containsFunction(formula, "DELTA")) {
++                    // TASK-0042：DELTA 原生算子（不走表达式引擎求值，但允许公式中引用）。
++                    // 取 DELTA(arg) 的入参样本，调用原生差分；质量码随差分结果透传（回退8/跨周期9/溢出1）。
++                    yield evaluateDeltaFormula(key, formula, node, graph, ts);
++                }
+                 double value = ArithmeticEvaluator.evaluate(formula,
+                         id -> {
+                             ValueSample s = store.get(id);
+                             return s == null ? null : s.value();
++                        },
++                        operators == null ? null : (name, arg) -> {
++                            // DELTA 之外的函数由 OperatorEvaluator 判定支持性；这里公式已单独处理 DELTA，
++                            // 其余函数（INTEGRAL 不开放手写）返回 null → 隔离失败。
++                            return null;
+                         });
+                 yield CalcResult.success(key, 2, ValueSample.of(value, ts));
+             }
+@@ -197,6 +216,45 @@ public final class DualTriggerExecutor {
+         };
+     }
+ 
++    /** 公式是否含 DELTA( 函数调用（TASK-0042 原生算子识别） */
++    private static boolean containsFunction(String formula, String name) {
++        return java.util.regex.Pattern.compile("\\b" + name + "\\s*\\(").matcher(formula).find();
++    }
++
++    /**
++     * DELTA 公式求值：从 DELTA(arg) 提取入参 key 与当前样本，交原生算子差分。
++     * 支持「DELTA(x)」纯调用与「DELTA(x) 作为更大表达式的一部分」——本期能源计量预置为纯调用
++     * （多算子/嵌套组合的真 Aviator 归 FEAT-0012）。质量码随差分结果透传，不打假 0。
++     */
++    private CalcResult evaluateDeltaFormula(String key, String formula, GraphNode node,
++                                            DependencyGraph graph, long ts) {
++        java.util.regex.Matcher m = java.util.regex.Pattern
++                .compile("DELTA\\s*\\(\\s*([A-Za-z_][\\w.]*)\\s*\\)").matcher(formula);
++        if (!m.find()) {
++            throw new IllegalStateException("DELTA 公式形态不支持: " + formula);
++        }
++        String argKey = m.group(1);
++        ValueSample current = store.get(argKey);
++        if (current == null) {
++            throw new IllegalStateException("DELTA 无值输入: " + argKey);
++        }
++        // 期望周期：取当前数据项 calc_period（秒→毫秒），0/null 不判跨周期；
++        // 满量程：快照 DataItem 暂无 validMax 之外的 full-scale 专属字段——DELTA 溢出按入参点位
++        // maxRange（演进位：点位档案满量程），本期通过 OperatorEvaluator 默认不启用量程判定。
++        Long periodMs = itemPeriodMs(node, graph);
++        ValueSample sample = operators.delta(argKey, current, periodMs, null, false);
++        return CalcResult.success(key, 2, sample);
++    }
++
++    /** 取 DELTA 入参的期望周期（来自当前数据项 calc_period；秒→毫秒，0/null→null） */
++    private Long itemPeriodMs(GraphNode node, DependencyGraph graph) {
++        DataItem item = node.item();
++        if (item == null || item.getCalcPeriod() == null || item.getCalcPeriod() <= 0) {
++            return null;
++        }
++        return item.getCalcPeriod() * 1000L;
++    }
++
+     /** 动态查找子级（按 rollup 边，本次求值实时读取 store——新增子级下一周期自动纳入） */
+     private List<RollupOperator.Child> childSamples(String rollupKey, DependencyGraph graph) {
+         List<RollupOperator.Child> children = new ArrayList<>();
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+index c71e3c7..a03a87b 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+@@ -59,12 +59,25 @@ public final class ExecutorRuntime implements AutoCloseable {
+     public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
+                            int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries,
+                            java.util.function.UnaryOperator<ResultSink> sinkDecorator, ValueStore sharedStore) {
++        this(holder, tenant, redisAddr, redisPassword, redisDatabase, tickSeconds, guardTtlMillis,
++                guardMaxEntries, sinkDecorator, sharedStore, null, null);
++    }
++
++    /** TASK-0042 完整构造：operators=原生算子桥（DELTA/INTEGRAL）；storageDecorator=同构写 Sink 桥接 */
++    public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
++                           int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries,
++                           java.util.function.UnaryOperator<ResultSink> sinkDecorator, ValueStore sharedStore,
++                           net.otlab.calc.operator.OperatorEvaluator operators,
++                           java.util.function.UnaryOperator<ResultSink> storageDecorator) {
+         this.holder = holder;
+         this.tenant = tenant;
+         this.store = sharedStore == null ? new ValueStore() : sharedStore;
+         this.guard = new WindowIdempotencyGuard(guardMaxEntries, guardTtlMillis);
+         ResultSink effective = sinkDecorator == null ? sink : sinkDecorator.apply(sink);
+-        this.executor = new DualTriggerExecutor(store, guard, effective);
++        if (storageDecorator != null) {
++            effective = storageDecorator.apply(effective);
++        }
++        this.executor = new DualTriggerExecutor(store, guard, effective, new RollupOperator(), operators);
+         this.scheduler = new PeriodicScheduler(holder, executor, tickSeconds);
+         this.subscriber = new RedisArrivalSubscriber(redisAddr, redisPassword, redisDatabase, tenant,
+                 (pointCode, sample) -> {
+diff --git a/calc/src/main/java/net/otlab/calc/operator/DeltaOperator.java b/calc/src/main/java/net/otlab/calc/operator/DeltaOperator.java
+new file mode 100644
+index 0000000..88fceb9
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/operator/DeltaOperator.java
+@@ -0,0 +1,115 @@
++package net.otlab.calc.operator;
++
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.Map;
++
++/**
++ * DELTA 原生差分算子（TASK-0042 brief 决策 1；REQ-0019；ADR-0010 TD-0019）：
++ * 差分 = 当前值 - 上周期值；五异常口径逐条落地——
++ *
++ * <ul>
++ *   <li>回退打码：差值 &lt; 0 → 不写负值（值 0）+ CONV-02 码 8（突变待核查，人工确认）；</li>
++ *   <li>换表 PARAM 边界分段：PARAM 变更时间点即分段边界（不新增换表事件表），跨段不差分，
++ *       新表底数只建新基线（与「读数回退分段」同一逻辑）；</li>
++ *   <li>溢出归零：差值超满量程 → 0 + 超上限码 1，不写超量程值；</li>
++ *   <li>跨周期标记：采样窗不连续（实际 ts 间隔 &gt; 期望周期容差）→ 码 9、不差分、不冒充单周期流量；</li>
++ *   <li>坏样本：上游质量码非 0 → 不差分、保留上游标记。</li>
++ * </ul>
++ *
++ * <p>原生实现、不走表达式引擎；DELTA 可引用（isHandwritable=true），与 0041
++ * ArithmeticEvaluator 白名单对齐。线程安全：状态按 key 存于 ConcurrentHashMap（周期调度与
++ * Redis 到达订阅并发写）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class DeltaOperator {
++
++    /** 单样本输入（value/quality/ts 统一三键 + 算子参数 + 换表事件标记） */
++    public record Input(String key, double value, long ts, int quality,
++                        Long expectedPeriodMs, Double maxRange, boolean paramChangeEvent) {
++        public Input {
++            Objects.requireNonNull(key, "key");
++        }
++    }
++
++    public enum Kind {
++        NORMAL, BACKFLOW, NEW_BASELINE, OVERFLOW, CROSS_PERIOD, BAD_INPUT
++    }
++
++    public record Result(double value, int quality, Kind kind, String reason, long ts) {
++    }
++
++    /** 跨周期容差：实际间隔 > 期望周期 × 1.5 视为采样窗不连续（容忍轻微抖动） */
++    private static final double GAP_TOLERANCE = 1.5;
++
++    private final Map<String, Baseline> baselines = new ConcurrentHashMap<>();
++    private final Map<String, Long> pendingParamChangeTs = new ConcurrentHashMap<>();
++
++    private record Baseline(double value, long ts) {
++    }
++
++    /** DELTA 可在公式中直接引用（REQ-0016 一期函数集含 DELTA） */
++    public boolean isHandwritable() {
++        return true;
++    }
++
++    /** 登记换表 PARAM 变更时间点（ADR-0010 TD-0019：PARAM 变更时间点即 DELTA 分段边界） */
++    public void markParamChange(String key, long ts) {
++        pendingParamChangeTs.put(key, ts);
++    }
++
++    /** 简洁求值（无期望周期/量程参数——测试与基线建立） */
++    public Result evaluate(Input in) {
++        return evaluate(in, in.expectedPeriodMs(), in.maxRange(), in.paramChangeEvent());
++    }
++
++    /**
++     * 差分求值（每 key 独立基线）。
++     *
++     * @param expectedPeriodMs 期望采样周期（毫秒）；非空且实际间隔超容差 → 跨周期打码 9
++     * @param maxRange        满量程上限；非空且差值超过 → 溢出归零 + 码 1
++     * @param paramChangeEvent 本次样本携带的换表事件标记（与 markParamChange 等价）
++     */
++    public Result evaluate(Input in, Long expectedPeriodMs, Double maxRange, boolean paramChangeEvent) {
++        String key = in.key();
++        Baseline prev = baselines.get(key);
++        long pendingTs = pendingParamChangeTs.getOrDefault(key, Long.MIN_VALUE);
++
++        // 换表分段：PARAM 变更发生在上次基线之后 → 本样本只建新表底数，跨段不差分。
++        boolean paramBoundary = paramChangeEvent
++                || (prev != null && pendingTs != Long.MIN_VALUE && pendingTs >= prev.ts() && pendingTs < in.ts());
++        if (paramBoundary) {
++            baselines.put(key, new Baseline(in.value(), in.ts()));
++            pendingParamChangeTs.remove(key);
++            return new Result(0.0, 0, Kind.NEW_BASELINE, "换表PARAM分段边界，新表底数建基线", in.ts());
++        }
++        if (prev == null) {
++            baselines.put(key, new Baseline(in.value(), in.ts()));
++            return new Result(0.0, 0, Kind.NEW_BASELINE, "首样本建基线", in.ts());
++        }
++        if (in.quality() != 0) {
++            return new Result(0.0, in.quality(), Kind.BAD_INPUT, "上游质量码非0，不差分", in.ts());
++        }
++        long gap = in.ts() - prev.ts();
++        if (expectedPeriodMs != null && expectedPeriodMs > 0
++                && gap > expectedPeriodMs * GAP_TOLERANCE) {
++            // 跨周期：以当前样本重建基线（恢复后不跨缺口），打码 9 不冒充单周期流量
++            baselines.put(key, new Baseline(in.value(), in.ts()));
++            return new Result(0.0, 9, Kind.CROSS_PERIOD, "采样窗不连续（跨周期）不差分", in.ts());
++        }
++        double diff = in.value() - prev.value();
++        if (maxRange != null && maxRange > 0 && Math.abs(diff) > maxRange) {
++            baselines.put(key, new Baseline(in.value(), in.ts()));
++            return new Result(0.0, 1, Kind.OVERFLOW, "差值超量程，溢出归零", in.ts());
++        }
++        if (diff < 0) {
++            // 回退：不写负值（值 0），打码 8 提示人工确认（CONV-02 / REQ-0019 验收 2）
++            baselines.put(key, new Baseline(in.value(), in.ts()));
++            return new Result(0.0, 8, Kind.BACKFLOW, "读数回退（差值负）不写负值，打码待确认", in.ts());
++        }
++        baselines.put(key, new Baseline(in.value(), in.ts()));
++        return new Result(diff, 0, Kind.NORMAL, "", in.ts());
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/operator/EnergyDerivation.java b/calc/src/main/java/net/otlab/calc/operator/EnergyDerivation.java
+new file mode 100644
+index 0000000..8e73928
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/operator/EnergyDerivation.java
+@@ -0,0 +1,91 @@
++package net.otlab.calc.operator;
++
++import java.util.Objects;
++
++/**
++ * 能源计量模板派生路径（TASK-0042 brief 决策 4；REQ-0019 验收 1；§1.6 能源计量模板）：
++ * 累计与流量两项只绑一个原始点位，另一项以 DELTA / INTEGRAL 派生，**只改绑定方向即换向**
++ * （正负号随绑定方向），模板/数据项/汇总/指标配置零改动。
++ *
++ * <p>绑定方向决定派生算子：绑累计点位→DELTA 派生流量；绑流量点位→INTEGRAL 派生累计。
++ * 方向（FORWARD/REVERSE）决定派生值的正负号——这是模板实例化时唯一切换点。
++ *
++ * <p>模板默认/覆盖口径与 0081 三方合并一致：实例值未填（null）→继承模板默认，显式填→覆盖。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class EnergyDerivation {
++
++    /** 绑定的原始点位类型 → 派生算子 */
++    public enum Binding {
++        CUMULATIVE, // 累计量点位 → DELTA 派生流量
++        FLOW;       // 流量点位 → INTEGRAL 派生累计
++
++        public Operator operator() {
++            return this == CUMULATIVE ? Operator.DELTA : Operator.INTEGRAL;
++        }
++    }
++
++    public enum Operator {
++        DELTA, INTEGRAL
++    }
++
++    /** 绑定方向 → 正负号 */
++    public enum Direction {
++        FORWARD(1.0), REVERSE(-1.0);
++
++        private final double sign;
++
++        Direction(double sign) {
++            this.sign = sign;
++        }
++
++        public double sign() {
++            return sign;
++        }
++    }
++
++    private final Binding binding;
++    private final Direction direction;
++
++    public EnergyDerivation(Binding binding) {
++        this(binding, Direction.FORWARD);
++    }
++
++    public EnergyDerivation(Binding binding, Direction direction) {
++        this.binding = Objects.requireNonNull(binding, "binding");
++        this.direction = Objects.requireNonNull(direction, "direction");
++    }
++
++    public Operator operator() {
++        return binding.operator();
++    }
++
++    public double sign() {
++        return direction.sign();
++    }
++
++    /** 派生值 = 方向系数 × 输入（反绑即取负，算子/数据项不变） */
++    public double apply(double value) {
++        return direction.sign() * value;
++    }
++
++    /** 派生的 data_code：累计绑→FLOW，流量绑→TOTAL（方向换向不影响 data_code） */
++    public String derivedDataCode() {
++        return binding == Binding.CUMULATIVE ? "FLOW" : "TOTAL";
++    }
++
++    /** 模板（预置默认）→ 实例有效值解析（三方合并：实例 null 继承模板默认） */
++    public record Template(String category, String derivedDataCode, Binding binding,
++                           double defaultSign, Double defaultOverride) {
++        public Effective resolve(String instanceCategory, Double instanceSign) {
++            return new Effective(
++                    instanceCategory == null ? category : instanceCategory,
++                    instanceSign == null ? defaultSign : instanceSign);
++        }
++    }
++
++    public record Effective(String category, double sign) {
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/operator/IntegralOperator.java b/calc/src/main/java/net/otlab/calc/operator/IntegralOperator.java
+new file mode 100644
+index 0000000..14bbce5
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/operator/IntegralOperator.java
+@@ -0,0 +1,94 @@
++package net.otlab.calc.operator;
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.Map;
++
++/**
++ * INTEGRAL 原生梯形积分算子（TASK-0042 brief 决策 2；REQ-0019；ADR-0010）：
++ * 瞬时流量 → 累计量；按相邻样本**真实 ts 间隔**梯形积分逐段累加（非固定周期）；
++ * 缺口不积分（质量码非 0 / 样本缺失的间隔跳过，禁止用最后流量填满缺口，计入完整度）；
++ * 停机零增量（正常质量、流量=0 → quality=0 的零增量）与断线（GapSkipped + 质量码）严格区分。
++ *
++ * <p>ADR-0010：INTEGRAL 不开放用户手写——仅随能源计量预置公式提供（isHandwritable=false，
++ * 供 FormulaExpressionValidator 白名单判定）。原生实现、不走表达式引擎。
++ *
++ * <p>线程安全：状态按 key 存于 ConcurrentHashMap。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class IntegralOperator {
++
++    /** 样本（value=瞬时流量 / quality=上游质量 / ts=真实采样时刻） */
++    public record Sample(String key, double value, long ts, int quality) {
++        public Sample {
++            java.util.Objects.requireNonNull(key, "key");
++        }
++    }
++
++    public enum Kind {
++        INITIAL, INTEGRATED, GAP_SKIPPED, STOPPED_ZERO
++    }
++
++    /** increment=本段增量；value=累计量；quality=本段质量 */
++    public record Result(double increment, double value, int quality, Kind kind, long ts) {
++    }
++
++    private record LastSample(double value, long ts, int quality) {
++    }
++
++    private final Map<String, Accum> accums = new ConcurrentHashMap<>();
++
++    private static final class Accum {
++        LastSample last;
++        double total;
++    }
++
++    /** ADR-0010：INTEGRAL 仅随预置公式提供，不开放手写 */
++    public boolean isHandwritable() {
++        return false;
++    }
++
++    /** 累计量查询（观测/同构写用），无样本返回 0 */
++    public double total(String key) {
++        Accum a = accums.get(key);
++        return a == null ? 0 : a.total;
++    }
++
++    public void reset(String key) {
++        accums.remove(key);
++    }
++
++    /**
++     * 接纳一个样本并返回本段积分结果。
++     *
++     * <p>规则：首样本仅建基线（INITIAL 增量 0）；当前样本质量非 0 或距上个样本质量非 0 →
++     * 该段不积分（GAP_SKIPPED，累计不变），并以当前样本重建基线（防跨缺口累计）；
++     * 当前值=0 且上值=0（稳态停机）→ STOPPED_ZERO（quality=0，正常零增量）；
++     * 其余按真实 ts 间隔梯形积分 ((v0+v1)/2)*dt（dt 秒）。
++     */
++    public Result accept(Sample sample) {
++        Accum a = accums.computeIfAbsent(sample.key(), k -> new Accum());
++        LastSample prev = a.last;
++        if (prev == null) {
++            a.last = new LastSample(sample.value(), sample.ts(), sample.quality());
++            return new Result(0.0, a.total, sample.quality(), Kind.INITIAL, sample.ts());
++        }
++        if (sample.quality() != 0 || prev.quality() != 0) {
++            a.last = new LastSample(sample.value(), sample.ts(), sample.quality());
++            return new Result(0.0, a.total, sample.quality() != 0 ? sample.quality() : prev.quality(),
++                    Kind.GAP_SKIPPED, sample.ts());
++        }
++        long deltaMs = sample.ts() - prev.ts();
++        if (deltaMs <= 0) {
++            a.last = new LastSample(sample.value(), sample.ts(), sample.quality());
++            return new Result(0.0, a.total, 0, Kind.INITIAL, sample.ts());
++        }
++        double dtSec = deltaMs / 1000.0;
++        double increment = (prev.value() + sample.value()) / 2.0 * dtSec;
++        a.last = new LastSample(sample.value(), sample.ts(), sample.quality());
++        Kind kind = (sample.value() == 0.0 && prev.value() == 0.0) ? Kind.STOPPED_ZERO : Kind.INTEGRATED;
++        a.total += increment;
++        return new Result(increment, a.total, 0, kind, sample.ts());
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/operator/OperatorEvaluator.java b/calc/src/main/java/net/otlab/calc/operator/OperatorEvaluator.java
+new file mode 100644
+index 0000000..f5bb464
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/operator/OperatorEvaluator.java
+@@ -0,0 +1,56 @@
++package net.otlab.calc.operator;
++
++import java.util.function.BiFunction;
++
++import net.otlab.calc.executor.ValueSample;
++
++/**
++ * 算子桥：把公式中的 DELTA(...) 调用接到原生 {@link DeltaOperator}，把预置 INTEGRAL 派生接到
++ * {@link IntegralOperator}（TASK-0042 brief 决策 1/2；ADR-0010 INTEGRAL 不开放手写）。
++ *
++ * <p>与 0041 ArithmeticEvaluator 白名单对齐：DELTA 可在公式中直接引用（Resolver 提供输入值）；
++ * INTEGRAL 仅随能源计量预置公式提供，白名单层（FormulaExpressionValidator）已禁手写，
++ * 本桥的 integral() 供预置派生路径调用，不解析用户公式中的 INTEGRAL(...)。
++ *
++ * <p>差分基线与积分累计按 key 独立持有，跨触发周期连续——这是「当前值减上周期值」「逐段累加」
++ * 的语义所必需。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class OperatorEvaluator {
++
++    private final DeltaOperator delta = new DeltaOperator();
++    private final IntegralOperator integral = new IntegralOperator();
++
++    public boolean supports(String functionName) {
++        return "DELTA".equalsIgnoreCase(functionName);
++    }
++
++    /** DELTA 求值：入参样本 → 原生差分结果（质量码原样透传） */
++    public ValueSample delta(String key, ValueSample current, Long expectedPeriodMs, Double maxRange,
++                             boolean paramChangeEvent) {
++        if (current == null) {
++            throw new IllegalStateException("DELTA 无值输入: " + key);
++        }
++        DeltaOperator.Result r = delta.evaluate(
++                new DeltaOperator.Input(key, current.value(), current.ts(), current.quality(),
++                        expectedPeriodMs, maxRange, paramChangeEvent));
++        return new ValueSample(r.value(), r.quality(), r.ts());
++    }
++
++    /** 换表 PARAM 分段登记（ADR-0010 TD-0019） */
++    public void markParamChange(String key, long ts) {
++        delta.markParamChange(key, ts);
++    }
++
++    /** INTEGRAL 预置派生求值（不开放手写——仅能源计量模板路径调用） */
++    public ValueSample integral(String key, ValueSample flow, boolean stopReason) {
++        if (flow == null) {
++            throw new IllegalStateException("INTEGRAL 无值输入: " + key);
++        }
++        IntegralOperator.Result r = integral.accept(new IntegralOperator.Sample(
++                key, flow.value(), flow.ts(), stopReason ? 0 : flow.quality()));
++        return new ValueSample(r.value(), r.quality(), r.ts());
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/storage/HomogeneousResultSink.java b/calc/src/main/java/net/otlab/calc/storage/HomogeneousResultSink.java
+new file mode 100644
+index 0000000..efd932a
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/storage/HomogeneousResultSink.java
+@@ -0,0 +1,109 @@
++package net.otlab.calc.storage;
++
++import java.util.List;
++
++import net.otlab.calc.executor.CalcResult;
++import net.otlab.calc.executor.ResultSink;
++import net.otlab.calc.executor.Trigger;
++import net.otlab.calc.executor.ValueSample;
++import net.otlab.calc.snapshot.DataItem;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 同构结果落地 Sink（TASK-0042 brief 决策 3/5）：接在 0041 执行器 ResultSink 边界后，
++ * 把每个成功结果按 source_type 同构写 st_item_value + Redis 点位缓存。
++ *
++ * <p>同构口径：DIRECT(1)/FORMULA(2)/ROLLUP(3) 同源同构——fullKey/instance/dataCode/category
++ * 由数据项派生，value/quality/ts 来自统一值样本，仅 source_type 不同（REQ-0020 验收 4）。
++ *
++ * <p>失败纪律：失败结果（sample=null）不写行（不发假 0，CONV-02 CALC_ERR 归日志）；
++ * TDengine / Redis 单条写失败只 WARN、不阻塞同批其他结果、不上抛（brief 决策 5）。
++ * 同窗窗口键交付语义沿用 ResultSink 默认（按 windowKey 覆盖，由下游真实存储幂等覆盖）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class HomogeneousResultSink implements ResultSink {
++
++    private static final Logger log = LoggerFactory.getLogger(HomogeneousResultSink.class);
++
++    /** st_item_value 写口（注入缝：假实现/真 REST） */
++    public interface ItemValueWriter {
++        void write(ItemValue v);
++    }
++
++    /** Redis 点位缓存写口 */
++    public interface ItemValueCache {
++        void put(ItemValue v);
++    }
++
++    /** 数据项元信息源（fullKey → instance/dataCode/category/sourceType）；缺省按 fullKey 解析 */
++    public interface Metadata {
++        ItemValue project(CalcResult r, long tenantId);
++    }
++
++    private final long tenantId;
++    private final ItemValueWriter writer;
++    private final ItemValueCache cache;
++    private final Metadata metadata;
++    /** 下游 Sink（装饰器链：同构写后再交给状态判定等；null=终端） */
++    private final ResultSink delegate;
++
++    public HomogeneousResultSink(long tenantId, ItemValueWriter writer, ItemValueCache cache) {
++        this(tenantId, writer, cache, defaultMetadata(), null);
++    }
++
++    public HomogeneousResultSink(long tenantId, ItemValueWriter writer, ItemValueCache cache, Metadata metadata) {
++        this(tenantId, writer, cache, metadata, null);
++    }
++
++    public HomogeneousResultSink(long tenantId, ItemValueWriter writer, ItemValueCache cache,
++                                 Metadata metadata, ResultSink delegate) {
++        this.tenantId = tenantId;
++        this.writer = writer;
++        this.cache = cache;
++        this.metadata = metadata == null ? defaultMetadata() : metadata;
++        this.delegate = delegate;
++    }
++
++    @Override
++    public void accept(Trigger trigger, List<CalcResult> results) {
++        for (CalcResult r : results) {
++            if (!r.isSuccess()) {
++                log.warn("[CALC-STORAGE] 失败结果不写时序行 fullKey={} error={}", r.fullKey(), r.error());
++                continue;
++            }
++            ItemValue v = metadata.project(r, tenantId);
++            try {
++                writer.write(v);
++            } catch (RuntimeException e) {
++                log.warn("[CALC-STORAGE] st_item_value 写失败（不阻塞）fullKey={}: {}",
++                        r.fullKey(), e.getMessage());
++            }
++            try {
++                cache.put(v);
++            } catch (RuntimeException e) {
++                log.warn("[CALC-STORAGE] Redis 点位缓存写失败（不阻塞）fullKey={}: {}",
++                        r.fullKey(), e.getMessage());
++            }
++        }
++        if (delegate != null) {
++            delegate.accept(trigger, results);
++        }
++    }
++
++    /** 缺省投影：fullKey = instance.dataCode 拆末段；category=OTHER（真实部署由快照元信息覆盖） */
++    static Metadata defaultMetadata() {
++        return (r, tenantId) -> {
++            String fullKey = r.fullKey();
++            int dot = fullKey.lastIndexOf('.');
++            String instance = dot > 0 ? fullKey.substring(0, dot) : fullKey;
++            String dataCode = dot > 0 ? fullKey.substring(dot + 1) : "VALUE";
++            ValueSample s = r.sample();
++            return new ItemValue(tenantId, fullKey, instance, dataCode, "OTHER",
++                    r.sourceType(), s.ts(), s.value(), s.quality());
++        };
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/storage/ItemValue.java b/calc/src/main/java/net/otlab/calc/storage/ItemValue.java
+new file mode 100644
+index 0000000..9d73302
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/storage/ItemValue.java
+@@ -0,0 +1,27 @@
++package net.otlab.calc.storage;
++
++import java.util.Objects;
++
++/**
++ * 同构写载荷（st_item_value 一行：ts/value/quality 三键 + 六元组 tag 维度）。
++ * DIRECT/FORMULA/ROLLUP 同源同构——仅 source_type 不同（REQ-0020 验收 4）。
++ *
++ * @param fullKey       规范全键 = instance_code + "." + data_code（无 full: 前缀）
++ * @param instanceCode  实例编码
++ * @param dataCode      数据编码
++ * @param category      类别（ELEC/WATER/GAS/...）
++ * @param sourceType    1 绑定 / 2 公式 / 3 汇总
++ * @param ts            时间戳（epoch 毫秒）
++ * @param value         数值（失败不打假 0——由 Sink 过滤，不构造失败载荷）
++ * @param quality       质量码（CONV-02 0-10，原样写）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record ItemValue(long tenantId, String fullKey, String instanceCode, String dataCode,
++                        String category, int sourceType, long ts, double value, int quality) {
++    public ItemValue {
++        Objects.requireNonNull(fullKey, "fullKey");
++        Objects.requireNonNull(instanceCode, "instanceCode");
++        Objects.requireNonNull(dataCode, "dataCode");
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/storage/RedisItemValueCache.java b/calc/src/main/java/net/otlab/calc/storage/RedisItemValueCache.java
+new file mode 100644
+index 0000000..741c2a4
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/storage/RedisItemValueCache.java
+@@ -0,0 +1,144 @@
++package net.otlab.calc.storage;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Redis 数据项点值缓存真写口（TASK-0042 brief 决策 3）：写 {@code iot:item:{tenant}:{fullKey}}
++ * Value = 稳定 JSON {fullKey, value, quality, ts}（与 §1.5B Redis 缓存同规范、同新鲜度，
++ * 复用 0041/0049 RESP2 字节级帧解析形态，零新增依赖）。
++ *
++ * <p>失败语义（brief 决策 5）：连接/命令失败只 WARN、不上抛——不阻塞计算；
++ * 点位缓存是查询结果，写失败不影响 st_item_value 主存储（真源）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class RedisItemValueCache implements HomogeneousResultSink.ItemValueCache {
++
++    private static final Logger log = LoggerFactory.getLogger(RedisItemValueCache.class);
++
++    private final String host;
++    private final int port;
++    private final String password;
++    private final int database;
++    private final String tenantCode;
++
++    public RedisItemValueCache(String addr, String password, int database, String tenantCode) {
++        String[] parts = (addr == null || addr.isBlank() ? "127.0.0.1:6379" : addr).split(":");
++        this.host = parts[0];
++        this.port = parts.length > 1 ? Integer.parseInt(parts[1]) : 6379;
++        this.password = password == null ? "" : password;
++        this.database = database;
++        this.tenantCode = tenantCode == null ? "" : tenantCode;
++    }
++
++    @Override
++    public void put(ItemValue v) {
++        String key = keyOf(tenantCode, v.fullKey());
++        String json = jsonOf(v);
++        try (Socket s = new Socket()) {
++            s.connect(new InetSocketAddress(host, port), 2000);
++            s.setSoTimeout(2000);
++            OutputStream out = s.getOutputStream();
++            Resp2Reply in = new Resp2Reply(s.getInputStream());
++            if (!password.isBlank()) {
++                send(out, "AUTH", password);
++                in.read();
++            }
++            if (database > 0) {
++                send(out, "SELECT", String.valueOf(database));
++                in.read();
++            }
++            send(out, "SET", key, json);
++            String reply = in.read();
++            if (!"OK".equalsIgnoreCase(reply)) {
++                log.warn("[CALC-STORAGE] Redis 点位缓存 SET 非 OK key={} reply={}", key, reply);
++            }
++        } catch (IOException | RuntimeException e) {
++            log.warn("[CALC-STORAGE] Redis 点位缓存写失败（不阻塞）key={}: {}", key, e.getMessage());
++        }
++    }
++
++    static String keyOf(String tenant, String fullKey) {
++        return "iot:item:" + tenant + ":" + fullKey;
++    }
++
++    static String jsonOf(ItemValue v) {
++        return "{\"fullKey\":\"" + esc(v.fullKey()) + "\",\"value\":" + v.value()
++                + ",\"quality\":" + v.quality() + ",\"ts\":" + v.ts() + "}";
++    }
++
++    private static String esc(String s) {
++        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
++    }
++
++    private static void send(OutputStream out, String... args) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        sb.append('*').append(args.length).append("\r\n");
++        for (String arg : args) {
++            byte[] b = arg.getBytes(StandardCharsets.UTF_8);
++            sb.append('$').append(b.length).append("\r\n").append(arg).append("\r\n");
++        }
++        out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
++        out.flush();
++    }
++
++    /** 字节级 RESP2 回复（0041/0049 同款帧解析） */
++    private static final class Resp2Reply {
++        private final InputStream in;
++
++        Resp2Reply(InputStream in) {
++            this.in = in;
++        }
++
++        String read() throws IOException {
++            int b = in.read();
++            if (b < 0) {
++                throw new IOException("连接关闭");
++            }
++            return switch (b) {
++                case '+' -> line();
++                case '-' -> throw new IOException("Redis 错误: " + line());
++                case ':' -> line();
++                case '$' -> {
++                    int len = Integer.parseInt(line());
++                    if (len < 0) {
++                        yield "";
++                    }
++                    byte[] buf = new byte[len];
++                    int off = 0;
++                    while (off < buf.length) {
++                        int n = in.read(buf, off, buf.length - off);
++                        if (n < 0) {
++                            throw new IOException("RESP 批量串截断");
++                        }
++                        off += n;
++                    }
++                    in.read();
++                    in.read();
++                    yield new String(buf, StandardCharsets.UTF_8);
++                }
++                default -> throw new IOException("RESP 类型非法: " + (char) b);
++            };
++        }
++
++        private String line() throws IOException {
++            ByteArrayOutputStream bout = new ByteArrayOutputStream();
++            int c;
++            while ((c = in.read()) >= 0 && c != '\r') {
++                bout.write(c);
++            }
++            in.read();
++            return bout.toString(StandardCharsets.UTF_8);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/storage/StorageRuntime.java b/calc/src/main/java/net/otlab/calc/storage/StorageRuntime.java
+new file mode 100644
+index 0000000..1928cde
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/storage/StorageRuntime.java
+@@ -0,0 +1,89 @@
++package net.otlab.calc.storage;
++
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++import net.otlab.calc.executor.ResultSink;
++import net.otlab.calc.operator.OperatorEvaluator;
++
++/**
++ * TASK-0042 运行时装配面：持有原生算子桥 {@link OperatorEvaluator} 与同构写 ResultSink 装饰器，
++ * 供 0041 执行器接入（默认关闭——通过 app 的 operators-enabled / homogeneous-storage-enabled 控制）。
++ *
++ * <p><b>记录式写口</b>：真 REST/Redis 在 live 冒烟中因 TDengine REST 故障不可验真，本运行时默认
++ * 用 {@link RecordingWriter} 捕获生成的 INSERT SQL 与六元组（契约断言面），并可注入真写口。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class StorageRuntime {
++
++    private final OperatorEvaluator operators;
++    private final long tenantId;
++    private final String tenantCode;
++    private final RecordingWriter recorder;
++    private final HomogeneousResultSink.ItemValueCache cache;
++
++    public StorageRuntime(OperatorEvaluator operators, long tenantId, String tenantCode,
++                          RecordingWriter recorder, HomogeneousResultSink.ItemValueCache cache) {
++        this.operators = operators;
++        this.tenantId = tenantId;
++        this.tenantCode = tenantCode;
++        this.recorder = recorder;
++        this.cache = cache;
++    }
++
++    public OperatorEvaluator operators() {
++        return operators;
++    }
++
++    public RecordingWriter recorder() {
++        return recorder;
++    }
++
++    /** 给执行器的 Sink 装饰器（同构写后把结果继续交给下游 delegate：状态判定等） */
++    public java.util.function.UnaryOperator<ResultSink> sinkDecorator() {
++        return delegate -> new HomogeneousResultSink(tenantId, recorder, cache, null, delegate);
++    }
++
++    /** 观测视图（供 /calc/v1/status 与 live 冒烟断言） */
++    public Map<String, Object> view() {
++        Map<String, Object> v = new java.util.LinkedHashMap<>();
++        v.put("tenantCode", tenantCode);
++        v.put("tenantId", tenantId);
++        v.put("writes", recorder.items().size());
++        v.put("lastWriteSql", recorder.lastSql());
++        v.put("lastFullKey", recorder.items().isEmpty() ? null : recorder.items().get(recorder.items().size() - 1).fullKey());
++        return v;
++    }
++
++    /** 记录式 st_item_value 写口：捕获 ItemValue + 生成 INSERT SQL（契约断言/观测，不写真库） */
++    public static final class RecordingWriter implements HomogeneousResultSink.ItemValueWriter {
++        private final List<ItemValue> items = new CopyOnWriteArrayList<>();
++        private final List<String> sqls = new CopyOnWriteArrayList<>();
++        private final String tenantCode;
++
++        public RecordingWriter(String tenantCode) {
++            this.tenantCode = tenantCode;
++        }
++
++        @Override
++        public void write(ItemValue v) {
++            items.add(v);
++            sqls.add(TdengineItemValueWriter.insertSql(v, tenantCode));
++        }
++
++        public List<ItemValue> items() {
++            return List.copyOf(items);
++        }
++
++        public List<String> sqls() {
++            return List.copyOf(sqls);
++        }
++
++        public String lastSql() {
++            return sqls.isEmpty() ? null : sqls.get(sqls.size() - 1);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/storage/TdengineItemValueWriter.java b/calc/src/main/java/net/otlab/calc/storage/TdengineItemValueWriter.java
+new file mode 100644
+index 0000000..1d41d34
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/storage/TdengineItemValueWriter.java
+@@ -0,0 +1,116 @@
++package net.otlab.calc.storage;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.Base64;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * st_item_value 同构写口真实现（TASK-0042 brief 决策 3）：taosAdapter REST，逐语句独立下发
++ * （0029 实证多语句信封静默空操作 code=0 rows=0），库名全限定（REST 无状态、USE 跨请求无效）。
++ *
++ * <p><b>full_key 规范</b>：{instance_code}.{data_code}，禁止 full: 前缀（0049 F-02 教训；
++ * 冻结契约 config-snapshot-schema.md:165 / tdengine-super-tables.md:15,37；读侧
++ * OpenApiTimeseriesClient WHERE full_key=? 按规范值等值查询）。<b>六元组 tag 顺序</b>：
++ * tenant_id / full_key / instance_code / data_code / category / source_type。
++ *
++ * <p>子表由写入方首写自动创建（USING st_item_value TAGS）。写入失败上抛
++ * {@link ItemWriteException}，由调用方（HomogeneousResultSink）WARN 吞掉——不阻塞计算。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class TdengineItemValueWriter implements HomogeneousResultSink.ItemValueWriter {
++
++    /** SQL 通道（注入缝：契约测试用假 runner 捕获 INSERT，真 impl 走 REST） */
++    @FunctionalInterface
++    public interface SqlRunner {
++        String execute(String sql) throws Exception;
++    }
++
++    public static final class ItemWriteException extends RuntimeException {
++        public ItemWriteException(String msg, Throwable cause) {
++            super(msg, cause);
++        }
++    }
++
++    private final SqlRunner runner;
++    private final String tenantCode;
++
++    public TdengineItemValueWriter(SqlRunner runner, String tenantCode) {
++        this.runner = runner;
++        this.tenantCode = tenantCode;
++    }
++
++    /** 真 REST 通道工厂（baseUrl 如 http://192.168.31.145:6041） */
++    public static TdengineItemValueWriter rest(String baseUrl, String tenantCode, String user, String password) {
++        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
++        String auth = "Basic " + Base64.getEncoder()
++                .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
++        SqlRunner runner = sql -> {
++            HttpRequest req = HttpRequest.newBuilder()
++                    .uri(URI.create(baseUrl + "/rest/sql"))
++                    .timeout(Duration.ofSeconds(60))
++                    .header("Authorization", auth)
++                    .header("Content-Type", "text/plain")
++                    .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
++                    .build();
++            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++            if (resp.statusCode() >= 400) {
++                throw new ItemWriteException("TDengine REST HTTP " + resp.statusCode(), null);
++            }
++            requireTaosSuccess(resp.body());
++            return resp.body();
++        };
++        return new TdengineItemValueWriter(runner, tenantCode);
++    }
++
++    /** taosAdapter code 解析（0049 F-01：正则容错冒号后空格，非 0/无 code fail-closed） */
++    static void requireTaosSuccess(String body) {
++        if (body == null || body.isBlank()) {
++            throw new ItemWriteException("TDengine 应答为空", null);
++        }
++        Matcher m = Pattern.compile("\"code\"\\s*:\\s*(-?\\d+)").matcher(body);
++        if (!m.find()) {
++            throw new ItemWriteException("TDengine 应答无 code: "
++                    + body.substring(0, Math.min(200, body.length())), null);
++        }
++        int code = Integer.parseInt(m.group(1));
++        if (code != 0) {
++            throw new ItemWriteException("TDengine 错误码 " + code + ": "
++                    + body.substring(0, Math.min(200, body.length())), null);
++        }
++    }
++
++    @Override
++    public void write(ItemValue v) {
++        String sql = insertSql(v, tenantCode);
++        try {
++            runner.execute(sql);
++        } catch (Exception e) {
++            if (e instanceof ItemWriteException iwe) {
++                throw iwe;
++            }
++            throw new ItemWriteException("st_item_value 写入失败: " + e.getMessage(), e);
++        }
++    }
++
++    /** 生成逐语句 INSERT（库名全限定；tenantCode 为空时用 v.tenantId() 占位保持 tag 契约） */
++    static String insertSql(ItemValue v, String tenantCode) {
++        String db = "iot_" + (tenantCode == null ? String.valueOf(v.tenantId()) : tenantCode);
++        String safeInstance = v.instanceCode().replaceAll("[^A-Za-z0-9_]", "_");
++        String child = "D_" + safeInstance + "_" + v.dataCode().replaceAll("[^A-Za-z0-9_]", "_").toUpperCase();
++        String fullKey = v.instanceCode() + "." + v.dataCode(); // 无 full: 前缀（0049 F-02）
++        return "INSERT INTO " + db + "." + child
++                + " USING " + db + ".st_item_value"
++                + " TAGS (" + v.tenantId() + ", '" + fullKey + "', '"
++                + v.instanceCode() + "', '" + v.dataCode() + "', '"
++                + v.category() + "', " + v.sourceType() + ")"
++                + " VALUES (" + v.ts() + ", " + v.value() + ", " + v.quality() + ")";
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index 5192032..973827a 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -31,13 +31,16 @@ public class CalcStatusController {
+     private final SnapshotReconciler reconciler;
+     private final ExecutorRuntime executorRuntime;
+     private final StatusEvaluatorRuntime statusRuntime;
++    private final net.otlab.calc.storage.StorageRuntime storageRuntime;
+ 
+     public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
+-                                ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime) {
++                                ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime,
++                                @Nullable net.otlab.calc.storage.StorageRuntime storageRuntime) {
+         this.holder = holder;
+         this.reconciler = reconciler;
+         this.executorRuntime = executorRuntime;
+         this.statusRuntime = statusRuntime;
++        this.storageRuntime = storageRuntime;
+     }
+ 
+     @GetMapping("/calc/v1/status")
+@@ -73,6 +76,9 @@ public class CalcStatusController {
+         if (statusRuntime != null) {
+             view.put("statusEvaluator", statusRuntime.view());
+         }
++        if (storageRuntime != null) {
++            view.put("storage", storageRuntime.view());
++        }
+         return view;
+     }
+ 
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index 1dd93c4..392d03a 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -37,3 +37,7 @@ calc:
+   tdengine-base-url: ${CALC_TDENGINE_BASE_URL:http://192.168.31.145:6041}
+   tdengine-user: ${CALC_TDENGINE_USER:root}
+   tdengine-password: ${CALC_TDENGINE_PASSWORD:taosdata}
++  # TASK-0042 原生算子桥（DELTA/INTEGRAL）+ 同构写 st_item_value/Redis 缓存：默认关闭，零回归
++  operators-enabled: ${CALC_OPERATORS_ENABLED:false}
++  homogeneous-storage-enabled: ${CALC_HOMOGENEOUS_STORAGE_ENABLED:false}
++  tenant-id: ${CALC_TENANT_ID:1}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index 861de8b..2ae4cf8 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -56,4 +56,12 @@ class CalcPropertiesTest {
+         assertEquals(Integer.valueOf(0), p.getRedisDatabase());
+         assertEquals(Integer.valueOf(1), p.getSchedulerTickSeconds());
+     }
++
++    @Test
++    void task0042DefaultsKeepExistingBehavior() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isOperatorsEnabled(), "原生算子桥默认关闭（0040/0041/0049 零回归）");
++        assertFalse(p.isHomogeneousStorageEnabled(), "同构写默认关闭（零回归）");
++        assertEquals(Long.valueOf(1L), p.getTenantId(), "tenant_id 默认 1");
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java b/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java
+new file mode 100644
+index 0000000..b97e7b0
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/OperatorIntegrationContractTest.java
+@@ -0,0 +1,89 @@
++package net.otlab.calc.executor;
++
++import net.otlab.calc.graph.DependencyGraph;
++import net.otlab.calc.graph.GraphBuilder;
++import net.otlab.calc.operator.OperatorEvaluator;
++import net.otlab.calc.snapshot.DataItem;
++import net.otlab.calc.snapshot.FormulaRef;
++import net.otlab.calc.snapshot.SnapshotBody;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 执行器接入 DELTA 原生算子的端到端契约测试（TASK-0042 brief 决策 1）：
++ * OperatorEvaluator 注入后，公式型数据项的 DELTA(...) 走原生差分并按周期连续建基线；
++ * 未注入时保持 0041 既有行为（函数调用隔离失败）；INTEGRAL 不开放手写（ADR-0010）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class OperatorIntegrationContractTest {
++
++    private static DataItem formula(long id, String key, String expression) {
++        return net.otlab.calc.support.TestSnapshots.formulaItem(id, key, "V", 10, expression);
++    }
++
++    private static DependencyGraph graph(DataItem item, String argKey) {
++        SnapshotBody body = new SnapshotBody("1.0.1", 1L, 2, 0, 1L,
++                List.of(item), List.of(net.otlab.calc.support.TestSnapshots.ref(1, 1, argKey, 2)), List.of());
++        DependencyGraph g = new GraphBuilder().build(body);
++        g.getNodes().values().forEach(n -> {
++            if (n.item() != null) {
++                n.item().setCalcPeriod(1L);
++            }
++        });
++        return g;
++    }
++
++    @Test
++    void deltaRunsNativelyThroughExecutorWithBaselineCarriedAcrossPeriods() {
++        DataItem flow = formula(1, "EQ1.FLOW.V", "DELTA(EQ1.METER.V)");
++        DependencyGraph g = graph(flow, "EQ1.METER.V");
++        ValueStore store = new ValueStore();
++        DualTriggerExecutor ex = new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
++                new ResultSink.InMemoryResultSink(), new RollupOperator(), new OperatorEvaluator());
++        Trigger t = Trigger.periodic("all@0", 1000L, 2000L);
++
++        store.put("EQ1.METER.V", 100.0, 1000L);
++        ex.execute(t, g);
++        CalcResult r1 = ex.sink() instanceof ResultSink.InMemoryResultSink s
++                ? s.deliveries().get(s.deliveries().size() - 1).results().stream()
++                        .filter(r -> r.fullKey().equals("EQ1.FLOW.V")).findFirst().orElseThrow()
++                : null;
++        // 首个基线差分 0（首样本建基线）
++        assertNotNull(r1);
++        assertEquals(0.0, r1.sample().value(), 1e-6);
++
++        store.put("EQ1.METER.V", 105.0, 2000L);
++        List<CalcResult> out = ex.execute(t, g);
++        CalcResult r2 = out.stream().filter(r -> r.fullKey().equals("EQ1.FLOW.V")).findFirst().orElseThrow();
++        assertEquals(5.0, r2.sample().value(), 1e-6, "第二周期差分 105-100=5（基线跨周期连续）");
++        assertEquals(0, r2.sample().quality());
++        assertEquals(2, r2.sourceType());
++    }
++
++    @Test
++    void withoutOperatorBridgeDeltaStillIsolatedAsFailure() {
++        // 0041 既有行为零变化：未注入算子桥时 DELTA(...) 仍单节点隔离失败（不打假 0）
++        DataItem flow = formula(1, "EQ1.FLOW.V", "DELTA(EQ1.METER.V)");
++        DependencyGraph g = graph(flow, "EQ1.METER.V");
++        ValueStore store = new ValueStore();
++        store.put("EQ1.METER.V", 100.0, 1000L);
++        DualTriggerExecutor ex = new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
++                new ResultSink.InMemoryResultSink());
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++        CalcResult r = out.stream().filter(x -> x.fullKey().equals("EQ1.FLOW.V")).findFirst().orElseThrow();
++        assertFalse(r.isSuccess(), "0041 既有：无算子桥时 DELTA 隔离失败");
++        assertTrue(r.error().contains("0042") || r.error().contains("算子"));
++    }
++
++    @Test
++    void handWrittenIntegralIsRejectedByWhitelist() {
++        // ADR-0010：INTEGRAL 不开放手写——白名单拒绝（即使执行器注入了算子桥）
++        assertFalse(net.otlab.calc.graph.FormulaExpressionValidator
++                .validate("INTEGRAL(EQ1.FLOW.V)").ok(), "INTEGRAL 手写被拒");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/operator/DeltaOperatorContractTest.java b/calc/src/test/java/net/otlab/calc/operator/DeltaOperatorContractTest.java
+new file mode 100644
+index 0000000..ac13e11
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/operator/DeltaOperatorContractTest.java
+@@ -0,0 +1,100 @@
++package net.otlab.calc.operator;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * DELTA 原生算子契约测试（TASK-0042 brief 决策 1，五异常/正常场景逐条遵守）：
++ * 正常差分 / 回退打码（差值<0 不写负值）/ 换表 PARAM 边界分段 / 溢出归零（差值超量程→0+质量标记）
++ * / 跨周期标记（采样窗不连续打标不差分）。
++ *
++ * <p>CONV-02 质量口径：0 正常、1 超上限、8 突变待核查（回退需人工确认）、9 跨周期用量。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class DeltaOperatorContractTest {
++
++    private static final String KEY = "F01.WS01.EQ001.FLOW";
++
++    @Test
++    void normalDifferenceIsCurrentMinusPrevious() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(10.0, 1000L));
++        DeltaOperator.Result r = op.evaluate(in(15.0, 2000L));
++        assertEquals(5.0, r.value(), 1e-6, "差分 = 当前 - 上周期");
++        assertEquals(0, r.quality(), "正常差分 quality=0（CONV-02）");
++        assertEquals(DeltaOperator.Kind.NORMAL, r.kind());
++    }
++
++    @Test
++    void backflowIsMarkedAndNeverWritesNegativeValue() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(10.0, 1000L));
++        DeltaOperator.Result r = op.evaluate(in(8.0, 2000L), 1000L, 1000.0, false);
++        assertEquals(0.0, r.value(), 1e-6, "回退不写负值（值置 0）");
++        assertTrue(r.value() >= 0, "永不为负");
++        assertEquals(8, r.quality(), "回退=突变待核查（CONV-02 码 8，提示人工确认）");
++        assertEquals(DeltaOperator.Kind.BACKFLOW, r.kind());
++        assertTrue(r.reason().contains("回退"), "原因含回退");
++    }
++
++    @Test
++    void paramChangeStartsNewBaselineAndNeverDiffsAcrossSegment() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(100.0, 1000L));
++        op.markParamChange(KEY, 1500L); // 换表 PARAM 变更（ADR-0010 TD-0019）
++        DeltaOperator.Result boundary = op.evaluate(in(5.0, 2000L), 1000L, 1000.0, false);
++        assertEquals(0.0, boundary.value(), 1e-6, "跨段不差分——新表底数只建基线");
++        assertEquals(DeltaOperator.Kind.NEW_BASELINE, boundary.kind());
++        assertEquals(0, boundary.quality(), "换表建基线本身正常");
++        // 新段内首个真实差分：以新底数 5 为基线，8-5=3（不得是 8-100=-92）
++        DeltaOperator.Result next = op.evaluate(in(8.0, 3000L), 1000L, 1000.0, false);
++        assertEquals(3.0, next.value(), 1e-6, "新段从新底数起算");
++        assertEquals(DeltaOperator.Kind.NORMAL, next.kind());
++    }
++
++    @Test
++    void overflowBeyondMaxRangeOutputsZeroWithQualityMark() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(2.0, 1000L));
++        // 差值 15-2=13 > 满量程 10 → 超量程归零（brief 决策 1），不写 13
++        DeltaOperator.Result r = op.evaluate(in(15.0, 2000L), 1000L, 10.0, false);
++        assertEquals(0.0, r.value(), 1e-6, "差值超量程→0（溢出归零）");
++        assertEquals(1, r.quality(), "超上限质量标记（CONV-02 码 1）");
++        assertEquals(DeltaOperator.Kind.OVERFLOW, r.kind());
++        assertTrue(r.reason().contains("超量程") || r.reason().contains("溢出"), "原因含超量程/溢出");
++    }
++
++    @Test
++    void discontinuousSamplingWindowIsMarkedCrossPeriodAndNotDifferenced() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(10.0, 1000L));
++        // 期望周期 1000ms，实际间隔 4000ms > 容差 → 采样窗不连续
++        DeltaOperator.Result r = op.evaluate(in(15.0, 5000L), 1000L, 1000.0, false);
++        assertEquals(0.0, r.value(), 1e-6, "跨周期不差分（不冒充单周期用量）");
++        assertEquals(9, r.quality(), "跨周期用量质量码 9（CONV-02 / REQ-0019）");
++        assertEquals(DeltaOperator.Kind.CROSS_PERIOD, r.kind());
++        assertTrue(r.reason().contains("跨周期") || r.reason().contains("断"), "原因含跨周期/断");
++        // 恢复后以 15 为新基线，下一周期正常差分 18-15=3（不拿断线前的 10 冒充）
++        DeltaOperator.Result next = op.evaluate(in(18.0, 6000L), 1000L, 1000.0, false);
++        assertEquals(3.0, next.value(), 1e-6, "恢复后从最近样本差分，不跨缺口");
++        assertEquals(0, next.quality());
++    }
++
++    @Test
++    void nonZeroInputQualitySuppressesDifferenceAndMarksSample() {
++        DeltaOperator op = new DeltaOperator();
++        op.evaluate(in(10.0, 1000L));
++        DeltaOperator.Result r = op.evaluate(new DeltaOperator.Input(KEY, 99.0, 2000L,
++                4, 1000L, null, false)); // 上游设备异常值 quality=4
++        assertEquals(0.0, r.value(), 1e-6, "坏样本不差分");
++        assertEquals(4, r.quality(), "保留上游质量标记");
++        assertEquals(DeltaOperator.Kind.BAD_INPUT, r.kind());
++    }
++
++    private static DeltaOperator.Input in(double value, long ts) {
++        return new DeltaOperator.Input(KEY, value, ts, 0, null, null, false);
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/operator/EnergyDerivationContractTest.java b/calc/src/test/java/net/otlab/calc/operator/EnergyDerivationContractTest.java
+new file mode 100644
+index 0000000..0aa65ce
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/operator/EnergyDerivationContractTest.java
+@@ -0,0 +1,71 @@
++package net.otlab.calc.operator;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 能源计量模板派生路径契约测试（TASK-0042 brief 决策 4；REQ-0019 验收 1）：
++ * 派生项（source_type=2 公式派生）只改绑定方向即换向（正负号随绑定方向）——
++ * 绑累计点位 → DELTA 派生流量；绑流量点位 → INTEGRAL 派生累计；模板/数据项/汇总零改动。
++ * 模板默认/覆盖口径与 0081 三方合并一致（实例未填继承模板默认，再未填不判定）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class EnergyDerivationContractTest {
++
++    @Test
++    void bindingCumulativePointDerivesFlowViaDelta() {
++        // 绑累计点位：派生流量 = DELTA(累计读数)，方向系数 +1
++        EnergyDerivation d = new EnergyDerivation(EnergyDerivation.Binding.CUMULATIVE);
++        assertEquals(EnergyDerivation.Operator.DELTA, d.operator());
++        assertEquals(1.0, d.sign(), 1e-9, "累计→流量：正方向");
++    }
++
++    @Test
++    void bindingFlowPointDerivesCumulativeViaIntegral() {
++        // 绑流量点位：派生累计 = INTEGRAL(瞬时流量)，方向系数 +1
++        EnergyDerivation d = new EnergyDerivation(EnergyDerivation.Binding.FLOW);
++        assertEquals(EnergyDerivation.Operator.INTEGRAL, d.operator());
++        assertEquals(1.0, d.sign(), 1e-9, "流量→累计：正方向");
++    }
++
++    @Test
++    void reversingBindingDirectionFlipsSignWithoutTemplateChange() {
++        // 只改绑定方向即换向：正绑 → 反绑，正负号翻转；模板/公式/数据项零改动
++        EnergyDerivation forward = new EnergyDerivation(EnergyDerivation.Binding.CUMULATIVE,
++                EnergyDerivation.Direction.FORWARD);
++        EnergyDerivation reverse = new EnergyDerivation(EnergyDerivation.Binding.CUMULATIVE,
++                EnergyDerivation.Direction.REVERSE);
++        assertEquals(1.0, forward.sign(), 1e-9);
++        assertEquals(-1.0, reverse.sign(), 1e-9, "反绑：正负号翻转");
++        assertEquals(forward.operator(), reverse.operator(), "算子不变（仍是 DELTA）");
++        assertEquals(forward.derivedDataCode(), reverse.derivedDataCode(), "派生的 data_code 不变");
++    }
++
++    @Test
++    void reverseDirectionNegatesDerivedValue() {
++        EnergyDerivation reverse = new EnergyDerivation(EnergyDerivation.Binding.CUMULATIVE,
++                EnergyDerivation.Direction.REVERSE);
++        assertEquals(-5.0, reverse.apply(5.0), 1e-9, "正向量 5 → 反向量 -5（换向）");
++        assertEquals(-9.0, reverse.apply(9.0), 1e-9);
++        EnergyDerivation forward = new EnergyDerivation(EnergyDerivation.Binding.CUMULATIVE,
++                EnergyDerivation.Direction.FORWARD);
++        assertEquals(5.0, forward.apply(5.0), 1e-9, "正绑保持原值");
++    }
++
++    @Test
++    void templateDefaultInheritedWhenInstanceValueMissing() {
++        // 与 0081 三方合并一致：实例未填 → 继承模板默认；实例显式覆盖 → 用实例值
++        EnergyDerivation.Template t = new EnergyDerivation.Template("WATER", "FLOW",
++                EnergyDerivation.Binding.CUMULATIVE, 1.0, null);
++        EnergyDerivation.Effective e = t.resolve(null, null);
++        assertEquals("WATER", e.category(), "实例未覆盖 → 模板默认 category");
++        assertEquals(1.0, e.sign(), 1e-9, "实例未覆盖 → 模板默认方向系数");
++
++        EnergyDerivation.Effective overridden = t.resolve("ELEC", -1.0);
++        assertEquals("ELEC", overridden.category(), "实例显式覆盖 → 实例值");
++        assertEquals(-1.0, overridden.sign(), 1e-9, "实例显式覆盖方向系数");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/operator/IntegralOperatorContractTest.java b/calc/src/test/java/net/otlab/calc/operator/IntegralOperatorContractTest.java
+new file mode 100644
+index 0000000..7091645
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/operator/IntegralOperatorContractTest.java
+@@ -0,0 +1,71 @@
++package net.otlab.calc.operator;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * INTEGRAL 原生算子契约测试（TASK-0042 brief 决策 2，三场景 + 不开放手写）：
++ * 真实间隔梯形积分（按相邻样本真实 ts 间隔，非固定周期）/ 缺口不积分（质量非0或样本缺失的间隔跳过）
++ * / 停机零增量与断线严格区分。ADR-0010：INTEGRAL 不开放用户手写——仅随能源计量预置公式提供。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IntegralOperatorContractTest {
++
++    private static final String KEY = "F01.WS01.EQ001.FLOW";
++
++    @Test
++    void usesRealIntervalTrapezoidNotFixedPeriod() {
++        IntegralOperator op = new IntegralOperator();
++        // q0 @t0=0, q1 @t1=3000ms（3s，非默认1s）；流量 2→4
++        // 梯形 = (2+4)/2 * 3 = 9（按真实 3s 间隔，非固定 1s）
++        op.accept(new IntegralOperator.Sample(KEY, 2.0, 0L, 0));
++        IntegralOperator.Result r = op.accept(new IntegralOperator.Sample(KEY, 4.0, 3000L, 0));
++        assertEquals(9.0, r.value(), 1e-6, "(2+4)/2 * 3s 真实间隔梯形积分");
++        assertEquals(0, r.quality());
++        assertEquals(IntegralOperator.Kind.INTEGRATED, r.kind());
++        // 第二段：t=3000→5000（2s），流量 4 恒定 → 8，累计 17
++        IntegralOperator.Result r2 = op.accept(new IntegralOperator.Sample(KEY, 4.0, 5000L, 0));
++        assertEquals(8.0, r2.increment(), 1e-6, "第二段增量 =4*2s");
++        assertEquals(17.0, r2.value(), 1e-6, "累计 = 9+8");
++    }
++
++    @Test
++    void gapIsNotIntegratedAndQualityCarried() {
++        IntegralOperator op = new IntegralOperator();
++        op.accept(new IntegralOperator.Sample(KEY, 5.0, 0L, 0));
++        // 上游断线补标 quality=3 的样本：该段不积分、不拿最后流量填满缺口
++        IntegralOperator.Result r = op.accept(new IntegralOperator.Sample(KEY, 5.0, 10000L, 3));
++        assertEquals(0.0, r.increment(), 1e-6, "缺口段不积分");
++        assertEquals(IntegralOperator.Kind.GAP_SKIPPED, r.kind());
++        assertEquals(3, r.quality(), "缺口质量码来自断线补标 3（CONV-02）");
++        // 恢复后：以恢复样本为新起点，下一段正常积分，不跨缺口累计
++        IntegralOperator.Result r2 = op.accept(new IntegralOperator.Sample(KEY, 5.0, 11000L, 0));
++        assertEquals(0.0, r2.increment(), 1e-6, "恢复样本仅建基线");
++        IntegralOperator.Result r3 = op.accept(new IntegralOperator.Sample(KEY, 6.0, 12000L, 0));
++        assertEquals(5.5, r3.increment(), 1e-6, "恢复后 (5+6)/2*1s=5.5，不跨缺口");
++    }
++
++    @Test
++    void stopProducesZeroIncrementDistinctFromDisconnect() {
++        IntegralOperator op = new IntegralOperator();
++        op.accept(new IntegralOperator.Sample(KEY, 4.0, 0L, 0));
++        // 停机：正常质量、流量=0 → 有明确原因的零增量（quality=0）
++        IntegralOperator.Result stop = op.accept(new IntegralOperator.Sample(KEY, 0.0, 1000L, 0));
++        assertEquals(2.0, stop.increment(), 1e-6, "流量降到0的过渡段按梯形仍有增量");
++        IntegralOperator.Result stop2 = op.accept(new IntegralOperator.Sample(KEY, 0.0, 2000L, 0));
++        assertEquals(0.0, stop2.increment(), 1e-6, "停机稳态零增量");
++        assertEquals(IntegralOperator.Kind.STOPPED_ZERO, stop2.kind());
++        assertEquals(0, stop2.quality(), "停机零增量 quality=0（正常，非断线）");
++        assertNotEquals(IntegralOperator.Kind.GAP_SKIPPED, stop2.kind(), "停机与断线严格区分");
++    }
++
++    @Test
++    void integralIsNotUserHandwritable() {
++        // ADR-0010：INTEGRAL 不开放手写——算子提供 isHandwritable()=false 供白名单判定
++        assertFalse(new IntegralOperator().isHandwritable(), "INTEGRAL 仅随预置公式提供，不开放手写");
++        assertTrue(new DeltaOperator().isHandwritable(), "DELTA 可在公式中直接引用");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/storage/HomogeneousResultSinkContractTest.java b/calc/src/test/java/net/otlab/calc/storage/HomogeneousResultSinkContractTest.java
+new file mode 100644
+index 0000000..d809f33
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/storage/HomogeneousResultSinkContractTest.java
+@@ -0,0 +1,127 @@
++package net.otlab.calc.storage;
++
++import net.otlab.calc.executor.CalcResult;
++import net.otlab.calc.executor.ResultSink;
++import net.otlab.calc.executor.Trigger;
++import net.otlab.calc.executor.ValueSample;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 同构结果 Sink 契约测试（TASK-0042 brief 决策 3/5）：
++ * 结果按 data_type 写 st_item_value（DIRECT/FORMULA/ROLLUP 同源同构）+ Redis 点位缓存；
++ * 单节点失败不打假 0（失败项 sample=null → 不写行）；TDengine 写失败 WARN 不阻塞计算；
++ * 失败隔离——一条结果写失败不影响同批其他结果。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class HomogeneousResultSinkContractTest {
++
++    @Test
++    void resultsWriteToBothStoreAndRedisCache() {
++        List<ItemValue> written = new ArrayList<>();
++        RecordingWriter writer = new RecordingWriter(written);
++        RecordingCache cache = new RecordingCache();
++        HomogeneousResultSink sink = new HomogeneousResultSink(42L, writer, cache);
++
++        sink.accept(Trigger.periodic("all@0", 1000L, 2000L), List.of(
++                CalcResult.success("F01.WS01.EQ001.FLOW", 2, new ValueSample(5.0, 0, 2000L)),
++                CalcResult.success("F01.WS01.EQ001.TOTAL", 3, new ValueSample(11.0, 7, 2000L))));
++
++        assertEquals(2, written.size(), "两条成功结果各写一行 st_item_value");
++        assertEquals(5.0, written.get(0).value(), 1e-6);
++        assertEquals(2, written.get(0).sourceType(), "source_type=2 FORMULA");
++        assertEquals("F01.WS01.EQ001.FLOW", written.get(0).fullKey());
++        assertEquals(11.0, written.get(1).value(), 1e-6);
++        assertEquals(7, written.get(1).quality(), "质量码 7 原样写");
++        assertEquals(2, cache.written.size(), "两条结果各写一份 Redis 缓存");
++        assertEquals(5.0, cache.written.get(0).value(), 1e-6);
++    }
++
++    @Test
++    void failedResultNeverWritesFakeZero() {
++        List<ItemValue> written = new ArrayList<>();
++        HomogeneousResultSink sink = new HomogeneousResultSink(42L,
++                new RecordingWriter(written), new RecordingCache());
++
++        sink.accept(Trigger.periodic("all@0", 1000L, 2000L), List.of(
++                CalcResult.failure("F01.WS01.EQ001.BAD", 2, "无值输入: P_BAD")));
++
++        assertTrue(written.isEmpty(), "失败结果无样本——不写假 0（CONV-02 CALC_ERR 不落时序行）");
++    }
++
++    @Test
++    void storeFailureDoesNotBlockOtherResultsOrThrow() {
++        List<ItemValue> written = new ArrayList<>();
++        HomogeneousResultSink sink = new HomogeneousResultSink(42L,
++                new RecordingWriter(written) {
++                    @Override
++                    public void write(ItemValue v) {
++                        if (v.fullKey().endsWith(".BAD")) {
++                            throw new RuntimeException("TDengine 不可达");
++                        }
++                        super.write(v);
++                    }
++                }, new RecordingCache());
++
++        assertDoesNotThrow(() -> sink.accept(Trigger.periodic("all@0", 1000L, 2000L), List.of(
++                CalcResult.success("F01.WS01.EQ001.BAD", 2, new ValueSample(1.0, 0, 2000L)),
++                CalcResult.success("F01.WS01.EQ001.GOOD", 2, new ValueSample(2.0, 0, 2000L)))),
++                "TDengine 写失败 WARN 不阻塞计算、不上抛");
++        assertEquals(1, written.size(), "失败项隔离，其他结果照常写");
++        assertEquals("F01.WS01.EQ001.GOOD", written.get(0).fullKey());
++    }
++
++    @Test
++    void redisCacheFailureAlsoIsolated() {
++        HomogeneousResultSink sink = new HomogeneousResultSink(42L,
++                new RecordingWriter(new ArrayList<>()), new RecordingCache() {
++                    @Override
++                    public void put(ItemValue v) {
++                        throw new RuntimeException("Redis 不可达");
++                    }
++                });
++        assertDoesNotThrow(() -> sink.accept(Trigger.periodic("all@0", 1000L, 2000L), List.of(
++                CalcResult.success("F01.WS01.EQ001.FLOW", 2, new ValueSample(5.0, 0, 2000L)))),
++                "Redis 缓存失败 WARN 不阻塞");
++    }
++
++    @Test
++    void nullMetadataFallsBackToDefaultProjection() {
++        // live 红转绿：StorageRuntime 传 null metadata → 旧实现 NPE 被到达订阅器吞掉、结果丢失；
++        // 修复后构造即以默认投影兜底，fullKey=instance.dataCode 正确派生。
++        HomogeneousResultSink sink = new HomogeneousResultSink(42L,
++                new RecordingWriter(new ArrayList<>()), new RecordingCache(), null, null);
++        assertDoesNotThrow(() -> sink.accept(Trigger.periodic("all@0", 1000L, 2000L), List.of(
++                CalcResult.success("F01.WS01.EQ001.FLOW", 2, new ValueSample(5.0, 0, 2000L)))));
++    }
++
++    // ---------- 测试替身 ----------
++
++    static class RecordingWriter implements HomogeneousResultSink.ItemValueWriter {
++        final List<ItemValue> written;
++
++        RecordingWriter(List<ItemValue> written) {
++            this.written = written;
++        }
++
++        @Override
++        public void write(ItemValue v) {
++            written.add(v);
++        }
++    }
++
++    static class RecordingCache implements HomogeneousResultSink.ItemValueCache {
++        final List<ItemValue> written = new ArrayList<>();
++
++        @Override
++        public void put(ItemValue v) {
++            written.add(v);
++        }
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/storage/TdengineItemValueWriterContractTest.java b/calc/src/test/java/net/otlab/calc/storage/TdengineItemValueWriterContractTest.java
+new file mode 100644
+index 0000000..62c7a27
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/storage/TdengineItemValueWriterContractTest.java
+@@ -0,0 +1,127 @@
++package net.otlab.calc.storage;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * st_item_value 同构写口契约测试（TASK-0042 brief 决策 3 + CONV-02 + 冻结契约）：
++ * 结果按 source_type 同源同构入库；逐语句 REST（0029 实证多语句静默空操作）；
++ * full_key={instance}.{data_code} 无 full: 前缀（0049 F-02 教训）；
++ * 六元组 tag 精确断言（tenant_id/full_key/instance_code/data_code/category/source_type）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class TdengineItemValueWriterContractTest {
++
++    private static ItemValue value(int sourceType, double v, int q, long ts) {
++        return new ItemValue(1L, "F01.WS01.EQ001.FLOW", "F01.WS01.EQ001", "FLOW", "WATER",
++                sourceType, ts, v, q);
++    }
++
++    @Test
++    void tagsSixTupleUsesContractFullKeyWithoutPrefix() {
++        String sql = TdengineItemValueWriter.insertSql(value(2, 5.0, 0, 1795211995000L), "t42");
++        String[] tags = tagsOf(sql);
++        assertEquals(6, tags.length, "六个 tag 齐全: " + sql);
++        assertEquals("1", tags[0], "tenant_id");
++        assertEquals("F01.WS01.EQ001.FLOW", tags[1], "full_key = instance_code + '.' + data_code，无 full: 前缀");
++        assertEquals("F01.WS01.EQ001", tags[2], "instance_code");
++        assertEquals("FLOW", tags[3], "data_code");
++        assertEquals("WATER", tags[4], "category");
++        assertEquals("2", tags[5], "source_type=2（FORMULA）");
++        assertFalse(sql.contains("full:"), "SQL 全文无 full: 非契约前缀: " + sql);
++    }
++
++    @Test
++    void directFormulaRollupAreHomogeneousOnlySourceTypeDiffers() {
++        String direct = TdengineItemValueWriter.insertSql(value(1, 5.0, 0, 1000L), "t42");
++        String formula = TdengineItemValueWriter.insertSql(value(2, 5.0, 0, 1000L), "t42");
++        String rollup = TdengineItemValueWriter.insertSql(value(3, 5.0, 0, 1000L), "t42");
++        // 同源同构：除 source_type tag 与子表名派生外，结构/值/质量/时间戳完全一致
++        assertTrue(direct.contains("VALUES (1000, 5.0, 0)"));
++        assertTrue(formula.contains("VALUES (1000, 5.0, 0)"));
++        assertTrue(rollup.contains("VALUES (1000, 5.0, 0)"));
++        assertTrue(direct.contains(", 1) VALUES"), "DIRECT source_type=1");
++        assertTrue(formula.contains(", 2) VALUES"), "FORMULA source_type=2");
++        assertTrue(rollup.contains(", 3) VALUES"), "ROLLUP source_type=3");
++        // 同 fullKey 同 category 同 instance/data code——三来源仅 source_type 不同
++        assertEquals("F01.WS01.EQ001.FLOW", tagsOf(direct)[1]);
++        assertEquals(tagsOf(direct)[1], tagsOf(formula)[1]);
++        assertEquals(tagsOf(formula)[1], tagsOf(rollup)[1]);
++    }
++
++    @Test
++    void operatorQualityCodesWrittenAsIsNotFakeZero() {
++        // CONV-02：回退码8 / 跨周期码9 / 溢出码1 原样写 quality，value=0 保留打标
++        String backflow = TdengineItemValueWriter.insertSql(value(2, 0.0, 8, 1000L), "t42");
++        String crossPeriod = TdengineItemValueWriter.insertSql(value(2, 0.0, 9, 1000L), "t42");
++        String overflow = TdengineItemValueWriter.insertSql(value(2, 0.0, 1, 1000L), "t42");
++        assertTrue(backflow.contains("VALUES (1000, 0.0, 8)"));
++        assertTrue(crossPeriod.contains("VALUES (1000, 0.0, 9)"));
++        assertTrue(overflow.contains("VALUES (1000, 0.0, 1)"));
++    }
++
++    @Test
++    void sqlIsSingleStatementFullQualifiedNoUse() {
++        String sql = TdengineItemValueWriter.insertSql(value(2, 5.0, 0, 1000L), "t42");
++        assertTrue(sql.startsWith("INSERT INTO iot_t42.D_F01_WS01_EQ001_FLOW USING iot_t42.st_item_value TAGS ("),
++                "库名全限定 + 子表首写 USING（逐语句）: " + sql);
++        assertEquals(0, countSemicolons(sql), "一条 SQL 单语句、无分号（多语句信封 0029 静默空操作）");
++        assertFalse(sql.contains("USE "), "REST 无库上下文 USE");
++    }
++
++    @Test
++    void writeCapturesSingleSqlViaInjectableRunner() {
++        List<String> captured = new ArrayList<>();
++        TdengineItemValueWriter w = new TdengineItemValueWriter(sql -> {
++            captured.add(sql);
++            return "{\"code\":0}";
++        }, "t42");
++        w.write(value(2, 5.0, 0, 1000L));
++        assertEquals(1, captured.size(), "一条结果一行 INSERT");
++        assertTrue(captured.get(0).contains("VALUES (1000, 5.0, 0)"));
++    }
++
++    @Test
++    void restParsesTaosAdapterResponses() {
++        // 0049 F-01：真 taosAdapter 应答样本离线验证（冒号后空格变体 + 错误码 fail-closed）
++        TdengineItemValueWriter.requireTaosSuccess("{\"code\":0,\"column_meta\":[],\"data\":[],\"rows\":0}");
++        TdengineItemValueWriter.requireTaosSuccess("{\"code\": 0, \"desc\": \"OK\"}");
++        assertThrows(RuntimeException.class, () ->
++                TdengineItemValueWriter.requireTaosSuccess("{\"code\":9728,\"desc\":\"syntax error\"}"));
++        assertThrows(RuntimeException.class, () ->
++                TdengineItemValueWriter.requireTaosSuccess(""));
++    }
++
++    @Test
++    void writeFailurePropagatesForCallerWarnNotBlock() {
++        TdengineItemValueWriter w = new TdengineItemValueWriter(sql -> { throw new Exception("不可达"); }, "t42");
++        assertThrows(RuntimeException.class, () -> w.write(value(2, 5.0, 0, 1000L)),
++                "写入失败上抛由 HomogeneousResultSink WARN 吞掉——不阻塞计算");
++    }
++
++    private static String[] tagsOf(String sql) {
++        int a = sql.indexOf("TAGS (");
++        int b = sql.indexOf(')', a);
++        String inside = sql.substring(a + "TAGS (".length(), b);
++        String[] raw = inside.split(",", -1);
++        String[] out = new String[raw.length];
++        for (int i = 0; i < raw.length; i++) {
++            out[i] = raw[i].trim().replaceAll("^'|'$", "");
++        }
++        return out;
++    }
++
++    private static int countSemicolons(String s) {
++        int n = 0;
++        for (char c : s.toCharArray()) {
++            if (c == ';') n++;
++        }
++        return n;
++    }
++}

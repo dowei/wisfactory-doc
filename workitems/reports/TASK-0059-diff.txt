@@ -1,0 +1,1847 @@
+diff --git a/frontend/src/api/display/display-api.ts b/frontend/src/api/display/display-api.ts
+index e1db896..96d33a4 100644
+--- a/frontend/src/api/display/display-api.ts
++++ b/frontend/src/api/display/display-api.ts
+@@ -1,16 +1,29 @@
+ /*
+- * 展示端数据服务（TASK-0058 批次一）
++ * 展示端数据服务（TASK-0058 批次一 / TASK-0059 设备详情页）
+  *
+- * 展示端（/display/**）只调数据服务；本批只封装**已交付**端点：
++ * 展示端（/display/**）只调数据服务；本服务只封装**已交付**端点：
+  * - GET /iot/instance/tree（TASK-0012，按数据权限裁剪，无权节点不返回）——模型树主路径；
+- * - 未交付的 0050 状态读口 / 0045 指标聚合 / 0049 状态判定——本批不写占位调用，
+- *   卡片数据接入批次二（报告登记）。
++ * - GET /api/v1/iot/status/current + /history（TASK-0050 状态读口——状态区三处同源，
++ *   名称/颜色/UNKNOWN 口径全由读口给，前端不现算）；
++ * - GET /iot/item/list（TASK-0013 数据项清单）、GET /iot/point/list（点位列表，0022）、
++ *   GET /iot/point/{id}/curve（TASK-0023 近 24h 曲线，fail-soft 空集）、
++ *   GET /iot/item/{id}/impact（TASK-0036 引用图反查）、
++ *   GET /iot/instance/{id}/items/{itemId}/effective-params（TASK-0014/0036 有效取值与公式）、
++ *   GET /iot/metric/list（TASK-0013 指标清单）——组件清单 / 实时区 / 曲线 / 来源追溯的数据源。
+  *
+- * 不直连 openapi/v1（那套 appKey+HMAC 是内网系统对接，浏览器不可直连）；展示端走
+- * 管理面已登录态 API（与 /iot/** 共用 axios 实例与登录态，但组件独立）。
++ * 安全红线（TASK-0059）：展示端绝不持有 appKey/secret，不直连 openapi/v1 的 HMAC 接口；
++ * 上述全部走管理面已登录态 API（与 /iot/** 共用 axios 实例，组件独立）。
++ * openapi/v1/items/realtime、openapi/v1/items/history、openapi/v1/points/history 需
++ * appKey+HMAC，浏览器不可直连——管理面无等价「按设备取数据项实时/历史值」端点，缺口
++ * 在 TASK-0059 报告登记等裁决，本服务不自造代理、不写死链。
++ *
++ * 0058 批次一遗留的 0045 指标聚合 / 0049 状态判定仍未交付——本批不写其占位调用。
+  */
+ import { getRequest } from '/@/lib/axios';
+ 
++/** 后端返回数组字段容错：null/undefined/非数组一律归一为空数组（空态纪律，不造假数据）。 */
++const asArray = <T>(value: T[] | null | undefined): T[] => (Array.isArray(value) ? value : []);
++
+ /** 实例树节点（对齐后端 IotInstanceTreeVO；mark 为 ADR-0011 上看板标记预留字段，接口未交付前恒缺省） */
+ export interface DisplayTreeNode {
+   id: number;
+@@ -40,24 +53,6 @@ export const DISPLAY_NODE_TYPE = {
+   COMPONENT: 5,
+ } as const;
+ 
+-/** 后端响应体 { code, message, data }；code!==200 已由 axios 拦截器全局处理并 reject */
+-interface TreeResponse {
+-  code: number;
+-  message?: string;
+-  data: DisplayTreeNode[];
+-}
+-
+-export const displayApi = {
+-  /**
+-   * 查询完整实例树（已按数据权限裁剪——无权节点后端不返回，前端不二次过滤）。
+-   * 返回 data 数组；空数组=无权/空厂，由视图渲染空态。
+-   */
+-  async queryInstanceTree(): Promise<DisplayTreeNode[]> {
+-    const res: TreeResponse = await getRequest('/iot/instance/tree', undefined);
+-    return Array.isArray(res?.data) ? res.data : [];
+-  },
+-};
+-
+ /** 按父节点 id 取子节点（模型树 lazy load 的纯函数；parentId=null 取根；无权节点不在树中自然不出现）。 */
+ export function childrenOf(nodes: DisplayTreeNode[], parentId: number | null): DisplayTreeNode[] {
+   if (parentId == null) return [...nodes].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0));
+@@ -96,3 +91,221 @@ export function descendantsOfType(nodes: DisplayTreeNode[], nodeId: number, node
+   walk(root);
+   return out;
+ }
++
++// ---------------- TASK-0059：设备详情页数据源类型（全部来自管理面已交付端点） ----------------
++
++/** 当前状态（对齐 0050 StatusCurrentVO；状态名/颜色由服务端动态翻译，前端不现算） */
++export interface StatusCurrentVO {
++  instanceId: number;
++  instanceCode: string;
++  statusCode: string;
++  statusName: string;
++  /** 展示色（服务端字典/规则翻译，可能 null=UNKNOWN 无字典项） */
++  color: string | null;
++  seq: number | null;
++  quality: number;
++  changeTime: number | null;
++}
++
++/** 状态历史时间线点（对齐 0050 StatusHistoryPointVO，写侧 -1 哨兵已被服务端归一为 null） */
++export interface StatusHistoryPointVO {
++  ts: number;
++  seq: number | null;
++  statusCode: string;
++  statusName: string;
++  color: string | null;
++  quality: number;
++}
++
++/** 实例数据项（对齐 IotDataItem 实体字段子集；sourceType 1 绑定 2 公式 3 汇总） */
++export interface DisplayDataItem {
++  id: number;
++  instanceId: number;
++  dataCode: string;
++  dataName: string;
++  fullKey: string;
++  category: string | null;
++  unit: string | null;
++  sourceType: number;
++  pointId: number | null;
++  formula: string | null;
++  rollupMethod: string | null;
++  calcPeriod: number | null;
++  validMin: number | string | null;
++  validMax: number | string | null;
++  alarmLow: number | string | null;
++  alarmHigh: number | string | null;
++  status: number;
++}
++
++/** 点位（对齐 IotPoint 实体字段子集；dataType 1 瞬时 2 累计 3 状态 4 开关） */
++export interface DisplayPoint {
++  id: number;
++  pointCode: string;
++  pointName: string;
++  dataType: number;
++  valueType: string;
++  unit: string | null;
++  boundInstanceId: number | null;
++  minValue: number | string | null;
++  maxValue: number | string | null;
++  status: number;
++}
++
++/** 点位近 24h 曲线数据点（对齐 PointCurvePointVO；ts 为 taosAdapter 原文） */
++export interface PointCurvePointVO {
++  ts: string | null;
++  value: number | null;
++  /** 质量码 0 正常 / 1 超上限 / 2 超下限 / 3 断线补标 / 5 手工补录…（ADR-0009 CONV-02） */
++  quality: number | null;
++}
++
++/** 点位近 24h 曲线响应（对齐 IotPointCurveVO；fail-soft 空集=数据接入中） */
++export interface IotPointCurveVO {
++  pointId: number;
++  pointCode: string;
++  windowHours: number;
++  dataPoints: PointCurvePointVO[];
++}
++
++/** 影响预览引用边（对齐 IotItemImpactEdgeVO；OUT=本项引用了谁，IN=谁引用了本项） */
++export interface ImpactEdgeVO {
++  direction: 'OUT' | 'IN';
++  refType: number;
++  refFullKey: string;
++  peerItemId: number | null;
++  peerFullKey: string | null;
++  peerDataCode: string | null;
++  peerDataName: string | null;
++  peerInstanceId: number | null;
++  peerInstanceCode: string | null;
++  peerInstanceName: string | null;
++}
++
++/** 影响预览响应（对齐 IotItemImpactVO；metrics 本期恒空集占位） */
++export interface IotItemImpactVO {
++  itemId: number;
++  instanceId: number;
++  instanceCode: string;
++  instanceName: string;
++  dataCode: string;
++  dataName: string;
++  fullKey: string;
++  outgoing: ImpactEdgeVO[];
++  incoming: ImpactEdgeVO[];
++  metrics: unknown[];
++}
++
++/** 数据项有效取值与公式（对齐 IotItemEffectiveParamsVO 子集；sourceType 1/2/3） */
++export interface IotItemEffectiveParamsVO {
++  instanceId: number;
++  itemId: number;
++  dataCode: string;
++  fullKey: string;
++  sourceType: number;
++  formula: string | null;
++  rollupMethod: string | null;
++  calcPeriod: number | null;
++}
++
++/** 指标（对齐 IotMetric 实体字段子集） */
++export interface DisplayMetric {
++  id: number;
++  metricCode: string;
++  metricName: string;
++  instanceId: number;
++  sourceItemId: number | null;
++  period: string | null;
++  status: number;
++}
++
++/** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
++interface ResultEnvelope<T> {
++  code: number;
++  message?: string;
++  data: T;
++}
++
++/** 后端 MyBatis-Plus Page<T> 包络（/iot/{item,point,metric}/list 返回） */
++interface PageEnvelope<T> {
++  records: T[];
++  total: number;
++}
++
++export const displayApi = {
++  /**
++   * 查询完整实例树（已按数据权限裁剪——无权节点后端不返回，前端不二次过滤）。
++   * 返回 data 数组；空数组=无权/空厂，由视图渲染空态。
++   */
++  async queryInstanceTree(): Promise<DisplayTreeNode[]> {
++    const res: ResultEnvelope<DisplayTreeNode[]> = await getRequest('/iot/instance/tree', undefined);
++    return asArray(res?.data);
++  },
++
++  // -------- 状态区（0050 读口，单一来源；不现算、不硬编码状态名/色） --------
++
++  /** 当前状态（读口返回 UNKNOWN 空态：seq=null/quality=3/changeTime=null，前端原样展示） */
++  async statusCurrent(instanceId: number): Promise<StatusCurrentVO> {
++    const res: ResultEnvelope<StatusCurrentVO> = await getRequest('/api/v1/iot/status/current', { instanceId });
++    return res?.data;
++  },
++
++  /** 状态历史时间线（from/to 为 epoch 毫秒且 from<to，空集由服务端如实给） */
++  async statusHistory(instanceId: number, from: number, to: number): Promise<StatusHistoryPointVO[]> {
++    const res: ResultEnvelope<StatusHistoryPointVO[]> = await getRequest('/api/v1/iot/status/history', {
++      instanceId,
++      from,
++      to,
++    });
++    return asArray(res?.data);
++  },
++
++  // -------- 组件清单 / 实时 / 曲线 / 追溯（管理面登录态端点，不触 HMAC openapi/v1） --------
++
++  /** 设备下数据项清单（数据权限裁剪，不可见实例返回空清单） */
++  async queryItemList(instanceId: number): Promise<DisplayDataItem[]> {
++    const res: ResultEnvelope<DisplayDataItem[]> = await getRequest('/iot/item/list', { instanceId });
++    return asArray(res?.data);
++  },
++
++  /** 点位分页列表（按 boundInstanceId 精确过滤取设备关联点；服务端按数据权限裁剪） */
++  async queryPointList(boundInstanceId: number): Promise<DisplayPoint[]> {
++    const res: ResultEnvelope<PageEnvelope<DisplayPoint>> = await getRequest('/iot/point/list', {
++      pageNum: 1,
++      pageSize: 500,
++      boundInstanceId,
++    });
++    return asArray(res?.data?.records);
++  },
++
++  /**
++   * 点位近 24h 曲线（0023 管理面端点，fail-soft 空集）。
++   * 实时区当前值、历史曲线均以此端点为数据源；后端无数据=空 dataPoints=前端「数据接入中」空态。
++   */
++  async pointCurve(pointId: number): Promise<IotPointCurveVO | null> {
++    const res: ResultEnvelope<IotPointCurveVO> = await getRequest(`/iot/point/${pointId}/curve`, undefined);
++    return res?.data ?? null;
++  },
++
++  /** 影响预览（0036 引用图反查：公式输入项/汇总子级贡献的来源关系） */
++  async itemImpact(itemId: number): Promise<IotItemImpactVO | null> {
++    const res: ResultEnvelope<IotItemImpactVO> = await getRequest(`/iot/item/${itemId}/impact`, undefined);
++    return res?.data ?? null;
++  },
++
++  /** 数据项有效取值与公式（0014/0036：source_type/formula/rollup_method/calc_period 继承链） */
++  async itemEffectiveParams(instanceId: number, itemId: number): Promise<IotItemEffectiveParamsVO | null> {
++    const res: ResultEnvelope<IotItemEffectiveParamsVO> = await getRequest(`/iot/instance/${instanceId}/items/${itemId}/effective-params`, undefined);
++    return res?.data ?? null;
++  },
++
++  /** 设备下指标清单（数据权限裁剪） */
++  async queryMetricList(instanceId: number): Promise<DisplayMetric[]> {
++    const res: ResultEnvelope<PageEnvelope<DisplayMetric>> = await getRequest('/iot/metric/list', {
++      pageNum: 1,
++      pageSize: 200,
++      instanceId,
++    });
++    return asArray(res?.data?.records);
++  },
++};
+diff --git a/frontend/src/router/display.ts b/frontend/src/router/display.ts
+index 518f236..07f367a 100644
+--- a/frontend/src/router/display.ts
++++ b/frontend/src/router/display.ts
+@@ -5,7 +5,8 @@
+  * - 本段为静态注册（无后端 sys_menu 菜单项，hideInMenu），与动态菜单路由同挂在 OtLayout 下；
+  * - 需要登录（无 meta.public），走 router/index.ts 的 token 守卫与已登录态数据服务；
+  * - 下钻路径 ≤3 次点击：/display（总览，0）→ /display/factory/:factoryId（1）
+- *   → /display/workshop/:factoryId/:workshopId（2）→ 设备详情（3，批次二 0059 承接，本批不写入口死链）。
++ *   → /display/workshop/:factoryId/:workshopId（2）→ /display/device?instanceId=（3，TASK-0059）。
++ *   设备详情用查询参数 instanceId（brief 口径），从车间页设备色块进入，下钻计数不变。
+  */
+ import type { RouteRecordRaw } from 'vue-router';
+ 
+@@ -28,4 +29,11 @@ export const displayRouters: Array<RouteRecordRaw> = [
+     component: () => import('/@/views/display/workshop/index.vue'),
+     meta: { title: '车间 / 产线', hideInMenu: true },
+   },
++  {
++    // 设备详情（TASK-0059）：查询参数 instanceId；展示端四区同源读管理面端点，不直连 HMAC openapi。
++    path: '/display/device',
++    name: 'DisplayDeviceDetail',
++    component: () => import('/@/views/display/device/index.vue'),
++    meta: { title: '设备详情', hideInMenu: true },
++  },
+ ];
+diff --git a/frontend/src/views/display/device/device-component-zone.vue b/frontend/src/views/display/device/device-component-zone.vue
+new file mode 100644
+index 0000000..39a3487
+--- /dev/null
++++ b/frontend/src/views/display/device/device-component-zone.vue
+@@ -0,0 +1,120 @@
++<!--
++  * 设备详情页 · 组件清单（TASK-0059）
++  *
++  * 按 data_type 分组：实例数据项（配置的数据类别 category）、点位（dataType 1 瞬时/2 累计/
++  * 3 状态/4 开关）、指标（period 周期）。点击组展开明细（不单独成页，REQ-0030）。
++  * 真数据来自管理面 /iot/item/list、/iot/point/list、/iot/metric/list；无数据显示
++  * 「数据接入中」空态，不造假。
++-->
++<template>
++  <a-card size="small" title="设备组件清单" class="device-component-zone">
++    <a-collapse v-if="groups.length" v-model:activeKey="activeKey" :bordered="false">
++      <a-collapse-panel v-for="group in groups" :key="group.key" :header="`${group.label}（${group.rows.length}）`">
++        <a-table :columns="columns" :data-source="group.rows" :pagination="false" size="small" row-key="key">
++          <template #bodyCell="{ column, record }">
++            <template v-if="column.key === 'detail'">
++              <span class="device-component-zone__detail">{{ record.detail }}</span>
++            </template>
++            <template v-else-if="column.key === 'trace' && record.itemId">
++              <a-button type="link" size="small" @click="emit('trace', record.itemId)">查看来源</a-button>
++            </template>
++          </template>
++        </a-table>
++      </a-collapse-panel>
++    </a-collapse>
++    <div v-else class="device-component-zone__empty">数据接入中（无组件清单数据）</div>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, ref } from 'vue';
++  import type { DisplayDataItem, DisplayMetric, DisplayPoint } from '/@/api/display/display-api';
++
++  const props = defineProps<{
++    items: DisplayDataItem[];
++    points: DisplayPoint[];
++    metrics: DisplayMetric[];
++  }>();
++  const emit = defineEmits<{ trace: [itemId: number] }>();
++
++  interface GroupRow {
++    key: string;
++    name: string;
++    code: string;
++    detail: string;
++    itemId?: number;
++  }
++  interface Group {
++    key: string;
++    label: string;
++    rows: GroupRow[];
++  }
++
++  const columns = [
++    { title: '名称', dataIndex: 'name', key: 'name' },
++    { title: '编码', dataIndex: 'code', key: 'code' },
++    { title: '详情', key: 'detail' },
++    { title: '操作', key: 'trace' },
++  ];
++
++  const activeKey = ref<string[]>([]);
++
++  const DATA_TYPE_LABEL: Record<number, string> = { 1: '瞬时点位', 2: '累计点位', 3: '状态点位', 4: '开关点位' };
++  const SOURCE_LABEL: Record<number, string> = { 1: '绑定点位', 2: '公式计算', 3: '子级汇总' };
++
++  const groups = computed<Group[]>(() => {
++    const result: Group[] = [];
++
++    // 数据项按业务类别（category，即配置的数据类别）分组
++    const itemGroups = new Map<string, GroupRow[]>();
++    for (const item of props.items) {
++      const category = item.category || '未分类';
++      const rows = itemGroups.get(category) ?? [];
++      rows.push({
++        key: `item-${item.id}`,
++        name: item.dataName,
++        code: item.dataCode,
++        detail: `${SOURCE_LABEL[item.sourceType] ?? '未知取值'}${item.unit ? ` · ${item.unit}` : ''}`,
++        itemId: item.id,
++      });
++      itemGroups.set(category, rows);
++    }
++    for (const [category, rows] of itemGroups) {
++      result.push({ key: `item-${category}`, label: `数据项 · ${category}`, rows });
++    }
++
++    // 点位按 dataType 分组
++    const pointGroups = new Map<number, GroupRow[]>();
++    for (const point of props.points) {
++      const rows = pointGroups.get(point.dataType) ?? [];
++      rows.push({
++        key: `point-${point.id}`,
++        name: point.pointName,
++        code: point.pointCode,
++        detail: `${DATA_TYPE_LABEL[point.dataType] ?? `dataType=${point.dataType}`}${point.unit ? ` · ${point.unit}` : ''}`,
++      });
++      pointGroups.set(point.dataType, rows);
++    }
++    for (const [dataType, rows] of [...pointGroups.entries()].sort((a, b) => a[0] - b[0])) {
++      result.push({ key: `point-${dataType}`, label: `点位 · ${DATA_TYPE_LABEL[dataType] ?? `类型 ${dataType}`}`, rows });
++    }
++
++    // 指标按 period 分组
++    const metricGroups = new Map<string, GroupRow[]>();
++    for (const metric of props.metrics) {
++      const period = metric.period || '未设周期';
++      const rows = metricGroups.get(period) ?? [];
++      rows.push({
++        key: `metric-${metric.id}`,
++        name: metric.metricName,
++        code: metric.metricCode,
++        detail: `指标 · ${period}`,
++      });
++      metricGroups.set(period, rows);
++    }
++    for (const [period, rows] of metricGroups) {
++      result.push({ key: `metric-${period}`, label: `指标 · ${period}`, rows });
++    }
++
++    return result;
++  });
++</script>
+diff --git a/frontend/src/views/display/device/device-curve-zone.vue b/frontend/src/views/display/device/device-curve-zone.vue
+new file mode 100644
+index 0000000..13f8d1f
+--- /dev/null
++++ b/frontend/src/views/display/device/device-curve-zone.vue
+@@ -0,0 +1,200 @@
++<!--
++  * 设备详情页 · 历史曲线区（TASK-0059）
++  *
++  * 数据源：管理面 GET /iot/point/{id}/curve（0023 近 24h 曲线，登录态，不触 HMAC）。
++  * 多项叠加（多选绑定点位）、时间范围选择（近 1 小时 / 近 24 小时 / 近 7 日 / 自定义）、
++  * 超限断线时段标注（质量码 1/2=超限标红段、3=断线灰段，markArea/markLine）。
++  *
++  * 降采样标注（ADR-0010 硬要求）：按所选跨度分档（原始/60s/300s/3600s），
++  * 图上方始终明示「当前展示为降采样结果：…」或「原始粒度，未降采样」，绝不静默降采样。
++  *
++  * 空态：无点位/曲线空集=「数据接入中」；不造假曲线。
++  * 缺口登记：近 7 日/自定义跨度超出管理面 24h 曲线窗口时，只展示已取回的 24h 数据，
++  * 并在标注中说明「数据源仅提供近 24h」——更长跨度待管理面历史端点（报告登记）。
++-->
++<template>
++  <a-card size="small" title="历史曲线" class="device-curve-zone">
++    <template #extra>
++      <a-space>
++        <a-select
++          v-model:value="selectedPointIds"
++          mode="multiple"
++          size="small"
++          placeholder="选择点位"
++          style="min-width: 220px"
++          :options="pointOptions"
++        />
++        <a-select v-model:value="rangeKey" size="small" style="width: 130px" :options="rangeOptions" />
++        <a-button size="small" :loading="loading" @click="$emit('refresh')">刷新</a-button>
++      </a-space>
++    </template>
++
++    <div class="device-curve-zone__annotation" :class="{ 'device-curve-zone__annotation--raw': tier.method === '原始粒度' }">
++      {{ annotation }}
++      <span v-if="rangeKey !== '24h'" class="device-curve-zone__limit">· 数据源仅提供近 24h，长跨度曲线待历史端点接入</span>
++    </div>
++
++    <a-spin :spinning="loading">
++      <div v-show="hasData" ref="chartRef" class="device-curve-zone__chart"></div>
++      <div v-if="!loading && !hasData" class="device-curve-zone__empty">数据接入中（无可展示曲线数据）</div>
++      <div v-if="hasData" class="device-curve-zone__legend-note">质量码标注：超限时段红色 · 断线时段灰色 · 数据点按质量码着色</div>
++    </a-spin>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
++  import * as echarts from 'echarts';
++  import type { ComposeOption, LineSeriesOption } from 'echarts';
++  import { displayApi, type DisplayPoint, type PointCurvePointVO } from '/@/api/display/display-api';
++  import { downsampleSeries, pickDownsampleTier, type CurveSample } from './device-utils';
++
++  type CurveChartOption = ComposeOption<LineSeriesOption>;
++
++  const props = defineProps<{ instanceId: number; points: DisplayPoint[] }>();
++  defineEmits<{ refresh: [] }>();
++
++  const RANGES = [
++    { key: '1h', label: '近 1 小时', ms: 60 * 60 * 1000 },
++    { key: '24h', label: '近 24 小时', ms: 24 * 60 * 60 * 1000 },
++    { key: '7d', label: '近 7 日', ms: 7 * 24 * 60 * 60 * 1000 },
++    { key: 'custom', label: '自定义（近 24h）', ms: 24 * 60 * 60 * 1000 },
++  ] as const;
++
++  const rangeOptions = RANGES.map((r) => ({ label: r.label, value: r.key }));
++  const pointOptions = computed(() => props.points.map((p) => ({ label: `${p.pointName}（${p.pointCode}）`, value: p.id })));
++
++  const rangeKey = ref<(typeof RANGES)[number]['key']>('24h');
++  const selectedPointIds = ref<number[]>([]);
++  const loading = ref(false);
++  const hasData = ref(false);
++  const annotation = ref('当前展示为原始粒度，未降采样');
++  const chartRef = ref<HTMLDivElement | null>(null);
++  let chart: echarts.ECharts | null = null;
++
++  const tier = computed(() => {
++    const range = RANGES.find((r) => r.key === rangeKey.value) ?? RANGES[1];
++    return pickDownsampleTier(Date.now() - range.ms, Date.now());
++  });
++
++  const RANGE_COLORS = ['#1677ff', '#52c41a', '#fa8c16', '#722ed1', '#13c2c2', '#eb2f96'];
++
++  async function load() {
++    if (!selectedPointIds.value.length) {
++      hasData.value = false;
++      clearChart();
++      return;
++    }
++    loading.value = true;
++    try {
++      const results = await Promise.all(
++        selectedPointIds.value.map(async (pid) => ({
++          pid,
++          curve: await displayApi.pointCurve(pid).catch(() => null),
++        }))
++      );
++      const range = RANGES.find((r) => r.key === rangeKey.value) ?? RANGES[1];
++      const from = Date.now() - range.ms;
++      const to = Date.now();
++      const selectedTier = pickDownsampleTier(from, to);
++      const pointMap = new Map(props.points.map((p) => [p.id, p]));
++
++      const series: LineSeriesOption[] = [];
++      let sampleCount = 0;
++      let idx = 0;
++      for (const { pid, curve } of results) {
++        const points: PointCurvePointVO[] = curve?.dataPoints ?? [];
++        const down = downsampleSeries(points, selectedTier);
++        const name = pointMap.get(pid)?.pointName ?? curve?.pointCode ?? `点位 ${pid}`;
++        const data: Array<[number, number]> = down.samples.map((s: CurveSample) => [s.ts, s.value]);
++        sampleCount += data.length;
++        const color = RANGE_COLORS[idx % RANGE_COLORS.length];
++        const alarmMarks = down.samples
++          .filter((s) => s.quality === 1 || s.quality === 2)
++          .map((s) => ({ xAxis: s.ts, itemStyle: { color: '#ff4d4f' } }));
++        const offlineMarks = down.samples.filter((s) => s.quality === 3).map((s) => ({ xAxis: s.ts, itemStyle: { color: '#bfbfbf' } }));
++        series.push({
++          name,
++          type: 'line',
++          showSymbol: false,
++          smooth: false,
++          data,
++          lineStyle: { color, width: 2 },
++          itemStyle: { color },
++          markLine: alarmMarks.length ? { symbol: 'none', silent: true, data: alarmMarks } : undefined,
++          markArea: offlineMarks.length
++            ? {
++                silent: true,
++                itemStyle: { color: 'rgba(191,191,191,0.35)' },
++                data: offlineMarks.map((m) => [{ xAxis: m.xAxis }, { xAxis: m.xAxis + selectedTier.bucketMs || 60_000 }]),
++              }
++            : undefined,
++        });
++        annotation.value = down.annotation;
++        idx += 1;
++      }
++
++      hasData.value = sampleCount > 0 && series.length > 0;
++      if (hasData.value) {
++        await nextTick();
++        renderChart(series);
++      } else {
++        clearChart();
++      }
++    } catch (e) {
++      hasData.value = false;
++      clearChart();
++      console.error('[display] curve zone load failed:', e);
++    } finally {
++      loading.value = false;
++    }
++  }
++
++  function renderChart(series: LineSeriesOption[]) {
++    if (!chartRef.value) return;
++    if (!chart) chart = echarts.init(chartRef.value);
++    const option: CurveChartOption = {
++      animation: false,
++      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
++      legend: { type: 'scroll', bottom: 0 },
++      grid: { left: 8, right: 16, top: 16, bottom: 48, containLabel: true },
++      xAxis: { type: 'time' },
++      yAxis: { type: 'value', scale: true },
++      series,
++    };
++    chart.setOption(option, true);
++    chart.resize();
++  }
++
++  function clearChart() {
++    if (chart) {
++      chart.clear();
++    }
++  }
++
++  function onResize() {
++    chart?.resize();
++  }
++
++  // 点位列表就绪后默认选前两个（选填，用户可改），随后加载
++  watch(
++    () => props.points,
++    (pts) => {
++      selectedPointIds.value = pts.slice(0, 2).map((p) => p.id);
++      void load();
++    },
++    { immediate: true }
++  );
++  watch(rangeKey, () => void load());
++  watch(selectedPointIds, () => void load(), { deep: false });
++
++  onMounted(() => {
++    window.addEventListener('resize', onResize);
++  });
++  onBeforeUnmount(() => {
++    window.removeEventListener('resize', onResize);
++    chart?.dispose();
++    chart = null;
++  });
++
++  defineExpose({ load });
++</script>
+diff --git a/frontend/src/views/display/device/device-realtime-zone.vue b/frontend/src/views/display/device/device-realtime-zone.vue
+new file mode 100644
+index 0000000..ad3ad7b
+--- /dev/null
++++ b/frontend/src/views/display/device/device-realtime-zone.vue
+@@ -0,0 +1,149 @@
++<!--
++  * 设备详情页 · 实时数据区（TASK-0059）
++  *
++  * 数据源：管理面 GET /iot/item/list（数据项清单）+ GET /iot/point/list（绑定点位）+
++  * GET /iot/point/{id}/curve（0023 近 24h 曲线，最后一条=当前采集值）。全部登录态端点，
++  * 不持有 appKey/secret、不直连 openapi/v1/items/realtime（HMAC，浏览器不可直连）。
++  *
++  * 注意（报告登记）：管理面无「按设备批量取数据项实时值」等价端点，当前值由绑定点位的
++  * 近 24h 曲线末点派生（仅绑定类数据项有当前值；公式/汇总类需计算引擎实时值接口，
++  * 缺口等裁决，本组件不造假）。无数据源/无点位/曲线空集=「数据接入中」。
++  * 质量标记/超限标红/离线灰显按质量码 + alarm 阈值（ADR-0011 TD-0022）展示。
++-->
++<template>
++  <a-card size="small" title="实时数据" class="device-realtime-zone">
++    <template #extra>
++      <a-button type="link" size="small" :loading="loading" @click="$emit('refresh')">刷新</a-button>
++    </template>
++    <a-spin :spinning="loading">
++      <template v-if="rows.length">
++        <a-table :columns="columns" :data-source="rows" :pagination="false" size="small" row-key="itemId">
++          <template #bodyCell="{ column, record }">
++            <template v-if="column.key === 'value'">
++              <span
++                class="device-realtime-zone__value"
++                :class="{ 'device-realtime-zone__value--red': record.red, 'device-realtime-zone__value--grey': record.grey }"
++                >{{ record.valueText }}</span
++              >
++            </template>
++            <template v-else-if="column.key === 'quality'">
++              <a-tag :color="qualityTagColor(record.tone)">{{ record.qualityLabel }}</a-tag>
++            </template>
++            <template v-else-if="column.key === 'source'">
++              <span class="device-realtime-zone__source">{{ record.sourceText }}</span>
++            </template>
++          </template>
++        </a-table>
++      </template>
++      <div v-else class="device-realtime-zone__empty">数据接入中（无实时值数据源，不展示假数据）</div>
++    </a-spin>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, ref, watch } from 'vue';
++  import { displayApi, type DisplayDataItem, type PointCurvePointVO } from '/@/api/display/display-api';
++  import { formatTs, qualityMeta, realtimeDisplayState } from './device-utils';
++
++  const props = defineProps<{ instanceId: number; items: DisplayDataItem[] }>();
++  defineEmits<{ refresh: [] }>();
++
++  interface RealtimeRow {
++    itemId: number;
++    dataCode: string;
++    dataName: string;
++    unit: string;
++    valueText: string;
++    qualityLabel: string;
++    tone: string;
++    red: boolean;
++    grey: boolean;
++    updateTime: string;
++    sourceText: string;
++  }
++
++  const columns = [
++    { title: '数据项', dataIndex: 'dataName', key: 'dataName' },
++    { title: '编码', dataIndex: 'dataCode', key: 'dataCode' },
++    { title: '当前值', key: 'value' },
++    { title: '质量标记', key: 'quality' },
++    { title: '更新时间', dataIndex: 'updateTime', key: 'updateTime' },
++    { title: '来源', key: 'source' },
++  ];
++
++  const loading = ref(false);
++  const rows = ref<RealtimeRow[]>([]);
++
++  function qualityTagColor(tone: string): string {
++    switch (tone) {
++      case 'alarm':
++        return 'red';
++      case 'offline':
++        return 'default';
++      case 'manual':
++        return 'blue';
++      case 'warn':
++        return 'orange';
++      default:
++        return 'green';
++    }
++  }
++
++  async function load() {
++    if (!props.items.length) {
++      rows.value = [];
++      return;
++    }
++    loading.value = true;
++    try {
++      // 绑定类项（sourceType=1）有 pointId → 走点位曲线末点取当前采集值；
++      // 公式/汇总类项无管理面实时值端点 → 源文本标明，值走空态（不造假）。
++      const bound = props.items.filter((it) => it.sourceType === 1 && it.pointId != null);
++      const pointIds = [...new Set(bound.map((it) => it.pointId as number))];
++      const pointCurves = await Promise.all(pointIds.map((pid) => displayApi.pointCurve(pid).catch(() => null)));
++      const latestByPoint = new Map<number, PointCurvePointVO | null>();
++      pointIds.forEach((pid, i) => {
++        const pts = pointCurves[i]?.dataPoints ?? [];
++        latestByPoint.set(pid, pts.length ? pts[pts.length - 1] : null);
++      });
++
++      rows.value = props.items.map((item) => {
++        const isBound = item.sourceType === 1 && item.pointId != null;
++        const latest = isBound ? latestByPoint.get(item.pointId as number) ?? null : null;
++        const rawValue = latest?.value ?? null;
++        const quality = latest?.quality ?? null;
++        const state = realtimeDisplayState(quality, rawValue, item);
++        const valueText = isBound ? (rawValue == null ? '数据接入中' : `${rawValue}${item.unit ?? ''}`) : '需实时计算（数据接入中）';
++        return {
++          itemId: item.id,
++          dataCode: item.dataCode,
++          dataName: item.dataName,
++          unit: item.unit ?? '',
++          valueText,
++          qualityLabel: isBound ? state.qualityLabel : '—',
++          tone: state.tone,
++          red: state.red,
++          grey: state.grey,
++          updateTime: isBound && latest?.ts ? formatTs(latest.ts) : '—',
++          sourceText: isBound
++            ? `点位 #${item.pointId}（近 24h 曲线末点）`
++            : item.sourceType === 2
++            ? '公式计算（实时值端点待接入）'
++            : '子级汇总（实时值端点待接入）',
++        };
++      });
++    } catch (e) {
++      rows.value = [];
++      console.error('[display] realtime zone load failed:', e);
++    } finally {
++      loading.value = false;
++    }
++  }
++
++  watch(
++    () => [props.instanceId, props.items],
++    () => void load(),
++    { deep: false }
++  );
++
++  defineExpose({ load });
++</script>
+diff --git a/frontend/src/views/display/device/device-status-zone.vue b/frontend/src/views/display/device/device-status-zone.vue
+new file mode 100644
+index 0000000..2297455
+--- /dev/null
++++ b/frontend/src/views/display/device/device-status-zone.vue
+@@ -0,0 +1,99 @@
++<!--
++  * 设备详情页 · 状态区（TASK-0059）
++  *
++  * 数据源：0050 状态展示读口（/api/v1/iot/status/current + /history）——状态名/颜色/
++  * UNKNOWN 口径全部来自服务端动态翻译，前端不现算、不硬编码（同源三处一致）。
++  * 当前状态大色块用服务端 color；持续时长由 changeTime 计算（null=「未知」，不编造）；
++  * 历史时间线逐条展示状态变化；LWT 离线/UNKNOWN 按读口口径原样展示。
++  * 空态：无数据/加载失败显示「数据接入中」，不造假状态。
++-->
++<template>
++  <a-card size="small" title="运行状态" class="device-status-zone">
++    <a-spin :spinning="loading">
++      <template v-if="loaded && current">
++        <div class="device-status-zone__current">
++          <div
++            class="device-status-zone__block"
++            :style="current.color ? { backgroundColor: current.color } : undefined"
++            :class="{ 'device-status-zone__block--unknown': !current.color }"
++          >
++            <span class="device-status-zone__name">{{ current.statusName || 'UNKNOWN' }}</span>
++            <span class="device-status-zone__code">{{ current.statusCode || 'UNKNOWN' }}</span>
++          </div>
++          <div class="device-status-zone__meta">
++            <div>
++              持续时长：<b>{{ duration }}</b>
++            </div>
++            <div class="device-status-zone__ts">变化时刻：{{ formatTs(current.changeTime) }}</div>
++            <div class="device-status-zone__quality">质量码：{{ qualityMeta(current.quality).label }}</div>
++          </div>
++        </div>
++
++        <div class="device-status-zone__timeline-title">状态历史时间线</div>
++        <a-timeline v-if="history.length" class="device-status-zone__timeline">
++          <a-timeline-item v-for="(point, i) in history" :key="`${point.ts}-${i}`" :color="point.color || undefined">
++            <span class="device-status-zone__tl-name">{{ point.statusName || point.statusCode }}</span>
++            <span class="device-status-zone__tl-ts">{{ formatTs(point.ts) }}</span>
++            <span v-if="point.quality !== 0" class="device-status-zone__tl-q">· {{ qualityMeta(point.quality).label }}</span>
++          </a-timeline-item>
++        </a-timeline>
++        <div v-else class="device-status-zone__empty">暂无状态变化记录（历史时间线为空）</div>
++      </template>
++      <div v-else-if="loaded" class="device-status-zone__empty">状态数据接入中</div>
++      <div v-else class="device-status-zone__empty">状态数据接入中</div>
++    </a-spin>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
++  import { displayApi, type StatusCurrentVO, type StatusHistoryPointVO } from '/@/api/display/display-api';
++  import { formatDuration, formatTs, qualityMeta } from './device-utils';
++
++  const props = defineProps<{ instanceId: number }>();
++
++  const current = ref<StatusCurrentVO | null>(null);
++  const history = ref<StatusHistoryPointVO[]>([]);
++  const loading = ref(false);
++  const loaded = ref(false);
++  const now = ref(Date.now());
++
++  const duration = computed(() => formatDuration(current.value?.changeTime, now.value));
++
++  async function load() {
++    loading.value = true;
++    // 时间窗：近 24h（与曲线默认窗一致）；from<to 由服务端强校验
++    const to = Date.now();
++    const from = to - 24 * 60 * 60 * 1000;
++    try {
++      // 两读口并行；任一失败不造假，整体走空态（两处同源，由服务端保证口径一致）
++      const [cur, hist] = await Promise.all([displayApi.statusCurrent(props.instanceId), displayApi.statusHistory(props.instanceId, from, to)]);
++      current.value = cur ?? null;
++      history.value = Array.isArray(hist) ? hist : [];
++    } catch (e) {
++      current.value = null;
++      history.value = [];
++      console.error('[display] status zone load failed:', e);
++    } finally {
++      loading.value = false;
++      loaded.value = true;
++    }
++  }
++
++  defineExpose({ load });
++
++  // 持续时长按秒刷新（简单本地轮询：只重算差值、不重复请求；重算后手动刷新由父级调用 load）。
++  let timer: ReturnType<typeof setInterval> | null = null;
++  onMounted(() => {
++    void load();
++    timer = setInterval(() => {
++      now.value = Date.now();
++    }, 1000);
++  });
++  watch(
++    () => props.instanceId,
++    () => void load()
++  );
++  onBeforeUnmount(() => {
++    if (timer) clearInterval(timer);
++  });
++</script>
+diff --git a/frontend/src/views/display/device/device-trace-zone.vue b/frontend/src/views/display/device/device-trace-zone.vue
+new file mode 100644
+index 0000000..8bcb298
+--- /dev/null
++++ b/frontend/src/views/display/device/device-trace-zone.vue
+@@ -0,0 +1,163 @@
++<!--
++  * 设备详情页 · 来源追溯区（TASK-0059）
++  *
++  * 数据源：管理面 GET /iot/item/{id}/impact（0036 引用图反查：OUT=本项引用了谁=公式输入项，
++  * IN=谁引用了本项）+ GET /iot/instance/{id}/items/{itemId}/effective-params（公式/汇总方式/
++  * 计算周期，0014/0036）。汇总类展开子级贡献：以 incoming/outgoing 的 ref 边呈现实例编码/
++  * dataCode/关系，值端无实时计算值端点 → 标「贡献值待计算值接口接入」，不造假数值。
++  *
++  * 缺口登记：计算留痕（iot_calc_log）归 0063 未交付——本区不写死链、不伪造留痕入口；
++  * 「本次计算输入值」在管理面无对应读口，公式输入项只展示引用关系与配置公式（报告登记）。
++  * 空态：无可追溯项 / 接口失败显示「数据接入中」，不造假。
++-->
++<template>
++  <a-card size="small" title="来源追溯" class="device-trace-zone">
++    <template #extra>
++      <span class="device-trace-zone__hint">点数据项展开来源与公式输入</span>
++    </template>
++    <a-spin :spinning="loading">
++      <template v-if="items.length">
++        <a-collapse v-model:activeKey="activeKey" :bordered="false" class="device-trace-zone__collapse">
++          <a-collapse-panel v-for="item in items" :key="String(item.id)" :header="panelTitle(item)">
++            <template v-if="detail[item.id] && detail[item.id].loaded">
++              <template v-if="detail[item.id].params">
++                <div class="device-trace-zone__row">
++                  <span class="device-trace-zone__label">取值方式</span>
++                  <span>{{ sourceTypeText(detail[item.id].params!.sourceType) }}</span>
++                </div>
++                <div v-if="detail[item.id].params!.formula" class="device-trace-zone__row">
++                  <span class="device-trace-zone__label">公式</span>
++                  <code>{{ detail[item.id].params!.formula }}</code>
++                </div>
++                <div v-if="detail[item.id].params!.rollupMethod" class="device-trace-zone__row">
++                  <span class="device-trace-zone__label">汇总方式</span>
++                  <span>{{ detail[item.id].params!.rollupMethod }}</span>
++                </div>
++                <div v-if="detail[item.id].params!.calcPeriod != null" class="device-trace-zone__row">
++                  <span class="device-trace-zone__label">计算周期</span>
++                  <span>{{ detail[item.id].params!.calcPeriod }} 秒</span>
++                </div>
++              </template>
++
++              <div class="device-trace-zone__section-title">子级贡献 / 公式输入项（引用关系）</div>
++              <template v-if="referenceRows(item.id).length">
++                <a-table :columns="edgeColumns" :data-source="referenceRows(item.id)" :pagination="false" size="small" row-key="key">
++                  <template #bodyCell="{ column, record }">
++                    <template v-if="column.key === 'role'">
++                      <a-tag :color="record.direction === 'OUT' ? 'blue' : 'purple'">{{ record.role }}</a-tag>
++                    </template>
++                    <template v-else-if="column.key === 'type'">
++                      {{ record.refType === 2 ? '点位' : '数据项' }}
++                    </template>
++                    <template v-else-if="column.key === 'value'">
++                      <span class="device-trace-zone__pending">贡献值待计算值接口接入</span>
++                    </template>
++                  </template>
++                </a-table>
++              </template>
++              <div v-else class="device-trace-zone__empty">暂无引用关系（无来源数据，不造假）</div>
++
++              <div class="device-trace-zone__footnote">计算留痕（iot_calc_log）接口未交付，本区不提供留痕入口，避免死链。</div>
++            </template>
++            <div v-else class="device-trace-zone__empty">来源数据接入中</div>
++          </a-collapse-panel>
++        </a-collapse>
++      </template>
++      <div v-else class="device-trace-zone__empty">数据接入中（无可追溯数据项）</div>
++    </a-spin>
++  </a-card>
++</template>
++<script setup lang="ts">
++  import { reactive, ref, watch } from 'vue';
++  import { displayApi, type DisplayDataItem, type IotItemEffectiveParamsVO, type IotItemImpactVO } from '/@/api/display/display-api';
++
++  const props = defineProps<{ instanceId: number; items: DisplayDataItem[] }>();
++
++  interface TraceDetail {
++    loaded: boolean;
++    params: IotItemEffectiveParamsVO | null;
++    impact: IotItemImpactVO | null;
++  }
++  interface EdgeRow {
++    key: string;
++    direction: string;
++    role: string;
++    refType: number;
++    refFullKey: string;
++    peerName: string;
++    value: string;
++  }
++
++  const detail = reactive<Record<number, TraceDetail>>({});
++  const activeKey = ref<string[]>([]);
++  const loading = ref(false);
++
++  const edgeColumns = [
++    { title: '角色', key: 'role' },
++    { title: '类型', key: 'type' },
++    { title: '来源编码', dataIndex: 'refFullKey', key: 'refFullKey' },
++    { title: '名称', dataIndex: 'peerName', key: 'peerName' },
++    { title: '贡献值', key: 'value' },
++  ];
++
++  function panelTitle(item: DisplayDataItem): string {
++    return `${item.dataName}（${item.dataCode}） · ${sourceTypeText(item.sourceType)}`;
++  }
++
++  function sourceTypeText(t: number): string {
++    return t === 2 ? '公式' : t === 3 ? '子级汇总' : t === 1 ? '绑定点位' : '未知';
++  }
++
++  function referenceRows(itemId: number): EdgeRow[] {
++    const impact = detail[itemId]?.impact;
++    if (!impact) return [];
++    const rows: EdgeRow[] = [];
++    for (const edge of [...(impact.outgoing ?? []), ...(impact.incoming ?? [])]) {
++      rows.push({
++        key: `${edge.direction}-${edge.refType}-${edge.refFullKey}-${rows.length}`,
++        direction: edge.direction,
++        role: edge.direction === 'OUT' ? '输入/被引用' : '依赖方/引用者',
++        refType: edge.refType,
++        refFullKey: edge.refFullKey,
++        peerName: edge.peerDataName || edge.peerInstanceName || '—',
++        value: '',
++      });
++    }
++    return rows;
++  }
++
++  async function loadDetail(item: DisplayDataItem) {
++    if (detail[item.id]?.loaded) return;
++    detail[item.id] = { loaded: false, params: null, impact: null };
++    try {
++      const [params, impact] = await Promise.all([
++        displayApi.itemEffectiveParams(props.instanceId, item.id).catch(() => null),
++        displayApi.itemImpact(item.id).catch(() => null),
++      ]);
++      detail[item.id] = { loaded: true, params, impact };
++    } catch (e) {
++      detail[item.id] = { loaded: true, params: null, impact: null };
++      console.error('[display] trace detail load failed:', e);
++    }
++  }
++
++  watch(
++    () => props.items,
++    (items) => {
++      for (const item of items) {
++        if (!detail[item.id]) detail[item.id] = { loaded: false, params: null, impact: null };
++      }
++    },
++    { immediate: true, deep: false }
++  );
++
++  // 展开面板时按需加载来源详情（下钻≤3 次点击不破坏：本展开是页内第 4 级以内的详情呈现）
++  watch(activeKey, (keys) => {
++    for (const key of keys) {
++      const item = props.items.find((i) => String(i.id) === key);
++      if (item) void loadDetail(item);
++    }
++  });
++
++  defineExpose({ loadDetail });
++</script>
+diff --git a/frontend/src/views/display/device/device-utils.ts b/frontend/src/views/display/device/device-utils.ts
+new file mode 100644
+index 0000000..d80462b
+--- /dev/null
++++ b/frontend/src/views/display/device/device-utils.ts
+@@ -0,0 +1,229 @@
++/*
++ * 设备详情页纯函数（TASK-0059）
++ *
++ * 集中三类口径，供状态区 / 实时区 / 曲线 / 追溯共用，且不依赖 DOM 或后端：
++ * 1) 质量码语义（ADR-0009 CONV-02：0 正常 / 1 超上限 / 2 超下限 / 3 断线补标 /
++ *    5 手工补录 / 8 突变待核查 …）——质量码来自服务端，前端只做映射，不重新判定；
++ * 2) 超限标红 / 离线灰显（REQ-0030 验收 3）：数据项阈值来自有效参数或实体配置，
++ *    判定仅用于展示着色，不改变值本身；
++ * 3) 曲线降采样（ADR-0010 留痕）：按跨度分档，标注「降采样结果 + 分档 + 方法」，
++ *    绝不静默丢点；本函数在展示侧对已取回的点位曲线做二次聚合，标注随结果返回。
++ */
++
++/** 质量码元信息（展示文案 + 样式类；0-9 冻结见 ADR-0009 CONV-02，10=双给偏差见 ADR-0010） */
++export interface QualityMeta {
++  label: string;
++  /** 展示样式键：normal / alarm / offline / manual / warn */
++  tone: 'normal' | 'alarm' | 'offline' | 'manual' | 'warn';
++}
++
++const QUALITY_MAP: Record<number, QualityMeta> = {
++  0: { label: '正常', tone: 'normal' },
++  1: { label: '超上限', tone: 'alarm' },
++  2: { label: '超下限', tone: 'alarm' },
++  3: { label: '断线/超时补标（离线）', tone: 'offline' },
++  4: { label: '设备异常值', tone: 'warn' },
++  5: { label: '手工补录', tone: 'manual' },
++  6: { label: '计算失败', tone: 'warn' },
++  7: { label: '汇总不完整', tone: 'warn' },
++  8: { label: '突变待核查', tone: 'warn' },
++  9: { label: '跨周期用量', tone: 'normal' },
++  10: { label: '比对偏差待核查', tone: 'warn' },
++};
++
++/** 质量码→展示元信息（未知码按「未知质量码 N」warn 处理，不吞错、不冒充正常） */
++export function qualityMeta(quality: number | null | undefined): QualityMeta {
++  if (quality == null) return { label: '质量码未知', tone: 'warn' };
++  return QUALITY_MAP[quality] ?? { label: `未知质量码 ${quality}`, tone: 'warn' };
++}
++
++/** 是否超限（质量码 1/2 = 超上/下限，ADR-0011 TD-0022；值本身照常显示，仅标红） */
++export function isOverLimit(quality: number | null | undefined): boolean {
++  return quality === 1 || quality === 2;
++}
++
++/** 是否离线（质量码 3 = STALE/OFFLINE 断线补标；离线项灰显） */
++export function isOffline(quality: number | null | undefined): boolean {
++  return quality === 3;
++}
++
++/** 数据项阈值区间（对齐 IotDataItem 四字段；null 表示不判定该侧） */
++export interface ThresholdRange {
++  validMin?: number | string | null;
++  validMax?: number | string | null;
++  alarmLow?: number | string | null;
++  alarmHigh?: number | string | null;
++}
++
++/**
++ * 值是否超阈值（alarm 低/高，用于「超限标红」辅助判定）。
++ * 优先级：质量码 1/2 是计算引擎下发的权威超限信号；此处只补充「值越界但质量码未标」的展示兜底，
++ * 且仅用 alarm 阈值（ADR-0011 TD-0022：valid→质量码、alarm→展示标红，语义不混用）。
++ */
++export function valueExceedsAlarm(value: number | null | undefined, range: ThresholdRange): boolean {
++  if (value == null || !Number.isFinite(value)) return false;
++  const low = range.alarmLow == null ? null : Number(range.alarmLow);
++  const high = range.alarmHigh == null ? null : Number(range.alarmHigh);
++  if (low != null && Number.isFinite(low) && value < low) return true;
++  if (high != null && Number.isFinite(high) && value > high) return true;
++  return false;
++}
++
++/** 实时值行统一展示态（由质量码 + 阈值派生，值/单位/时间保持服务端原文） */
++export interface RealtimeDisplayState {
++  /** CSS 样式键：normal / alarm / offline / manual / warn */
++  tone: QualityMeta['tone'];
++  /** 是否叠加超限标红 */
++  red: boolean;
++  /** 是否灰显 */
++  grey: boolean;
++  qualityLabel: string;
++}
++
++/** 派生实时值展示态（超限红 + 离线灰：两态不叠加，离线优先灰显） */
++export function realtimeDisplayState(
++  quality: number | null | undefined,
++  value: number | null | undefined,
++  range: ThresholdRange
++): RealtimeDisplayState {
++  const meta = qualityMeta(quality);
++  const red = !isOffline(quality) && (isOverLimit(quality) || valueExceedsAlarm(value, range));
++  return {
++    tone: meta.tone,
++    red,
++    grey: isOffline(quality),
++    qualityLabel: meta.label,
++  };
++}
++
++/** 降采样分档（ADR-0010：跨度联动，标注保留方式；分档即标注文案，不做静默降采样） */
++export interface DownsampleTier {
++  /** 跨度上限（毫秒） */
++  maxSpanMs: number;
++  /** 标注文案（含分档与聚合方式） */
++  label: string;
++  /** 目标桶宽（毫秒）；0=原始粒度不聚合 */
++  bucketMs: number;
++  /** 聚合方式 */
++  method: '原始粒度' | '取最新' | '均值';
++}
++
++const DOWNSAMPLE_TIERS: DownsampleTier[] = [
++  { maxSpanMs: 2 * 60 * 60 * 1000, label: '原始粒度（未降采样）', bucketMs: 0, method: '原始粒度' },
++  { maxSpanMs: 24 * 60 * 60 * 1000, label: '降采样结果：60s 分档 · 每档取最新', bucketMs: 60_000, method: '取最新' },
++  { maxSpanMs: 7 * 24 * 60 * 60 * 1000, label: '降采样结果：300s 分档 · 每档取最新', bucketMs: 300_000, method: '取最新' },
++  { maxSpanMs: Number.MAX_SAFE_INTEGER, label: '降采样结果：3600s 分档 · 每档取均值', bucketMs: 3_600_000, method: '均值' },
++];
++
++/** 按时间跨度选降采样档（from<to 由调用方保证；非法回退原始档，不抛错） */
++export function pickDownsampleTier(from: number, to: number): DownsampleTier {
++  const span = to - from;
++  if (!Number.isFinite(span) || span < 0) return DOWNSAMPLE_TIERS[0];
++  return DOWNSAMPLE_TIERS.find((t) => span <= t.maxSpanMs) ?? DOWNSAMPLE_TIERS[DOWNSAMPLE_TIERS.length - 1];
++}
++
++/** 降采样后的曲线点（保留质量码用于超限/断线标注） */
++export interface CurveSample {
++  ts: number;
++  value: number;
++  quality: number | null;
++}
++
++/** 降采样结果（含必显式展示的标注） */
++export interface DownsampledSeries {
++  samples: CurveSample[];
++  /** 必展示标注（ADR-0010）：如「当前展示为降采样结果：60s 分档 · 每档取最新」 */
++  annotation: string;
++  tier: DownsampleTier;
++}
++
++/**
++ * 对已取回的点位曲线做时间桶聚合（ADR-0010 留痕）。
++ *
++ * 输入 ts 为 epoch 毫秒或可解析时间字符串；无法解析的行跳过（不造假点）。
++ * 60s/300s 档取桶内最后一条（保留最新质量码）；3600s 档取桶内值的算术均值
++ * （质量码取桶内最差：超上限=1/超下限=2 优先，其次断线=3，再其次其他非 0）。
++ * 原始档仅做排序与过滤，标注为「未降采样」。
++ */
++export function downsampleSeries(
++  points: Array<{ ts: string | null; value: number | null; quality: number | null }>,
++  tier: DownsampleTier
++): DownsampledSeries {
++  const parsed: CurveSample[] = [];
++  for (const p of points) {
++    if (p.ts == null) continue;
++    const ts = typeof p.ts === 'number' ? p.ts : Date.parse(p.ts);
++    if (!Number.isFinite(ts) || p.value == null || !Number.isFinite(p.value)) continue;
++    parsed.push({ ts, value: p.value, quality: p.quality ?? null });
++  }
++  parsed.sort((a, b) => a.ts - b.ts);
++
++  if (tier.bucketMs <= 0) {
++    return {
++      samples: parsed,
++      annotation: tier.method === '原始粒度' ? '当前展示为原始粒度，未降采样' : tier.label,
++      tier,
++    };
++  }
++
++  const buckets = new Map<number, CurveSample[]>();
++  for (const p of parsed) {
++    const key = Math.floor(p.ts / tier.bucketMs) * tier.bucketMs;
++    const list = buckets.get(key);
++    if (list) list.push(p);
++    else buckets.set(key, [p]);
++  }
++
++  const samples: CurveSample[] = [];
++  for (const [key, list] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
++    if (tier.method === '均值') {
++      const avg = list.reduce((sum, p) => sum + p.value, 0) / list.length;
++      samples.push({ ts: key, value: avg, quality: worstQuality(list.map((p) => p.quality)) });
++    } else {
++      const last = list[list.length - 1];
++      samples.push({ ts: key, value: last.value, quality: last.quality });
++    }
++  }
++
++  return {
++    samples,
++    annotation: `当前展示为降采样结果：${tier.label.replace(/^降采样结果：/, '')}`,
++    tier,
++  };
++}
++
++/** 桶内最差质量码（超限 1/2 > 断线 3 > 其他非 0 > 正常 0；未知码非 0 视为异常） */
++function worstQuality(qualities: Array<number | null>): number | null {
++  let worst: number | null = null;
++  for (const q of qualities) {
++    if (q == null) continue;
++    if (worst == null) worst = q;
++    else if ((q === 1 || q === 2) && worst !== 1 && worst !== 2) worst = q;
++    else if (q === 3 && worst === 0) worst = q;
++    else if (q !== 0 && worst === 0) worst = q;
++  }
++  return worst;
++}
++
++/** 时间展示（epoch 毫秒 ISO 本地化；无效值回退原文，不编造） */
++export function formatTs(ts: number | string | null | undefined): string {
++  if (ts == null) return '—';
++  if (typeof ts === 'string') return ts;
++  if (!Number.isFinite(ts)) return '—';
++  const d = new Date(ts);
++  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('zh-CN', { hour12: false });
++}
++
++/** 持续时长（ms→可读中文；changeTime 为 null 时展示「未知」，不编造起始时刻） */
++export function formatDuration(changeTime: number | null | undefined, now = Date.now()): string {
++  if (changeTime == null || !Number.isFinite(changeTime)) return '未知';
++  const ms = Math.max(0, now - changeTime);
++  const sec = Math.floor(ms / 1000);
++  if (sec < 60) return `${sec} 秒`;
++  const min = Math.floor(sec / 60);
++  if (min < 60) return `${min} 分 ${sec % 60} 秒`;
++  const hour = Math.floor(min / 60);
++  if (hour < 24) return `${hour} 小时 ${min % 60} 分`;
++  const day = Math.floor(hour / 24);
++  return `${day} 天 ${hour % 24} 小时`;
++}
+diff --git a/frontend/src/views/display/device/index.vue b/frontend/src/views/display/device/index.vue
+new file mode 100644
+index 0000000..d6c4875
+--- /dev/null
++++ b/frontend/src/views/display/device/index.vue
+@@ -0,0 +1,138 @@
++<!--
++  * 展示端 · 设备详情页（TASK-0059）
++  *
++  * 路由：/display/device?instanceId=（车间页设备色块点击进入，下钻第 3 次，总路径 ≤3 次）。
++  * 四区：状态区（0050 同源）/ 实时数据区 / 历史曲线 / 来源追溯 + 组件清单。
++  * 全部走管理面登录态端点，前端不持有 appKey/secret、不直连 openapi/v1 HMAC 接口。
++  *
++  * 数据纪律：不造假数据；任一数据源无数据/失败显示「数据接入中」空态；曲线明示降采样标注；
++  * 重算后手动刷新（刷新按钮一次刷新全部区，最简单方案——避免 WebSocket 长连接与轮询风暴）。
++  * 无权设备详情由后端各端点数据权限裁剪（403/空），前端不二次伪造。
++-->
++<template>
++  <div class="display-page device-detail">
++    <div class="display-page__back">
++      <a-button type="link" size="small" @click="goBack">
++        <template #icon><LeftOutlined /></template>
++        返回车间
++      </a-button>
++    </div>
++
++    <div class="display-page__header">
++      <div>
++        <h2 class="display-page__title">{{ device?.instanceName || '设备详情' }}</h2>
++        <div class="display-page__subtitle">{{ device?.instanceCode || '' }}</div>
++      </div>
++      <a-button size="small" :loading="refreshing" @click="refreshAll">刷新数据</a-button>
++    </div>
++
++    <a-alert v-if="treeError" type="error" :message="treeError" show-icon class="display-page__alert" />
++
++    <template v-if="validInstanceId">
++      <a-row :gutter="16">
++        <a-col :span="10">
++          <device-status-zone ref="statusRef" :instance-id="instanceId" />
++        </a-col>
++        <a-col :span="14">
++          <device-realtime-zone ref="realtimeRef" :instance-id="instanceId" :items="items" @refresh="refreshAll" />
++        </a-col>
++      </a-row>
++
++      <div class="device-detail__section">
++        <device-curve-zone ref="curveRef" :instance-id="instanceId" :points="points" @refresh="refreshAll" />
++      </div>
++
++      <div class="device-detail__section">
++        <device-trace-zone ref="traceRef" :instance-id="instanceId" :items="items" />
++      </div>
++
++      <div class="device-detail__section">
++        <device-component-zone :items="items" :points="points" :metrics="metrics" @trace="onTrace" />
++      </div>
++    </template>
++    <a-empty v-else description="设备不存在或实例参数无效（instanceId 缺失）" class="display-page__empty" />
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted, ref } from 'vue';
++  import { useRoute, useRouter } from 'vue-router';
++  import LeftOutlined from '@ant-design/icons-vue/LeftOutlined';
++  import { displayApi, findNode, type DisplayDataItem, type DisplayMetric, type DisplayPoint } from '/@/api/display/display-api';
++  import { useDisplayTree } from '../composables/use-display-tree';
++  import DeviceStatusZone from './device-status-zone.vue';
++  import DeviceRealtimeZone from './device-realtime-zone.vue';
++  import DeviceCurveZone from './device-curve-zone.vue';
++  import DeviceTraceZone from './device-trace-zone.vue';
++  import DeviceComponentZone from './device-component-zone.vue';
++
++  const route = useRoute();
++  const router = useRouter();
++  const { tree, error: treeError, loadTree } = useDisplayTree();
++
++  const instanceId = computed(() => Number(route.query.instanceId));
++  const validInstanceId = computed(() => Number.isFinite(instanceId.value) && instanceId.value > 0);
++  const device = computed(() => findNode(tree.value, instanceId.value));
++
++  const items = ref<DisplayDataItem[]>([]);
++  const points = ref<DisplayPoint[]>([]);
++  const metrics = ref<DisplayMetric[]>([]);
++  const refreshing = ref(false);
++
++  const statusRef = ref<InstanceType<typeof DeviceStatusZone> | null>(null);
++  const realtimeRef = ref<InstanceType<typeof DeviceRealtimeZone> | null>(null);
++  const curveRef = ref<InstanceType<typeof DeviceCurveZone> | null>(null);
++  const traceRef = ref<InstanceType<typeof DeviceTraceZone> | null>(null);
++
++  function goBack() {
++    // 从车间页进入时返回车间（params 在前一路由中）；直达时回总览
++    const factoryId = route.query.factoryId;
++    const workshopId = route.query.workshopId;
++    if (factoryId && workshopId) {
++      void router.push({ name: 'DisplayWorkshop', params: { factoryId: String(factoryId), workshopId: String(workshopId) } });
++    } else {
++      void router.push({ name: 'DisplayOverview' });
++    }
++  }
++
++  async function loadBase() {
++    if (!validInstanceId.value) return;
++    try {
++      // 组件清单三源并行；任一失败不造假（各列表内部已对 null 归一为空）
++      const [itemList, pointList, metricList] = await Promise.all([
++        displayApi.queryItemList(instanceId.value).catch(() => []),
++        displayApi.queryPointList(instanceId.value).catch(() => []),
++        displayApi.queryMetricList(instanceId.value).catch(() => []),
++      ]);
++      items.value = itemList;
++      points.value = pointList;
++      metrics.value = metricList;
++    } catch (e) {
++      items.value = [];
++      points.value = [];
++      metrics.value = [];
++      console.error('[display] device base load failed:', e);
++    }
++  }
++
++  async function refreshAll() {
++    refreshing.value = true;
++    try {
++      await loadBase();
++      await Promise.all([statusRef.value?.load(), realtimeRef.value?.load(), curveRef.value?.load()]);
++    } finally {
++      refreshing.value = false;
++    }
++  }
++
++  function onTrace(itemId: number) {
++    const item = items.value.find((i) => i.id === itemId);
++    // 组件清单「查看来源」→ 展开追溯面板对应项（页面内定位，不新增点击层级）
++    if (traceRef.value && item) void traceRef.value.loadDetail(item);
++    void router.push({ query: { ...route.query, traceItemId: String(itemId) } });
++  }
++
++  onMounted(() => {
++    void loadTree();
++    void loadBase();
++  });
++</script>
+diff --git a/frontend/src/views/display/display.less b/frontend/src/views/display/display.less
+index d2cd7f2..42ff26c 100644
+--- a/frontend/src/views/display/display.less
++++ b/frontend/src/views/display/display.less
+@@ -47,3 +47,185 @@
+   color: #999;
+   font-size: 12px;
+ }
++
++// 设备详情页（TASK-0059）四区公共样式
++.device-detail__section {
++  margin-top: 16px;
++}
++
++.device-status-zone {
++  &__current {
++    display: flex;
++    gap: 16px;
++    align-items: stretch;
++  }
++  &__block {
++    display: flex;
++    flex: 0 0 140px;
++    flex-direction: column;
++    align-items: center;
++    justify-content: center;
++    min-height: 110px;
++    color: #fff;
++    border-radius: 6px;
++    &--unknown {
++      color: #595959;
++      background: #f0f0f0;
++    }
++  }
++  &__name {
++    font-size: 20px;
++    font-weight: 600;
++  }
++  &__code {
++    margin-top: 4px;
++    font-size: 12px;
++    opacity: 0.85;
++  }
++  &__meta {
++    display: flex;
++    flex: 1;
++    flex-direction: column;
++    justify-content: center;
++    gap: 4px;
++    font-size: 13px;
++  }
++  &__ts,
++  &__quality {
++    color: #8c8c8c;
++  }
++  &__timeline-title {
++    margin-top: 16px;
++    margin-bottom: 8px;
++    font-weight: 600;
++  }
++  &__timeline {
++    max-height: 220px;
++    overflow: auto;
++  }
++  &__tl-name {
++    font-weight: 500;
++  }
++  &__tl-ts {
++    margin-left: 8px;
++    color: #8c8c8c;
++    font-size: 12px;
++  }
++  &__tl-q {
++    margin-left: 6px;
++    color: #fa8c16;
++    font-size: 12px;
++  }
++  &__empty {
++    padding: 24px 0;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++  }
++}
++
++.device-realtime-zone {
++  &__value {
++    font-weight: 500;
++    &--red {
++      color: #ff4d4f;
++    }
++    &--grey {
++      color: #bfbfbf;
++    }
++  }
++  &__source {
++    color: #8c8c8c;
++    font-size: 12px;
++  }
++  &__empty {
++    padding: 24px 0;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++  }
++}
++
++.device-curve-zone {
++  &__annotation {
++    margin-bottom: 8px;
++    padding: 6px 10px;
++    color: #fa8c16;
++    font-size: 12px;
++    background: #fff7e6;
++    border-radius: 4px;
++    &--raw {
++      color: #52c41a;
++      background: #f6ffed;
++    }
++  }
++  &__limit {
++    margin-left: 8px;
++    color: #8c8c8c;
++  }
++  &__chart {
++    width: 100%;
++    height: 340px;
++  }
++  &__legend-note {
++    margin-top: 6px;
++    color: #8c8c8c;
++    font-size: 12px;
++  }
++  &__empty {
++    padding: 60px 0;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++  }
++}
++
++.device-trace-zone {
++  &__hint {
++    color: #8c8c8c;
++    font-size: 12px;
++  }
++  &__row {
++    display: flex;
++    gap: 12px;
++    align-items: baseline;
++    padding: 3px 0;
++    font-size: 13px;
++  }
++  &__label {
++    flex: 0 0 80px;
++    color: #8c8c8c;
++  }
++  &__section-title {
++    margin: 12px 0 8px;
++    font-weight: 600;
++  }
++  &__pending {
++    color: #bfbfbf;
++    font-size: 12px;
++  }
++  &__footnote {
++    margin-top: 12px;
++    color: #bfbfbf;
++    font-size: 12px;
++  }
++  &__empty {
++    padding: 24px 0;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++  }
++}
++
++.device-component-zone {
++  &__detail {
++    color: #595959;
++    font-size: 12px;
++  }
++  &__empty {
++    padding: 24px 0;
++    color: #999;
++    font-size: 12px;
++    text-align: center;
++  }
++}
+diff --git a/frontend/src/views/display/workshop/index.vue b/frontend/src/views/display/workshop/index.vue
+index e42863a..09d8f7b 100644
+--- a/frontend/src/views/display/workshop/index.vue
++++ b/frontend/src/views/display/workshop/index.vue
+@@ -2,9 +2,9 @@
+   * 展示端车间 / 产线页（TASK-0058 批次一）
+   *
+   * 设备列表 = 实例树车间（或产线）节点的设备级真数据（nodeType=4，无权重节点后端已裁剪）；
+-  * 设备状态色块、实时值 = 空态槽位（0050 状态读口 / 0045 未交付，不造假数字，状态色块仅占位）；
+-  * 设备详情入口本批不写死链（0059 承接）——设备行只展示，不提供跳转。
+-  * 下钻深度：总览(0)→工厂(1)→车间(2)，全程 2 次点击；设备详情将作为第 3 次（批次二接入）。
++  * 设备状态色块、实时值 = 空态槽位（0058 批一——0059 详情页已落地，此处槽位保留不造假）；
++  * 点击设备色块 → /display/device?instanceId=（TASK-0059 第 3 次点击，下钻≤3 不破坏）。
++  * 下钻深度：总览(0)→工厂(1)→车间(2)→设备详情(3)。
+ -->
+ <template>
+   <div class="display-page">
+@@ -30,7 +30,7 @@
+         <h3 class="display-page__section-title">设备列表</h3>
+         <a-row v-if="devices.length" :gutter="16">
+           <a-col v-for="dev in sortedDevices" :key="dev.id" :span="8" :class="{ 'display-page__pinned': dev.mark }">
+-            <a-card size="small" :bordered="false" :hoverable="true" class="display-device-card">
++            <a-card size="small" :bordered="false" :hoverable="true" class="display-device-card" @click="onOpenDevice(dev)">
+               <template #title>
+                 <span class="display-device-card__title">
+                   <span v-if="dev.mark" class="display-device-card__mark" title="上看板">上看板</span>
+@@ -59,7 +59,7 @@
+   import { computed, onMounted } from 'vue';
+   import { useRoute, useRouter } from 'vue-router';
+   import LeftOutlined from '@ant-design/icons-vue/LeftOutlined';
+-  import { descendantsOfType, findNode, DISPLAY_NODE_TYPE } from '/@/api/display/display-api';
++  import { descendantsOfType, findNode, DISPLAY_NODE_TYPE, type DisplayTreeNode } from '/@/api/display/display-api';
+   import DisplaySlotCard from '../components/display-slot-card.vue';
+   import { useDisplayTree } from '../composables/use-display-tree';
+ 
+@@ -78,6 +78,19 @@
+   const devices = computed(() => (section.value ? descendantsOfType(tree.value, section.value.id, DISPLAY_NODE_TYPE.DEVICE) : []));
+   const sortedDevices = computed(() => [...devices.value].sort((a, b) => Number(!!b.mark) - Number(!!a.mark)));
+ 
++  /** 第 3 次点击：设备色块 → 详情页（查询参数 instanceId + 返回用的 factory/workshopId）。 */
++  function onOpenDevice(dev: DisplayTreeNode) {
++    if (dev.status === 0) return;
++    void router.push({
++      name: 'DisplayDeviceDetail',
++      query: {
++        instanceId: String(dev.id),
++        factoryId: factoryId.value,
++        workshopId: String(workshopId.value),
++      },
++    });
++  }
++
+   onMounted(() => void loadTree());
+ </script>
+ <style scoped lang="less">
+diff --git a/frontend/tests/unit/display/device-utils.spec.ts b/frontend/tests/unit/display/device-utils.spec.ts
+new file mode 100644
+index 0000000..f92dc90
+--- /dev/null
++++ b/frontend/tests/unit/display/device-utils.spec.ts
+@@ -0,0 +1,95 @@
++/*
++ * 设备详情页纯函数单测（TASK-0059）
++ *
++ * 覆盖验收口径：质量码 0-5/10 映射（ADR-0009/ADR-0010）、超限标红 + 离线灰显
++ * （REQ-0030 验收 3）、降采样分档标注必现（ADR-0010 留痕，不静默降采样）、
++ * 持续时长 UNKNOWN 空态（0050 changeTime=null）、空输入不造假。
++ */
++import { describe, expect, it } from 'vitest';
++import {
++  downsampleSeries,
++  formatDuration,
++  formatTs,
++  isOffline,
++  isOverLimit,
++  pickDownsampleTier,
++  qualityMeta,
++  realtimeDisplayState,
++  valueExceedsAlarm,
++} from '/@/views/display/device/device-utils';
++
++describe('device quality-code semantics (REQ-0030 验收 3)', () => {
++  it('质量码 0-5/10 语义映射：超限 1/2 红、断线 3 灰、手工 5、比对偏差 10', () => {
++    expect(qualityMeta(0)).toMatchObject({ label: '正常', tone: 'normal' });
++    expect(qualityMeta(1).tone).toBe('alarm');
++    expect(qualityMeta(2).tone).toBe('alarm');
++    expect(qualityMeta(3).tone).toBe('offline');
++    expect(qualityMeta(5).tone).toBe('manual');
++    expect(qualityMeta(10).tone).toBe('warn');
++    expect(qualityMeta(999).label).toContain('未知质量码');
++    expect(isOverLimit(1)).toBe(true);
++    expect(isOverLimit(2)).toBe(true);
++    expect(isOverLimit(0)).toBe(false);
++    expect(isOffline(3)).toBe(true);
++    expect(isOffline(0)).toBe(false);
++  });
++
++  it('超限标红 / 离线灰显：离线优先灰显，两态不叠加；阈值 alarm 越界补充标红', () => {
++    expect(realtimeDisplayState(1, 10, {}).red).toBe(true);
++    expect(realtimeDisplayState(3, 10, {}).grey).toBe(true);
++    expect(realtimeDisplayState(3, 10, {}).red).toBe(false);
++    expect(realtimeDisplayState(0, 100, { alarmHigh: 80 }).red).toBe(true);
++    expect(realtimeDisplayState(0, 50, { alarmHigh: 80, alarmLow: 10 }).red).toBe(false);
++    expect(valueExceedsAlarm(null, { alarmHigh: 80 })).toBe(false);
++  });
++});
++
++describe('device downsampling annotation (ADR-0010 留痕)', () => {
++  it('按跨度分档：≤2h 原始、≤24h 60s、≤7d 300s、更长 3600s', () => {
++    expect(pickDownsampleTier(0, 60 * 60 * 1000).method).toBe('原始粒度');
++    expect(pickDownsampleTier(0, 3 * 60 * 60 * 1000).bucketMs).toBe(60_000);
++    expect(pickDownsampleTier(0, 24 * 60 * 60 * 1000).bucketMs).toBe(60_000);
++    expect(pickDownsampleTier(0, 2 * 24 * 60 * 60 * 1000).bucketMs).toBe(300_000);
++    expect(pickDownsampleTier(0, 30 * 24 * 60 * 60 * 1000).bucketMs).toBe(3_600_000);
++  });
++
++  it('降采样标注始终可见且带分档方式，绝不静默降采样', () => {
++    const pts = [
++      { ts: '2026-01-01T00:00:00.000Z', value: 1, quality: 0 },
++      { ts: '2026-01-01T00:00:30.000Z', value: 2, quality: 1 },
++      { ts: '2026-01-01T00:01:00.000Z', value: 3, quality: 0 },
++    ];
++    const tier = pickDownsampleTier(0, 3 * 60 * 60 * 1000); // 60s 档
++    const result = downsampleSeries(pts, tier);
++    expect(result.annotation).toContain('降采样结果');
++    expect(result.annotation).toContain('60s');
++    expect(result.samples.length).toBeGreaterThan(0);
++    // 60s 档每桶取最新：第 2 桶取 value=3，质量码随最新点=0
++    expect(result.samples[result.samples.length - 1].value).toBe(3);
++  });
++
++  it('空输入 / 无有效点 → 空 samples 但标注仍在（空态不造假）', () => {
++    const result = downsampleSeries([], pickDownsampleTier(0, 60_000));
++    expect(result.samples).toEqual([]);
++    expect(result.annotation).toBeTruthy();
++    expect(downsampleSeries([{ ts: null, value: 5, quality: 0 }], pickDownsampleTier(0, 60_000)).samples).toEqual([]);
++  });
++});
++
++describe('device status duration / time (0050 同源 UNKNOWN 口径)', () => {
++  it('changeTime=null → 持续时长「未知」（不编造起始时刻）', () => {
++    expect(formatDuration(null)).toBe('未知');
++    expect(formatDuration(undefined, 1_000_000)).toBe('未知');
++  });
++
++  it('changeTime 有值 → 按 now 差值给出可读时长', () => {
++    const now = 1_000_000;
++    expect(formatDuration(now - 5_000, now)).toBe('5 秒');
++    expect(formatDuration(now - 120_000, now)).toBe('2 分 0 秒');
++  });
++
++  it('时间戳格式化：null 显示占位符，不编造', () => {
++    expect(formatTs(null)).toBe('—');
++    expect(formatTs('')).toBe('');
++  });
++});
+diff --git a/frontend/tests/unit/display/display-routes.spec.ts b/frontend/tests/unit/display/display-routes.spec.ts
+index 32ff88f..955c478 100644
+--- a/frontend/tests/unit/display/display-routes.spec.ts
++++ b/frontend/tests/unit/display/display-routes.spec.ts
+@@ -1,27 +1,32 @@
+ /*
+- * 展示端路由单测（TASK-0058 批次一）
++ * 展示端路由单测（TASK-0058 批次一 / TASK-0059 设备详情页）
+  *
+- * 覆盖：三页路由路径/命名、下钻深度 ≤3（总览 0→工厂 1→车间 2，设备详情 3 本批未注册=
+- * 不写死链）、需登录（无 meta.public）、hideInMenu（不进侧栏菜单树）、
+- * 与管理端 /iot/** 路径不混用。
++ * 覆盖：四页路由路径/命名（总览 / 工厂 / 车间 / 设备详情）、下钻深度 ≤3
++ * （总览 0→工厂 1→车间 2→设备详情 3）、需登录（无 meta.public）、
++ * hideInMenu（不进侧栏菜单树）、与管理端 /iot/** 路径不混用。
+  */
+ import { describe, expect, it } from 'vitest';
+ import { displayRouters } from '/@/router/display';
+ 
+ describe('display routes', () => {
+-  it('注册三条展示端路由：总览 / 工厂 / 车间，均在 /display/** 命名空间', () => {
+-    expect(displayRouters.map((r) => r.path)).toEqual(['/display', '/display/factory/:factoryId', '/display/workshop/:factoryId/:workshopId']);
+-    expect(displayRouters.map((r) => r.name)).toEqual(['DisplayOverview', 'DisplayFactory', 'DisplayWorkshop']);
++  it('注册四条展示端路由：总览 / 工厂 / 车间 / 设备详情，均在 /display/** 命名空间', () => {
++    expect(displayRouters.map((r) => r.path)).toEqual([
++      '/display',
++      '/display/factory/:factoryId',
++      '/display/workshop/:factoryId/:workshopId',
++      '/display/device',
++    ]);
++    expect(displayRouters.map((r) => r.name)).toEqual(['DisplayOverview', 'DisplayFactory', 'DisplayWorkshop', 'DisplayDeviceDetail']);
+   });
+ 
+-  it('下钻深度 ≤3：三级路径存在，第四级设备详情本批未注册（不写死链，由 0059 承接）', () => {
++  it('下钻深度 ≤3：设备详情为第 3 级（/display/device?instanceId=，查询参数不增路径段）', () => {
+     const paths = displayRouters.map((r) => r.path);
+     expect(paths).toContain('/display');
+     expect(paths).toContain('/display/factory/:factoryId');
+     expect(paths).toContain('/display/workshop/:factoryId/:workshopId');
+-    expect(paths.some((p) => p.includes('/device/'))).toBe(false);
+-    // 路径段计数：总览=1、工厂=3、车间=4（含 display 前缀与参数段）；无第 5 段=未注册设备详情下钻
+-    expect(paths.map((p) => p.split('/').filter(Boolean).length)).toEqual([1, 3, 4]);
++    expect(paths).toContain('/display/device');
++    // 路径段计数：总览=1、工厂=3、车间=4、设备详情=2（instanceId 走 query 不增段）。
++    expect(paths.map((p) => p.split('/').filter(Boolean).length)).toEqual([1, 3, 4, 2]);
+   });
+ 
+   it('需登录且不在侧栏菜单显示（与管理端 /iot/** 并存不混用）', () => {

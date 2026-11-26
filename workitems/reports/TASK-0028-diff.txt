@@ -1,0 +1,2374 @@
+diff --git a/ingest/README.md b/ingest/README.md
+index 5e39cab..f856712 100644
+--- a/ingest/README.md
++++ b/ingest/README.md
+@@ -11,24 +11,35 @@ ingest/
+ ├── cmd/ingestd/       # 服务入口（TASK-0027 接线：mux+httpapi+pipeline+consumer+对账）
+ ├── internal/
+ │   ├── message/       # 统一消息模型 v1.1.0 §3.2 解析器（信封纪律：空 points 4001、单消息 ≤500）
+-│   ├── quality/       # CONV-02 质量码 0-10 枚举与产品文本码映射（判定逻辑归 TASK-0028）
++│   ├── quality/       # CONV-02 质量码 0-10 枚举、文本码映射 + 量程二次判定合并规则（TASK-0028）
+ │   ├── snapshot/      # 配置快照 Schema v1.0.1 类型/校验、真客户端（哈希校验）、对账循环、缓存原子替换
+ │   ├── mqttsource/    # MQTT 消费源（§3.2 主题矩阵路由；Port 薄接口隔离 paho，TASK-0027）
+ │   ├── tdengine/      # 超级表契约 v1.0.0 写入侧：kind/表映射、附录 B DDL、INSERT 构造、假执行器
+ │   ├── cache/         # Redis 点位缓存抽象（值形态 v/q/ts，§3.5）+ 内存假实现
+ │   ├── gwtoken/       # 网关令牌链（凭据拉取/TTL 缓存/fail-closed 校验 + gatewayStatus，TASK-0076/0027）
+ │   ├── httpapi/       # HTTP 接入面（/ingest/v1/report、/ingest/v1/auth/mqtt，TASK-0076）
+-│   └── pipeline/      # 内核流水线组装：Consumer→Parser→校验→Batcher→Writer→Cache（幂等 TTL 真实现，TASK-0027）
++│   └── pipeline/      # 内核流水线组装：Consumer→Parser→四步校验→Batcher→Writer→Cache
++│                      # （幂等 TTL 真实现 0027；量程判定/时间三分裁决/死信统一通道 0028）
+ └── go.mod
+ ```
+ 
+-## 内核流水线（TASK-0073）
++## 内核流水线（TASK-0073，校验面 TASK-0028）
+ 
+-- 组件间只经接口交互；假实现（内存 channel 消费源、记录式 TDengine 执行器、内存去重、
+-  内存缓存、httptest 假快照端点）在 TASK-0027~0029 接线时零改动替换。
++- 组件间只经接口交互；假实现（内存 channel 消费源、记录式 TDengine 执行器、
++  内存缓存、httptest 假快照端点）在接线时零改动替换。
+ - 处理顺序冻结口径：验令牌与租户（租户必须来自消费侧令牌解析产物）→ 查配置快照 →
+   未知编码死信不落库 → 质量判定挂点 → 按 data_type 分发写 st_point_num / st_point_state
+   + 更新点位缓存。
++- 入库前校验四步（TASK-0028）：格式（信封级 Parse 整批拒绝 + 点位级非有限值防御）
++  → 量程（网关先填 + 快照 min/max 二次判定覆盖写 1/2，原值保留不丢弃不假 0，边界不算
++  越界，缺失跳过）→ 时间（三分裁决：ts 越界拒绝 ts_overflow/ts_too_old；未来窄带纠偏
++  为接收时间并打标；补传窗内原始 ts 落库不纠偏——§1.9A）→ 去重（点级幂等键靠后，
++  键取消息原始 ts；重复上报不产生重复死信计数）。
++- 死信统一通道（TASK-0028）：原因码枚举与拒绝明细对齐（unknown_code / ts_overflow /
++  ts_too_old / format_invalid / disabled_point / invalid_config / invalid_envelope）；
++  按租户+原因隔离计数（进程内有界 map，Redis 化演进位）；WARN 告警固定格式、
++  首次+每 N 条采样（INGEST_DEADLETTER_WARN_EVERY 默认 100）；最近明细进程内环形缓冲。
++  人工补录不走 ingest（ADR-0009 TD-0048）。
+ - 并发模型（起步口径）：单消费循环 + 有界队列（消费源有界通道，满则背压阻塞，
+   QoS1 至少一次语义下安全）+ 单 flusher；攒批水位（默认 500，FEAT-0009 口径 100-500）
+   或定时（默认 200ms）触发；攒批缓冲有界，满时丢最旧并计数（ADR-0014 FIFO 口径），
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index b87a0c9..1b671ba 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -17,10 +17,21 @@
+ //	INGEST_SNAPSHOT_TENANT      快照消歧租户编码（可选——跨租户同名 scope）
+ //	INGEST_SNAPSHOT_INTERVAL    对账周期（默认 30s）
+ //	INGEST_DEDUP_TTL            幂等键保留窗口（默认 1h——须 ≥ QoS1 重投窗口）
++//	INGEST_TS_FUTURE_REJECT     未来拒绝上界（TASK-0028：ts > now+该值 → ts_overflow 死信；
++//	                            默认 5m；now < ts ≤ 上界为未来窄带 → 纠偏为接收时间并打标）
++//	INGEST_TS_MAX_AGE           最大年龄（TASK-0028：ts < now-该值 → ts_too_old 死信；
++//	                            默认 30 天；now-该值 ≤ ts ≤ now 为补传豁免——§1.9A
++//	                            原始 ts 落库不纠偏）
++//	INGEST_DEADLETTER_WARN_EVERY 死信告警采样周期（首次 + 每 N 条各告警一次；默认 100）
+ //
+-// 组件口径（决策 3/4/6）：幂等=TTL 真实现（单实例形态）；快照=InternalSnapshotClient
++// 组件口径（决策 3/4/6 + TASK-0028）：幂等=TTL 真实现（单实例形态）；快照=InternalSnapshotClient
+ // 真客户端（哈希校验 + 0073 缓存原子替换）+ Reconciler 拉取对账（config.changed 通知
+-// 本期不消费）；writer=记录式假执行器（0029 换真写）；点位缓存=内存假实现（0029 Redis 化）。
++// 本期不消费）；质量判定挂点=RangeQualityJudge 真实现（网关先填 + min/max 量程二次
++// 判定覆盖写，CONV-02 口径）；死信出口=DeadLetterCounter 统一死信通道（租户隔离计数 +
++// 采样 WARN + 环形缓冲明细）；纠偏打标=CorrectionTagger（独立计数器 + 采样 WARN；
++// 不改 CONV-02 码域——枚举冻结）；writer=记录式假执行器（0029 换真写）；
++// 点位缓存=内存假实现（0029 Redis 化）。
++// 边界注记（ADR-0009 TD-0048）：人工补录/修正走管理面接口，ingest 不提供人工补录入口。
+ //
+ // 优雅停机：SIGTERM/SIGINT → HTTP Server 排空（Shutdown）→ 取消流水线/消费源/对账
+ // 语境 → broker 连接释放 → 退出。
+@@ -52,20 +63,23 @@ import (
+ 
+ // Config 服务配置（loadConfig 从环境变量装配）。
+ type Config struct {
+-	HTTPAddr         string
+-	BackendBaseURL   string
+-	InternalToken    string
+-	GatewayMap       map[string]gwtoken.ResolvedChannel
+-	MQTTBroker       string
+-	MQTTUsername     string
+-	MQTTPassword     string
+-	MQTTClientID     string
+-	RedisAddr        string // 0029 键位预留（本任务不消费）
+-	SnapshotScopeType int
+-	SnapshotScopeID  int64
+-	SnapshotTenant   string
+-	SnapshotInterval time.Duration
+-	DedupTTL         time.Duration
++	HTTPAddr            string
++	BackendBaseURL      string
++	InternalToken       string
++	GatewayMap          map[string]gwtoken.ResolvedChannel
++	MQTTBroker          string
++	MQTTUsername        string
++	MQTTPassword        string
++	MQTTClientID        string
++	RedisAddr           string // 0029 键位预留（本任务不消费）
++	SnapshotScopeType   int
++	SnapshotScopeID     int64
++	SnapshotTenant      string
++	SnapshotInterval    time.Duration
++	DedupTTL            time.Duration
++	TSFutureReject      time.Duration // INGEST_TS_FUTURE_REJECT（默认 5m）
++	TSMaxAge            time.Duration // INGEST_TS_MAX_AGE（默认 30 天）
++	DeadLetterWarnEvery int           // INGEST_DEADLETTER_WARN_EVERY（默认 100）
+ 
+ 	bound chan string // 绑定地址观测（测试/冒烟；nil = 不上报）
+ }
+@@ -73,18 +87,21 @@ type Config struct {
+ // loadConfig 从环境变量装配配置（缺省值见包注释）。
+ func loadConfig(getenv func(string) string) Config {
+ 	cfg := Config{
+-		HTTPAddr:         getenv("INGEST_HTTP_ADDR"),
+-		BackendBaseURL:   getenv("INGEST_BACKEND_BASE_URL"),
+-		InternalToken:    getenv("INGEST_INTERNAL_TOKEN"),
+-		MQTTBroker:       getenv("INGEST_MQTT_BROKER"),
+-		MQTTUsername:     getenv("INGEST_MQTT_USERNAME"),
+-		MQTTPassword:     getenv("INGEST_MQTT_PASSWORD"),
+-		MQTTClientID:     getenv("INGEST_MQTT_CLIENT_ID"),
+-		RedisAddr:        getenv("INGEST_REDIS_ADDR"),
+-		SnapshotTenant:   getenv("INGEST_SNAPSHOT_TENANT"),
+-		SnapshotInterval: 30 * time.Second,
+-		DedupTTL:         time.Hour,
+-		GatewayMap:       map[string]gwtoken.ResolvedChannel{},
++		HTTPAddr:            getenv("INGEST_HTTP_ADDR"),
++		BackendBaseURL:      getenv("INGEST_BACKEND_BASE_URL"),
++		InternalToken:       getenv("INGEST_INTERNAL_TOKEN"),
++		MQTTBroker:          getenv("INGEST_MQTT_BROKER"),
++		MQTTUsername:        getenv("INGEST_MQTT_USERNAME"),
++		MQTTPassword:        getenv("INGEST_MQTT_PASSWORD"),
++		MQTTClientID:        getenv("INGEST_MQTT_CLIENT_ID"),
++		RedisAddr:           getenv("INGEST_REDIS_ADDR"),
++		SnapshotTenant:      getenv("INGEST_SNAPSHOT_TENANT"),
++		SnapshotInterval:    30 * time.Second,
++		DedupTTL:            time.Hour,
++		TSFutureReject:      pipeline.DefaultTSFutureReject,
++		TSMaxAge:            pipeline.DefaultTSMaxAge,
++		DeadLetterWarnEvery: 100,
++		GatewayMap:          map[string]gwtoken.ResolvedChannel{},
+ 	}
+ 	if cfg.HTTPAddr == "" {
+ 		cfg.HTTPAddr = ":8090"
+@@ -104,6 +121,21 @@ func loadConfig(getenv func(string) string) Config {
+ 			cfg.DedupTTL = d
+ 		}
+ 	}
++	if v := getenv("INGEST_TS_FUTURE_REJECT"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			cfg.TSFutureReject = d
++		}
++	}
++	if v := getenv("INGEST_TS_MAX_AGE"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			cfg.TSMaxAge = d
++		}
++	}
++	if v := getenv("INGEST_DEADLETTER_WARN_EVERY"); v != "" {
++		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
++			cfg.DeadLetterWarnEvery = n
++		}
++	}
+ 	for _, entry := range strings.Split(getenv("INGEST_GATEWAY_MAP"), ";") {
+ 		entry = strings.TrimSpace(entry)
+ 		if entry == "" {
+@@ -147,29 +179,40 @@ func parseScope(v string) (int, int64, error) {
+ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	logger := log.Default()
+ 
+-	// ---- 流水线组件（决策 3/4/6 口径）----
++	// ---- 流水线组件（决策 3/4/6 口径 + TASK-0028 校验流水线接线）----
+ 	pctx, pcancel := context.WithCancel(ctx)
+ 	defer pcancel()
+ 
+-	batchDedup := pipeline.NewTTLBatchDeduper(0, cfg.DedupTTL)   // 幂等真实现（单实例形态）
+-	pointDedup := pipeline.NewTTLPointDeduper(0, cfg.DedupTTL)   // 多实例演进位=Redis 化（0028 定版）
+-	exec := tdengine.NewFakeExecutor(0)                          // 记录式假执行器（0029 换真写）
+-	ptCache := cache.NewMemoryPointCache()                       // 内存假实现（0029 Redis 化）
+-	snapCache := snapshot.NewCache()                             // 0073 原子替换缓存
++	batchDedup := pipeline.NewTTLBatchDeduper(0, cfg.DedupTTL) // 幂等真实现（单实例形态）
++	pointDedup := pipeline.NewTTLPointDeduper(0, cfg.DedupTTL) // 多实例演进位=Redis 化（0028 定版）
++	exec := tdengine.NewFakeExecutor(0)                        // 记录式假执行器（0029 换真写）
++	ptCache := cache.NewMemoryPointCache()                     // 内存假实现（0029 Redis 化）
++	snapCache := snapshot.NewCache()                           // 0073 原子替换缓存
++	deadCounter := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{
++		WarnEvery: cfg.DeadLetterWarnEvery, // 统一死信通道：租户隔离计数 + 采样 WARN（brief 裁决 2）
++	})
++	correctionTagger := pipeline.NewCorrectionTagger(0, logger) // 纠偏打标：独立计数器 + 采样 WARN（裁决 3）
+ 
+ 	deps := pipeline.Deps{
+ 		Parser:    message.Parser{},
+ 		Snapshots: snapCache,
+ 		Batches:   batchDedup,
+ 		Points:    pointDedup,
++		Judge:     pipeline.RangeQualityJudge, // 质量挂点真实现：网关先填 + min/max 二次判定覆盖写
++		Dead:      deadCounter,
++		TimeTag:   correctionTagger.Tag,
+ 		Writer:    &tdengine.Writer{Ex: exec},
+ 		Cache:     ptCache,
+ 	}
++	pipeCfg := pipeline.Config{
++		TSFutureReject: cfg.TSFutureReject, // 时间三分裁决阈值（env 配置化，brief 裁决 3）
++		TSMaxAge:       cfg.TSMaxAge,
++	}
+ 	var pipe *pipeline.Pipeline
+ 	if cfg.MQTTBroker != "" {
+ 		consumer := mqttsource.NewConsumer(port, mqttsource.Options{})
+ 		deps.Consumer = consumer
+-		p, err := pipeline.Assemble(pipeline.Config{}, deps)
++		p, err := pipeline.Assemble(pipeCfg, deps)
+ 		if err != nil {
+ 			return fmt.Errorf("ingestd: 流水线装配失败: %w", err)
+ 		}
+@@ -183,7 +226,7 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 		logger.Printf("ingestd: MQTT 消费源已装配 broker=%s", cfg.MQTTBroker)
+ 	} else {
+ 		deps.Consumer = idleConsumer{}
+-		p, err := pipeline.Assemble(pipeline.Config{}, deps)
++		p, err := pipeline.Assemble(pipeCfg, deps)
+ 		if err != nil {
+ 			return fmt.Errorf("ingestd: 流水线装配失败: %w", err)
+ 		}
+@@ -249,7 +292,7 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	if err := srv.Shutdown(shutCtx); err != nil {
+ 		logger.Printf("ingestd: HTTP 排空超时（强制返回）: %v", err)
+ 	}
+-	pcancel() // 排空流水线/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
++	pcancel()                         // 排空流水线/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
+ 	time.Sleep(50 * time.Millisecond) // 给消费源 goroutine 一拍退出（连接释放可观测）
+ 	logger.Print("ingestd: 已停机")
+ 	return nil
+diff --git a/ingest/cmd/ingestd/main_test.go b/ingest/cmd/ingestd/main_test.go
+index 901c5b2..9868893 100644
+--- a/ingest/cmd/ingestd/main_test.go
++++ b/ingest/cmd/ingestd/main_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/http/httptest"
+ 	"strings"
+ 	"sync"
+ 	"testing"
+@@ -25,6 +26,7 @@ func getenvOf(env map[string]string) func(string) string {
+ 
+ // 契约依据：决策 1 配置键位——INGEST_HTTP_ADDR 默认 :8090（端口纪律：不占 8098/8099）；
+ // INGEST_REDIS_ADDR 为 0029 键位预留（本任务不消费）；快照对账间隔/幂等 TTL 有默认值。
++// TASK-0028 时间/死信键位默认：未来拒绝 5m、最大年龄 30 天、死信告警采样 100。
+ func TestIngestdLoadConfigDefaults(t *testing.T) {
+ 	cfg := loadConfig(getenvOf(nil))
+ 	if cfg.HTTPAddr != ":8090" {
+@@ -36,23 +38,35 @@ func TestIngestdLoadConfigDefaults(t *testing.T) {
+ 	if cfg.DedupTTL != time.Hour {
+ 		t.Errorf("DedupTTL = %v, want 1h（幂等窗口默认）", cfg.DedupTTL)
+ 	}
++	if cfg.TSFutureReject != 5*time.Minute {
++		t.Errorf("TSFutureReject = %v, want 5m（INGEST_TS_FUTURE_REJECT 默认）", cfg.TSFutureReject)
++	}
++	if cfg.TSMaxAge != 30*24*time.Hour {
++		t.Errorf("TSMaxAge = %v, want 30 天（INGEST_TS_MAX_AGE 默认）", cfg.TSMaxAge)
++	}
++	if cfg.DeadLetterWarnEvery != 100 {
++		t.Errorf("DeadLetterWarnEvery = %d, want 100（INGEST_DEADLETTER_WARN_EVERY 默认）", cfg.DeadLetterWarnEvery)
++	}
+ }
+ 
+ // 契约依据：决策 1——配置走环境变量（覆盖默认值）；快照 scope 形态 "scopeType:scopeId"。
+ func TestIngestdLoadConfigFromEnv(t *testing.T) {
+ 	cfg := loadConfig(getenvOf(map[string]string{
+-		"INGEST_HTTP_ADDR":         ":18091",
+-		"INGEST_BACKEND_BASE_URL":  "http://127.0.0.1:8098",
+-		"INGEST_INTERNAL_TOKEN":    "tok-main",
+-		"INGEST_MQTT_BROKER":       "tcp://127.0.0.1:1883",
+-		"INGEST_MQTT_USERNAME":     "u",
+-		"INGEST_MQTT_PASSWORD":     "p",
+-		"INGEST_REDIS_ADDR":        "127.0.0.1:6379",
+-		"INGEST_SNAPSHOT_SCOPE":    "1:9111",
+-		"INGEST_SNAPSHOT_TENANT":   "default",
+-		"INGEST_SNAPSHOT_INTERVAL": "5s",
+-		"INGEST_DEDUP_TTL":         "2h",
+-		"INGEST_GATEWAY_MAP":       "GW_A:7:default;GW_B:9:group_a",
++		"INGEST_HTTP_ADDR":             ":18091",
++		"INGEST_BACKEND_BASE_URL":      "http://127.0.0.1:8098",
++		"INGEST_INTERNAL_TOKEN":        "tok-main",
++		"INGEST_MQTT_BROKER":           "tcp://127.0.0.1:1883",
++		"INGEST_MQTT_USERNAME":         "u",
++		"INGEST_MQTT_PASSWORD":         "p",
++		"INGEST_REDIS_ADDR":            "127.0.0.1:6379",
++		"INGEST_SNAPSHOT_SCOPE":        "1:9111",
++		"INGEST_SNAPSHOT_TENANT":       "default",
++		"INGEST_SNAPSHOT_INTERVAL":     "5s",
++		"INGEST_DEDUP_TTL":             "2h",
++		"INGEST_GATEWAY_MAP":           "GW_A:7:default;GW_B:9:group_a",
++		"INGEST_TS_FUTURE_REJECT":      "90s",
++		"INGEST_TS_MAX_AGE":            "72h",
++		"INGEST_DEADLETTER_WARN_EVERY": "7",
+ 	}))
+ 	if cfg.HTTPAddr != ":18091" || cfg.BackendBaseURL != "http://127.0.0.1:8098" || cfg.InternalToken != "tok-main" {
+ 		t.Errorf("基础配置 = %+v", cfg)
+@@ -69,6 +83,12 @@ func TestIngestdLoadConfigFromEnv(t *testing.T) {
+ 	if cfg.SnapshotInterval != 5*time.Second || cfg.DedupTTL != 2*time.Hour {
+ 		t.Errorf("间隔/TTL = %v/%v", cfg.SnapshotInterval, cfg.DedupTTL)
+ 	}
++	if cfg.TSFutureReject != 90*time.Second || cfg.TSMaxAge != 72*time.Hour {
++		t.Errorf("时间阈值 = %v/%v, want 90s/72h", cfg.TSFutureReject, cfg.TSMaxAge)
++	}
++	if cfg.DeadLetterWarnEvery != 7 {
++		t.Errorf("DeadLetterWarnEvery = %d, want 7", cfg.DeadLetterWarnEvery)
++	}
+ 	if len(cfg.GatewayMap) != 2 {
+ 		t.Fatalf("GatewayMap = %v, want 2 条", cfg.GatewayMap)
+ 	}
+@@ -85,16 +105,16 @@ func TestIngestdLoadConfigFromEnv(t *testing.T) {
+ func TestIngestdAssemblySmoke(t *testing.T) {
+ 	port := &smokeFakePort{}
+ 	cfg := Config{
+-		HTTPAddr:         "127.0.0.1:0",
+-		BackendBaseURL:   "http://127.0.0.1:1", // 不可达：令牌链 fail-closed / 对账 fail-soft
+-		InternalToken:    "internal-tok",
+-		MQTTBroker:       "tcp://127.0.0.1:1", // 不可达：MQTT 消费源 fail-soft（指数退避）装配
+-		GatewayMap:       map[string]gwtoken.ResolvedChannel{"GW_SMOKE": {ChannelID: 7, TenantCode: "group_a"}},
++		HTTPAddr:          "127.0.0.1:0",
++		BackendBaseURL:    "http://127.0.0.1:1", // 不可达：令牌链 fail-closed / 对账 fail-soft
++		InternalToken:     "internal-tok",
++		MQTTBroker:        "tcp://127.0.0.1:1", // 不可达：MQTT 消费源 fail-soft（指数退避）装配
++		GatewayMap:        map[string]gwtoken.ResolvedChannel{"GW_SMOKE": {ChannelID: 7, TenantCode: "group_a"}},
+ 		SnapshotScopeType: 1,
+-		SnapshotScopeID:  88,
+-		SnapshotInterval: time.Hour,
+-		DedupTTL:         time.Hour,
+-		bound:            make(chan string, 1),
++		SnapshotScopeID:   88,
++		SnapshotInterval:  time.Hour,
++		DedupTTL:          time.Hour,
++		bound:             make(chan string, 1),
+ 	}
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+@@ -175,7 +195,7 @@ type smokeFakePort struct {
+ 	closed bool
+ }
+ 
+-func (p *smokeFakePort) Connect() error { return fmt.Errorf("smoke: broker 未配置") }
++func (p *smokeFakePort) Connect() error                               { return fmt.Errorf("smoke: broker 未配置") }
+ func (p *smokeFakePort) Subscribe(string, func(string, []byte)) error { return nil }
+ func (p *smokeFakePort) SetConnectionLostHandler(func(error))         {}
+ func (p *smokeFakePort) Close() {
+@@ -187,3 +207,165 @@ func (p *smokeFakePort) Close() {
+ var (
+ 	_ mqttsource.Port = (*smokeFakePort)(nil)
+ )
++
++// ---- TASK-0028 校验流水线装配接线（端到端：真 run() + 假 backend）----
++
++// wireSnapshotJSON 假 backend 下发的快照体（W_M01 双边量程 0-100；W_M02 无量程）。
++const wireSnapshotJSON = `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [
++    {"id":301,"tenantId":1,"pointCode":"W_M01","pointName":"带量程","dataType":1,"valueType":"DOUBLE","minValue":0,"maxValue":100,"deptId":3,"status":1},
++    {"id":302,"tenantId":1,"pointCode":"W_M02","pointName":"无量程","dataType":1,"valueType":"DOUBLE","deptId":3,"status":1}
++  ]
++}`
++
++// wireFakeBackend 假管理系统内部面：credential/pull + config/snapshot（信封形态照契约）。
++func wireFakeBackend(t *testing.T) *httptest.Server {
++	t.Helper()
++	hash := strings.Repeat("ab", 32) // 64 位小写 hex（对账锚点形态）
++	mux := http.NewServeMux()
++	mux.HandleFunc("/internal/v1/credential/pull", func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = w.Write([]byte(`{"code":200,"message":"ok","data":{"channelId":7,"credType":"HTTP_SECRET","ciphertext":"gw-wire-token","keyVersion":"1"}}`))
++	})
++	mux.HandleFunc("/internal/v1/config/snapshot", func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = w.Write([]byte(`{"code":200,"message":"ok","data":{"version":17,"snapshotHash":"` + hash +
++			`","snapshot":` + wireSnapshotJSON + `}}`))
++	})
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++// wireReport POST /ingest/v1/report 并解析受理结果。
++func wireReport(t *testing.T, base, batchID string, points ...string) map[string]any {
++	t.Helper()
++	body := fmt.Sprintf(`{"tenant":"group_a","gateway":"GW_WIRE","batchId":%q,"sentAt":%d,"points":[%s]}`,
++		batchID, time.Now().UnixMilli(), strings.Join(points, ","))
++	req, err := http.NewRequest(http.MethodPost, base+"/ingest/v1/report", strings.NewReader(body))
++	if err != nil {
++		t.Fatalf("构造 report 请求失败: %v", err)
++	}
++	req.Header.Set("X-Gateway-Token", "gw-wire-token")
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("report: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		b, _ := io.ReadAll(resp.Body)
++		t.Fatalf("report status = %d, want 200 body=%s", resp.StatusCode, b)
++	}
++	var out map[string]any
++	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
++		t.Fatalf("report 响应解析失败: %v", err)
++	}
++	return out
++}
++
++// num 读响应数值字段。
++func num(m map[string]any, key string) int {
++	v, _ := m[key].(float64)
++	return int(v)
++}
++
++// 契约依据：TASK-0028「既有挂点接线」——ingestd run() 真装配下校验流水线行为：
++// 快照真装载 → 越限值受理（量程只打码不拒绝）、未来窄带 ts 受理（纠偏）、
++// 越未来界 ts 拒绝（ts_overflow）、陈旧 ts 拒绝（ts_too_old）、未知编码拒绝（unknown_code）。
++// 拒绝原因码与 HTTP report 拒绝明细对齐（brief 裁决 2）。
++func TestIngestdValidationPipelineWiring(t *testing.T) {
++	backend := wireFakeBackend(t)
++	cfg := Config{
++		HTTPAddr:            "127.0.0.1:0",
++		BackendBaseURL:      backend.URL,
++		InternalToken:       "tok-wire",
++		GatewayMap:          map[string]gwtoken.ResolvedChannel{"GW_WIRE": {ChannelID: 7, TenantCode: "group_a"}},
++		SnapshotScopeType:   1,
++		SnapshotScopeID:     88,
++		SnapshotInterval:    time.Hour,
++		DedupTTL:            time.Hour,
++		TSFutureReject:      5 * time.Minute,
++		TSMaxAge:            30 * 24 * time.Hour,
++		DeadLetterWarnEvery: 100,
++		bound:               make(chan string, 1),
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { done <- run(ctx, cfg, nopPort{}) }()
++
++	var base string
++	select {
++	case addr := <-cfg.bound:
++		base = "http://" + addr
++	case err := <-done:
++		t.Fatalf("run 提前退出: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("绑定地址未上报")
++	}
++
++	// 探针：等快照对账装载（未知编码→受理即视为已装载；每次探针独立 batchId）。
++	probePoint := fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":1,"quality":0}`, time.Now().UnixMilli()-2000)
++	var probe map[string]any
++	deadline := time.Now().Add(3 * time.Second)
++	for i := 0; ; i++ {
++		probe = wireReport(t, base, fmt.Sprintf("WIRE-PROBE-%d", i), probePoint)
++		if num(probe, "accepted") == 1 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("快照未装载（探针超时）: %v", probe)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	nowMs := time.Now().UnixMilli()
++	// 1) 越限值受理（量程判定只打码不拒绝；原值保留）。
++	out := wireReport(t, base, "WIRE-OVER",
++		fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":500,"quality":0}`, nowMs-1000))
++	if num(out, "accepted") != 1 || num(out, "rejected") != 0 {
++		t.Errorf("越限值受理 = %v, want accepted=1 rejected=0（只打码不丢弃）", out)
++	}
++	// 2) 未来窄带（+2m）受理（纠偏为接收时间）。
++	out = wireReport(t, base, "WIRE-FUT",
++		fmt.Sprintf(`{"pointCode":"W_M02","ts":%d,"value":2,"quality":0}`, nowMs+2*60*1000))
++	if num(out, "accepted") != 1 || num(out, "rejected") != 0 {
++		t.Errorf("未来窄带受理 = %v, want accepted=1 rejected=0", out)
++	}
++	// 3) 越未来界（+10m > 5m）拒绝 ts_overflow。
++	out = wireReport(t, base, "WIRE-OVERFLOW",
++		fmt.Sprintf(`{"pointCode":"W_M02","ts":%d,"value":2,"quality":0}`, nowMs+10*60*1000))
++	if num(out, "rejected") != 1 {
++		t.Errorf("越未来界 = %v, want rejected=1", out)
++	}
++	if rj := out["rejections"].([]any); len(rj) != 1 || rj[0].(map[string]any)["reason"] != "ts_overflow" {
++		t.Errorf("拒绝明细 = %v, want reason=ts_overflow", out["rejections"])
++	}
++	// 4) 陈旧 ts（-40 天 < 30 天）拒绝 ts_too_old。
++	out = wireReport(t, base, "WIRE-STALE",
++		fmt.Sprintf(`{"pointCode":"W_M02","ts":%d,"value":2,"quality":0}`, nowMs-40*24*60*60*1000))
++	if num(out, "rejected") != 1 {
++		t.Errorf("陈旧 ts = %v, want rejected=1", out)
++	}
++	if rj := out["rejections"].([]any); len(rj) != 1 || rj[0].(map[string]any)["reason"] != "ts_too_old" {
++		t.Errorf("拒绝明细 = %v, want reason=ts_too_old", out["rejections"])
++	}
++	// 5) 未知编码拒绝 unknown_code（0027 语义保持）。
++	out = wireReport(t, base, "WIRE-UNKNOWN",
++		fmt.Sprintf(`{"pointCode":"W_X99_UNKNOWN","ts":%d,"value":2,"quality":0}`, nowMs-1000))
++	if num(out, "rejected") != 1 {
++		t.Errorf("未知编码 = %v, want rejected=1", out)
++	}
++	if rj := out["rejections"].([]any); len(rj) != 1 || rj[0].(map[string]any)["reason"] != "unknown_code" {
++		t.Errorf("拒绝明细 = %v, want reason=unknown_code", out["rejections"])
++	}
++
++	cancel()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("run error: %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("优雅停机超时")
++	}
++}
+diff --git a/ingest/internal/httpapi/report_contract_test.go b/ingest/internal/httpapi/report_contract_test.go
+index 5305dd6..02f3548 100644
+--- a/ingest/internal/httpapi/report_contract_test.go
++++ b/ingest/internal/httpapi/report_contract_test.go
+@@ -504,6 +504,7 @@ func newRealPipelineFixture(t *testing.T) *realPipelineFixture {
+ 		Writer:    &tdengine.Writer{Ex: f.exec},
+ 		Cache:     f.cache,
+ 		Dead:      f.sink,
++		Now:       func() time.Time { return time.UnixMilli(1795212000000) }, // TASK-0028 冻结时钟
+ 	}
+ 	p, err := pipeline.Assemble(pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond}, deps)
+ 	if err != nil {
+diff --git a/ingest/internal/mqttsource/twopath_contract_test.go b/ingest/internal/mqttsource/twopath_contract_test.go
+index d594b7f..2daf90d 100644
+--- a/ingest/internal/mqttsource/twopath_contract_test.go
++++ b/ingest/internal/mqttsource/twopath_contract_test.go
+@@ -89,6 +89,7 @@ func newIsoPipelineWithConsumer(t *testing.T, consumer pipeline.Consumer) *isoPi
+ 		Writer:    &tdengine.Writer{Ex: f.exec},
+ 		Cache:     f.ptCache,
+ 		Dead:      f.dead,
++		Now:       func() time.Time { return time.UnixMilli(1795212000000) }, // TASK-0028 冻结时钟：契约样例 ts 恒落补传豁免带
+ 	}
+ 	p, err := pipeline.Assemble(pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond}, deps)
+ 	if err != nil {
+diff --git a/ingest/internal/pipeline/deadletter.go b/ingest/internal/pipeline/deadletter.go
+new file mode 100644
+index 0000000..1e39804
+--- /dev/null
++++ b/ingest/internal/pipeline/deadletter.go
+@@ -0,0 +1,189 @@
++// deadletter.go 死信统一通道（TASK-0028 裁决 2）：0027 未知编码死信扩展为统一死信
++// 计数/告警/明细留存组件。
++//
++// 契约依据（TASK-0028 brief 裁决 2）：
++//   - 原因码枚举扩展（与 HTTP report 拒绝明细原因码对齐——SubmitRejection.Reason 同源）；
++//   - 按租户隔离计数：进程内有界 map（key=tenant+reason，FIFO 淘汰最旧键，对齐 ADR-0014
++//     有界口径）；多实例 Redis 化登记为演进位（单实例形态一期）；
++//   - 告警=WARN 日志：固定格式含租户/原因/计数，防风暴=首次 + 每 N 条采样
++//     （N 配置化 INGEST_DEADLETTER_WARN_EVERY，默认 100）；
++//   - 「异常队列单独存储」一期落地为进程内有界环形缓冲（最近 N 条明细，供排查读口）。
++package pipeline
++
++import (
++	"log"
++	"sync"
++
++	"net.otlab/ingest/internal/message"
++)
++
++// 死信原因码扩展（TASK-0028 裁决 2/3：时间三分裁决与点位级格式防御）。
++const (
++	// DeadLetterTsOverflow ts 越未来上界（ts > now+TSFutureReject，默认 now+5m）：
++	// 拒绝死信不落库（§3.2 时间戳越界为拒绝明细；MQTT 路径进死信计数、HTTP 路径进拒绝明细）。
++	DeadLetterTsOverflow DeadLetterReason = "ts_overflow"
++	// DeadLetterTsTooOld ts 越最大年龄（ts < now-TSMaxAge，默认 now-30 天）：
++	// 拒绝死信不落库（脏数据防线；补传豁免窗之外的一律拒绝）。
++	DeadLetterTsTooOld DeadLetterReason = "ts_too_old"
++	// DeadLetterFormatInvalid 点位级格式非法（防御分支：值非有限数——JSON 解析层
++	// 不可达，防注入式 Parser/未来解析器；信封级格式非法为 invalid_envelope 整批拒绝）。
++	DeadLetterFormatInvalid DeadLetterReason = "format_invalid"
++)
++
++// deadKey 计数键：租户 + 原因（brief 裁决 2：按租户隔离计数）。
++type deadKey struct {
++	tenant string
++	reason DeadLetterReason
++}
++
++// DeadLetterCounterOptions 死信计数器配置（零值取默认）。
++type DeadLetterCounterOptions struct {
++	// WarnEvery 告警采样周期：首次 + 每 N 条各告警一次。0 → 100。
++	WarnEvery int
++	// RecentCap 环形缓冲容量（最近 N 条明细）。0 → 128。
++	RecentCap int
++	// Cap 计数 map 容量（超限 FIFO 淘汰最旧键）。0 → 1024。
++	Cap int
++	// Logger WARN 日志出口。nil → log.Default()。
++	Logger *log.Logger
++	// Next 可选链式下游 DeadLetterSink（计数器不改变原出口行为）。
++	Next DeadLetterSink
++}
++
++// DeadLetterCounter 死信统一通道：按租户+原因隔离计数、采样 WARN 告警、
++// 有界环形缓冲留存最近明细。实现 DeadLetterSink。
++type DeadLetterCounter struct {
++	opts DeadLetterCounterOptions
++
++	mu     sync.Mutex
++	counts map[deadKey]int64
++	order  []deadKey // FIFO 淘汰序（未淘汰键的首入序，最旧在前）
++
++	ring       []DeadLetterRecord // 固定容量环形缓冲
++	ringNext   int                // 下一写入位
++	ringFilled int                // 已填充数（≤ 容量）
++
++	total int64
++}
++
++// NewDeadLetterCounter 创建死信计数器（选项零值取默认）。
++func NewDeadLetterCounter(opts DeadLetterCounterOptions) *DeadLetterCounter {
++	if opts.WarnEvery <= 0 {
++		opts.WarnEvery = 100
++	}
++	if opts.RecentCap <= 0 {
++		opts.RecentCap = 128
++	}
++	if opts.Cap <= 0 {
++		opts.Cap = 1024
++	}
++	if opts.Logger == nil {
++		opts.Logger = log.Default()
++	}
++	return &DeadLetterCounter{
++		opts:   opts,
++		counts: make(map[deadKey]int64),
++		ring:   make([]DeadLetterRecord, opts.RecentCap),
++	}
++}
++
++// OnDeadLetter 实现 DeadLetterSink：计数 → 采样告警 → 明细入环形缓冲 → 链式下游。
++func (c *DeadLetterCounter) OnDeadLetter(reason DeadLetterReason, tenant, batchID string, p *message.Point) {
++	k := deadKey{tenant: tenant, reason: reason}
++
++	c.mu.Lock()
++	// 有界 map：新键且容量满时按 FIFO 淘汰最旧键（order 恒为「未淘汰键的首入序」，
++	// 重复计数不改变位置；淘汰即整体前移一位——容量有界，前移开销可接受）。
++	if _, exists := c.counts[k]; !exists && len(c.order) >= c.opts.Cap {
++		old := c.order[0]
++		c.order = c.order[1:]
++		delete(c.counts, old)
++	}
++	c.counts[k]++
++	c.order = appendOrder(c.order, k)
++	c.ring[c.ringNext] = DeadLetterRecord{Reason: reason, Tenant: tenant, BatchID: batchID, Point: p}
++	c.ringNext = (c.ringNext + 1) % len(c.ring)
++	if c.ringFilled < len(c.ring) {
++		c.ringFilled++
++	}
++	c.total++
++	n := c.counts[k]
++	c.mu.Unlock()
++
++	// 告警采样：首次 + 每 N 条（防风暴；固定格式含租户/原因/计数）。
++	if n == 1 || n%int64(c.opts.WarnEvery) == 0 {
++		code := ""
++		if p != nil {
++			code = p.PointCode
++		}
++		c.opts.Logger.Printf("pipeline: [dead-letter] tenant=%s reason=%s count=%d pointCode=%s batchId=%s",
++			tenant, string(reason), n, code, batchID)
++	}
++
++	if c.opts.Next != nil {
++		c.opts.Next.OnDeadLetter(reason, tenant, batchID, p)
++	}
++}
++
++// appendOrder 把键追加到淘汰序尾部（已存在则先移除旧位再追加——LRU-FIFO 混合口径：
++// 淘汰序反映「首次入表序」，重复计数不改变位置）。
++func appendOrder(order []deadKey, k deadKey) []deadKey {
++	for i := range order {
++		if order[i] == k {
++			return order // 已在序中（未淘汰过的键重复计数不动位置）
++		}
++	}
++	return append(order, k)
++}
++
++// Count 返回指定租户+原因的当前计数（淘汰后为 0——有界 map 口径，持久计数归演进位）。
++func (c *DeadLetterCounter) Count(tenant string, reason DeadLetterReason) int64 {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.counts[deadKey{tenant: tenant, reason: reason}]
++}
++
++// Total 返回全部死信事件总数（含被 FIFO 淘汰键的历史计数）。
++func (c *DeadLetterCounter) Total() int64 {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.total
++}
++
++// DeadLetterCount 计数快照条目。
++type DeadLetterCount struct {
++	Tenant string
++	Reason DeadLetterReason
++	Count  int64
++}
++
++// Counts 返回当前全部计数快照（租户+原因分列）。
++func (c *DeadLetterCounter) Counts() []DeadLetterCount {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	out := make([]DeadLetterCount, 0, len(c.counts))
++	for k, n := range c.counts {
++		out = append(out, DeadLetterCount{Tenant: k.tenant, Reason: k.reason, Count: n})
++	}
++	return out
++}
++
++// Recent 返回最近 n 条死信明细（时序保留：最旧在前；不足 n 条返回全部）。
++// 排查读口（FEAT-0020 运维监控数据源挂点）。
++func (c *DeadLetterCounter) Recent(n int) []DeadLetterRecord {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if n <= 0 || c.ringFilled == 0 {
++		return nil
++	}
++	if n > c.ringFilled {
++		n = c.ringFilled
++	}
++	// ringNext 指向下一写入位；最近 n 条从 (ringNext-n) 起、按写入顺序读出。
++	first := (c.ringNext - n + len(c.ring)) % len(c.ring)
++	out := make([]DeadLetterRecord, 0, n)
++	for i := 0; i < n; i++ {
++		out = append(out, c.ring[(first+i)%len(c.ring)])
++	}
++	return out
++}
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+index 2bde895..0b9f658 100644
+--- a/ingest/internal/pipeline/pipeline.go
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -20,13 +20,24 @@
+ //
+ // 处理顺序（统一消息模型 v1.1.0 §3.2 冻结口径）：验令牌与租户（挂点：租户必须来自
+ // Consumer 侧令牌解析产物，不从消息自带 tenant 选库）→ 按 pointCode 查配置快照 →
+-// 未知编码进死信计数告警、不落库 → 质量判定（挂点，完整逻辑归 TASK-0028）→
++// 未知编码进死信计数告警、不落库 → 质量判定（挂点真实现 TASK-0028：量程二次判定）→
+ // 按 data_type 分发写 st_point_num / st_point_state + 更新 Redis 点位缓存。
+ //
++// 入库前校验流水线（TASK-0028：格式/量程/时间/去重四步，嵌入冻结五步之内——
++// 格式=信封级 Parse 整批拒绝 + 点位级防御〔非有限值 format_invalid〕；量程=质量判定
++// 挂点真实现〔只打码不拒绝，§3.2 覆盖写口径见 internal/quality〕；时间=三分裁决
++// 〔越界拒绝 / 未来窄带纠偏打标 / 补传豁免，见 timepolicy.go〕；去重=点级幂等键，
++// 靠后放置——重复上报不产生重复死信计数：同 batchId 重报被整批幂等吸收（零逐点
++// 处理），跨 batchId 重报已受理点过四步校验后被点级去重吸收（不产生死信事件）；
++// 被拒点（时间越界/未知编码等）不标记去重键，跨 batchId 重发按新事件计数——观测口径，
++// 采样告警防风暴；纠偏只改落库 ts、不改幂等键，(pointCode, ts) 去重取消息原始 ts）。
++//
++// 边界注记（ADR-0009 TD-0048）：人工补录/修正改走管理面接口（质量码 MANUAL=5 记操作
++// 审计），ingest 通道收敛为纯机器上报——本流水线不提供任何人工补录入口。
++//
+ // 内核简化口径（0027/0028 接线时收紧）：
+-//   - batchId / (pointCode, ts) 幂等去重为内存假实现（原子 MarkIfSeen——修订轮 C1，
+-//     并发同键重报恰一处理）；真实去重（崩溃安全）归 TASK-0028 经存储实现，
+-//     且必须保持 MarkIfSeen 原子语义；
++//   - batchId / (pointCode, ts) 幂等去重为 TTL 有界表真实现（TASK-0027 交付：原子
++//     MarkIfSeen——修订轮 C1，并发同键重报恰一处理；多实例 Redis 化登记演进位）；
+ //   - 整批标记在逐点校验前完成（接受即标记）；写失败重排后的重试不再过点级去重
+ //     （同一批已在接受时标记），避免自吞重排行。
+ package pipeline
+@@ -35,16 +46,24 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"math"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/cache"
+ 	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/quality"
+ 	"net.otlab/ingest/internal/snapshot"
+ 	"net.otlab/ingest/internal/tdengine"
+ )
+ 
++// isFinite 点位值可写性防御（四步校验格式步）：非有限值（NaN/±Inf）不可进 TDengine
++// 数值列，按 format_invalid 死信。
++func isFinite(v float64) bool {
++	return !math.IsNaN(v) && !math.IsInf(v, 0)
++}
++
+ // ---- 组件接口（假实现替换点）----
+ 
+ // Inbound 消费入站消息。
+@@ -87,12 +106,22 @@ type PointDeduper interface {
+ 	MarkIfSeen(pointCode string, ts int64) bool
+ }
+ 
+-// QualityJudge 质量判定挂点（处理顺序第 4 步）。完整判定逻辑（量程二次判定覆盖、
+-// 时间校验纠偏等）归 TASK-0028；内核默认网关 quality 直通。
++// QualityJudge 质量判定挂点（处理顺序第 4 步 / 四步校验之量程步）。量程二次判定
++// 合并规则见 internal/quality.MergeRange（TASK-0028 真实现）；时间校验纠偏为独立
++// 三分裁决步（timePolicy），不经本挂点（本挂点只产质量码、不拒绝）。
+ // 返回值必须是 CONV-02 质量码（internal/quality 0-10 枚举）。
+ type QualityJudge func(cfg *snapshot.Point, p *message.Point) int
+ 
+-// PassthroughJudge 默认判定挂点：网关能判断的先填，内核不做二次判定（TASK-0028 接手）。
++// RangeQualityJudge 质量判定挂点真实现（TASK-0028）：网关先填 + 按快照点位 min/max
++// 量程二次判定覆盖写（§3.2 口径：超限覆盖 1/2、非超限保留网关值、缺失跳过、
++// 边界不算越界、原值保留不丢弃）。判定规则委托 internal/quality.MergeRange。
++func RangeQualityJudge(cfg *snapshot.Point, p *message.Point) int {
++	return quality.MergeRange(p.Quality, p.Value, cfg.MinValue, cfg.MaxValue)
++}
++
++// PassthroughJudge 直通判定挂点（0027 内核缺省形态保留）：网关 quality 原样透传。
++// TASK-0028 起 Assemble 缺省挂点已换 RangeQualityJudge 真实现；本函数保留供测试与
++// 「网关完全可信」特殊装配显式选用。
+ func PassthroughJudge(_ *snapshot.Point, p *message.Point) int { return p.Quality }
+ 
+ // DeadLetterReason 死信/丢弃原因（挂点细分，运维监控 FEAT-0020 消费计数）。
+@@ -150,6 +179,12 @@ type Config struct {
+ 	BufferCap int
+ 	// DedupCap batchId / (pointCode,ts) 内存去重表容量（FIFO 淘汰）。默认 65536。
+ 	DedupCap int
++	// TSFutureReject 未来拒绝上界（裁决 3 路径 1a：ts > now+该值 → ts_overflow）。
++	// 默认 5m（INGEST_TS_FUTURE_REJECT）。
++	TSFutureReject time.Duration
++	// TSMaxAge 最大年龄（裁决 3 路径 1b/3：ts < now-该值 → ts_too_old；
++	// now-该值 ≤ ts ≤ now 为补传豁免窗）。默认 30 天（INGEST_TS_MAX_AGE）。
++	TSMaxAge time.Duration
+ }
+ 
+ // Deps 组件依赖（全部接口注入；nil 的可选依赖取默认）。
+@@ -157,12 +192,19 @@ type Deps struct {
+ 	Consumer  Consumer         // 必填
+ 	Parser    Parser           // 必填
+ 	Snapshots SnapshotLookup   // 必填（配置快照缓存）
+-	Batches   BatchDeduper     // 必填（假实现：NewMemoryBatchDeduper）
+-	Points    PointDeduper     // 必填（假实现：NewMemoryPointDeduper）
+-	Judge     QualityJudge     // 可选：nil → PassthroughJudge
+-	Dead      DeadLetterSink   // 可选：nil → 丢弃（仅计数不外发）
++	Batches   BatchDeduper     // 必填（TTL 真实现：NewTTLBatchDeduper）
++	Points    PointDeduper     // 必填（TTL 真实现：NewTTLPointDeduper）
++	Judge     QualityJudge     // 可选：nil → RangeQualityJudge（TASK-0028 挂点真实现）
++	Dead      DeadLetterSink   // 可选：nil → DeadLetterCounter（统一死信通道缺省装配）
+ 	Writer    Writer           // 必填（假实现：tdengine.Writer + tdengine.FakeExecutor）
+ 	Cache     cache.PointCache // 必填（假实现：cache.NewMemoryPointCache）
++	// TimeTag 未来窄带纠偏打标回调（裁决 3 路径 2：结构化 WARN 日志采样 + 独立计数器；
++	// nil → 不回调。ingestd 装配 CorrectionTagger.Tag）。
++	// 参数：tenant、pointCode、消息原始 ts、纠偏后接收时间（毫秒）。
++	TimeTag func(tenant, pointCode string, origTs, correctedTs int64)
++	// Now 消息接收时钟（时间三分裁决基准——纠偏目标=接收时间、越界窗基准）。
++	// nil → time.Now。测试注入冻结时钟。
++	Now func() time.Time
+ }
+ 
+ // Pipeline 组装完成的内核流水线。Run 一次只允许一个消费循环实例。
+@@ -173,6 +215,9 @@ type Pipeline struct {
+ 	judgeMu sync.RWMutex
+ 	judge   QualityJudge
+ 
++	time timePolicy       // 时间三分裁决器（Assemble 按 Config 阈值构建）
++	now  func() time.Time // 接收时钟（nil-safe 缺省 time.Now）
++
+ 	bufMu   sync.Mutex
+ 	buf     []bufItem
+ 	flushCh chan struct{}
+@@ -224,16 +269,32 @@ func Assemble(cfg Config, deps Deps) (*Pipeline, error) {
+ 	if cfg.BufferCap < 1 {
+ 		return nil, fmt.Errorf("pipeline: BufferCap=%d 必须为正", cfg.BufferCap)
+ 	}
++	if cfg.TSFutureReject == 0 {
++		cfg.TSFutureReject = DefaultTSFutureReject
++	}
++	if cfg.TSMaxAge == 0 {
++		cfg.TSMaxAge = DefaultTSMaxAge
++	}
++	if cfg.TSFutureReject < 0 || cfg.TSMaxAge < 0 {
++		return nil, fmt.Errorf("pipeline: TSFutureReject/TSMaxAge 必须为正（got %v/%v）", cfg.TSFutureReject, cfg.TSMaxAge)
++	}
+ 	if deps.Judge == nil {
+-		deps.Judge = PassthroughJudge
++		deps.Judge = RangeQualityJudge // TASK-0028：缺省挂点=量程二次判定真实现
+ 	}
+ 	if deps.Dead == nil {
+-		deps.Dead = DeadLetterFunc(func(DeadLetterReason, string, string, *message.Point) {})
++		// TASK-0028：缺省死信出口=统一死信通道（租户隔离计数 + 采样 WARN + 环形缓冲）。
++		deps.Dead = NewDeadLetterCounter(DeadLetterCounterOptions{})
++	}
++	nowFn := deps.Now
++	if nowFn == nil {
++		nowFn = time.Now
+ 	}
+ 	return &Pipeline{
+ 		cfg:     cfg,
+ 		deps:    deps,
+ 		judge:   deps.Judge,
++		time:    timePolicy{futureReject: cfg.TSFutureReject, maxAge: cfg.TSMaxAge},
++		now:     nowFn,
+ 		flushCh: make(chan struct{}, 1),
+ 	}, nil
+ }
+@@ -343,6 +404,7 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 	}
+ 
+ 	judge := p.currentJudge()
++	nowT := p.now() // 消息接收时间（时间三分裁决基准：纠偏目标/越界窗锚点）
+ 	rows := make([]tdengine.PointRow, 0, len(env.Points))
+ 	for i := range env.Points {
+ 		pt := &env.Points[i]
+@@ -364,16 +426,55 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 			continue
+ 		}
+ 
+-		// (pointCode, ts) 幂等键（原子 MarkIfSeen，修订轮 C1 同 batchId 口径）。
+-		if !p.deps.Points.MarkIfSeen(pt.PointCode, pt.Ts) {
+-			p.stats.DuplicatePoints.Add(1)
+-			res.Accepted++ // QoS1 重报：幂等无操作，按受理计（不是拒绝）
++		// 四步校验第 1 步「格式」点位级防御：值必须为可写数值（非有限值 → format_invalid
++		// 死信；JSON 解析层不可达，防注入式 Parser/未来解析器）。信封级格式已在 Parse 整批拒绝。
++		if !isFinite(pt.Value) {
++			p.stats.DeadLettered.Add(1)
++			p.deps.Dead.OnDeadLetter(DeadLetterFormatInvalid, in.Tenant, env.BatchID, pt)
++			res.Rejected++
++			res.Rejections = append(res.Rejections, SubmitRejection{PointCode: pt.PointCode, Ts: pt.Ts, Reason: DeadLetterFormatInvalid})
+ 			continue
+ 		}
+ 
+-		// 第 4 步：质量判定（挂点；CONV-02 质量码口径见 internal/quality）。
++		// 四步校验第 2 步「量程」= 第 4 步质量判定挂点（真实现：网关先填 + min/max
++		// 二次判定覆盖写；只打码不拒绝，原值保留——CONV-02 口径见 internal/quality）。
+ 		q := judge(cfgPt, pt)
+ 
++		// 四步校验第 3 步「时间」：三分裁决（越界拒绝 / 未来窄带纠偏打标 / 补传豁免）。
++		origTs := pt.Ts // 幂等键口径：去重取消息原始 ts（纠偏只改落库 ts）
++		rowTs := pt.Ts
++		verdict := p.time.judge(nowT, pt.Ts)
++		switch verdict.Action {
++		case TimeReject:
++			// 路径 1：ts 越界拒绝死信不落库（MQTT 路径进死信计数、HTTP 路径进拒绝明细——
++			// 同一实现两路同构）；不标记去重键（跨 batchId 重发按新事件计数，采样告警防风暴）。
++			p.stats.DeadLettered.Add(1)
++			p.deps.Dead.OnDeadLetter(verdict.Reason, in.Tenant, env.BatchID, pt)
++			res.Rejected++
++			res.Rejections = append(res.Rejections, SubmitRejection{PointCode: pt.PointCode, Ts: origTs, Reason: verdict.Reason})
++			continue
++		case TimeCorrect:
++			// 路径 2：未来窄带 → 纠偏为接收时间并打标（独立计数器 + TimeTag 回调；
++			// 不改 CONV-02 quality 码域——枚举冻结）。
++			rowTs = verdict.Ts
++			p.stats.TimeCorrected.Add(1)
++			if p.deps.TimeTag != nil {
++				p.deps.TimeTag(in.Tenant, pt.PointCode, origTs, rowTs)
++			}
++		default:
++			// 路径 3：补传豁免（now-maxAge ≤ ts ≤ now）——原始 ts 落库、不纠偏不打标
++			// （§1.9A：计算引擎按补传时间窗重算，原始 ts 不可被纠偏破坏）。
++			rowTs = verdict.Ts
++		}
++
++		// 四步校验第 4 步「去重」（靠后）：(pointCode, 原始 ts) 幂等键（原子 MarkIfSeen，
++		// 修订轮 C1 同 batchId 口径）——重复上报过四步校验后在此吸收，不产生死信事件。
++		if !p.deps.Points.MarkIfSeen(pt.PointCode, origTs) {
++			p.stats.DuplicatePoints.Add(1)
++			res.Accepted++ // QoS1 重报：幂等无操作，按受理计（不是拒绝）
++			continue
++		}
++
+ 		kind, ok := tdengine.KindFor(cfgPt.DataType)
+ 		if !ok {
+ 			p.stats.DeadLettered.Add(1)
+@@ -383,15 +484,15 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 			continue
+ 		}
+ 
+-		// 第 5 步前半：按 data_type 分发构造写入行（标签取自配置快照）。
++		// 第 5 步前半：按 data_type 分发构造写入行（标签取自配置快照；ts=三分裁决产物）。
+ 		rows = append(rows, tdengine.PointRow{
+ 			TenantCode: in.Tenant, // 选库键：令牌解析租户（防写错靠写方选库）
+ 			TenantID:   cfgPt.TenantID,
+ 			PointCode:  pt.PointCode,
+ 			Kind:       kind,
+ 			DeptID:     deptIDOf(cfgPt),
+-			Ts:         pt.Ts,
+-			Value:      pt.Value,
++			Ts:         rowTs,
++			Value:      pt.Value, // 原值保留不丢弃不假 0（brief 裁决 1：量程越界只打码）
+ 			Quality:    q,
+ 		})
+ 		res.Accepted++
+@@ -545,8 +646,9 @@ type Stats struct {
+ 	RejectedBatches       int64 // 信封级整批拒绝（空 points 4001 / 超 500 / 缺租户 / JSON 非法）
+ 	DuplicateBatches      int64 // batchId 整批去重命中数
+ 	DuplicatePoints       int64 // (pointCode, ts) 去重命中数
+-	DeadLettered          int64 // 未知编码等死信计数
++	DeadLettered          int64 // 未知编码/时间越界/格式非法等死信计数
+ 	DisabledDiscarded     int64 // 禁用点位丢弃计数
++	TimeCorrected         int64 // 未来窄带纠偏打标计数（裁决 3 路径 2 独立计数器）
+ 	AcceptedPoints        int64 // 进入攒批缓冲的行数
+ 	DroppedOldest         int64 // 攒批缓冲满丢最旧行数（ADR-0014 FIFO 口径）
+ 	RequeuedRows          int64 // 写失败重排行数
+@@ -564,6 +666,7 @@ type statsCounters struct {
+ 	DuplicatePoints       atomic.Int64
+ 	DeadLettered          atomic.Int64
+ 	DisabledDiscarded     atomic.Int64
++	TimeCorrected         atomic.Int64
+ 	AcceptedPoints        atomic.Int64
+ 	DroppedOldest         atomic.Int64
+ 	RequeuedRows          atomic.Int64
+@@ -583,6 +686,7 @@ func (p *Pipeline) Stats() Stats {
+ 		DuplicatePoints:       p.stats.DuplicatePoints.Load(),
+ 		DeadLettered:          p.stats.DeadLettered.Load(),
+ 		DisabledDiscarded:     p.stats.DisabledDiscarded.Load(),
++		TimeCorrected:         p.stats.TimeCorrected.Load(),
+ 		AcceptedPoints:        p.stats.AcceptedPoints.Load(),
+ 		DroppedOldest:         p.stats.DroppedOldest.Load(),
+ 		RequeuedRows:          p.stats.RequeuedRows.Load(),
+diff --git a/ingest/internal/pipeline/pipeline_contract_test.go b/ingest/internal/pipeline/pipeline_contract_test.go
+index d8c5fac..c0b3a4f 100644
+--- a/ingest/internal/pipeline/pipeline_contract_test.go
++++ b/ingest/internal/pipeline/pipeline_contract_test.go
+@@ -126,6 +126,9 @@ func newHarnessWithSnapshotJSON(t *testing.T, cfg pipeline.Config, snapJSON stri
+ 		Dead:      h.sink,
+ 		Writer:    &tdengine.Writer{Ex: h.executor},
+ 		Cache:     h.cache,
++		// TASK-0028 冻结时钟：契约样例 sentAt——既有硬编码 ts（1795211995000 等）恒落
++		// 补传豁免带内，时间三分裁决不随墙钟漂移。
++		Now: clockAt(1795212000000),
+ 	}
+ 	p, err := pipeline.Assemble(cfg, deps)
+ 	if err != nil {
+@@ -419,9 +422,13 @@ func TestContractFlushByInterval(t *testing.T) {
+ }
+ 
+ // 契约依据：brief 决策 5（对齐 ADR-0014 缓存 FIFO 丢最旧口径）——攒批缓冲有上限，
+-// 满时丢最旧并计数，绝不无界增长。
++// 满时丢最旧并计数，绝不无界增长。（本测专查攒批缓冲语义，与时间裁决正交：
++// 阈值放开使 1970 纪元样例 ts 不触发 ts_too_old。）
+ func TestContractBufferCapDropsOldestAndCounts(t *testing.T) {
+-	h := newHarness(t, pipeline.Config{BatchSize: 500, FlushInterval: 60 * time.Millisecond, BufferCap: 2})
++	h := newHarness(t, pipeline.Config{
++		BatchSize: 500, FlushInterval: 60 * time.Millisecond, BufferCap: 2,
++		TSFutureReject: 24 * time.Hour, TSMaxAge: 100 * 365 * 24 * time.Hour,
++	})
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
+ 	done := make(chan struct{})
+diff --git a/ingest/internal/pipeline/pipeline_deadletter_contract_test.go b/ingest/internal/pipeline/pipeline_deadletter_contract_test.go
+new file mode 100644
+index 0000000..e79f367
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_deadletter_contract_test.go
+@@ -0,0 +1,228 @@
++package pipeline_test
++
++import (
++	"bytes"
++	"fmt"
++	"log"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0028 死信统一通道契约（brief 裁决 2）：
++//
++//   - 0027 未知编码死信扩展为统一死信通道：原因码枚举 unknown_code/ts_overflow/ts_too_old/
++//     format_invalid 等（与 HTTP report 拒绝明细原因码对齐——SubmitRejection.Reason 同源）；
++//   - 按租户隔离计数：进程内有界 map，key=tenant+reason（多实例 Redis 化登记演进位）；
++//   - 告警=WARN 日志：固定格式含租户/原因/计数，防风暴=首次 + 每 N 条采样
++//     （N 配置化 INGEST_DEADLETTER_WARN_EVERY 默认 100）；
++//   - 「异常队列单独存储」一期落地：进程内有界环形缓冲（最近 N 条明细，供排查读口）。
++
++// counterLogger 测试用日志缓冲。
++func counterLogger() (*bytes.Buffer, *log.Logger) {
++	buf := &bytes.Buffer{}
++	return buf, log.New(buf, "", 0)
++}
++
++func pt(code string, ts int64) *message.Point {
++	return &message.Point{PointCode: code, Ts: ts, Value: 1}
++}
++
++// 契约依据：brief 裁决 2——死信按租户隔离计数（key=tenant+reason）。
++func TestContractDeadLetterCounterTenantIsolation(t *testing.T) {
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{})
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tenant_a", "b1", pt("P1", frozenNowMs))
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tenant_a", "b2", pt("P2", frozenNowMs))
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tenant_b", "b3", pt("P3", frozenNowMs))
++	if got := c.Count("tenant_a", pipeline.DeadLetterUnknownCode); got != 2 {
++		t.Errorf("tenant_a unknown_code = %d, want 2", got)
++	}
++	if got := c.Count("tenant_b", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("tenant_b unknown_code = %d, want 1（租户隔离）", got)
++	}
++	if got := c.Total(); got != 3 {
++		t.Errorf("Total = %d, want 3", got)
++	}
++}
++
++// 契约依据：brief 裁决 2——同一租户按原因码分列计数。
++func TestContractDeadLetterCounterPerReasonIsolation(t *testing.T) {
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{})
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "t1", "b1", nil)
++	c.OnDeadLetter(pipeline.DeadLetterTsOverflow, "t1", "b2", pt("P", frozenNowMs))
++	c.OnDeadLetter(pipeline.DeadLetterTsOverflow, "t1", "b3", pt("P", frozenNowMs))
++	c.OnDeadLetter(pipeline.DeadLetterTsTooOld, "t1", "b4", pt("P", frozenNowMs))
++	if got := c.Count("t1", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("unknown_code = %d, want 1", got)
++	}
++	if got := c.Count("t1", pipeline.DeadLetterTsOverflow); got != 2 {
++		t.Errorf("ts_overflow = %d, want 2", got)
++	}
++	if got := c.Count("t1", pipeline.DeadLetterTsTooOld); got != 1 {
++		t.Errorf("ts_too_old = %d, want 1", got)
++	}
++}
++
++// 契约依据：brief 裁决 2——告警 WARN 固定格式含租户/原因/计数；防风暴=首次+每 N 条采样
++// （默认 N=100：count=1 首条 + count=100 第 100 条采样，中间 98 条不产生日志）。
++func TestContractDeadLetterCounterWarnSampleFirstAndEveryN(t *testing.T) {
++	buf, logger := counterLogger()
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{Logger: logger})
++	for i := 0; i < 101; i++ {
++		c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "group_a", fmt.Sprintf("b%d", i), pt("P", frozenNowMs))
++	}
++	lines := nonEmptyLines(buf.String())
++	if len(lines) != 2 {
++		t.Fatalf("WARN 行数 = %d, want 2（首次 + 每 100 条采样）: %v", len(lines), lines)
++	}
++	for i, want := range []string{"count=1", "count=100"} {
++		if !strings.Contains(lines[i], want) {
++			t.Errorf("第 %d 行缺 %q: %s", i+1, want, lines[i])
++		}
++		if !strings.Contains(lines[i], "tenant=group_a") || !strings.Contains(lines[i], "reason=unknown_code") {
++			t.Errorf("第 %d 行缺租户/原因字段: %s", i+1, lines[i])
++		}
++		if !strings.Contains(lines[i], "[dead-letter]") {
++			t.Errorf("第 %d 行缺固定前缀 [dead-letter]: %s", i+1, lines[i])
++		}
++	}
++}
++
++// 契约依据：brief 裁决 2——采样周期 N 配置化（INGEST_DEADLETTER_WARN_EVERY）。
++func TestContractDeadLetterCounterWarnEveryConfigurable(t *testing.T) {
++	buf, logger := counterLogger()
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{WarnEvery: 3, Logger: logger})
++	for i := 0; i < 6; i++ {
++		c.OnDeadLetter(pipeline.DeadLetterTsOverflow, "group_a", "b", pt("P", frozenNowMs))
++	}
++	lines := nonEmptyLines(buf.String())
++	if len(lines) != 3 {
++		t.Fatalf("WARN 行数 = %d, want 3（count=1/3/6）: %v", len(lines), lines)
++	}
++	for i, want := range []string{"count=1", "count=3", "count=6"} {
++		if !strings.Contains(lines[i], want) {
++			t.Errorf("第 %d 行缺 %q: %s", i+1, want, lines[i])
++		}
++	}
++}
++
++// 契约依据：brief 裁决 2——「异常队列单独存储」一期落地为进程内有界环形缓冲
++// （最近 N 条明细，供排查读口）；容量有界、覆盖最旧。
++func TestContractDeadLetterCounterRecentRingBuffer(t *testing.T) {
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{RecentCap: 3})
++	for i := 1; i <= 5; i++ {
++		c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "group_a", "b",
++			pt(fmt.Sprintf("P%d", i), frozenNowMs))
++	}
++	rec := c.Recent(10)
++	if len(rec) != 3 {
++		t.Fatalf("Recent(10) = %d 条, want 3（环形缓冲只留最近 3 条）", len(rec))
++	}
++	for i, want := range []string{"P3", "P4", "P5"} {
++		if rec[i].Point == nil || rec[i].Point.PointCode != want {
++			t.Errorf("Recent[%d] = %+v, want 点位 %s（时序保留）", i, rec[i], want)
++		}
++	}
++	rec2 := c.Recent(2)
++	if len(rec2) != 2 || rec2[0].Point.PointCode != "P4" || rec2[1].Point.PointCode != "P5" {
++		t.Errorf("Recent(2) = %+v, want [P4 P5]", rec2)
++	}
++	if rec[0].Reason != pipeline.DeadLetterUnknownCode || rec[0].Tenant != "group_a" || rec[0].BatchID != "b" {
++		t.Errorf("Recent 记录字段不完整: %+v", rec[0])
++	}
++}
++
++// 契约依据：brief 裁决 2——计数 map 进程内有界：超容量 FIFO 淘汰最旧键（ADR-0014 口径），
++// Redis 化登记为多实例演进位。
++func TestContractDeadLetterCounterBoundedCountsFIFOEviction(t *testing.T) {
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{Cap: 2})
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tA", "b", nil)
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tB", "b", nil)
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tC", "b", nil) // 淘汰 tA
++	if got := c.Count("tA", pipeline.DeadLetterUnknownCode); got != 0 {
++		t.Errorf("tA = %d, want 0（最旧键被 FIFO 淘汰）", got)
++	}
++	if got := c.Count("tB", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("tB = %d, want 1", got)
++	}
++	if got := c.Count("tC", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("tC = %d, want 1", got)
++	}
++	// 淘汰后再计数从 1 重新开始（有界 map 口径；持久计数归演进位）。
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "tA", "b", nil)
++	if got := c.Count("tA", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("tA 重新计数 = %d, want 1", got)
++	}
++}
++
++// 契约依据：DeadLetterSink 组合纪律——计数器可链式委托下游（记录/外发挂点不因计数器而丢失）。
++func TestContractDeadLetterCounterChainsNextSink(t *testing.T) {
++	next := &recordingSink{}
++	c := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{Next: next})
++	c.OnDeadLetter(pipeline.DeadLetterUnknownCode, "group_a", "b1", pt("P1", frozenNowMs))
++	c.OnDeadLetter(pipeline.DeadLetterTsTooOld, "group_a", "b2", pt("P2", frozenNowMs))
++	if next.byReason(pipeline.DeadLetterUnknownCode) != 1 || next.byReason(pipeline.DeadLetterTsTooOld) != 1 {
++		t.Errorf("下游 sink 记录缺失: %v", next.records)
++	}
++}
++
++// 契约依据：brief 裁决 2——原因码枚举与 HTTP report 拒绝明细原因码对齐（SubmitRejection.
++// Reason 同为 DeadLetterReason：unknown_code/ts_overflow/ts_too_old/format_invalid）。
++func TestContractDeadLetterReasonEnumValues(t *testing.T) {
++	cases := []struct {
++		r pipeline.DeadLetterReason
++		s string
++	}{
++		{pipeline.DeadLetterUnknownCode, "unknown_code"},
++		{pipeline.DeadLetterTsOverflow, "ts_overflow"},
++		{pipeline.DeadLetterTsTooOld, "ts_too_old"},
++		{pipeline.DeadLetterFormatInvalid, "format_invalid"},
++	}
++	for _, c := range cases {
++		if string(c.r) != c.s {
++			t.Errorf("reason = %q, want %q", string(c.r), c.s)
++		}
++	}
++}
++
++// 契约依据：统一死信通道端到端——流水线死信经计数器按租户/原因计数、明细进环形缓冲、
++// 首条触发 WARN（ingestd 装配同款）。
++func TestContractDeadLetterCounterThroughPipeline(t *testing.T) {
++	buf, logger := counterLogger()
++	counter := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{Logger: logger})
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++		deps.Dead = counter
++	})
++	defer s.close()
++
++	res := s.submitBatch("DL-1",
++		`{"pointCode":"X99_UNKNOWN","ts":1795211995000,"value":1,"quality":0}`,
++	)
++	if res.Rejected != 1 || len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterUnknownCode {
++		t.Fatalf("拒绝明细 = %+v, want unknown_code", res.Rejections)
++	}
++	if got := counter.Count("group_a", pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Fatalf("计数器 unknown_code = %d, want 1", got)
++	}
++	rec := counter.Recent(1)
++	if len(rec) != 1 || rec[0].Point == nil || rec[0].Point.PointCode != "X99_UNKNOWN" {
++		t.Fatalf("环形缓冲明细 = %+v, want X99_UNKNOWN", rec)
++	}
++	if line := buf.String(); !strings.Contains(line, "[dead-letter]") ||
++		!strings.Contains(line, "tenant=group_a") || !strings.Contains(line, "reason=unknown_code") {
++		t.Errorf("WARN 日志缺固定字段: %q", line)
++	}
++}
++
++func nonEmptyLines(s string) []string {
++	var out []string
++	for _, l := range strings.Split(s, "\n") {
++		if strings.TrimSpace(l) != "" {
++			out = append(out, l)
++		}
++	}
++	return out
++}
+diff --git a/ingest/internal/pipeline/pipeline_order_contract_test.go b/ingest/internal/pipeline/pipeline_order_contract_test.go
+new file mode 100644
+index 0000000..f5ef1dd
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_order_contract_test.go
+@@ -0,0 +1,137 @@
++package pipeline_test
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0028 四步校验顺序与去重位置口径契约（brief 裁决 4）：
++//
++//   四步校验「格式 → 量程 → 时间 → 去重」嵌入冻结五步（验令牌与租户 → 查快照 → 未知编码
++//   死信 → 质量判定 → 分发写库+缓存）之内：格式=信封级 Parse（整批拒绝）+ 点位级防御
++//   （非有限值 format_invalid）；量程=质量判定挂点真实现（只打码不拒绝）；时间=三分裁决
++//   （拒绝/纠偏）；去重=点级幂等键，靠后放置——重复上报不产生重复死信计数：
++//   同 batchId 重报被整批幂等吸收（零逐点处理），跨 batchId 重报已受理点被点级去重吸收
++//   （已过校验、不产生死信事件）。
++
++// 契约依据：同一批内三分流量正确分流——重复点（同批内第二次出现）被去重吸收不计拒绝、
++// 时间越界点拒绝、越限点受理打码；拒绝明细顺序与 points 一致。
++func TestContractFourStepOrderOneBatchSplit(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil)
++	defer s.close()
++
++	res := s.submitBatch("O-SPLIT",
++		pointJSON("R_M01", frozenNowMs-1000, 150, 0),           // 超上限 → 受理打码 1（量程不拒绝）
++		pointJSON("R_M04", frozenNowMs-31*24*3600*1000, 50, 0), // 时间越旧 → ts_too_old
++		pointJSON("R_M01", frozenNowMs-1000, 150, 0),           // 同批重复 → 点级去重吸收
++	)
++	if res.Accepted != 2 || res.Rejected != 1 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 2/1（重复点吸收+越限受理+越旧拒绝）",
++			res.Accepted, res.Rejected)
++	}
++	if len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterTsTooOld ||
++		res.Rejections[0].PointCode != "R_M04" {
++		t.Fatalf("拒绝明细 = %+v, want 仅 R_M04/ts_too_old", res.Rejections)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 150, 1)", frozenNowMs-1000)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q（越限点原值打码落库恰一次）: %s", want, sql)
++	}
++	st := s.pipe.Stats()
++	if st.DuplicatePoints != 1 {
++		t.Errorf("DuplicatePoints = %d, want 1（同批重复点吸收）", st.DuplicatePoints)
++	}
++}
++
++// 契约依据：brief 裁决 4——重复上报不产生重复死信计数：同 batchId 重报整批幂等
++// （duplicate=true、零逐点处理），首报的时间越界死信计数不因重报而增加。
++func TestContractSameBatchReplayNoDuplicateDeadLetter(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	points := []string{
++		pointJSON("F01_WS01_EQ001_M01", tooOldMs, 98231.4, 0), // ts_too_old 死信
++		pointJSON("F01_WS01_EQ001_M02", frozenNowMs-1000, 132.5, 0),
++	}
++	res1 := s.submitBatch("O-REPLAY", points...)
++	if res1.Rejected != 1 || res1.Accepted != 1 {
++		t.Fatalf("首报 = accepted:%d rejected:%d, want 1/1", res1.Accepted, res1.Rejected)
++	}
++	s.waitWritten(1)
++	if got := s.dead.byReason(pipeline.DeadLetterTsTooOld); got != 1 {
++		t.Fatalf("首报 ts_too_old 死信 = %d, want 1", got)
++	}
++
++	res2 := s.submitBatch("O-REPLAY", points...)
++	if !res2.Duplicate {
++		t.Fatalf("重报 duplicate = false, want true（整批幂等）")
++	}
++	if res2.Rejected != 0 || len(res2.Rejections) != 0 {
++		t.Errorf("重报拒绝明细 = %+v, want 空（重复上报不产生死信事件）", res2.Rejections)
++	}
++	if got := s.dead.byReason(pipeline.DeadLetterTsTooOld); got != 1 {
++		t.Errorf("重报后 ts_too_old 死信 = %d, want 仍为 1（不重复计数）", got)
++	}
++	if got := s.pipe.Stats().WrittenPoints; got != 1 {
++		t.Errorf("重报后 WrittenPoints = %d, want 仍为 1", got)
++	}
++}
++
++// 契约依据：跨 batchId 重报已受理点——四步校验全过后被点级去重吸收（去重靠后），
++// 不产生死信、不重复落库。
++func TestContractCrossBatchDuplicateNoDeadLetter(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	p := pointJSON("F01_WS01_EQ001_M01", frozenNowMs-1000, 98231.4, 0)
++	res1 := s.submitBatch("O-X-1", p)
++	res2 := s.submitBatch("O-X-2", p)
++	if res1.Accepted != 1 || res2.Accepted != 1 || res2.Rejected != 0 {
++		t.Fatalf("两报 = %+v / %+v, want 各 accepted=1、重报无拒绝", res1, res2)
++	}
++	s.waitWritten(1) // 攒批异步落库：先等首报行写出再断言计数快照
++	st := s.pipe.Stats()
++	if st.DuplicatePoints != 1 || st.WrittenPoints != 1 {
++		t.Errorf("stats = dup:%d written:%d, want 1/1（点级去重恰一落库）", st.DuplicatePoints, st.WrittenPoints)
++	}
++	if got := s.dead.totalRecords(); got != 0 {
++		t.Errorf("死信记录 = %d, want 0（已受理点重报不产生死信）", got)
++	}
++}
++
++// 契约依据：时间拒绝明细携带消息原始 ts（对账/排查口径——网关侧按原始 ts 定位重发）。
++func TestContractTimeRejectionDetailCarriesMessageTs(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("O-DETAIL",
++		pointJSON("F01_WS01_EQ001_M01", overflowMs, 98231.4, 0),
++		pointJSON("F01_WS01_EQ001_M02", tooOldMs, 132.5, 0),
++	)
++	if res.Rejected != 2 || len(res.Rejections) != 2 {
++		t.Fatalf("拒绝明细 = %+v, want 2 条", res.Rejections)
++	}
++	if res.Rejections[0].Reason != pipeline.DeadLetterTsOverflow || res.Rejections[0].Ts != overflowMs {
++		t.Errorf("明细[0] = %+v, want ts_overflow @ %d", res.Rejections[0], overflowMs)
++	}
++	if res.Rejections[1].Reason != pipeline.DeadLetterTsTooOld || res.Rejections[1].Ts != tooOldMs {
++		t.Errorf("明细[1] = %+v, want ts_too_old @ %d", res.Rejections[1], tooOldMs)
++	}
++}
++
++// totalRecords 死信出口记录总数（测试辅助）。
++func (r *recordingSink) totalRecords() int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return len(r.records)
++}
+diff --git a/ingest/internal/pipeline/pipeline_quality_range_contract_test.go b/ingest/internal/pipeline/pipeline_quality_range_contract_test.go
+new file mode 100644
+index 0000000..462c014
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_quality_range_contract_test.go
+@@ -0,0 +1,291 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0028 量程质量判定（质量挂点真实现）流水线级契约：
++//
++// 契约依据：
++//   - 统一消息模型 v1.1.0 §3.2（设计文档 §3.2 p24）：超限类质量码由接入服务按点位配置的
++//     min/max 二次判定后覆盖写入；非超限类保留网关值；
++//   - 配置快照 Schema v1.0.1 点位 minValue/maxValue 备注：超限只打质量码标记、不丢弃；
++//   - TASK-0028 brief 裁决 1 验收锚点：超限打码原值保留、无假 0；
++//     边界值（==min/==max）不算越界；min/max 缺失跳过量程判定。
++
++// frozenNowMs 契约 §3.2 样例 sentAt（2026-11-21T03:00:00Z）。验证类 harness 的冻结时钟：
++// 既有契约样例硬编码 ts（1795211995000 等）相对该时钟恒落在补传豁免带内，测试不随墙钟漂移。
++const frozenNowMs = int64(1795212000000)
++
++// clockAt 冻结时钟（Deps.Now 注入用）。
++func clockAt(ms int64) func() time.Time {
++	return func() time.Time { return time.UnixMilli(ms) }
++}
++
++// rangeSnapshotJSON 量程判定预置快照（R_M01 双边、R_M02 无量程、R_M03 仅下限、R_M04 仅上限）。
++const rangeSnapshotJSON = `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [
++    {"id":201,"tenantId":1,"pointCode":"R_M01","pointName":"双边量程","dataType":1,"valueType":"DOUBLE","minValue":0,"maxValue":100,"deptId":3,"status":1},
++    {"id":202,"tenantId":1,"pointCode":"R_M02","pointName":"无量程","dataType":1,"valueType":"DOUBLE","deptId":3,"status":1},
++    {"id":203,"tenantId":1,"pointCode":"R_M03","pointName":"仅下限","dataType":1,"valueType":"DOUBLE","minValue":-50,"deptId":3,"status":1},
++    {"id":204,"tenantId":1,"pointCode":"R_M04","pointName":"仅上限","dataType":1,"valueType":"DOUBLE","maxValue":200,"deptId":3,"status":1}
++  ]
++}`
++
++// tagCall 一次纠偏打标（tenant/pointCode/原始 ts/纠偏后接收时间）。
++type tagCall struct {
++	tenant      string
++	pointCode   string
++	origTs      int64
++	correctedTs int64
++}
++
++// tagRecorder 纠偏打标记录（Deps.TimeTag 假实现）。
++type tagRecorder struct {
++	mu    sync.Mutex
++	calls []tagCall
++}
++
++func (r *tagRecorder) tag(tenant, pointCode string, origTs, correctedTs int64) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.calls = append(r.calls, tagCall{tenant: tenant, pointCode: pointCode, origTs: origTs, correctedTs: correctedTs})
++}
++
++func (r *tagRecorder) all() []tagCall {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return append([]tagCall(nil), r.calls...)
++}
++
++// idleChan 永不投递的空消费源（Submit 同步面不需要消费循环）。
++type idleChan struct{ ch chan pipeline.Inbound }
++
++func newIdleChan() *idleChan { return &idleChan{ch: make(chan pipeline.Inbound)} }
++
++func (c *idleChan) Messages() <-chan pipeline.Inbound { return c.ch }
++
++// valPipe 验证流水线 harness：同步 Submit + StartFlusher；默认冻结时钟在契约样例 sentAt、
++// Judge 不设（走 Assemble 默认挂点——真实现）、内存去重、假执行器。
++type valPipe struct {
++	t         *testing.T
++	pipe      *pipeline.Pipeline
++	snapCache *snapshot.Cache
++	exec      *tdengine.FakeExecutor
++	ptCache   *cache.MemoryPointCache
++	dead      *recordingSink
++	tag       *tagRecorder
++	cancel    context.CancelFunc
++}
++
++// newValPipe 组装验证 harness。mutate 可改写 Config 与 Deps（改 Judge/Now/Dead/阈值等）。
++func newValPipe(t *testing.T, snapJSON string, mutate func(cfg *pipeline.Config, deps *pipeline.Deps)) *valPipe {
++	t.Helper()
++	exec := tdengine.NewFakeExecutor(0)
++	dead := &recordingSink{}
++	tag := &tagRecorder{}
++	snapCache := preloadSnapshotJSON(t, snapJSON)
++	deps := pipeline.Deps{
++		Consumer:  newIdleChan(),
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   pipeline.NewMemoryBatchDeduper(65536),
++		Points:    pipeline.NewMemoryPointDeduper(65536),
++		Dead:      dead,
++		TimeTag:   tag.tag,
++		Now:       clockAt(frozenNowMs),
++		Writer:    &tdengine.Writer{Ex: exec},
++	}
++	ptCache := cache.NewMemoryPointCache()
++	deps.Cache = ptCache
++	cfg := pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond}
++	if mutate != nil {
++		mutate(&cfg, &deps)
++	}
++	p, err := pipeline.Assemble(cfg, deps)
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	p.StartFlusher(ctx)
++	return &valPipe{t: t, pipe: p, snapCache: snapCache, exec: exec, ptCache: ptCache, dead: dead, tag: tag, cancel: cancel}
++}
++
++func (s *valPipe) close() { s.cancel() }
++
++// submitBatch 同步提交一批（tenant 固定 group_a；points 为点位对象 JSON 片段）。
++func (s *valPipe) submitBatch(batchID string, points ...string) pipeline.SubmitResult {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, `{"tenant":"group_a","gateway":"GW_F01_01","batchId":%q,"sentAt":%d,"points":[`, batchID, frozenNowMs)
++	for i, p := range points {
++		if i > 0 {
++			sb.WriteByte(',')
++		}
++		sb.WriteString(p)
++	}
++	sb.WriteString("]}")
++	return s.pipe.Submit(context.Background(), pipeline.Inbound{Tenant: "group_a", Payload: []byte(sb.String())})
++}
++
++// sqlAll 返回假执行器收到的全部 SQL。
++func (s *valPipe) sqlAll() []string {
++	var out []string
++	for _, c := range s.exec.Calls() {
++		out = append(out, c.SQL)
++	}
++	return out
++}
++
++// waitWritten 等待落库行数收敛。
++func (s *valPipe) waitWritten(n int) {
++	s.t.Helper()
++	eventually(s.t, 2*time.Second, fmt.Sprintf("落库 %d 行", n), func() bool {
++		return int(s.pipe.Stats().WrittenPoints) == n
++	})
++}
++
++// 契约依据：§3.2 超限二次判定覆盖写 + 快照 Schema「超限只打质量码标记、不丢弃」+
++// brief 验收锚点「超限打码原值保留、无假 0」——越限行原值 150/-10 原样写入（SQL 与缓存），
++// 质量码 1/2 打标；范围内值保持网关码 0。
++func TestContractRangeJudgeRowsKeepOriginalValueAndMarkQuality(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil)
++	defer s.close()
++
++	res := s.submitBatch("R-KEEP",
++		pointJSON("R_M01", frozenNowMs-1000, 50, 0),  // 范围内
++		pointJSON("R_M01", frozenNowMs-2000, 150, 0), // 超上限 → 1，原值 150 保留
++		pointJSON("R_M01", frozenNowMs-3000, -10, 0), // 超下限 → 2，原值 -10 保留
++	)
++	if res.Accepted != 3 || res.Rejected != 0 || len(res.Rejections) != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d detail:%v, want 3/0/无（量程越界只打码不拒绝）",
++			res.Accepted, res.Rejected, res.Rejections)
++	}
++	s.waitWritten(3)
++	sql := strings.Join(s.sqlAll(), "\n")
++	for _, want := range []string{
++		fmt.Sprintf("VALUES (%d, 50, 0)", frozenNowMs-1000),
++		fmt.Sprintf("VALUES (%d, 150, 1)", frozenNowMs-2000),
++		fmt.Sprintf("VALUES (%d, -10, 2)", frozenNowMs-3000),
++	} {
++		if !strings.Contains(sql, want) {
++			t.Errorf("SQL 缺 %q（超限打码必须原值保留并覆盖质量码）: %s", want, sql)
++		}
++	}
++	// 三行同点位依次写缓存，末行为最后落库行（-10, q=2）——缓存原值保留且质量码覆盖（无假 0）。
++	got, gerr := s.ptCache.GetPoint(context.Background(), "group_a", "R_M01")
++	if gerr != nil {
++		t.Fatalf("缓存读取失败: %v", gerr)
++	}
++	if got.V != -10 || got.Q != 2 {
++		t.Errorf("缓存 = %+v, want V=-10 Q=2（无假 0：缓存值不归零、质量码为越限码）", got)
++	}
++}
++
++// 契约依据：§3.2 合并规则——非超限保留网关值；超限覆盖写；min/max 缺失透传网关码。
++func TestContractRangeJudgeMergeGatewayQualityAndMissingBounds(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil)
++	defer s.close()
++
++	res := s.submitBatch("R-MERGE",
++		pointJSON("R_M01", frozenNowMs-1000, 50, 3),  // 范围内 + 网关 3 → 保留 3
++		pointJSON("R_M01", frozenNowMs-2000, 150, 3), // 超上限 + 网关 3 → 覆盖 1
++		pointJSON("R_M02", frozenNowMs-3000, 5, 4),   // 无 min/max → 网关 4 透传
++	)
++	if res.Accepted != 3 || res.Rejected != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 3/0", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(3)
++	sql := strings.Join(s.sqlAll(), "\n")
++	for _, want := range []string{
++		fmt.Sprintf("VALUES (%d, 50, 3)", frozenNowMs-1000),
++		fmt.Sprintf("VALUES (%d, 150, 1)", frozenNowMs-2000),
++		fmt.Sprintf("VALUES (%d, 5, 4)", frozenNowMs-3000),
++	} {
++		if !strings.Contains(sql, want) {
++			t.Errorf("SQL 缺 %q: %s", want, sql)
++		}
++	}
++}
++
++// 契约依据：单边量程（仅 min 或仅 max）仍按存在边界判定。
++func TestContractRangeJudgeSingleSideBounds(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil)
++	defer s.close()
++
++	res := s.submitBatch("R-SIDE",
++		pointJSON("R_M03", frozenNowMs-1000, -60, 0), // < min(-50) → 2
++		pointJSON("R_M03", frozenNowMs-2000, -40, 0), // 范围内 → 0
++		pointJSON("R_M04", frozenNowMs-3000, 250, 0), // > max(200) → 1
++		pointJSON("R_M04", frozenNowMs-4000, 150, 0), // 范围内 → 0
++	)
++	if res.Accepted != 4 || res.Rejected != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 4/0", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(4)
++	sql := strings.Join(s.sqlAll(), "\n")
++	for _, want := range []string{
++		fmt.Sprintf("VALUES (%d, -60, 2)", frozenNowMs-1000),
++		fmt.Sprintf("VALUES (%d, -40, 0)", frozenNowMs-2000),
++		fmt.Sprintf("VALUES (%d, 250, 1)", frozenNowMs-3000),
++		fmt.Sprintf("VALUES (%d, 150, 0)", frozenNowMs-4000),
++	} {
++		if !strings.Contains(sql, want) {
++			t.Errorf("SQL 缺 %q: %s", want, sql)
++		}
++	}
++}
++
++// 契约依据：TASK-0028「质量判定挂点真实现」——Assemble 缺省挂点为量程二次判定真实现
++// （0027 的 PassthroughJudge 直通形态保留但不再是内核默认）。
++func TestContractDefaultJudgeIsRangeJudge(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil) // Judge 未设 → 缺省挂点
++	defer s.close()
++
++	res := s.submitBatch("R-DEFAULT",
++		pointJSON("R_M01", frozenNowMs-1000, 150, 0), // 超上限 → 缺省挂点应打 1
++	)
++	if res.Accepted != 1 {
++		t.Fatalf("accepted = %d, want 1", res.Accepted)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 150, 1)", frozenNowMs-1000)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("缺省判定挂点未做量程二次判定（缺 %q）: %s", want, sql)
++	}
++}
++
++// 契约依据：brief 裁决 1——边界值（==min/==max）不算越界，网关码保留。
++func TestContractRangeJudgeBoundaryInclusive(t *testing.T) {
++	s := newValPipe(t, rangeSnapshotJSON, nil)
++	defer s.close()
++
++	res := s.submitBatch("R-BOUND",
++		pointJSON("R_M01", frozenNowMs-1000, 0, 3),   // ==min → 保留网关 3
++		pointJSON("R_M01", frozenNowMs-2000, 100, 3), // ==max → 保留网关 3
++	)
++	if res.Accepted != 2 || res.Rejected != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 2/0", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(2)
++	sql := strings.Join(s.sqlAll(), "\n")
++	for _, want := range []string{
++		fmt.Sprintf("VALUES (%d, 0, 3)", frozenNowMs-1000),
++		fmt.Sprintf("VALUES (%d, 100, 3)", frozenNowMs-2000),
++	} {
++		if !strings.Contains(sql, want) {
++			t.Errorf("SQL 缺 %q（边界不算越界）: %s", want, sql)
++		}
++	}
++}
+diff --git a/ingest/internal/pipeline/pipeline_submit_race_contract_test.go b/ingest/internal/pipeline/pipeline_submit_race_contract_test.go
+index 79aac99..30e198f 100644
+--- a/ingest/internal/pipeline/pipeline_submit_race_contract_test.go
++++ b/ingest/internal/pipeline/pipeline_submit_race_contract_test.go
+@@ -127,8 +127,10 @@ func TestContractSubmitRaceSamePointTsExactlyOnce(t *testing.T) {
+ 		return h.pipe.Stats().WrittenPoints == rounds
+ 	})
+ 	// 重复写行零容忍：唯一键数 == 写出行数（AcceptedPoints 已证零重复入攒批，
+-	// WrittenPoints 收敛同值则无重复行到达写出口）。
+-	if st.WrittenPoints != rounds {
+-		t.Fatalf("写出后 WrittenPoints = %d, want %d（唯一 (pointCode, ts) 键恰一次写出）", st.WrittenPoints, rounds)
++	// WrittenPoints 收敛同值则无重复行到达写出口）。收敛判定后取最新快照复核
++	// ——上方 st 为收敛前快照（TASK-0028 修订：攒批异步落库下旧快照属测试侧竞态读，
++	// 曾在 -count=10 下偶发 26/30 误报；收敛值以新快照为准）。
++	if got := h.pipe.Stats().WrittenPoints; got != rounds {
++		t.Fatalf("写出后 WrittenPoints = %d, want %d（唯一 (pointCode, ts) 键恰一次写出）", got, rounds)
+ 	}
+ }
+diff --git a/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go b/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go
+index b3dc94a..644d39a 100644
+--- a/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go
++++ b/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go
+@@ -48,6 +48,7 @@ func newTTLHarness(t *testing.T, cfg pipeline.Config) *ttlHarness {
+ 		Dead:      &recordingSink{},
+ 		Writer:    &tdengine.Writer{Ex: h.executor},
+ 		Cache:     cache.NewMemoryPointCache(),
++		Now:       clockAt(1795212000000), // TASK-0028 冻结时钟（同 0073 harness 口径）
+ 	}
+ 	p, err := pipeline.Assemble(cfg, deps)
+ 	if err != nil {
+diff --git a/ingest/internal/pipeline/pipeline_time_contract_test.go b/ingest/internal/pipeline/pipeline_time_contract_test.go
+new file mode 100644
+index 0000000..28eebed
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_time_contract_test.go
+@@ -0,0 +1,324 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"math"
++	"strings"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0028 时间语义三分裁决契约（协调者裁决口径，设计锚点 §1.9A p17 / §3.2 p24）：
++//
++//   1. ts 越界拒绝：ts > now+INGEST_TS_FUTURE_REJECT（默认 5m）→ 拒绝死信 reason=ts_overflow；
++//      ts < now-INGEST_TS_MAX_AGE（默认 30 天）→ 拒绝死信 reason=ts_too_old（脏数据防线；
++//      MQTT 路径进死信计数，HTTP 路径进拒绝明细——同一 processOne 两路同构）。
++//   2. 未来窄带纠偏+打标：now < ts ≤ now+5m → ts 纠偏为接收时间并打标
++//      （结构化 WARN 日志采样 + 独立计数器；不改 CONV-02 quality 码域——枚举冻结）。
++//   3. 补传豁免：now-30 天 ≤ ts ≤ now → 原始 ts 落库、不纠偏不打标
++//      （§1.9A 断网补传锚点：计算引擎按补传时间窗重算，原始 ts 不可被纠偏破坏）。
++//   去重键取消息原始 ts：纠偏只改落库 ts，不改幂等键（否则未来漂移点重报会因纠偏后的
++//   新接收时间产生新键而重复落库）。
++
++const (
++	futureDriftMs = frozenNowMs + 2*60*1000        // 未来窄带（+2m）
++	overflowMs    = frozenNowMs + 6*60*1000        // 越未来上界（+6m > 5m）
++	bandUpperMs   = frozenNowMs + 5*60*1000        // 窄带上界（==now+5m → 纠偏）
++	bandOverMs    = frozenNowMs + 5*60*1000 + 1    // 越窄带上界 1ms → ts_overflow
++	tooOldMs      = frozenNowMs - 31*24*60*60*1000 // 31 天前 → ts_too_old
++	maxAgeEdgeMs  = frozenNowMs - 30*24*60*60*1000 // ==30 天 → 补传豁免（边界）
++	maxAgeOverMs  = maxAgeEdgeMs - 1               // 30 天-1ms → ts_too_old
++	backfillMs    = frozenNowMs - 10*24*60*60*1000 // 10 天前 → 补传豁免
++)
++
++// 契约依据：裁决 3 路径 2——未来窄带 ts 纠偏为接收时间并打标；落库行 ts=接收时间，
++// 消息原始 ts 不出现在写入行；独立计数器与打标回调各计一次。
++func TestContractTimeFutureDriftCorrectedAndTagged(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-CORR",
++		pointJSON("F01_WS01_EQ001_M01", futureDriftMs, 98231.4, 0),
++	)
++	if res.Accepted != 1 || res.Rejected != 0 || len(res.Rejections) != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d detail:%v, want 1/0/无（窄带未来 ts 不拒绝）",
++			res.Accepted, res.Rejected, res.Rejections)
++	}
++	s.waitWritten(1)
++	sql := strings.Join(s.sqlAll(), "\n")
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", frozenNowMs) // 纠偏为接收时间（冻结时钟）
++	if !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q（ts 应纠偏为接收时间）: %s", want, sql)
++	}
++	if strings.Contains(sql, fmt.Sprintf("%d", futureDriftMs)) {
++		t.Errorf("SQL 含消息原始未来 ts %d（纠偏后原始 ts 不得落库）: %s", futureDriftMs, sql)
++	}
++	if got := s.pipe.Stats().TimeCorrected; got != 1 {
++		t.Errorf("TimeCorrected = %d, want 1（独立计数器）", got)
++	}
++	calls := s.tag.all()
++	if len(calls) != 1 {
++		t.Fatalf("打标回调 = %d 次, want 1", len(calls))
++	}
++	c := calls[0]
++	if c.tenant != "group_a" || c.pointCode != "F01_WS01_EQ001_M01" ||
++		c.origTs != futureDriftMs || c.correctedTs != frozenNowMs {
++		t.Errorf("打标内容 = %+v, want tenant=group_a point=F01_WS01_EQ001_M01 origTs=%d correctedTs=%d",
++			c, futureDriftMs, frozenNowMs)
++	}
++}
++
++// 契约依据：裁决 3 路径 2 边界——now < ts ≤ now+5m 为窄带（含上界 ==now+5m 纠偏）；
++// 超上界（>now+5m）拒绝 ts_overflow。同批两点一分流。
++func TestContractTimeNarrowBandBoundaryAndOverflowSplit(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-BAND",
++		pointJSON("F01_WS01_EQ001_M01", bandUpperMs, 98231.4, 0), // ==now+5m → 纠偏
++		pointJSON("F01_WS01_EQ001_M02", bandOverMs, 132.5, 0),    // >now+5m → ts_overflow
++	)
++	if res.Accepted != 1 || res.Rejected != 1 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 1/1", res.Accepted, res.Rejected)
++	}
++	if len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterTsOverflow ||
++		res.Rejections[0].PointCode != "F01_WS01_EQ001_M02" || res.Rejections[0].Ts != bandOverMs {
++		t.Fatalf("拒绝明细 = %+v, want M02/%s/原始 ts %d", res.Rejections, pipeline.DeadLetterTsOverflow, bandOverMs)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", frozenNowMs)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q（上界点应纠偏落库）: %s", want, sql)
++	}
++}
++
++// 契约依据：裁决 3 路径 1——ts > now+5m 拒绝死信（reason=ts_overflow），不落库；
++// 拒绝明细携带消息原始 ts；纠偏计数不受影响。
++func TestContractTimeOverflowRejectedNotStored(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-OVER",
++		pointJSON("F01_WS01_EQ001_M01", overflowMs, 98231.4, 0),
++	)
++	if res.Accepted != 0 || res.Rejected != 1 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 0/1", res.Accepted, res.Rejected)
++	}
++	if len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterTsOverflow ||
++		res.Rejections[0].Ts != overflowMs {
++		t.Fatalf("拒绝明细 = %+v, want ts_overflow/原始 ts %d", res.Rejections, overflowMs)
++	}
++	if got := s.pipe.Stats().DeadLettered; got != 1 {
++		t.Errorf("DeadLettered = %d, want 1（死信计数）", got)
++	}
++	if got := s.pipe.Stats().TimeCorrected; got != 0 {
++		t.Errorf("TimeCorrected = %d, want 0", got)
++	}
++	if s.dead.byReason(pipeline.DeadLetterTsOverflow) != 1 {
++		t.Errorf("死信出口 ts_overflow 记录 = %d, want 1", s.dead.byReason(pipeline.DeadLetterTsOverflow))
++	}
++	if n := len(s.sqlAll()); n != 0 {
++		t.Errorf("落库 SQL = %d 条, want 0（越界死信不落库）", n)
++	}
++}
++
++// 契约依据：裁决 3 路径 1——ts < now-30 天拒绝死信（reason=ts_too_old，脏数据防线），不落库。
++func TestContractTimeTooOldRejectedNotStored(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-OLD",
++		pointJSON("F01_WS01_EQ001_M01", tooOldMs, 98231.4, 0),
++	)
++	if res.Accepted != 0 || res.Rejected != 1 ||
++		len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterTsTooOld {
++		t.Fatalf("受理结果 = %+v, want rejected=1 reason=ts_too_old", res)
++	}
++	if got := s.pipe.Stats().DeadLettered; got != 1 {
++		t.Errorf("DeadLettered = %d, want 1", got)
++	}
++	if n := len(s.sqlAll()); n != 0 {
++		t.Errorf("落库 SQL = %d 条, want 0", n)
++	}
++}
++
++// 契约依据：裁决 3 路径 3 + §1.9A 断网补传锚点——补传窗内（now-30d ≤ ts ≤ now）原始 ts
++// 落库、不纠偏不打标；计算引擎按补传时间窗识别重算，原始 ts 不可被纠偏破坏。
++func TestContractTimeBackfillExemptionKeepsOriginalTs(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-BACKFILL",
++		pointJSON("F01_WS01_EQ001_M01", backfillMs, 98231.4, 0),
++	)
++	if res.Accepted != 1 || res.Rejected != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 1/0（补传豁免不拒绝）", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", backfillMs)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q（补传数据必须按原始 ts 落库）: %s", want, sql)
++	}
++	if got := s.pipe.Stats().TimeCorrected; got != 0 {
++		t.Errorf("TimeCorrected = %d, want 0（补传豁免不纠偏）", got)
++	}
++	if len(s.tag.all()) != 0 {
++		t.Errorf("打标回调 = %d 次, want 0（补传豁免不打标）", len(s.tag.all()))
++	}
++}
++
++// 契约依据：裁决 3 路径 3 边界——ts == now-30 天属补传豁免（不拒绝）；再旧 1ms 即 ts_too_old。
++func TestContractTimeMaxAgeBoundary(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-EDGE-KEEP",
++		pointJSON("F01_WS01_EQ001_M01", maxAgeEdgeMs, 98231.4, 0),
++	)
++	if res.Accepted != 1 || res.Rejected != 0 {
++		t.Fatalf("==30 天受理 = accepted:%d rejected:%d, want 1/0（边界豁免）", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(1)
++
++	res2 := s.submitBatch("T-EDGE-REJECT",
++		pointJSON("F01_WS01_EQ001_M02", maxAgeOverMs, 132.5, 0),
++	)
++	if res2.Accepted != 0 || res2.Rejected != 1 ||
++		len(res2.Rejections) != 1 || res2.Rejections[0].Reason != pipeline.DeadLetterTsTooOld {
++		t.Fatalf("30 天-1ms 受理 = %+v, want rejected=1 ts_too_old", res2)
++	}
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", maxAgeEdgeMs)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q（边界点按原始 ts 落库）: %s", want, sql)
++	}
++}
++
++// 契约依据：裁决 3——ts == now 不属未来（保持原值）；now-30d ≤ ts < now 的迟到数据同理豁免。
++func TestContractTimeEqualNowKept(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-EQ",
++		pointJSON("F01_WS01_EQ001_M01", frozenNowMs, 98231.4, 0),
++	)
++	if res.Accepted != 1 || res.Rejected != 0 {
++		t.Fatalf("受理结果 = accepted:%d rejected:%d, want 1/0", res.Accepted, res.Rejected)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", frozenNowMs)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q: %s", want, sql)
++	}
++	if got := s.pipe.Stats().TimeCorrected; got != 0 {
++		t.Errorf("TimeCorrected = %d, want 0", got)
++	}
++}
++
++// 契约依据：裁决 3——所有阈值 env 配置化（INGEST_TS_FUTURE_REJECT/INGEST_TS_MAX_AGE，
++// 流水线侧 Config.TSFutureReject/TSMaxAge）：窄带收窄后原「未来 2 分钟」变越界拒绝，
++// 补传窗收窄后原「3 天前迟到」变 ts_too_old。
++func TestContractTimeThresholdsConfigurable(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(cfg *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++		cfg.TSFutureReject = time.Minute
++		cfg.TSMaxAge = 2 * time.Hour
++	})
++	defer s.close()
++
++	res := s.submitBatch("T-CFG1", pointJSON("F01_WS01_EQ001_M01", frozenNowMs+2*60*1000, 98231.4, 0))
++	if res.Rejected != 1 || len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterTsOverflow {
++		t.Fatalf("未来 Reject=1m 时 +2m 应 ts_overflow：res=%+v", res)
++	}
++	res2 := s.submitBatch("T-CFG2", pointJSON("F01_WS01_EQ001_M02", frozenNowMs-3*60*60*1000, 132.5, 0))
++	if res2.Rejected != 1 || len(res2.Rejections) != 1 || res2.Rejections[0].Reason != pipeline.DeadLetterTsTooOld {
++		t.Fatalf("MaxAge=2h 时 -3h 应 ts_too_old：res=%+v", res2)
++	}
++	res3 := s.submitBatch("T-CFG3", pointJSON("F01_WS01_EQ001_M01", frozenNowMs-60*60*1000, 98231.4, 0))
++	if res3.Accepted != 1 || res3.Rejected != 0 {
++		t.Fatalf("MaxAge=2h 时 -1h 应豁免：res=%+v", res3)
++	}
++	s.waitWritten(1)
++	want := fmt.Sprintf("VALUES (%d, 98231.4, 0)", frozenNowMs-60*60*1000)
++	if sql := strings.Join(s.sqlAll(), "\n"); !strings.Contains(sql, want) {
++		t.Errorf("SQL 缺 %q: %s", want, sql)
++	}
++}
++
++// 契约依据：去重键取消息原始 ts——纠偏只改落库 ts、不改幂等键；未来漂移点跨批重报
++// （新 batchId）被点级去重吸收，不得因纠偏后的新接收时间产生新键而重复落库。
++func TestContractTimeDedupKeyedOnOriginalTs(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++	})
++	defer s.close()
++
++	res1 := s.submitBatch("T-DUP-1", pointJSON("F01_WS01_EQ001_M01", futureDriftMs, 98231.4, 0))
++	if res1.Accepted != 1 {
++		t.Fatalf("首次 accepted = %d, want 1", res1.Accepted)
++	}
++	s.waitWritten(1)
++	res2 := s.submitBatch("T-DUP-2", pointJSON("F01_WS01_EQ001_M01", futureDriftMs, 98231.4, 0))
++	if res2.Accepted != 1 || res2.Rejected != 0 {
++		t.Fatalf("重报 accepted:%d rejected:%d, want 1/0（幂等重报按受理计）", res2.Accepted, res2.Rejected)
++	}
++	st := s.pipe.Stats()
++	if st.DuplicatePoints != 1 {
++		t.Errorf("DuplicatePoints = %d, want 1（重报按原始 ts 键命中点级去重）", st.DuplicatePoints)
++	}
++	if st.WrittenPoints != 1 {
++		t.Errorf("WrittenPoints = %d, want 1（不得重复落库）", st.WrittenPoints)
++	}
++	if n := len(s.sqlAll()); n != 1 {
++		t.Errorf("SQL = %d 条, want 1", n)
++	}
++}
++
++// nanParser 点位级格式非法假解析器（value=NaN：JSON 解析层不可达，防御流水线格式步）。
++type nanParser struct{}
++
++func (nanParser) Parse([]byte) (*message.Envelope, error) {
++	return &message.Envelope{
++		Tenant:  "group_a",
++		Gateway: "GW_F01_01",
++		BatchID: "T-NAN",
++		Points: []message.Point{
++			{PointCode: "F01_WS01_EQ001_M01", Ts: tooOldMs, Value: math.NaN(), Quality: 0}, // 格式非法 + ts 越旧：格式步在前
++		},
++	}, nil
++}
++
++// 契约依据：四步校验「格式→量程→时间→去重」——格式步先行：非有限值（防御分支，
++// reason=format_invalid）先于时间步拒绝，拒绝原因不得被 ts_too_old 遮蔽。
++func TestContractFormatStepPrecedesTimeStep(t *testing.T) {
++	s := newValPipe(t, defaultSnapshotJSON, func(_ *pipeline.Config, deps *pipeline.Deps) {
++		deps.Judge = passthroughJudge
++		deps.Parser = nanParser{}
++	})
++	defer s.close()
++
++	res := s.pipe.Submit(context.Background(), pipeline.Inbound{Tenant: "group_a", Payload: []byte("x")})
++	if res.Rejected != 1 || len(res.Rejections) != 1 || res.Rejections[0].Reason != pipeline.DeadLetterFormatInvalid {
++		t.Fatalf("拒绝明细 = %+v, want format_invalid（格式步先于时间步）", res.Rejections)
++	}
++	if n := len(s.sqlAll()); n != 0 {
++		t.Errorf("落库 SQL = %d 条, want 0", n)
++	}
++}
+diff --git a/ingest/internal/pipeline/timepolicy.go b/ingest/internal/pipeline/timepolicy.go
+new file mode 100644
+index 0000000..05fcc9a
+--- /dev/null
++++ b/ingest/internal/pipeline/timepolicy.go
+@@ -0,0 +1,118 @@
++// timepolicy.go 时间语义三分裁决（TASK-0028 裁决 3——协调者裁决口径，设计文档无独立
++// 章节，以 TASK 要点 + §1.9A p17 锚点为准）：
++//
++//	路径 1  ts 越界拒绝      ts > now+TSFutureReject（默认 5m）→ 拒绝死信 ts_overflow；
++//	                        ts < now-TSMaxAge（默认 30 天）→ 拒绝死信 ts_too_old
++//	                        （脏数据防线；MQTT 路径进死信计数、HTTP 路径进拒绝明细——
++//	                        同一 processOne 两路同构）。
++//	路径 2  未来窄带纠偏+打标 now < ts ≤ now+TSFutureReject → ts 纠偏为接收时间并打标
++//	                        （结构化 WARN 日志采样 + 独立计数器；不改 CONV-02 quality
++//	                        码域——枚举冻结，不自造「已纠偏」码，显式标记归契约变更另议）。
++//	路径 3  补传豁免         now-TSMaxAge ≤ ts ≤ now → 原始 ts 落库、不纠偏不打标
++//	                        （§1.9A 断网补传锚点：网关断网期间本地续采，恢复后补传按
++//	                        原始 ts 落 st_point_*，计算引擎按补传时间窗重算——原始 ts
++//	                        不可被纠偏破坏；TSMaxAge 内的迟到数据同理豁免）。
++//
++// 边界：ts == now+TSFutureReject 归窄带（裁决字面为「>」才拒绝）；ts == now-TSMaxAge
++// 归豁免（裁决字面为「<」才拒绝）；ts == now 归豁免（不属未来）。
++// 去重键口径：纠偏只改落库 ts、不改幂等键——(pointCode, ts) 去重取消息原始 ts
++// （否则未来漂移点跨批重报会因纠偏后的新接收时间产生新键而重复落库）。
++package pipeline
++
++import (
++	"log"
++	"sync/atomic"
++	"time"
++)
++
++// 时间阈值默认值（brief 裁决 3：所有阈值 env 配置化——INGEST_TS_FUTURE_REJECT /
++// INGEST_TS_MAX_AGE，ingestd 装配侧注入）。
++const (
++	// DefaultTSFutureReject 未来拒绝上界默认 5 分钟。
++	DefaultTSFutureReject = 5 * time.Minute
++	// DefaultTSMaxAge 最大年龄默认 30 天（补传豁免窗）。
++	DefaultTSMaxAge = 30 * 24 * time.Hour
++)
++
++// TimeAction 三分裁决动作。
++type TimeAction int
++
++const (
++	// TimeKeep 补传豁免：原始 ts 落库（路径 3）。
++	TimeKeep TimeAction = iota
++	// TimeCorrect 未来窄带：纠偏为接收时间并打标（路径 2）。
++	TimeCorrect
++	// TimeReject 越界拒绝：进死信（路径 1，Reason 携带原因码）。
++	TimeReject
++)
++
++// TimeVerdict 三分裁决结论。
++type TimeVerdict struct {
++	// Action 裁决动作。
++	Action TimeAction
++	// Ts 落库时间戳（毫秒）：Keep=原始 ts；Correct=接收时间（纠偏）；Reject 时无意义。
++	Ts int64
++	// Reason 拒绝原因码（仅 Reject 非空：ts_overflow / ts_too_old）。
++	Reason DeadLetterReason
++}
++
++// timePolicy 三分裁决器（不可变值；Assemble 时按 Config 阈值构建）。
++type timePolicy struct {
++	futureReject time.Duration
++	maxAge       time.Duration
++}
++
++// judge 对消息点位 ts（毫秒）做三分裁决。now 为消息接收时间（处理时刻）。
++func (tp timePolicy) judge(now time.Time, tsMs int64) TimeVerdict {
++	ts := time.UnixMilli(tsMs)
++	switch {
++	case ts.After(now.Add(tp.futureReject)):
++		// 路径 1a：越未来上界 → 拒绝（ts_overflow）。
++		return TimeVerdict{Action: TimeReject, Reason: DeadLetterTsOverflow}
++	case ts.Before(now.Add(-tp.maxAge)):
++		// 路径 1b：越最大年龄 → 拒绝（ts_too_old）。
++		return TimeVerdict{Action: TimeReject, Reason: DeadLetterTsTooOld}
++	case ts.After(now):
++		// 路径 2：未来窄带（now < ts ≤ now+futureReject）→ 纠偏为接收时间并打标。
++		return TimeVerdict{Action: TimeCorrect, Ts: now.UnixMilli()}
++	default:
++		// 路径 3：补传豁免（now-maxAge ≤ ts ≤ now）→ 原始 ts 落库。
++		return TimeVerdict{Action: TimeKeep, Ts: tsMs}
++	}
++}
++
++// DefaultCorrectionWarnEvery 纠偏打标日志采样默认周期（首次 + 每 N 条；与死信告警采样
++// 同量纲但独立配置——brief 裁决 3 打标=结构化 WARN 日志（采样）+独立计数器）。
++const DefaultCorrectionWarnEvery = 100
++
++// CorrectionTagger 未来窄带纠偏打标器：独立计数器 + 采样结构化 WARN 日志。
++// 打标不改 CONV-02 quality 码域（枚举冻结）——显式「已纠偏」标记归契约变更另议。
++type CorrectionTagger struct {
++	n         atomic.Int64
++	warnEvery int64
++	logger    *log.Logger
++}
++
++// NewCorrectionTagger 创建纠偏打标器（warnEvery<=0 取 DefaultCorrectionWarnEvery；
++// logger nil 取 log.Default()）。
++func NewCorrectionTagger(warnEvery int, logger *log.Logger) *CorrectionTagger {
++	if warnEvery <= 0 {
++		warnEvery = DefaultCorrectionWarnEvery
++	}
++	if logger == nil {
++		logger = log.Default()
++	}
++	return &CorrectionTagger{warnEvery: int64(warnEvery), logger: logger}
++}
++
++// Tag 记一次纠偏打标：独立计数递增；首次与每 N 条输出结构化 WARN（防风暴采样）。
++func (t *CorrectionTagger) Tag(tenant, pointCode string, origTs, correctedTs int64) {
++	n := t.n.Add(1)
++	if n == 1 || n%t.warnEvery == 0 {
++		t.logger.Printf("pipeline: [ts-corrected] tenant=%s pointCode=%s origTs=%d correctedTs=%d count=%d",
++			tenant, pointCode, origTs, correctedTs, n)
++	}
++}
++
++// Count 独立计数器当前值（纠偏打标次数）。
++func (t *CorrectionTagger) Count() int64 { return t.n.Load() }
+diff --git a/ingest/internal/quality/range.go b/ingest/internal/quality/range.go
+new file mode 100644
+index 0000000..fd5d955
+--- /dev/null
++++ b/ingest/internal/quality/range.go
+@@ -0,0 +1,40 @@
++// range.go 量程质量判定与合并规则（TASK-0028 质量挂点真实现的判定核心）。
++//
++// 契约依据：
++//   - 统一消息模型 v1.1.0 §3.2（设计文档 §3.2 p24 逐字）：「quality 由网关能判断的先填
++//     （如设备异常码映射），超限类质量码由接入服务按点位配置的 min/max 二次判定后覆盖写入」；
++//   - 配置快照 Schema v1.0.1 点位对象：minValue/maxValue（DECIMAL(20,6)，可空）——
++//     「低于下限只打质量码标记、不丢弃；接入服务按此二次判定覆盖质量码」；
++//   - CONV-02（本包枚举，冻结）：1=超上限（OverMax）、2=超下限（UnderMin）。
++//     注：TASK-0028 brief 行文「value<min→1、value>max→2」与冻结枚举文字相反，
++//     以冻结枚举为准（报告已登记偏离）；「量程外打码 1/2 不丢弃」语义两侧一致。
++//   - ADR-0009 TD-0048 边界注记：人工补录/修正走管理面接口（质量码 MANUAL=5 记操作审计），
++//     ingest 通道为纯机器上报——ingest 不提供任何人工补录入口，本判定不产生 MANUAL 码，
++//     网关上报携带的 MANUAL 码按「网关能判断的先填」透传存储。
++package quality
++
++// MergeRange 按点位有效范围（min/max，可空）对上报值做量程二次判定，并按 §3.2 口径
++// 合并网关先填的质量码：
++//
++//   - value > maxValue → OverMax(1)；value < minValue → UnderMin(2)（超限类接入覆盖写，
++//     无论网关先填何值）；
++//   - 边界值（==min / ==max）不算越界；范围内值保留网关质量码（非超限类不覆盖）；
++//   - minValue/maxValue 为 nil（快照点位未配置该边界）时跳过该侧判定；
++//     双侧均缺失时整跳过量程判定，网关质量码原样透传；
++//   - 网关质量码越出 0-10 存储口径时防御收敛为 Good(0)（CONV-02 唯一存储口径，
++//     越域码不得写入时序行）；
++//   - 只产出质量码，不触碰数值本身——原值保留、不丢弃、不假 0（brief 裁决 1）。
++func MergeRange(gatewayQuality int, value float64, minValue, maxValue *float64) int {
++	// 超限覆盖写：优先级高于网关码与码域收敛（越域码遇上越限值仍打越限码）。
++	if maxValue != nil && value > *maxValue {
++		return OverMax
++	}
++	if minValue != nil && value < *minValue {
++		return UnderMin
++	}
++	// 非超限：网关码保留；越域防御收敛（CONV-02 0-10 唯一存储口径）。
++	if !Valid(gatewayQuality) {
++		return Good
++	}
++	return gatewayQuality
++}
+diff --git a/ingest/internal/quality/range_contract_test.go b/ingest/internal/quality/range_contract_test.go
+new file mode 100644
+index 0000000..1bbdf22
+--- /dev/null
++++ b/ingest/internal/quality/range_contract_test.go
+@@ -0,0 +1,107 @@
++package quality_test
++
++import (
++	"testing"
++
++	"net.otlab/ingest/internal/quality"
++)
++
++// TASK-0028 量程质量判定契约（质量挂点真实现）：
++//
++// 契约依据：
++//   - 统一消息模型 v1.1.0 §3.2（设计文档 §3.2 p24 逐字）：「quality 由网关能判断的先填
++//     （如设备异常码映射），超限类质量码由接入服务按点位配置的 min/max 二次判定后覆盖写入」；
++//   - 配置快照 Schema v1.0.1 点位对象 minValue/maxValue 备注：「低于下限只打质量码标记、
++//     不丢弃；接入服务按此二次判定覆盖质量码」；
++//   - CONV-02 质量码数值枚举（冻结）：1=超上限、2=超下限——value>max 打 OverMax(1)、
++//     value<min 打 UnderMin(2)（brief 行文「value<min→1、value>max→2」与冻结枚举
++//     文字相反，以冻结枚举为准——见 TASK-0028 报告偏离登记）；
++//   - TASK-0028 brief 裁决 1：原值保留不丢弃不假 0（本函数只产质量码，不碰数值）；
++//     min/max 缺失跳过量程判定（原 quality 透传）；边界值（==min/==max）不算越界。
++
++func f64(v float64) *float64 { return &v }
++
++// 契约依据：CONV-02——超上限=1；§3.2——超限类由接入二次判定覆盖写入（无论网关先填何值）。
++func TestContractQualityRangeOverMaxOverwritesGatewayQuality(t *testing.T) {
++	max100 := f64(100)
++	cases := []struct {
++		name           string
++		gatewayQuality int
++	}{
++		{"网关正常码被覆盖", quality.Good},
++		{"网关断线码被覆盖", quality.StaleOffline},
++		{"网关突变码被覆盖", quality.JumpPendingReview},
++	}
++	for _, c := range cases {
++		got := quality.MergeRange(c.gatewayQuality, 150.5, nil, max100)
++		if got != quality.OverMax {
++			t.Errorf("%s: MergeRange(q=%d, 150.5, max=100) = %d, want OverMax(1)", c.name, c.gatewayQuality, got)
++		}
++	}
++}
++
++// 契约依据：CONV-02——超下限=2；§3.2 二次判定覆盖写。
++func TestContractQualityRangeUnderMinOverwritesGatewayQuality(t *testing.T) {
++	min0 := f64(0)
++	for _, q := range []int{quality.Good, quality.StaleOffline, quality.JumpPendingReview} {
++		if got := quality.MergeRange(q, -12.5, min0, nil); got != quality.UnderMin {
++			t.Errorf("MergeRange(q=%d, -12.5, min=0) = %d, want UnderMin(2)", q, got)
++		}
++	}
++}
++
++// 契约依据：TASK-0028 brief 裁决 1——边界值（==min/==max）不算越界；非超限类保留网关值。
++func TestContractQualityRangeBoundaryInclusiveKeepsGatewayQuality(t *testing.T) {
++	min0, max100 := f64(0), f64(100)
++	cases := []struct {
++		name  string
++		value float64
++	}{
++		{"等于下限", 0},
++		{"等于上限", 100},
++	}
++	for _, c := range cases {
++		if got := quality.MergeRange(quality.StaleOffline, c.value, min0, max100); got != quality.StaleOffline {
++			t.Errorf("%s: MergeRange(q=3, %v, [0,100]) = %d, want 3（边界不算越界，网关值保留）", c.name, c.value, got)
++		}
++	}
++	if got := quality.MergeRange(quality.Good, 50, min0, max100); got != quality.Good {
++		t.Errorf("范围内值 MergeRange = %d, want 0（非超限保留网关值）", got)
++	}
++}
++
++// 契约依据：TASK-0028 brief 裁决 1——min/max 缺失的点位跳过量程判定（原 quality 透传）；
++// 单边缺失时仍按存在的边界判定。
++func TestContractQualityRangeMissingBoundsPassthrough(t *testing.T) {
++	if got := quality.MergeRange(quality.StaleOffline, 1e18, nil, nil); got != quality.StaleOffline {
++		t.Errorf("min/max 全缺 MergeRange = %d, want 3（跳过量程判定，网关值透传）", got)
++	}
++	max100 := f64(100)
++	if got := quality.MergeRange(quality.Good, 101, nil, max100); got != quality.OverMax {
++		t.Errorf("min 缺失 max=100 值 101: MergeRange = %d, want 1", got)
++	}
++	if got := quality.MergeRange(quality.Good, 99, nil, max100); got != quality.Good {
++		t.Errorf("min 缺失 max=100 值 99: MergeRange = %d, want 0", got)
++	}
++	minM50 := f64(-50)
++	if got := quality.MergeRange(quality.Good, -51, minM50, nil); got != quality.UnderMin {
++		t.Errorf("max 缺失 min=-50 值 -51: MergeRange = %d, want 2", got)
++	}
++	if got := quality.MergeRange(quality.Good, -49, minM50, nil); got != quality.Good {
++		t.Errorf("max 缺失 min=-50 值 -49: MergeRange = %d, want 0", got)
++	}
++}
++
++// 契约依据：CONV-02——0-10 为唯一存储口径；网关越出码域的质量码防御收敛为 Good(0)，
++// 不得把越域码写入时序行。
++func TestContractQualityRangeInvalidGatewayQualityNormalized(t *testing.T) {
++	min0, max100 := f64(0), f64(100)
++	for _, q := range []int{99, -1, 11, 100} {
++		if got := quality.MergeRange(q, 50, min0, max100); got != quality.Good {
++			t.Errorf("越域网关码 q=%d（范围内值）MergeRange = %d, want 0（CONV-02 存储口径防御收敛）", q, got)
++		}
++	}
++	if got := quality.MergeRange(99, 150, nil, max100); got != quality.OverMax {
++		t.Errorf("越域网关码 q=99（超上限）MergeRange = %d, want 1（超限覆盖写不受影响）", got)
++	}
++}
+diff --git a/ingest/internal/tdengine/rest_contract_test.go b/ingest/internal/tdengine/rest_contract_test.go
+index 74b7ebf..f0a226f 100644
+--- a/ingest/internal/tdengine/rest_contract_test.go
++++ b/ingest/internal/tdengine/rest_contract_test.go
+@@ -266,6 +266,7 @@ func TestContractRESTEnvFailSoftRetryCountThroughPipeline(t *testing.T) {
+ 		Points:    pipeline.NewMemoryPointDeduper(0),
+ 		Writer:    &tdengine.Writer{Ex: client},
+ 		Cache:     cache.NewMemoryPointCache(),
++		Now:       func() time.Time { return time.UnixMilli(1795212000000) }, // TASK-0028 冻结时钟
+ 	})
+ 	if err != nil {
+ 		t.Fatalf("Assemble error: %v", err)

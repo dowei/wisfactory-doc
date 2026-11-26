@@ -1,0 +1,3200 @@
+commit 6126aa1d1a8fef6ec6e9b82582e2e99d27eb079b
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 03:27:28 2026 +0800
+
+    feat(iot): 模型模板与模板数据项域——模板 CRUD/删除保护/数据项批量保存接线字典三态校验器/菜单 4024-4029（TASK-0011）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+index 8737b3b..ffc9073 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+@@ -77,7 +77,11 @@ public interface IotDataDictService extends IService<IotDataDict> {
+      *
+      * @param tenantId 租户 ID（显式入参，跨租户编码不可见）
+      * @param dataCodes 待核对的数据编码集合（模板数据项选码），可空
+-     * @return 每个编码的核对状态；入参为 null/空集合时返回空 Map
++     * @return 每个编码的核对状态；入参为 null/空集合时返回空 Map。
++     *         <b>保序契约（TASK-0010 评审 Minor①，TASK-0011 接线消化）</b>：返回 Map 为
++     *         {@code LinkedHashMap} 实现，键集合与入参一致、迭代顺序与入参编码顺序一致
++     *         （含 fail-closed 早退路径），调用方可按模板数据项请求顺序遍历取<b>首个失败项</b>
++     *         报错——切换实现类为无序 Map 即构成对此契约的违约
+      */
+     Map<String, DictCodeStatus> validateForTemplateRef(Long tenantId, Collection<String> dataCodes);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java
+new file mode 100644
+index 0000000..3d4d7e1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java
+@@ -0,0 +1,86 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotTemplateItemBatchForm;
++import net.otlab.admin.module.iot.template.service.IotDataItemTemplateService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.annotation.RepeatSubmit;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.stream.Collectors;
++
++/**
++ * 模板数据项控制器（TASK-0011）
++ *
++ * <p>路径命名空间 /iot/template/item（模板子资源，宿主控制器
++ * {@link IotModelTemplateController}）。权限：查询共用 iot:template:list（详细设计 §3.1
++ * 「按 templateId 查模板数据项」查询语义）；三个写接口共用 iot:template:item:edit
++ * （sys_menu 4029「数据项编辑」，brief 六行权限清单一一对应）。
++ *
++ * <p>批量保存一次调用 N 项：控制器只做表单级联 bean 校验，字典三态核对/批内互撞/
++ * 双道闸/白名单构建全部在服务层（IotDataDictService.validateForTemplateRef 接线，
++ * NOT_REGISTERED/DISABLED 按文案拒整批不落库）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "模板数据项")
++@RestController
++@RequestMapping("/iot/template/item")
++public class IotDataItemTemplateController {
++
++    @Autowired
++    private IotDataItemTemplateService itemService;
++
++    @Operation(summary = "按模板查数据项清单")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:template:list")
++    public Result<List<IotDataItemTemplate>> list(@RequestParam("templateId") Long templateId) {
++        return Result.success(itemService.selectItemsByTemplateId(templateId));
++    }
++
++    @OperateLog(title = "模板数据项", businessType = BusinessType.INSERT)
++    @Operation(summary = "批量保存数据项（一次 ≤500 项；data_code 必须取自字典，未登记/已停用按文案拒整批）")
++    @RepeatSubmit(interval = 3000)
++    @PostMapping
++    @SaCheckPermission("iot:template:item:edit")
++    public Result<Integer> add(@Valid @RequestBody IotTemplateItemBatchForm form) {
++        return Result.success(itemService.saveItems(form.getTemplateId(), form.getItems()));
++    }
++
++    @OperateLog(title = "模板数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改数据项（data_code 创建后不可改；默认公式一期仅长度+基础格式校验）")
++    @PutMapping
++    @SaCheckPermission("iot:template:item:edit")
++    public Result<Void> edit(@Valid @RequestBody IotDataItemTemplate item) {
++        itemService.updateItem(item);
++        return Result.success();
++    }
++
++    @OperateLog(title = "模板数据项", businessType = BusinessType.DELETE)
++    @Operation(summary = "批量删除数据项（逻辑删）")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:template:item:edit")
++    public Result<Void> remove(@PathVariable("ids") String ids) {
++        itemService.deleteItems(parseIds(ids));
++        return Result.success();
++    }
++
++    /** 逗号分隔 id 路径参数解析（照框架批量删除口径，空白段剔除） */
++    private List<Long> parseIds(String ids) {
++        return Arrays.stream(ids.split(","))
++                .map(String::trim)
++                .filter(s -> !s.isEmpty())
++                .map(Long::valueOf)
++                .collect(Collectors.toList());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java
+new file mode 100644
+index 0000000..36c3050
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateController.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotModelTemplateDetailVO;
++import net.otlab.admin.module.iot.template.service.IotModelTemplateService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.stream.Collectors;
++
++/**
++ * 模型模板控制器（TASK-0011）
++ *
++ * <p>路径命名空间 /iot/template（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；
++ * 权限前缀 iot:template:*（sys_menu 4024-4028，模板管理页 4009 之下）。
++ * 数据项子资源 /iot/template/item 在 {@link IotDataItemTemplateController}
++ * （三写接口共用 iot:template:item:edit，sys_menu 4029）。
++ *
++ * <p>删除为真实逻辑删（@TableLogic deleted=1，模板编码随租户生命周期不再语义复用，
++ * 与字典「只增不删」口径不同——字典编码承载全厂统一语义永不复用，模板编码仅租户内
++ * 业务语义），有实例引用或数据项引用时拒绝并提示引用来源（引用计数查询）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "模型模板")
++@RestController
++@RequestMapping("/iot/template")
++public class IotModelTemplateController {
++
++    @Autowired
++    private IotModelTemplateService templateService;
++
++    @Operation(summary = "分页查询模型模板")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:template:list")
++    public Result<Page<IotModelTemplate>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                               @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                               IotModelTemplate query) {
++        Page<IotModelTemplate> page = new Page<>(pageNum, pageSize);
++        return Result.success(templateService.selectTemplateList(page, query));
++    }
++
++    @Operation(summary = "模板详情（withItems=true 聚合模板数据项清单）")
++    @GetMapping("/{id}")
++    @SaCheckPermission("iot:template:query")
++    public Result<IotModelTemplateDetailVO> getById(@PathVariable("id") Long id,
++                                                    @RequestParam(value = "withItems", required = false, defaultValue = "false") boolean withItems) {
++        return Result.success(templateService.getTemplateDetail(id, withItems));
++    }
++
++    @OperateLog(title = "模型模板", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增模板（template_code 租户内唯一，重复报 4002；tenant_id 会话覆盖，平台预置模板走 SQL 种子）")
++    @PostMapping
++    @SaCheckPermission("iot:template:add")
++    public Result<Void> add(@Valid @RequestBody IotModelTemplate template) {
++        templateService.insertTemplate(template);
++        return Result.success();
++    }
++
++    @OperateLog(title = "模型模板", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改模板（template_code 创建后不可改；node_type 1-5；status 可启停）")
++    @PutMapping
++    @SaCheckPermission("iot:template:edit")
++    public Result<Void> edit(@Valid @RequestBody IotModelTemplate template) {
++        templateService.updateTemplate(template);
++        return Result.success();
++    }
++
++    @OperateLog(title = "模型模板", businessType = BusinessType.DELETE)
++    @Operation(summary = "批量删除模板（逻辑删；有实例引用或模板数据项时拒绝并提示引用来源）")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:template:remove")
++    public Result<Void> remove(@PathVariable("ids") String ids) {
++        templateService.deleteTemplates(parseIds(ids));
++        return Result.success();
++    }
++
++    /** 逗号分隔 id 路径参数解析（照框架批量删除口径，空白段剔除） */
++    private List<Long> parseIds(String ids) {
++        return Arrays.stream(ids.split(","))
++                .map(String::trim)
++                .filter(s -> !s.isEmpty())
++                .map(Long::valueOf)
++                .collect(Collectors.toList());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotDataItemTemplate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotDataItemTemplate.java
+new file mode 100644
+index 0000000..4d9f9f0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotDataItemTemplate.java
+@@ -0,0 +1,107 @@
++package net.otlab.admin.module.iot.template.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Pattern;
++import jakarta.validation.constraints.Size;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.math.BigDecimal;
++
++/**
++ * 模板数据项实体类（TASK-0011，详细设计 §1.6 / 附录 A p32 + ADR-0011 补字段）
++ *
++ * <p>定义模板上「有哪些数据」与默认取值方式，实例创建时据此批量生成实例数据项
++ * （TASK-0012）。data_code 必须取自业务数据字典 iot_data_dict（ADR-0003 唯一来源，
++ * 批量保存接线 IotDataDictService.validateForTemplateRef 三态校验器），一经创建不可改
++ * （REQ-0004 核心规则：换编码=新增一项+停用旧项）。(template_id, data_code) 模板内唯一
++ * （uk_template_data_code 物理唯一索引）。
++ *
++ * <p>相对上游附录 A p32 逐字 DDL 的两处补列（均已在升级脚本头注声明）：
++ * default_calc_period（ADR-0011 TD-0011）与 tenant_id（详细设计 §0.3 改造二统一补列，
++ * 附录 A 漏项——iot_ 前缀表被多租户插件 fail-closed 纳入，缺列即运行期 SQL 报错）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_data_item_template")
++@Schema(description = "模板数据项")
++public class IotDataItemTemplate extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "模板数据项ID")
++    private Long id;
++
++    @Schema(description = "租户ID（§0.3 改造二补列；服务层一律从会话覆盖，请求值不信任；空为平台预置模板数据项）")
++    private Long tenantId;
++
++    @Schema(description = "所属模板ID（批量保存时以 form.templateId 为准，项内携带值不信任；编辑不进更新集）")
++    private Long templateId;
++
++    @NotBlank(message = "数据编码不能为空")
++    @Size(max = 64, message = "数据编码长度不能超过 64")
++    @Schema(description = "数据编码（取自业务数据字典，创建后不可改）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String dataCode;
++
++    @NotBlank(message = "数据名称不能为空")
++    @Size(max = 100, message = "数据名称长度不能超过 100")
++    @Schema(description = "数据名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String dataName;
++
++    @Size(max = 32, message = "类别长度不能超过 32")
++    @Pattern(regexp = "ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER",
++            message = "类别仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER")
++    @Schema(description = "类别（七选一，可空）")
++    private String category;
++
++    @Min(value = 1, message = "值性质仅允许 1-3")
++    @Max(value = 3, message = "值性质仅允许 1-3")
++    @Schema(description = "值性质：1 瞬时 2 累计 3 增量（可空）")
++    private Integer valueKind;
++
++    @Size(max = 32, message = "单位长度不能超过 32")
++    @Schema(description = "单位（引用单位字典 sys_dict）")
++    private String unit;
++
++    @Min(value = 1, message = "默认取值方式仅允许 1-3")
++    @Max(value = 3, message = "默认取值方式仅允许 1-3")
++    @Schema(description = "默认取值方式：1 绑定 2 公式 3 汇总（可空）")
++    private Integer defaultSourceType;
++
++    @Size(max = 2000, message = "默认公式长度不能超过 2000")
++    @Schema(description = "默认公式（Aviator 语法，相对引用；一期服务层仅做长度与基础格式校验，"
++            + "Aviator 真语法校验归 FEAT-0012 校验器接线）")
++    private String defaultFormula;
++
++    @Pattern(regexp = "SUM|AVG|MAX|MIN", message = "缺省聚合仅允许 SUM/AVG/MAX/MIN")
++    @Schema(description = "缺省聚合：SUM/AVG/MAX/MIN（可空）")
++    private String aggMethod;
++
++    @Size(max = 16, message = "默认计算周期长度不能超过 16")
++    @Schema(description = "默认计算周期（如 MINUTE/HOUR/DAY；ADR-0011 补字段，上游漏项）")
++    private String defaultCalcPeriod;
++
++    @Schema(description = "默认有效下限（空不判定）")
++    private BigDecimal defaultValidMin;
++
++    @Schema(description = "默认有效上限")
++    private BigDecimal defaultValidMax;
++
++    @Schema(description = "默认告警低阈值")
++    private BigDecimal defaultAlarmLow;
++
++    @Schema(description = "默认告警高阈值")
++    private BigDecimal defaultAlarmHigh;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java
+new file mode 100644
+index 0000000..57baf57
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelInstance.java
+@@ -0,0 +1,68 @@
++package net.otlab.admin.module.iot.template.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 模型实例实体类（TASK-0011 建库先行，详细设计 §1.5 / 附录 A p31）
++ *
++ * <p><b>本实体仅为模板删除保护的引用计数查询提供最小映射</b>：iot_model_instance 表随
++ * TASK-0011 升级脚本建库先行（TASK-0005 数据权限组件 selectAllForPerm 亦以本表存在为前提），
++ * 实例业务逻辑——实例接口、路径式编码规则、绑部门流程、树管理——全部归 TASK-0012，
++ * 本任务零实例业务代码；TASK-0012 届时按需扩展本实体。
++ *
++ * <p>字段映射照附录 A p31 逐字 DDL：instance_code 租户内路径式唯一
++ * （uk_tenant_instance_code），template_id 为来源模板（删除保护引用计数的关键列），
++ * dept_id 为数据权限锚点，ancestors 仿 sys_dept 前缀匹配。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_model_instance")
++@Schema(description = "模型实例（TASK-0011 建库先行，业务逻辑归 TASK-0012）")
++public class IotModelInstance extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "实例ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "实例编码（租户内唯一，路径式 F01、F01.WS01、F01.WS01.EQ001）")
++    private String instanceCode;
++
++    @Schema(description = "实例名称")
++    private String instanceName;
++
++    @Schema(description = "来源模板ID（删除保护引用计数的关键列）")
++    private Long templateId;
++
++    @Schema(description = "父实例ID，顶级为 0")
++    private Long parentId;
++
++    @Schema(description = "祖级路径（逗号分隔 ID，仿 sys_dept.ancestors）")
++    private String ancestors;
++
++    @Schema(description = "节点类型：1 工厂 2 车间 3 产线 4 设备 5 组件")
++    private Integer nodeType;
++
++    @Schema(description = "绑定部门ID（数据权限锚点，工厂/车间级必填——校验归 TASK-0012）")
++    private Long deptId;
++
++    @Schema(description = "同级排序")
++    private Integer sort;
++
++    @Schema(description = "状态 0 禁用 1 启用")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplate.java
+new file mode 100644
+index 0000000..49aa463
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/IotModelTemplate.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.template.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 模型模板实体类（TASK-0011，详细设计 §1.5 / 附录 A p31）
++ *
++ * <p>模板定义一类节点的共性（数据项清单、默认取值方式、默认公式、默认阈值），实例只做
++ * 绑定与参数覆盖（TASK-0012 交付实例域）。template_code 租户内唯一
++ * （uk_tenant_template_code 物理唯一索引）；tenant_id 为空表示平台预置模板——一期接口
++ * 降级：创建接口仅允许租户模板（tenant_id 服务层从会话覆盖），平台预置模板仅 SQL 种子
++ * 可产生（REQ-0004 非目标口径）。template_code 创建后不可改（一期不开放改编码）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_model_template")
++@Schema(description = "模型模板")
++public class IotModelTemplate extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "模板ID")
++    private Long id;
++
++    @Schema(description = "租户ID（服务层一律从会话覆盖，请求值不信任；空为平台预置模板，仅 SQL 种子可产生）")
++    private Long tenantId;
++
++    @NotBlank(message = "模板编码不能为空")
++    @Size(max = 64, message = "模板编码长度不能超过 64")
++    @Schema(description = "模板编码（租户内唯一，创建后不可改）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String templateCode;
++
++    @NotBlank(message = "模板名称不能为空")
++    @Size(max = 100, message = "模板名称长度不能超过 100")
++    @Schema(description = "模板名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String templateName;
++
++    @NotNull(message = "节点类型不能为空")
++    @Min(value = 1, message = "节点类型仅允许 1-5")
++    @Max(value = 5, message = "节点类型仅允许 1-5")
++    @Schema(description = "节点类型：1 工厂 2 车间 3 产线 4 设备 5 组件（约束实例可建层级）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer nodeType;
++
++    @Min(value = 1, message = "模板版本号必须为正整数")
++    @Schema(description = "模板版本号（未携带落库默认 1；模板变更升版，已建实例不自动跟随）")
++    private Integer version;
++
++    @Schema(description = "状态 0 禁用 1 启用（新增强制 1；编辑可启停）")
++    private Integer status;
++
++    @Size(max = 500, message = "备注长度不能超过 500")
++    @Schema(description = "备注")
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotModelTemplateDetailVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotModelTemplateDetailVO.java
+new file mode 100644
+index 0000000..181efb7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotModelTemplateDetailVO.java
+@@ -0,0 +1,49 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import com.fasterxml.jackson.annotation.JsonInclude;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++
++import java.util.List;
++
++/**
++ * 模型模板详情 VO（TASK-0011）：GET /iot/template/{id} 返回体。
++ *
++ * <p>items 仅在请求携带 withItems=true 时由服务层聚合填充（默认不查数据项表，
++ * 列表页详情只取模板本体）；null 时 Jackson 不序列化该字段（前端据此区分「未请求」
++ * 与「空清单」）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@EqualsAndHashCode(callSuper = true)
++@Schema(description = "模型模板详情（可选聚合模板数据项清单）")
++public class IotModelTemplateDetailVO extends IotModelTemplate {
++
++    @JsonInclude(JsonInclude.Include.NON_NULL)
++    @Schema(description = "模板数据项清单（仅 withItems=true 时返回）")
++    private List<IotDataItemTemplate> items;
++
++    /** 静态工厂：模板本体拷贝为 VO（items 由调用方按需填充） */
++    public static IotModelTemplateDetailVO from(IotModelTemplate template) {
++        IotModelTemplateDetailVO vo = new IotModelTemplateDetailVO();
++        vo.setId(template.getId());
++        vo.setTenantId(template.getTenantId());
++        vo.setTemplateCode(template.getTemplateCode());
++        vo.setTemplateName(template.getTemplateName());
++        vo.setNodeType(template.getNodeType());
++        vo.setVersion(template.getVersion());
++        vo.setStatus(template.getStatus());
++        vo.setRemark(template.getRemark());
++        vo.setCreateTime(template.getCreateTime());
++        vo.setCreateBy(template.getCreateBy());
++        vo.setUpdateTime(template.getUpdateTime());
++        vo.setUpdateBy(template.getUpdateBy());
++        vo.setDeleted(template.getDeleted());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotTemplateItemBatchForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotTemplateItemBatchForm.java
+new file mode 100644
+index 0000000..437e936
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/IotTemplateItemBatchForm.java
+@@ -0,0 +1,35 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++
++import java.util.List;
++
++/**
++ * 模板数据项批量保存表单（TASK-0011）：POST /iot/template/item 请求体。
++ *
++ * <p>一次调用保存 N 个数据项（照 0010 校验器批量口径）：templateId 为宿主模板
++ * （必填，服务层以入参为准覆盖项内携带值）；items 级联 {@code @Valid} 逐项 bean 校验；
++ * 单批上限 500 项在服务层以 {@link net.otlab.admin.module.iot.template.service.IotDataItemTemplateService#ITEM_BATCH_MAX}
++ * 强制（消化 TASK-0010 评审 Minor② 调用侧约束）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "模板数据项批量保存表单")
++public class IotTemplateItemBatchForm {
++
++    @NotNull(message = "模板ID不能为空")
++    @Schema(description = "宿主模板ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long templateId;
++
++    @NotEmpty(message = "数据项清单不能为空")
++    @Valid
++    @Schema(description = "数据项清单（单批 ≤500 项）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<IotDataItemTemplate> items;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java
+new file mode 100644
+index 0000000..751f3f6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java
+@@ -0,0 +1,19 @@
++package net.otlab.admin.module.iot.template.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 模板数据项数据访问层（TASK-0011）
++ *
++ * <p>空 BaseMapper：iot_data_item_template 为 iot_ 前缀表，多租户条件由 TASK-0002
++ * TenantLineInnerInterceptor 自动注入（OtTenantLineHandler 前缀规则）——tenant_id 列为
++ * §0.3 改造二统一补列（升级脚本「与上游差异」2），缺列会使插件注入后的 SQL 运行期报错。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotDataItemTemplateMapper extends BaseMapper<IotDataItemTemplate> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelInstanceMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelInstanceMapper.java
+new file mode 100644
+index 0000000..6908aba
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelInstanceMapper.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.template.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 模型实例数据访问层（TASK-0011 建库先行）
++ *
++ * <p>空 BaseMapper：本 Mapper 在 TASK-0011 仅承载模板删除保护的引用计数查询
++ * （iot_model_instance.template_id）；实例业务逻辑与更完整的访问方法归 TASK-0012。
++ * iot_ 前缀表的多租户条件由 TASK-0002 TenantLineInnerInterceptor 自动注入——
++ * 删除保护计数天然只数本租户实例（跨租户引用不可见）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotModelInstanceMapper extends BaseMapper<IotModelInstance> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateMapper.java
+new file mode 100644
+index 0000000..adbb020
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotModelTemplateMapper.java
+@@ -0,0 +1,18 @@
++package net.otlab.admin.module.iot.template.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 模型模板数据访问层（TASK-0011）
++ *
++ * <p>空 BaseMapper：iot_ 前缀表的多租户条件由 TASK-0002 TenantLineInnerInterceptor
++ * 自动注入（OtTenantLineHandler 前缀规则），无 @Mapper 旁路需求。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotModelTemplateMapper extends BaseMapper<IotModelTemplate> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java
+new file mode 100644
+index 0000000..aa2c25e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java
+@@ -0,0 +1,66 @@
++package net.otlab.admin.module.iot.template.service;
++
++import com.baomidou.mybatisplus.spring.service.IService;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++
++import java.util.List;
++
++/**
++ * 模板数据项服务接口（TASK-0011）
++ *
++ * <p>业务口径（REQ-0004 / ADR-0003 / brief 裁决）：data_code 必须取自业务数据字典——
++ * 批量保存全项编码收集后一次调用 IotDataDictService.validateForTemplateRef（TASK-0010
++ * 交付的三态校验器），任一项 NOT_REGISTERED/DISABLED 按 0010 文案拒整批不落库（错误码
++ * PARAM_ERROR，映射在本调用方——TASK-0009 先例：批量校验口径归 PARAM_ERROR，4002 语义
++ * 留给编码重复）；(template_id, data_code) 批内互撞先判（先于字典校验）、库内已有活跃行
++ * 预检 + uk_template_data_code 物理唯一兜底双道闸均 4002；单批上限 500 项（消化
++ * TASK-0010 评审 Minor②）；编辑锁 data_code（创建后不可改）；默认公式一期降级——非空时
++ * 长度 ≤2000 + 括号/占位符配平基础格式校验，Aviator 真语法校验归 FEAT-0012 接线（遗留
++ * 登记义务）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotDataItemTemplateService extends IService<IotDataItemTemplate> {
++
++    /**
++     * 批量保存单批上限（brief 裁决：消化 TASK-0010 评审 Minor②——validateForTemplateRef
++     * 调用侧入参上限；模板一次保存 N 个数据项天然以此封顶，超大 IN 子句不可达）
++     */
++    int ITEM_BATCH_MAX = 500;
++
++    /**
++     * 按模板查数据项清单（按 id 升序；模板不存在/已删报 PARAM_ERROR）。
++     * 租户条件由多租户插件按会话租户自动追加。
++     */
++    List<IotDataItemTemplate> selectItemsByTemplateId(Long templateId);
++
++    /**
++     * 批量保存数据项（一次调用 N 项，整批原子）：空清单/超 {@link #ITEM_BATCH_MAX} 项/
++     * 宿主模板不存在 → PARAM_ERROR 拒绝；逐项必填与公式基础格式校验 + (template_id,
++     * data_code) 批内互撞先判（4002）；全项编码收集后一次 validateForTemplateRef 三态核对，
++     * 任一项非 OK 按请求顺序取首个失败项以 0010 文案拒整批（PARAM_ERROR，不落库）；库内
++     * 已有同 (template_id, data_code) 活跃行预检 4002；全部通过才白名单构建逐项落库
++     * （status=1、deleted=0、templateId/tenantId 以入参会话为准，项内携带值不信任），
++     * 并发撞物理唯一索引兜底映射 4002 整批拒绝。
++     *
++     * @param templateId 宿主模板 id（form.templateId，服务层以此覆盖项内携带值）
++     * @param items      数据项清单（1-500 项）
++     * @return 落库项数
++     */
++    int saveItems(Long templateId, List<IotDataItemTemplate> items);
++
++    /**
++     * 编辑数据项：data_code 不可改（未携带或携带不一致一律 PARAM_ERROR 拒绝）；
++     * 白名单更新 dataName/category/valueKind/unit/defaultSourceType/defaultFormula/
++     * aggMethod/defaultCalcPeriod/默认阈值四字段（templateId/tenantId/status/审计字段/
++     * deleted 不进更新集）；公式非空时按一期降级口径校验（长度 ≤2000 + 括号配平）。
++     */
++    boolean updateItem(IotDataItemTemplate item);
++
++    /**
++     * 批量逻辑删数据项（removeByIds；模板数据项无外部引用方——实例数据项由 TASK-0012
++     * 生成时即独立落行，不回指模板数据项——故无删除保护）；空列表 PARAM_ERROR 拒绝。
++     */
++    boolean deleteItems(List<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotModelTemplateService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotModelTemplateService.java
+new file mode 100644
+index 0000000..e5eb7b0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotModelTemplateService.java
+@@ -0,0 +1,59 @@
++package net.otlab.admin.module.iot.template.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.IService;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotModelTemplateDetailVO;
++
++import java.util.List;
++
++/**
++ * 模型模板服务接口（TASK-0011）
++ *
++ * <p>业务口径（REQ-0004 / ADR-0003 / brief）：template_code 租户内唯一，重复报 4002
++ * （活跃行预检 + uk_tenant_template_code 物理唯一兜底双道闸，照字典域范式）；
++ * template_code 创建后不可改（一期不开放改编码）；删除保护——有实例引用
++ * （iot_model_instance.template_id）或模板数据项引用（iot_data_item_template.template_id）
++ * 时拒绝并提示引用来源，无引用才逻辑删；平台预置模板（tenant_id=null）创建入口一期
++ * 接口降级——本服务对新建一律以会话租户覆盖 tenant_id，平台预置仅 SQL 种子可产生。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotModelTemplateService extends IService<IotModelTemplate> {
++
++    /**
++     * 分页查询模板（过滤 templateCode/templateName 模糊、nodeType/status 精确）。
++     * 租户条件由多租户插件按会话租户自动追加（tenant_id=null 的平台预置模板对
++     * 租户会话不可见，一期降级口径）。
++     */
++    Page<IotModelTemplate> selectTemplateList(Page<IotModelTemplate> page, IotModelTemplate query);
++
++    /**
++     * 模板详情（不存在报 PARAM_ERROR）；withItems=true 时聚合模板数据项清单
++     * （按 id 升序），false 时 items 保持 null（Jackson 不序列化）。
++     */
++    IotModelTemplateDetailVO getTemplateDetail(Long id, boolean withItems);
++
++    /**
++     * 新增模板：node_type 必填 1-5；字段白名单构建（status 强制 1 启用、deleted 强制 0、
++     * version 未携带落库默认 1、审计字段由 MetaObjectHandler 回填、tenant_id 服务层从
++     * 会话覆盖禁前端传参）；template_code 唯一双道闸 4002。
++     */
++    boolean insertTemplate(IotModelTemplate template);
++
++    /**
++     * 编辑模板：template_code 不可改（未携带或携带不一致一律 PARAM_ERROR 拒绝，
++     * 照 data_code 不可改范式）；白名单更新 templateName/nodeType/version/status/remark
++     * （status 仅允许 0/1；nodeType 仍校验 1-5；tenant_id/审计字段不进更新集）。
++     */
++    boolean updateTemplate(IotModelTemplate template);
++
++    /**
++     * 批量逻辑删模板（删除保护）：任一 id 有实例引用（iot_model_instance.template_id，
++     * 引用计数查询并提示实例编码）或仍有模板数据项（iot_data_item_template.template_id，
++     * 提示模板编码与项数）时整批拒绝并汇总两类引用来源；无引用才 removeByIds 逻辑删。
++     * 批内含不存在/已删 id 时 fail-closed 整批拒绝。
++     */
++    boolean deleteTemplates(List<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+new file mode 100644
+index 0000000..ea6ee1c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+@@ -0,0 +1,253 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.service.DictCodeStatus;
++import net.otlab.admin.module.iot.service.IotDataDictService;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.service.IotDataItemTemplateService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 模板数据项服务实现类（TASK-0011）
++ *
++ * <p>字典来源校验接线（ADR-0003 / TASK-0010 校验器消费方）：批量保存把全项 data_code
++ * 收集去重后<b>一次</b>调用 {@link IotDataDictService#validateForTemplateRef}（批量 IN 预检，
++ * 不逐项 count），按返回 Map 保序契约（0010 评审 Minor①，LinkedHashMap 按入参序）以请求
++ * 顺序取首个失败项报错——NOT_REGISTERED/DISABLED 各用 0010 文案常量
++ * （{@link DictCodeStatus#messageFor(String)}）拒整批不落库，错误码 PARAM_ERROR 映射在本
++ * 调用方（TASK-0009 先例：批量校验口径归 PARAM_ERROR，4002 语义留给编码重复）。单批上限
++ * {@link #ITEM_BATCH_MAX}=500 项（0010 评审 Minor② 调用侧约束）。
++ *
++ * <p>(template_id, data_code) 唯一双道闸（照 IotDataDictServiceImpl 范式）：批内互撞先判
++ * （先于字典校验，brief 明文）；库内活跃行预检 4002；落库并发撞 uk_template_data_code 由
++ * {@link DuplicateKeyException} 兜底映射 4002（rollbackFor=Exception 整批回滚）。
++ *
++ * <p>默认公式一期降级口径（brief 裁决）：非空时长度 ≤2000 + 括号/占位符配平的基础格式
++ * 占位校验——<b>Aviator 真实语法校验归 FEAT-0012 公式校验器交付时接线</b>（任务正文
++ * 「公式语法校验调 FEAT-0012 校验器」所述组件尚不存在，0011 遗留登记接线义务）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTemplateMapper, IotDataItemTemplate> implements IotDataItemTemplateService {
++
++    /** 默认公式限长口径（与 iot_data_item_template DDL default_formula varchar(2000) 一致） */
++    private static final int MAX_LEN_FORMULA = 2000;
++
++    @Autowired
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Autowired
++    private IotDataDictService dictService;
++
++    @Override
++    public List<IotDataItemTemplate> selectItemsByTemplateId(Long templateId) {
++        requireTemplateExists(templateId);
++        LambdaQueryWrapper<IotDataItemTemplate> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(IotDataItemTemplate::getTemplateId, templateId);
++        wrapper.orderByAsc(IotDataItemTemplate::getId);
++        return this.list(wrapper);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public int saveItems(Long templateId, List<IotDataItemTemplate> items) {
++        // 批级前置拒绝（无可逐项标注的对象）：空清单 / 超 500 项（Minor② 调用侧约束，
++        // 先于任何查库——超大集合不可达 validateForTemplateRef）
++        if (items == null || items.isEmpty()) {
++            throw paramError("数据项清单不能为空");
++        }
++        if (items.size() > ITEM_BATCH_MAX) {
++            throw paramError("单批保存上限 " + ITEM_BATCH_MAX + " 项，当前 " + items.size() + " 项");
++        }
++        requireTemplateExists(templateId);
++
++        // 第一遍：逐项必填与公式基础格式校验 + 批内互撞判定（brief 明文：批内互撞先判，
++        // 先于字典校验——撞码批连字典核对都无需消耗）
++        Set<String> seenCodes = new HashSet<>(items.size());
++        for (IotDataItemTemplate item : items) {
++            if (item.getDataCode() == null || item.getDataCode().isEmpty()) {
++                throw paramError("数据编码不能为空");
++            }
++            if (item.getDataName() == null || item.getDataName().isEmpty()) {
++                throw paramError("数据名称不能为空");
++            }
++            validateFormula(item.getDefaultFormula());
++            if (!seenCodes.add(item.getDataCode())) {
++                throw duplicateDataCode("模板数据项编码批内重复: " + item.getDataCode());
++            }
++        }
++
++        // 字典来源校验（ADR-0003：data_code 必须取自字典）——0010 三态校验器一次批量调用：
++        // 全项编码收集后单次 validateForTemplateRef（tenant_id 显式取会话租户；校验器返回
++        // Map 保序，按请求顺序取首个失败项报错，文案复用 0010 常量区分「未登记/已停用」）。
++        // 错误码 PARAM_ERROR 映射在本调用方（TASK-0009 先例：批量校验口径归 PARAM_ERROR），
++        // 拒整批不落库。
++        Map<String, DictCodeStatus> statusByCode =
++                dictService.validateForTemplateRef(TenantContext.getTenantId(), seenCodes);
++        for (IotDataItemTemplate item : items) {
++            DictCodeStatus status = statusByCode.get(item.getDataCode());
++            if (status != null && status != DictCodeStatus.OK) {
++                throw paramError(status.messageFor(item.getDataCode()));
++            }
++        }
++
++        // 第二遍：库内已有 (template_id, data_code) 活跃行预检（双道闸第一道；
++        // @TableLogic 过滤已删行，租户条件由插件追加）
++        LambdaQueryWrapper<IotDataItemTemplate> existWrapper = new LambdaQueryWrapper<>();
++        existWrapper.select(IotDataItemTemplate::getDataCode)
++                .eq(IotDataItemTemplate::getTemplateId, templateId)
++                .in(IotDataItemTemplate::getDataCode, seenCodes);
++        List<IotDataItemTemplate> existingRows = this.list(existWrapper);
++        if (!existingRows.isEmpty()) {
++            throw duplicateDataCode("模板数据项编码已存在: "
++                    + existingRows.get(0).getDataCode() + "（同模板内编码唯一，重复请改用编辑）");
++        }
++
++        // 全部通过：白名单构建实体逐项落库（照 IotDataDictServiceImpl.importDicts 范式）——
++        // 1) templateId 以方法入参（form.templateId）为准，项内携带值不信任；
++        // 2) tenantId 服务层从会话覆盖（§0.3 改造二补列；插件对 INSERT 自动补列与会话
++        //    租户同值，双保险口径同字典域）；
++        // 3) deleted 强制 0 / id 与审计字段不复制（mass assignment 无注入通道）；
++        //    本表无 status 列（上游 DDL 口径：项的生命周期跟随模板与实例，自身不启停）。
++        try {
++            for (IotDataItemTemplate item : items) {
++                this.save(buildEntity(templateId, item));
++            }
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的并发撞码窗口（物理唯一索引 uk_template_data_code），
++            // rollbackFor=Exception 整批回滚——批量口径统一 4002
++            throw duplicateDataCode("模板数据项编码并发冲突，整批未入库，请重试");
++        }
++        return items.size();
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateItem(IotDataItemTemplate item) {
++        IotDataItemTemplate existing = this.getById(item.getId());
++        if (existing == null) {
++            throw paramError("模板数据项不存在或已删除");
++        }
++        // data_code 创建后不可改（REQ-0004 核心规则：换编码=新增一项+停用旧项）：
++        // 请求携带的编码与库中不一致（含未携带）即拒绝（照字典 data_code 不可改范式）
++        if (item.getDataCode() == null || !item.getDataCode().equals(existing.getDataCode())) {
++            throw paramError("数据编码不允许修改");
++        }
++        // 公式非空时按一期降级口径校验（Aviator 真语法归 FEAT-0012，见类 javadoc）
++        validateFormula(item.getDefaultFormula());
++
++        // 字段白名单构建更新（不直接 updateById 请求实体；不可变字段不回写、连 no-op 都不进 SET）：
++        // 1) 仅 dataName/category/valueKind/unit/defaultSourceType/defaultFormula/aggMethod/
++        //    defaultCalcPeriod/默认阈值四字段 可变——dataCode 经上方不可改校验后不进更新集；
++        // 2) templateId 不进更新集（数据项不换模板，换模板=删旧建新，历史留旧键）；
++        // 3) tenantId 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写）；
++        // 4) deleted/审计字段不进更新集（本表无 status 列——项的生命周期跟随模板与实例，
++        //    自身不启停，编辑不承载启停语义）。
++        IotDataItemTemplate upd = new IotDataItemTemplate();
++        upd.setId(existing.getId());
++        upd.setDataName(item.getDataName());
++        upd.setCategory(item.getCategory());
++        upd.setValueKind(item.getValueKind());
++        upd.setUnit(item.getUnit());
++        upd.setDefaultSourceType(item.getDefaultSourceType());
++        upd.setDefaultFormula(item.getDefaultFormula());
++        upd.setAggMethod(item.getAggMethod());
++        upd.setDefaultCalcPeriod(item.getDefaultCalcPeriod());
++        upd.setDefaultValidMin(item.getDefaultValidMin());
++        upd.setDefaultValidMax(item.getDefaultValidMax());
++        upd.setDefaultAlarmLow(item.getDefaultAlarmLow());
++        upd.setDefaultAlarmHigh(item.getDefaultAlarmHigh());
++        return this.updateById(upd);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteItems(List<Long> ids) {
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要删除的数据项");
++        }
++        // 逻辑删（@TableLogic）；模板数据项无外部引用方（实例数据项由 TASK-0012 生成时
++        // 独立落行不回指模板数据项），无删除保护
++        return this.removeByIds(ids);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    private void requireTemplateExists(Long templateId) {
++        if (modelTemplateMapper.selectById(templateId) == null) {
++            throw paramError("模板不存在或已删除");
++        }
++    }
++
++    /**
++     * 默认公式一期降级校验（brief 裁决口径）：可空；非空时 ① 长度 ≤2000（DDL 列宽口径）；
++     * ② 括号/占位符配平的基础格式占位校验（() 与 {} 各自计数配平）。
++     * <b>Aviator 真实语法校验归 FEAT-0012 公式校验器交付时接线（遗留登记义务）</b>——届时
++     * 替换/叠加本方法，本任务的口径仅保证「明显残缺的公式不落库」。
++     */
++    private void validateFormula(String formula) {
++        if (formula == null || formula.isEmpty()) {
++            return;
++        }
++        if (formula.length() > MAX_LEN_FORMULA) {
++            throw paramError("默认公式长度不能超过 " + MAX_LEN_FORMULA);
++        }
++        long parens = formula.chars().filter(c -> c == '(').count()
++                - formula.chars().filter(c -> c == ')').count();
++        long braces = formula.chars().filter(c -> c == '{').count()
++                - formula.chars().filter(c -> c == '}').count();
++        if (parens != 0 || braces != 0) {
++            throw paramError("默认公式基础格式非法：括号/占位符不配平（Aviator 语法校验归 FEAT-0012，"
++                    + "本任务仅做基础格式校验）");
++        }
++    }
++
++    /** 保存行 → 落库实体（白名单构建，照 importDicts 范式） */
++    private IotDataItemTemplate buildEntity(Long templateId, IotDataItemTemplate item) {
++        IotDataItemTemplate entity = new IotDataItemTemplate();
++        entity.setTemplateId(templateId);
++        entity.setTenantId(TenantContext.getTenantId());
++        entity.setDataCode(item.getDataCode());
++        entity.setDataName(item.getDataName());
++        entity.setCategory(item.getCategory());
++        entity.setValueKind(item.getValueKind());
++        entity.setUnit(item.getUnit());
++        entity.setDefaultSourceType(item.getDefaultSourceType());
++        entity.setDefaultFormula(item.getDefaultFormula());
++        entity.setAggMethod(item.getAggMethod());
++        entity.setDefaultCalcPeriod(item.getDefaultCalcPeriod());
++        entity.setDefaultValidMin(item.getDefaultValidMin());
++        entity.setDefaultValidMax(item.getDefaultValidMax());
++        entity.setDefaultAlarmLow(item.getDefaultAlarmLow());
++        entity.setDefaultAlarmHigh(item.getDefaultAlarmHigh());
++        entity.setDeleted(0);
++        return entity;
++    }
++
++    private BusinessException duplicateDataCode(String message) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+new file mode 100644
+index 0000000..80da259
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImpl.java
+@@ -0,0 +1,274 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotModelTemplateDetailVO;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.service.IotModelTemplateService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++
++/**
++ * 模型模板服务实现类（TASK-0011）
++ *
++ * <p>编码唯一性双道闸（照 IotDataDictServiceImpl / SysTenantServiceImpl 范式）：先对活跃行
++ * （@TableLogic 过滤 deleted=0）预检，友好报 4002；再捕获 {@link DuplicateKeyException} 兜底
++ * ——uk_tenant_template_code 是 (tenant_id, template_code) 物理唯一索引，逻辑删不释放编码。
++ * 预检只按 template_code 精确匹配：租户内唯一由多租户插件对 iot_ 前缀表自动追加 tenant_id
++ * 条件（TASK-0002，无需旁路）。平台级 template_code 全局唯一语义一期降级不实现（接口仅允许
++ * 创建租户模板；平台预置模板走 SQL 种子，REQ-0004 非目标口径）。
++ *
++ * <p>字段白名单构建：新增/更新均不直接落请求实体——status 强制启用（新增）或仅允许 0/1
++ * （编辑）、tenant_id 服务层从会话覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经
++ * API 注入，杜绝 mass assignment。
++ *
++ * <p>删除保护（REQ-0004 验收 4 / brief）：模板删除前引用计数查询两类外部引用——
++ * ① 实例引用（iot_model_instance.template_id，提示实例编码）；② 模板数据项
++ * （iot_data_item_template.template_id，提示模板编码与项数——模板下仍有数据项即删除会
++ * 产生孤儿行，照详细设计 §3.1 网关/通道「其下有点位时拒绝并提示」同范式 fail-closed）。
++ * 任一引用命中即整批拒绝并汇总来源，无引用才 removeByIds 逻辑删。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotModelTemplateServiceImpl extends ServiceImpl<IotModelTemplateMapper, IotModelTemplate> implements IotModelTemplateService {
++
++    /** varchar 限长口径（与 iot_model_template DDL 一致） */
++    private static final int MAX_LEN_TEMPLATE_CODE = 64;
++    private static final int MAX_LEN_TEMPLATE_NAME = 100;
++    private static final int MAX_LEN_REMARK = 500;
++
++    /** node_type 值域（与实体 @Min/@Max 一致：1 工厂 2 车间 3 产线 4 设备 5 组件） */
++    private static final int NODE_TYPE_MIN = 1;
++    private static final int NODE_TYPE_MAX = 5;
++
++    /** 引用来源提示最多列出的编码数（超出以「等 N 个」汇总，防消息过长） */
++    private static final int MAX_REF_SOURCES_DISPLAYED = 5;
++
++    @Autowired
++    private IotModelInstanceMapper modelInstanceMapper;
++
++    @Autowired
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Override
++    public Page<IotModelTemplate> selectTemplateList(Page<IotModelTemplate> page, IotModelTemplate query) {
++        LambdaQueryWrapper<IotModelTemplate> wrapper = new LambdaQueryWrapper<>();
++        if (query.getTemplateCode() != null) {
++            wrapper.like(IotModelTemplate::getTemplateCode, SqlLikeUtils.escape(query.getTemplateCode()));
++        }
++        if (query.getTemplateName() != null) {
++            wrapper.like(IotModelTemplate::getTemplateName, SqlLikeUtils.escape(query.getTemplateName()));
++        }
++        if (query.getNodeType() != null) {
++            wrapper.eq(IotModelTemplate::getNodeType, query.getNodeType());
++        }
++        if (query.getStatus() != null) {
++            wrapper.eq(IotModelTemplate::getStatus, query.getStatus());
++        }
++        wrapper.orderByDesc(IotModelTemplate::getId);
++        return this.page(page, wrapper);
++    }
++
++    @Override
++    public IotModelTemplateDetailVO getTemplateDetail(Long id, boolean withItems) {
++        IotModelTemplate template = this.getById(id);
++        if (template == null) {
++            throw paramError("模板不存在或已删除");
++        }
++        IotModelTemplateDetailVO vo = IotModelTemplateDetailVO.from(template);
++        if (withItems) {
++            LambdaQueryWrapper<IotDataItemTemplate> itemWrapper = new LambdaQueryWrapper<>();
++            itemWrapper.eq(IotDataItemTemplate::getTemplateId, id);
++            itemWrapper.orderByAsc(IotDataItemTemplate::getId);
++            vo.setItems(dataItemTemplateMapper.selectList(itemWrapper));
++        }
++        return vo;
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean insertTemplate(IotModelTemplate template) {
++        // node_type 必填 1-5（bean 校验之外的服务层防线，standalone 服务调用同样拦截）
++        validateNodeType(template.getNodeType());
++        if (isOverLength(template.getTemplateCode(), MAX_LEN_TEMPLATE_CODE)
++                || isOverLength(template.getTemplateName(), MAX_LEN_TEMPLATE_NAME)
++                || isOverLength(template.getRemark(), MAX_LEN_REMARK)) {
++            throw paramError("模板编码/名称/备注超长（上限 64/100/500）");
++        }
++
++        // 字段白名单构建新增实体（照 IotDataDictServiceImpl.insertDict 范式）：请求仅可携带
++        // template_code/template_name/node_type/version/remark 五个业务字段，其余一律不取请求值——
++        // 1) status 强制 1：新建模板一律启用（启停走编辑接口，请求携带 status 不落库）；
++        // 2) deleted 强制 0：@TableLogic 直带 1 会落库成全 API 不可见的幽灵行，且永久占用
++        //    uk_tenant_template_code（编码语义上未创建即报废且无法经 API 排查）；
++        // 3) id / createBy / createTime / updateBy / updateTime 不复制（id 框架自增，审计字段由
++        //    MetaObjectHandler 按当前登录者回填——strictInsertFill 仅填空值，直落请求实体即被注入）；
++        // 4) tenant_id 服务层从会话覆盖（REQ-0001 核心规则；平台预置模板 tenant_id=null 仅
++        //    SQL 种子可产生——一期接口降级，创建入口只产租户模板）；插件对 iot_ 前缀表 INSERT
++        //    自动补列与会话租户同值（双保险，口径一致）。
++        IotModelTemplate entity = new IotModelTemplate();
++        entity.setTemplateCode(template.getTemplateCode());
++        entity.setTemplateName(template.getTemplateName());
++        entity.setNodeType(template.getNodeType());
++        entity.setVersion(template.getVersion() != null ? template.getVersion() : 1);
++        entity.setRemark(template.getRemark());
++        entity.setStatus(1);
++        entity.setDeleted(0);
++        entity.setTenantId(TenantContext.getTenantId());
++
++        // 预检活跃行：@TableLogic 过滤已删行；租户条件由插件追加（会话态下即租户内唯一）
++        LambdaQueryWrapper<IotModelTemplate> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(IotModelTemplate::getTemplateCode, entity.getTemplateCode());
++        if (this.count(wrapper) > 0) {
++            throw duplicateTemplateCode(entity.getTemplateCode());
++        }
++        try {
++            return this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：并发插入或已删除行仍占用编码（物理唯一索引不被逻辑删除释放）
++            throw duplicateTemplateCode(entity.getTemplateCode());
++        }
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateTemplate(IotModelTemplate template) {
++        IotModelTemplate existing = this.getById(template.getId());
++        if (existing == null) {
++            throw paramError("模板不存在或已删除");
++        }
++        // template_code 创建后不可改（一期不开放改编码，REQ-0004 核心规则）：
++        // 请求携带的编码与库中不一致（含未携带）即拒绝（照 data_code 不可改范式）
++        if (template.getTemplateCode() == null || !template.getTemplateCode().equals(existing.getTemplateCode())) {
++            throw paramError("模板编码不允许修改");
++        }
++        validateNodeType(template.getNodeType());
++        if (template.getStatus() != null && template.getStatus() != 0 && template.getStatus() != 1) {
++            throw paramError("模板状态仅允许 0 禁用 / 1 启用");
++        }
++        if (template.getVersion() != null && template.getVersion() < 1) {
++            throw paramError("模板版本号必须为正整数");
++        }
++
++        // 字段白名单构建更新（不直接 updateById 请求实体；不可变字段不回写、连 no-op 都不进 SET）：
++        // 1) 仅 templateName/nodeType/version/status/remark 可变——templateCode 经上方不可改校验
++        //    后不进更新集（库内值本就不变，SET 不含不可变字段，语义更干净）；
++        // 2) tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写；模板不可跨租户挪移）；
++        // 3) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
++        //    杜绝客户端 mass assignment（updateBy/updateTime 由 MetaObjectHandler 按当前登录者回填）。
++        IotModelTemplate upd = new IotModelTemplate();
++        upd.setId(existing.getId());
++        upd.setTemplateName(template.getTemplateName());
++        upd.setNodeType(template.getNodeType());
++        upd.setVersion(template.getVersion());
++        upd.setStatus(template.getStatus());
++        upd.setRemark(template.getRemark());
++        return this.updateById(upd);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteTemplates(List<Long> ids) {
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要删除的模板");
++        }
++        // fail-closed：批内全部 id 必须存在且活跃（@TableLogic 过滤已删行），
++        // 缺失即整批拒绝（不半删）
++        List<IotModelTemplate> existingList = this.listByIds(ids);
++        if (existingList.size() < ids.size()) {
++            Map<Long, IotModelTemplate> found = existingList.stream()
++                    .collect(Collectors.toMap(IotModelTemplate::getId, Function.identity()));
++            List<Long> missing = ids.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("模板不存在或已删除: " + missing);
++        }
++
++        // 删除保护：两类外部引用任一命中即整批拒绝并汇总来源（引用计数查询）
++        List<String> reasons = new ArrayList<>();
++
++        // ① 实例引用（iot_model_instance.template_id）：租户条件由插件追加、deleted 由
++        //    @TableLogic 运行时过滤——引用计数天然只数本租户活跃实例
++        LambdaQueryWrapper<IotModelInstance> instanceWrapper = new LambdaQueryWrapper<>();
++        instanceWrapper.select(IotModelInstance::getInstanceCode)
++                .in(IotModelInstance::getTemplateId, ids);
++        List<IotModelInstance> instanceRefs = modelInstanceMapper.selectList(instanceWrapper);
++        if (!instanceRefs.isEmpty()) {
++            List<String> instanceCodes = instanceRefs.stream()
++                    .map(IotModelInstance::getInstanceCode)
++                    .collect(Collectors.toList());
++            reasons.add("模板被实例引用，禁止删除（实例: " + joinLimit(instanceCodes) + "）");
++        }
++
++        // ② 模板数据项引用（iot_data_item_template.template_id）：模板下仍有数据项即删除
++        //    会产生孤儿数据项行（照网关/通道「其下有点位时拒绝」范式 fail-closed）
++        LambdaQueryWrapper<IotDataItemTemplate> itemWrapper = new LambdaQueryWrapper<>();
++        itemWrapper.select(IotDataItemTemplate::getTemplateId)
++                .in(IotDataItemTemplate::getTemplateId, ids);
++        List<IotDataItemTemplate> itemRefs = dataItemTemplateMapper.selectList(itemWrapper);
++        if (!itemRefs.isEmpty()) {
++            Map<Long, Long> countByTemplate = itemRefs.stream()
++                    .collect(Collectors.groupingBy(IotDataItemTemplate::getTemplateId, Collectors.counting()));
++            Map<Long, String> codeById = existingList.stream()
++                    .collect(Collectors.toMap(IotModelTemplate::getId, IotModelTemplate::getTemplateCode));
++            List<String> itemSources = countByTemplate.entrySet().stream()
++                    .map(e -> codeById.getOrDefault(e.getKey(), String.valueOf(e.getKey())) + "（" + e.getValue() + " 项）")
++                    .collect(Collectors.toList());
++            reasons.add("模板存在模板数据项，禁止删除（先清理数据项: " + joinLimit(itemSources) + "）");
++        }
++
++        if (!reasons.isEmpty()) {
++            throw paramError(String.join("；", reasons));
++        }
++
++        // 无引用：逻辑删（@TableLogic，deleted=1）
++        return this.removeByIds(ids);
++    }
++
++    private void validateNodeType(Integer nodeType) {
++        if (nodeType == null || nodeType < NODE_TYPE_MIN || nodeType > NODE_TYPE_MAX) {
++            throw paramError("节点类型仅允许 1-5（1 工厂 2 车间 3 产线 4 设备 5 组件）");
++        }
++    }
++
++    private boolean isOverLength(String value, int max) {
++        return value != null && value.length() > max;
++    }
++
++    /** 引用来源展示限长：最多展示前 5 个，超出以「等 N 个」汇总 */
++    private String joinLimit(List<String> sources) {
++        if (sources.size() <= MAX_REF_SOURCES_DISPLAYED) {
++            return String.join(", ", sources);
++        }
++        return String.join(", ", sources.subList(0, MAX_REF_SOURCES_DISPLAYED))
++                + " 等 " + sources.size() + " 个";
++    }
++
++    private BusinessException duplicateTemplateCode(String templateCode) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "模板编码已存在: " + templateCode);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/config/IotTemplateMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/config/IotTemplateMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..6ee4c65
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/config/IotTemplateMenuPermissionGuardTest.java
+@@ -0,0 +1,137 @@
++package net.otlab.admin.module.iot.template.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.template.controller.IotDataItemTemplateController;
++import net.otlab.admin.module.iot.template.controller.IotModelTemplateController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0011 守卫测试：模板域菜单权限（sys_menu 4024-4029 六行）与控制器接口清单一一对应。
++ *
++ * <p>brief 硬要求「权限标识与接口清单一一对应（后端守卫测试会强制）」。本测试双向锁定：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_template_domain.sql 的 sys_menu 六行种子
++ *     （id 4024-4029，parent_id=4009）权限码必须恰好等于预期的六值映射——删行/换码/挪 parent 即红；</li>
++ * <li>代码侧：模板域两个 @RestController 全部 @SaCheckPermission 权限码并集必须恰好等于
++ *     六值集合——多注解/漏注解/写错码即红；</li>
++ * <li>双向相等（一一对应）。</li>
++ * </ul>
++ *
++ * <p>与既有 {@code SaPermissionRegistryConsistencyTest}（注解 ⊆ 全库 sys_menu SQL 并集）
++ * 互补：本测试是模板域的精确守卫，防止未来任务挪用/复用本号段权限码造成口径漂移。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotTemplateMenuPermissionGuardTest {
++
++    /** 六行菜单种子的预期映射（id → perms），与升级脚本 4024-4029 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4024L, "iot:template:list",
++            4025L, "iot:template:query",
++            4026L, "iot:template:add",
++            4027L, "iot:template:edit",
++            4028L, "iot:template:remove",
++            4029L, "iot:template:item:edit");
++
++    /** 升级脚本路径（从模块目录或仓库根目录向上定位 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_template_domain.sql";
++
++    /** 菜单种子行形如 (4024, 4009, 4, '模板查询', 3, NULL, NULL, NULL, 'iot:template:list', ...） */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[2-9]\\d),\\s*4009,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的模板菜单行恰好等于预期六值映射（4024-4029）")
++    void scriptRegistersExactlyTheSixMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4024-4029 六行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 模板域控制器权限码并集恰好等于六值集合")
++    void controllerPermissionsAreExactlyTheSixPerms() {
++        Set<String> annotated = collectControllerPerms();
++
++        Set<String> expected = new TreeSet<>(EXPECTED_MENU_ROWS.values());
++        assertEquals(expected, annotated,
++                "模板域 @SaCheckPermission 权限码并集必须恰好等于菜单六值集合（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向一致 - SQL 登记集与注解集一一对应（brief：权限标识与接口清单一一对应）")
++    void sqlRegistryAndAnnotationsAreInOneToOneCorrespondence() throws Exception {
++        Set<String> fromSql = new TreeSet<>(parseMenuRows(readScript()).values());
++        Set<String> fromCode = collectControllerPerms();
++        assertEquals(fromCode, fromSql, "SQL 登记与控制器注解两集合必须完全一致");
++        assertTrue(fromSql.containsAll(EXPECTED_MENU_ROWS.values()), "六值映射必须全部被登记");
++    }
++
++    /** 收集模板域两个控制器的全部 @SaCheckPermission 权限码（方法级 + 类级） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        for (Class<?> clazz : Arrays.asList(IotModelTemplateController.class, IotDataItemTemplateController.class)) {
++            assertTrue(clazz.isAnnotationPresent(RestController.class),
++                    clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++            SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++            if (classLevel != null) {
++                perms.addAll(Arrays.asList(classLevel.value()));
++            }
++            for (Method method : clazz.getDeclaredMethods()) {
++                SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++                if (annotation != null) {
++                    perms.addAll(Arrays.asList(annotation.value()));
++                }
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（模板管理页 4009 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript() throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(SCRIPT_RELATIVE);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateControllerTest.java
+new file mode 100644
+index 0000000..ac863d0
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateControllerTest.java
+@@ -0,0 +1,268 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotTemplateItemBatchForm;
++import net.otlab.admin.module.iot.template.service.IotDataItemTemplateService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 模板数据项控制器测试（TASK-0011 接口层）
++ *
++ * <p>查询接口共用 iot:template:list 权限点（详细设计 §3.1「按 templateId 查模板数据项」），
++ * 三个写接口共用 iot:template:item:edit 权限点（sys_menu 4029，brief 六行权限清单一一对应）。
++ * standalone MockMvc + Mockito（照 IotDataDictControllerTest 范式）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataItemTemplateControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotDataItemTemplateService itemService;
++
++    private IotDataItemTemplateController itemController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        itemController = new IotDataItemTemplateController();
++        ReflectionTestUtils.setField(itemController, "itemService", itemService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(itemController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private IotDataItemTemplate testItem() {
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setId(50L);
++        item.setTemplateId(1L);
++        item.setDataCode("ELEC_CONS");
++        item.setDataName("用电量");
++        item.setCategory("ELEC");
++        item.setValueKind(2);
++        item.setUnit("kWh");
++        item.setDefaultSourceType(2);
++        item.setAggMethod("SUM");
++        item.setDefaultCalcPeriod("MINUTE");
++        return item;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 查询共用 iot:template:list，三个写接口共用 iot:template:item:edit（sys_menu 4029）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:template:list", IotDataItemTemplateController.class
++                .getMethod("list", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:item:edit", IotDataItemTemplateController.class
++                .getMethod("add", IotTemplateItemBatchForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:item:edit", IotDataItemTemplateController.class
++                .getMethod("edit", IotDataItemTemplate.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:item:edit", IotDataItemTemplateController.class
++                .getMethod("remove", String.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 三个写操作（批量保存/编辑/删除）均有 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method add = IotDataItemTemplateController.class.getMethod("add", IotTemplateItemBatchForm.class);
++        Method edit = IotDataItemTemplateController.class.getMethod("edit", IotDataItemTemplate.class);
++        Method remove = IotDataItemTemplateController.class.getMethod("remove", String.class);
++        for (Method method : List.of(add, edit, remove)) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, add.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, edit.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.DELETE, remove.getAnnotation(OperateLog.class).businessType());
++    }
++
++    // ---------- 路由与参数校验（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("按模板查数据项 - GET /iot/template/item/list?templateId= 返回清单")
++    void testList_Success() throws Exception {
++        when(itemService.selectItemsByTemplateId(1L)).thenReturn(List.of(testItem()));
++
++        mockMvc.perform(get("/iot/template/item/list").param("templateId", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").isArray())
++                .andExpect(jsonPath("$.data[0].dataCode").value("ELEC_CONS"));
++
++        verify(itemService).selectItemsByTemplateId(1L);
++    }
++
++    @Test
++    @DisplayName("按模板查数据项 - 服务层拒绝透传（模板不存在 400）")
++    void testList_TemplateNotFound() throws Exception {
++        when(itemService.selectItemsByTemplateId(99L))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "模板不存在或已删除"));
++
++        mockMvc.perform(get("/iot/template/item/list").param("templateId", "99"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("批量保存 - POST /iot/template/item 正常返回 200 且带保存数")
++    void testAdd_Success() throws Exception {
++        IotTemplateItemBatchForm form = new IotTemplateItemBatchForm();
++        form.setTemplateId(1L);
++        form.setItems(List.of(testItem()));
++        when(itemService.saveItems(eq(1L), any())).thenReturn(1);
++
++        mockMvc.perform(post("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(1));
++
++        verify(itemService).saveItems(eq(1L), any());
++    }
++
++    @Test
++    @DisplayName("批量保存 - templateId 缺失返回业务码 400")
++    void testAdd_TemplateIdMissing() throws Exception {
++        IotTemplateItemBatchForm form = new IotTemplateItemBatchForm();
++        form.setItems(List.of(testItem()));
++
++        mockMvc.perform(post("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(itemService, never()).saveItems(any(), any());
++    }
++
++    @Test
++    @DisplayName("批量保存 - 数据项清单为空返回业务码 400")
++    void testAdd_EmptyItems() throws Exception {
++        IotTemplateItemBatchForm form = new IotTemplateItemBatchForm();
++        form.setTemplateId(1L);
++        form.setItems(List.of());
++
++        mockMvc.perform(post("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(itemService, never()).saveItems(any(), any());
++    }
++
++    @Test
++    @DisplayName("批量保存 - 项内 data_code 缺失级联校验返回业务码 400")
++    void testAdd_ItemBlankCode() throws Exception {
++        IotTemplateItemBatchForm form = new IotTemplateItemBatchForm();
++        form.setTemplateId(1L);
++        IotDataItemTemplate item = testItem();
++        item.setDataCode(null);
++        form.setItems(List.of(item));
++
++        mockMvc.perform(post("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(itemService, never()).saveItems(any(), any());
++    }
++
++    @Test
++    @DisplayName("批量保存 - 字典校验拒整批透传（未登记 400 + 文案）")
++    void testAdd_DictRejected() throws Exception {
++        IotTemplateItemBatchForm form = new IotTemplateItemBatchForm();
++        form.setTemplateId(1L);
++        form.setItems(List.of(testItem()));
++        when(itemService.saveItems(eq(1L), any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "数据编码未在字典登记: ELEC_CONS"));
++
++        mockMvc.perform(post("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("数据编码未在字典登记: ELEC_CONS"));
++    }
++
++    @Test
++    @DisplayName("编辑 - PUT /iot/template/item 正常返回 200")
++    void testEdit_Success() throws Exception {
++        when(itemService.updateItem(any(IotDataItemTemplate.class))).thenReturn(true);
++
++        mockMvc.perform(put("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testItem())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(itemService).updateItem(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - data_code 改动被拒透传（REQ-0004：data_code 改动被拒）")
++    void testEdit_RejectCodeChange() throws Exception {
++        when(itemService.updateItem(any(IotDataItemTemplate.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "数据编码不允许修改"));
++
++        mockMvc.perform(put("/iot/template/item")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testItem())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /iot/template/item/{ids} 逻辑删透传")
++    void testRemove_Success() throws Exception {
++        when(itemService.deleteItems(any())).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/template/item/{ids}", "50,51"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(itemService).deleteItems(List.of(50L, 51L));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java
+new file mode 100644
+index 0000000..1778ff5
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/controller/IotModelTemplateControllerTest.java
+@@ -0,0 +1,320 @@
++package net.otlab.admin.module.iot.template.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.dto.IotModelTemplateDetailVO;
++import net.otlab.admin.module.iot.template.service.IotModelTemplateService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 模型模板控制器测试（TASK-0011 接口层）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），权限注解以反射断言，
++ * 路由与参数校验走真实 MockMvc 请求（照 IotDataDictControllerTest 范式）。
++ * node_type 必填 1-5 边界以 bean 校验断言（@Min(1) @Max(5)）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotModelTemplateControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotModelTemplateService templateService;
++
++    private IotModelTemplateController templateController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        templateController = new IotModelTemplateController();
++        ReflectionTestUtils.setField(templateController, "templateService", templateService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(templateController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private IotModelTemplate testTemplate() {
++        IotModelTemplate template = new IotModelTemplate();
++        template.setId(1L);
++        template.setTenantId(1L);
++        template.setTemplateCode("AIR_COMPRESSOR");
++        template.setTemplateName("空压机模板");
++        template.setNodeType(4);
++        template.setVersion(1);
++        template.setStatus(1);
++        return template;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 五个接口的 @SaCheckPermission 取值符合 iot:template:* 契约")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:template:list", IotModelTemplateController.class
++                .getMethod("list", Integer.class, Integer.class, IotModelTemplate.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:query", IotModelTemplateController.class
++                .getMethod("getById", Long.class, boolean.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:add", IotModelTemplateController.class
++                .getMethod("add", IotModelTemplate.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:edit", IotModelTemplateController.class
++                .getMethod("edit", IotModelTemplate.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:template:remove", IotModelTemplateController.class
++                .getMethod("remove", String.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 三个写操作（新增/编辑/删除）均有 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method add = IotModelTemplateController.class.getMethod("add", IotModelTemplate.class);
++        Method edit = IotModelTemplateController.class.getMethod("edit", IotModelTemplate.class);
++        Method remove = IotModelTemplateController.class.getMethod("remove", String.class);
++        for (Method method : List.of(add, edit, remove)) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, add.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, edit.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.DELETE, remove.getAnnotation(OperateLog.class).businessType(),
++                "模板删除是真实逻辑删（deleted=1），操作日志如实记 DELETE");
++    }
++
++    // ---------- 路由与参数校验（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("分页查询 - GET /iot/template/list 返回分页数据")
++    void testList_Success() throws Exception {
++        Page<IotModelTemplate> page = new Page<>(1, 10);
++        page.setRecords(List.of(testTemplate()));
++        page.setTotal(1);
++        when(templateService.selectTemplateList(any(), any(IotModelTemplate.class))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/template/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10")
++                        .param("templateCode", "AIR")
++                        .param("nodeType", "4")
++                        .param("status", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.records").isArray())
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].templateCode").value("AIR_COMPRESSOR"));
++
++        verify(templateService).selectTemplateList(any(), any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("详情查询 - GET /iot/template/{id} 默认不聚合数据项")
++    void testGetById_Default() throws Exception {
++        when(templateService.getTemplateDetail(1L, false)).thenReturn(IotModelTemplateDetailVO.from(testTemplate()));
++
++        mockMvc.perform(get("/iot/template/{id}", 1L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.templateCode").value("AIR_COMPRESSOR"))
++                .andExpect(jsonPath("$.data.nodeType").value(4))
++                .andExpect(jsonPath("$.data.items").doesNotExist());
++
++        verify(templateService).getTemplateDetail(1L, false);
++    }
++
++    @Test
++    @DisplayName("详情查询 - withItems=true 聚合数据项清单")
++    void testGetById_WithItems() throws Exception {
++        IotModelTemplateDetailVO vo = IotModelTemplateDetailVO.from(testTemplate());
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setId(50L);
++        item.setTemplateId(1L);
++        item.setDataCode("ELEC_CONS");
++        item.setDataName("用电量");
++        vo.setItems(List.of(item));
++        when(templateService.getTemplateDetail(1L, true)).thenReturn(vo);
++
++        mockMvc.perform(get("/iot/template/{id}", 1L).param("withItems", "true"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.items").isArray())
++                .andExpect(jsonPath("$.data.items[0].dataCode").value("ELEC_CONS"));
++
++        verify(templateService).getTemplateDetail(1L, true);
++    }
++
++    @Test
++    @DisplayName("新增 - POST /iot/template 正常返回 200")
++    void testAdd_Success() throws Exception {
++        when(templateService.insertTemplate(any(IotModelTemplate.class))).thenReturn(true);
++
++        mockMvc.perform(post("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTemplate())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(templateService).insertTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：node_type 缺失返回业务码 400")
++    void testAdd_NodeTypeMissing() throws Exception {
++        IotModelTemplate template = testTemplate();
++        template.setNodeType(null);
++
++        mockMvc.perform(post("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(template)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(templateService, org.mockito.Mockito.never()).insertTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：node_type 下界 0 拒绝（仅允许 1-5）")
++    void testAdd_NodeTypeBelowBound() throws Exception {
++        IotModelTemplate template = testTemplate();
++        template.setNodeType(0);
++
++        mockMvc.perform(post("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(template)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(templateService, org.mockito.Mockito.never()).insertTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：node_type 上界 6 拒绝（仅允许 1-5）")
++    void testAdd_NodeTypeAboveBound() throws Exception {
++        IotModelTemplate template = testTemplate();
++        template.setNodeType(6);
++
++        mockMvc.perform(post("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(template)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(templateService, org.mockito.Mockito.never()).insertTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增 - node_type 边界值 1 与 5 通过 bean 校验到达服务层")
++    void testAdd_NodeTypeBoundariesPass() throws Exception {
++        when(templateService.insertTemplate(any(IotModelTemplate.class))).thenReturn(true);
++
++        for (Integer boundary : List.of(1, 5)) {
++            IotModelTemplate template = testTemplate();
++            template.setNodeType(boundary);
++            mockMvc.perform(post("/iot/template")
++                            .contentType(MediaType.APPLICATION_JSON)
++                            .content(objectMapper.writeValueAsString(template)))
++                    .andExpect(status().isOk())
++                    .andExpect(jsonPath("$.code").value(200));
++        }
++        verify(templateService, org.mockito.Mockito.times(2)).insertTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 重复编码透传服务层 4002")
++    void testAdd_DuplicateCode() throws Exception {
++        when(templateService.insertTemplate(any(IotModelTemplate.class)))
++                .thenThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "模板编码已存在: AIR_COMPRESSOR"));
++
++        mockMvc.perform(post("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTemplate())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4002));
++    }
++
++    @Test
++    @DisplayName("编辑 - PUT /iot/template 正常返回 200")
++    void testEdit_Success() throws Exception {
++        when(templateService.updateTemplate(any(IotModelTemplate.class))).thenReturn(true);
++
++        mockMvc.perform(put("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTemplate())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(templateService).updateTemplate(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 改 template_code 被服务层拒绝（PARAM_ERROR 400 透传）")
++    void testEdit_RejectCodeChange() throws Exception {
++        when(templateService.updateTemplate(any(IotModelTemplate.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "模板编码不允许修改"));
++
++        mockMvc.perform(put("/iot/template")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTemplate())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /iot/template/{ids} 透传服务层（逗号分隔批量）")
++    void testRemove_Success() throws Exception {
++        when(templateService.deleteTemplates(any())).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/template/{ids}", "1,2"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(templateService).deleteTemplates(List.of(1L, 2L));
++    }
++
++    @Test
++    @DisplayName("删除 - 有实例引用透传服务层参数错误")
++    void testRemove_ReferenceProtected() throws Exception {
++        when(templateService.deleteTemplates(any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "模板被实例引用，禁止删除（实例: F01.WS01.EQ001）"));
++
++        mockMvc.perform(delete("/iot/template/{ids}", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+new file mode 100644
+index 0000000..9cf5b6a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+@@ -0,0 +1,505 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.service.DictCodeStatus;
++import net.otlab.admin.module.iot.service.IotDataDictService;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.service.IotDataItemTemplateService;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 模板数据项服务单元测试（TASK-0011）
++ *
++ * <p>核心业务纪律（REQ-0004 / ADR-0003 / brief 裁决）：
++ * ① data_code 必须取自业务数据字典——批量保存全项编码收集后<b>一次</b>
++ * {@link IotDataDictService#validateForTemplateRef}（TASK-0010 校验器接线），任一项
++ * NOT_REGISTERED/DISABLED 按文案拒整批不落库（首失败项按请求顺序，消化 0010 评审 Minor①
++ * 返回 Map 保序契约）；② (template_id, data_code) 批内互撞先判（先于字典校验），库内已有
++ * 活跃行预检 + uk_template_data_code 物理唯一兜底双道闸均 4002；③ 单批上限 500 项
++ * （消化 0010 评审 Minor② 调用侧约束）；④ 编辑锁 data_code（创建后不可改）；⑤ 默认公式
++ * 一期降级口径：非空时长度 ≤2000 + 括号/占位符配平的基础格式校验，Aviator 真语法校验归
++ * FEAT-0012（接线义务遗留登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataItemTemplateServiceImplTest {
++
++    @Mock
++    private IotDataItemTemplateMapper baseMapper;
++
++    @Mock
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Mock
++    private IotDataDictService dictService;
++
++    private IotDataItemTemplateServiceImpl itemService;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        itemService = new IotDataItemTemplateServiceImpl();
++        ReflectionTestUtils.setField(itemService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(itemService, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(itemService, "dictService", dictService);
++    }
++
++    private IotModelTemplate existingTemplate() {
++        IotModelTemplate template = new IotModelTemplate();
++        template.setId(1L);
++        template.setTemplateCode("AIR_COMPRESSOR");
++        template.setTemplateName("空压机模板");
++        template.setNodeType(4);
++        template.setTenantId(1L);
++        return template;
++    }
++
++    private IotDataItemTemplate newItem(String code) {
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setDataCode(code);
++        item.setDataName("数据项-" + code);
++        item.setCategory("ELEC");
++        item.setValueKind(2);
++        item.setUnit("kWh");
++        item.setDefaultSourceType(2);
++        item.setDefaultFormula("{SELF." + code + "} / 3600");
++        item.setAggMethod("SUM");
++        item.setDefaultCalcPeriod("MINUTE");
++        item.setDefaultValidMin(new BigDecimal("0"));
++        item.setDefaultValidMax(new BigDecimal("9999"));
++        item.setDefaultAlarmLow(new BigDecimal("10"));
++        item.setDefaultAlarmHigh(new BigDecimal("90"));
++        // 模拟前端恶意携带 templateId / tenant_id / deleted / id（mass assignment 防护的测试前提）
++        item.setTemplateId(999L);
++        item.setTenantId(888L);
++        item.setDeleted(1);
++        item.setId(777L);
++        return item;
++    }
++
++    private Map<String, DictCodeStatus> statusMap() {
++        // 保序 Map（LinkedHashMap）：0010 评审 Minor① 契约——调用方按请求顺序取首失败项
++        return new LinkedHashMap<>();
++    }
++
++    // ---------- 批量保存 ----------
++
++    @Test
++    @DisplayName("批量保存 - 正常情况：白名单构建逐项落库，项内携带的 templateId/status/deleted/id 不落库")
++    void testSaveItems_Success() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> okMap = statusMap();
++        okMap.put("ELEC_METER", DictCodeStatus.OK);
++        okMap.put("ELEC_CONS", DictCodeStatus.OK);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(baseMapper.insert(any(IotDataItemTemplate.class))).thenReturn(1);
++
++        List<IotDataItemTemplate> items = Arrays.asList(newItem("ELEC_METER"), newItem("ELEC_CONS"));
++        int saved = itemService.saveItems(1L, items);
++
++        assertEquals(2, saved);
++        // 字典校验器一次性批量调用（不逐项 count）
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Collection<String>> codesCaptor = ArgumentCaptor.captor();
++        verify(dictService, times(1)).validateForTemplateRef(any(), codesCaptor.capture());
++        assertEquals(new java.util.HashSet<>(Arrays.asList("ELEC_METER", "ELEC_CONS")),
++                new java.util.HashSet<>(codesCaptor.getValue()));
++        // 白名单落库断言
++        ArgumentCaptor<IotDataItemTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper, times(2)).insert(captor.capture());
++        List<IotDataItemTemplate> entities = captor.getAllValues();
++        assertEquals("ELEC_METER", entities.get(0).getDataCode());
++        assertEquals(Long.valueOf(1L), entities.get(0).getTemplateId(),
++                "templateId 以 form 入参为准，项内携带的 999 不得落库");
++        assertEquals(Integer.valueOf(0), entities.get(0).getDeleted(), "落库 deleted 强制 0");
++        assertNull(entities.get(0).getId(), "id 由框架自增，白名单不复制请求值");
++        assertNull(entities.get(0).getTenantId(),
++                "请求携带的 tenantId=888 不得落库：服务层一律以 TenantContext 会话值覆盖（standalone 无会话为 null，"
++                        + "运行时插件对 INSERT 自动补列与会话租户同值，双保险口径同字典域）");
++        assertEquals("{SELF.ELEC_METER} / 3600", entities.get(0).getDefaultFormula());
++        assertEquals("MINUTE", entities.get(0).getDefaultCalcPeriod(), "ADR-0011 补字段 default_calc_period 白名单透传");
++        assertEquals(Integer.valueOf(2), entities.get(0).getValueKind());
++        assertEquals("SUM", entities.get(0).getAggMethod());
++        assertEquals(new BigDecimal("10"), entities.get(0).getDefaultAlarmLow());
++        assertNull(entities.get(1).getCreateBy(), "审计字段由 MetaObjectHandler 回填");
++    }
++
++    @Test
++    @DisplayName("批量保存 - 未登记编码（NOT_REGISTERED）按文案拒整批不落库")
++    void testSaveItems_NotRegisteredRejected() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> mixMap = statusMap();
++        mixMap.put("ELEC_METER", DictCodeStatus.OK);
++        mixMap.put("MISSING_CODE", DictCodeStatus.NOT_REGISTERED);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(mixMap);
++
++        List<IotDataItemTemplate> items = Arrays.asList(newItem("ELEC_METER"), newItem("MISSING_CODE"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, items));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains(DictCodeStatus.MSG_NOT_REGISTERED),
++                "文案应区分「未登记」（0010 文案常量原样复用）");
++        assertTrue(e.getMessage().contains("MISSING_CODE"));
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 已停用编码（DISABLED）按文案拒整批不落库")
++    void testSaveItems_DisabledRejected() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> mixMap = statusMap();
++        mixMap.put("ELEC_METER", DictCodeStatus.OK);
++        mixMap.put("ELEC_CONS", DictCodeStatus.DISABLED);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(mixMap);
++
++        List<IotDataItemTemplate> items = Arrays.asList(newItem("ELEC_METER"), newItem("ELEC_CONS"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, items));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains(DictCodeStatus.MSG_DISABLED), "文案应区分「已停用」");
++        assertTrue(e.getMessage().contains("ELEC_CONS"));
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 多项失败时按请求顺序取首个失败项报错（0010 评审 Minor① 保序契约）")
++    void testSaveItems_FirstFailureInRequestOrder() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> mixMap = statusMap();
++        mixMap.put("GOOD_CODE", DictCodeStatus.OK);
++        mixMap.put("STOPPED_CODE", DictCodeStatus.DISABLED);
++        mixMap.put("MISSING_CODE", DictCodeStatus.NOT_REGISTERED);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(mixMap);
++
++        List<IotDataItemTemplate> items = Arrays.asList(
++                newItem("GOOD_CODE"), newItem("STOPPED_CODE"), newItem("MISSING_CODE"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, items));
++        assertTrue(e.getMessage().contains("STOPPED_CODE"),
++                "首个失败项应按请求顺序命中（DISABLED 在前），而非报后面的 MISSING_CODE");
++        assertTrue(e.getMessage().contains("已停用"));
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - (template_id, data_code) 批内互撞先判（先于字典校验），4002 拒整批")
++    void testSaveItems_BatchInternalCollision() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++
++        List<IotDataItemTemplate> items = Arrays.asList(newItem("ELEC_CONS"), newItem("ELEC_CONS"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, items));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("ELEC_CONS"));
++        verify(dictService, never()).validateForTemplateRef(any(), anyCollection());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 超 500 项整批拒绝（消化 0010 评审 Minor②：validateForTemplateRef 调用侧入参上限）")
++    void testSaveItems_OverLimit() {
++        List<IotDataItemTemplate> items = new ArrayList<>();
++        for (int i = 0; i < 501; i++) {
++            items.add(newItem("CODE_" + i));
++        }
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, items));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("单批保存上限 500"));
++        verify(dictService, never()).validateForTemplateRef(any(), anyCollection());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 空清单拒绝（null 与空列表两口径）")
++    void testSaveItems_Empty() {
++        BusinessException e1 = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, null));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e1.getCode());
++        BusinessException e2 = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, Collections.emptyList()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e2.getCode());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 模板不存在（含已删）整批拒绝")
++    void testSaveItems_TemplateNotFound() {
++        when(modelTemplateMapper.selectById(99L)).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(99L, List.of(newItem("ELEC_CONS"))));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(dictService, never()).validateForTemplateRef(any(), anyCollection());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 库内已有 (template_id, data_code) 活跃行预检 4002 拒整批（双道闸第一道）")
++    void testSaveItems_ExistingCodePrecheck() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> okMap = statusMap();
++        okMap.put("ELEC_CONS", DictCodeStatus.OK);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
++        IotDataItemTemplate existingRow = new IotDataItemTemplate();
++        existingRow.setId(50L);
++        existingRow.setTemplateId(1L);
++        existingRow.setDataCode("ELEC_CONS");
++        when(baseMapper.selectList(any())).thenReturn(List.of(existingRow));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(newItem("ELEC_CONS"))));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("ELEC_CONS"));
++        ArgumentCaptor<Wrapper<IotDataItemTemplate>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectList(captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("template_id"), "库内预检应按 template_id 过滤");
++        assertTrue(sql.contains("data_code"), "库内预检应按 data_code IN 过滤");
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 预检与落库间并发撞 uk_template_data_code 兜底映射 4002（双道闸第二道，整批回滚）")
++    void testSaveItems_DuplicateKeyFallback() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> okMap = statusMap();
++        okMap.put("ELEC_CONS", DictCodeStatus.OK);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(baseMapper.insert(any(IotDataItemTemplate.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '1-ELEC_CONS' for key 'uk_template_data_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(newItem("ELEC_CONS"))));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++    }
++
++    @Test
++    @DisplayName("批量保存 - 项内 data_code 空串拒绝（服务层防线，不调字典不落库；纯空白串由控制器 @NotBlank 拦截）")
++    void testSaveItems_BlankCode() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        IotDataItemTemplate item = newItem("ELEC_CONS");
++        item.setDataCode("");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(item)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(dictService, never()).validateForTemplateRef(any(), anyCollection());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    // ---------- 默认公式一期降级校验 ----------
++
++    @Test
++    @DisplayName("默认公式 - 非空且超 2000 拒绝（长度口径）")
++    void testSaveItems_FormulaTooLong() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        IotDataItemTemplate item = newItem("ELEC_CONS");
++        item.setDefaultFormula("1+".repeat(1001));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(item)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("2000"));
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("默认公式 - 括号/占位符不配平拒绝（基础格式占位校验）")
++    void testSaveItems_FormulaUnbalanced() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        IotDataItemTemplate item = newItem("ELEC_CONS");
++        item.setDefaultFormula("DELTA(F01.WS01.EQ001.ELEC_CONS, 3600 / 3600");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(item)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("配平"));
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("默认公式 - null 可空（公式校验仅对非空值生效）")
++    void testSaveItems_FormulaNullAllowed() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> okMap = statusMap();
++        okMap.put("ELEC_CONS", DictCodeStatus.OK);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(baseMapper.insert(any(IotDataItemTemplate.class))).thenReturn(1);
++
++        IotDataItemTemplate item = newItem("ELEC_CONS");
++        item.setDefaultFormula(null);
++        assertEquals(1, itemService.saveItems(1L, List.of(item)));
++        verify(baseMapper).insert(any(IotDataItemTemplate.class));
++    }
++
++    // ---------- 编辑 ----------
++
++    @Test
++    @DisplayName("编辑数据项 - 白名单构建更新：data_code/template_id/tenant/status/审计字段不进更新集")
++    void testUpdateItem_Success() {
++        IotDataItemTemplate existing = newItem("ELEC_CONS");
++        existing.setId(50L);
++        existing.setTemplateId(1L);
++        existing.setDeleted(0);
++        when(baseMapper.selectById(50L)).thenReturn(existing);
++        when(baseMapper.updateById(any(IotDataItemTemplate.class))).thenReturn(1);
++
++        IotDataItemTemplate form = newItem("ELEC_CONS");
++        form.setId(50L);
++        form.setDataName("用电量-改名");
++        form.setDefaultAlarmHigh(new BigDecimal("95"));
++        assertTrue(itemService.updateItem(form));
++
++        ArgumentCaptor<IotDataItemTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        IotDataItemTemplate upd = captor.getValue();
++        assertEquals(50L, upd.getId());
++        assertEquals("用电量-改名", upd.getDataName());
++        assertEquals(new BigDecimal("95"), upd.getDefaultAlarmHigh());
++        assertEquals("MINUTE", upd.getDefaultCalcPeriod(), "default_calc_period 白名单透传");
++        assertNull(upd.getDataCode(), "data_code 创建后不可改：校验通过后也不进更新集");
++        assertNull(upd.getTemplateId(), "template_id 不进更新集（数据项不换模板，换模板=删旧建新）");
++        assertNull(upd.getTenantId(), "tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写）");
++        assertNull(upd.getDeleted(), "deleted 逻辑删字段不进更新集");
++    }
++
++    @Test
++    @DisplayName("编辑数据项 - data_code 未携带即拒绝（照 data_code 不可改范式：含未携带）")
++    void testUpdateItem_CodeNotCarried() {
++        IotDataItemTemplate existing = newItem("ELEC_CONS");
++        existing.setId(50L);
++        when(baseMapper.selectById(50L)).thenReturn(existing);
++        IotDataItemTemplate form = newItem("ELEC_CONS");
++        form.setId(50L);
++        form.setDataCode(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.updateItem(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("数据编码不允许修改"));
++        verify(baseMapper, never()).updateById(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑数据项 - data_code 携带与库中不一致即拒绝（REQ-0004 验收：data_code 改动被拒）")
++    void testUpdateItem_CodeChanged() {
++        IotDataItemTemplate existing = newItem("ELEC_CONS");
++        existing.setId(50L);
++        when(baseMapper.selectById(50L)).thenReturn(existing);
++        IotDataItemTemplate form = newItem("ELEC_METER");
++        form.setId(50L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.updateItem(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑数据项 - 数据项不存在报参数错误")
++    void testUpdateItem_NotFound() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++        IotDataItemTemplate form = newItem("ELEC_CONS");
++        form.setId(99L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.updateItem(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑数据项 - 携带超长公式拒绝")
++    void testUpdateItem_FormulaTooLong() {
++        IotDataItemTemplate existing = newItem("ELEC_CONS");
++        existing.setId(50L);
++        when(baseMapper.selectById(50L)).thenReturn(existing);
++        IotDataItemTemplate form = newItem("ELEC_CONS");
++        form.setId(50L);
++        form.setDefaultFormula("1+".repeat(1001));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.updateItem(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotDataItemTemplate.class));
++    }
++
++    // ---------- 查询与删除 ----------
++
++    @Test
++    @DisplayName("按模板查数据项 - template_id 过滤 + 按 id 升序；模板不存在拒绝")
++    void testSelectItemsByTemplateId() {
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        List<IotDataItemTemplate> expected = List.of(newItem("ELEC_CONS"));
++        when(baseMapper.selectList(any())).thenReturn(expected);
++
++        List<IotDataItemTemplate> result = itemService.selectItemsByTemplateId(1L);
++        assertEquals(expected, result);
++        ArgumentCaptor<Wrapper<IotDataItemTemplate>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectList(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("template_id"));
++
++        when(modelTemplateMapper.selectById(99L)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.selectItemsByTemplateId(99L));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++    }
++
++    @Test
++    @DisplayName("删除数据项 - 逻辑删（removeByIds → deleteByIds）；空列表拒绝")
++    void testDeleteItems() {
++        when(baseMapper.deleteByIds(any())).thenReturn(1);
++        assertTrue(itemService.deleteItems(List.of(50L)));
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Collection<java.io.Serializable>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).deleteByIds(captor.capture());
++        assertEquals(List.of(50L), new ArrayList<>(captor.getValue()));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.deleteItems(Collections.emptyList()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++    }
++
++    // ---------- 上限常量 ----------
++
++    @Test
++    @DisplayName("单批上限常量 = 500（brief 裁决，Minor② 调用侧约束口径）")
++    void testItemBatchMaxConstant() {
++        assertEquals(500, IotDataItemTemplateService.ITEM_BATCH_MAX);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+new file mode 100644
+index 0000000..f3b0800
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotModelTemplateServiceImplTest.java
+@@ -0,0 +1,439 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 模型模板服务单元测试（TASK-0011）
++ *
++ * <p>核心业务纪律（详细设计 §1.5 / REQ-0004 / brief）：template_code 租户内唯一且重复报 4002
++ * （活跃行预检 + uk_tenant_template_code 物理唯一兜底双道闸，照 IotDataDictServiceImpl 范式）；
++ * 编辑锁 template_code（创建后不可改）；删除保护——有实例引用（iot_model_instance.template_id）
++ * 或模板数据项引用（iot_data_item_template.template_id）时拒绝并提示引用来源，无引用才逻辑删；
++ * 平台预置模板创建入口一期降级——tenant_id 服务层从会话覆盖（standalone 无会话为 null，
++ * 请求携带值不落库），平台预置模板仅 SQL 种子可产生。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotModelTemplateServiceImplTest {
++
++    @Mock
++    private IotModelTemplateMapper baseMapper;
++
++    @Mock
++    private IotModelInstanceMapper modelInstanceMapper;
++
++    @Mock
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    private IotModelTemplateServiceImpl templateService;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataDict.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        templateService = new IotModelTemplateServiceImpl();
++        ReflectionTestUtils.setField(templateService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(templateService, "modelInstanceMapper", modelInstanceMapper);
++        ReflectionTestUtils.setField(templateService, "dataItemTemplateMapper", dataItemTemplateMapper);
++    }
++
++    private IotModelTemplate newTemplate() {
++        IotModelTemplate template = new IotModelTemplate();
++        template.setTemplateCode("AIR_COMPRESSOR");
++        template.setTemplateName("空压机模板");
++        template.setNodeType(4);
++        template.setRemark("smoke");
++        template.setStatus(0);
++        // 模拟前端恶意携带 tenant_id（mass assignment 防护的测试前提）
++        template.setTenantId(999L);
++        return template;
++    }
++
++    // ---------- 新增 ----------
++
++    @Test
++    @DisplayName("新增模板 - 正常情况：白名单构建落库，请求携带的 tenantId/status 不落库（会话覆盖 + 强制启用）")
++    void testInsertTemplate_Success() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(IotModelTemplate.class))).thenReturn(1);
++
++        assertTrue(templateService.insertTemplate(newTemplate()));
++
++        verify(baseMapper).selectCount(any());
++        ArgumentCaptor<IotModelTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        IotModelTemplate entity = captor.getValue();
++        assertNull(entity.getTenantId(),
++                "请求携带的 tenantId=999 不得落库：服务层一律以 TenantContext 会话值覆盖（standalone 无会话为 null）；"
++                        + "平台预置模板（tenant_id=null）一期仅 SQL 种子可产生，接口创建入口降级");
++        assertEquals(Integer.valueOf(1), entity.getStatus(),
++                "新增强制 status=1 启用（写侧白名单，请求携带 status=0 不得落库）");
++        assertEquals(Integer.valueOf(0), entity.getDeleted());
++        assertEquals(Integer.valueOf(1), entity.getVersion(), "version 未携带时落库默认 1（DDL DEFAULT '1' 口径）");
++        assertEquals("AIR_COMPRESSOR", entity.getTemplateCode());
++        assertEquals("空压机模板", entity.getTemplateName());
++        assertEquals(Integer.valueOf(4), entity.getNodeType());
++        assertNull(entity.getId(), "id 由框架自增，白名单不复制请求值");
++        assertNull(entity.getCreateBy(), "审计字段由 MetaObjectHandler 回填，白名单不复制请求值");
++    }
++
++    @Test
++    @DisplayName("新增模板 - version 携带时按请求值落库")
++    void testInsertTemplate_VersionCarried() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(IotModelTemplate.class))).thenReturn(1);
++
++        IotModelTemplate template = newTemplate();
++        template.setVersion(3);
++        assertTrue(templateService.insertTemplate(template));
++
++        ArgumentCaptor<IotModelTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(Integer.valueOf(3), captor.getValue().getVersion());
++    }
++
++    @Test
++    @DisplayName("新增模板 - template_code 重复（活跃行预检）报 4002 且不落库")
++    void testInsertTemplate_DuplicateActiveCode() {
++        when(baseMapper.selectCount(any())).thenReturn(1L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.insertTemplate(newTemplate()));
++
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("AIR_COMPRESSOR"));
++        // 预检条件必须按 template_code 精确匹配（租户条件由多租户插件对 iot_ 前缀表自动追加）
++        ArgumentCaptor<Wrapper<IotModelTemplate>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectCount(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("template_code"), "重复预检应按 template_code 过滤");
++        verify(baseMapper, never()).insert(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("新增模板 - 编码被已删除行占用（uk_tenant_template_code 物理唯一不释放）兜底映射 4002")
++    void testInsertTemplate_DeletedRowOccupiesCode() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(IotModelTemplate.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '1-AIR_COMPRESSOR' for key 'uk_tenant_template_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.insertTemplate(newTemplate()));
++
++        assertEquals(4002, e.getCode());
++    }
++
++    @Test
++    @DisplayName("新增模板 - node_type 必填且仅允许 1-5（0/6/null 均拒，服务层防线）")
++    void testInsertTemplate_NodeTypeRange() {
++        for (Integer invalid : Arrays.asList(0, 6, null)) {
++            IotModelTemplate template = newTemplate();
++            template.setNodeType(invalid);
++            BusinessException e = assertThrows(BusinessException.class, () -> templateService.insertTemplate(template),
++                    "node_type=" + invalid + " 应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        }
++        verify(baseMapper, never()).insert(any(IotModelTemplate.class));
++        verify(baseMapper, never()).selectCount(any());
++    }
++
++    // ---------- 编辑 ----------
++
++    @Test
++    @DisplayName("编辑模板 - 正常情况：白名单构建更新，template_code/tenant_id/审计字段不进更新集")
++    void testUpdateTemplate_Success() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        existing.setTenantId(1L);
++        existing.setStatus(1);
++        existing.setVersion(1);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(IotModelTemplate.class))).thenReturn(1);
++
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setTemplateCode("AIR_COMPRESSOR");
++        form.setTemplateName("空压机模板 V2");
++        form.setNodeType(4);
++        form.setStatus(0);
++        form.setVersion(2);
++        form.setRemark(null);
++        assertTrue(templateService.updateTemplate(form));
++
++        ArgumentCaptor<IotModelTemplate> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        IotModelTemplate upd = captor.getValue();
++        assertEquals(1L, upd.getId());
++        assertEquals("空压机模板 V2", upd.getTemplateName());
++        assertEquals(Integer.valueOf(4), upd.getNodeType());
++        assertEquals(Integer.valueOf(0), upd.getStatus(), "编辑可启停模板（接口清单无独立 changeStatus）");
++        assertEquals(Integer.valueOf(2), upd.getVersion());
++        assertNull(upd.getTemplateCode(), "template_code 创建后不可改：校验通过后也不进更新集（SET 不含不可变字段）");
++        assertNull(upd.getTenantId(), "tenant_id 不进更新集");
++        assertNull(upd.getRemark(), "未携带的 remark 不进更新集（null 列 MP 自动跳过，保持库内原值）");
++    }
++
++    @Test
++    @DisplayName("编辑模板 - 模板不存在报参数错误")
++    void testUpdateTemplate_NotFound() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++        IotModelTemplate form = newTemplate();
++        form.setId(99L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑模板 - template_code 未携带即拒绝（照 data_code 不可改范式：含未携带）")
++    void testUpdateTemplate_CodeNotCarried() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setTemplateCode(null);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("模板编码不允许修改"));
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑模板 - template_code 携带与库中不一致即拒绝（一期不开放改编码）")
++    void testUpdateTemplate_CodeChanged() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        existing.setTemplateCode("AIR_COMPRESSOR");
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setTemplateCode("NEW_CODE");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑模板 - node_type 越界（7）拒绝")
++    void testUpdateTemplate_NodeTypeInvalid() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setNodeType(7);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    @Test
++    @DisplayName("编辑模板 - status 越界（2）拒绝（仅允许 0 禁用 / 1 启用）")
++    void testUpdateTemplate_StatusInvalid() {
++        IotModelTemplate existing = newTemplate();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        IotModelTemplate form = newTemplate();
++        form.setId(1L);
++        form.setStatus(2);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.updateTemplate(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(IotModelTemplate.class));
++    }
++
++    // ---------- 删除保护 ----------
++
++    @Test
++    @DisplayName("删除保护 - 有实例引用（iot_model_instance.template_id）拒绝并提示实例编码，不删")
++    void testDeleteTemplates_InstanceRefRejected() {
++        IotModelTemplate t1 = newTemplate();
++        t1.setId(1L);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(t1));
++        IotModelInstance ref = new IotModelInstance();
++        ref.setId(10L);
++        ref.setInstanceCode("F01.WS01.EQ001");
++        ref.setTemplateId(1L);
++        when(modelInstanceMapper.selectList(any())).thenReturn(List.of(ref));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.deleteTemplates(List.of(1L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("实例引用"), "应提示引用类型：实例引用");
++        assertTrue(e.getMessage().contains("F01.WS01.EQ001"), "应提示引用来源：实例编码");
++        // 实例引用查询按 template_id IN 过滤（租户条件由插件追加、deleted 由 @TableLogic 运行时过滤）
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(modelInstanceMapper).selectList(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("template_id"));
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除保护 - 有模板数据项引用拒绝并提示模板编码与项数，不删")
++    void testDeleteTemplates_ItemRefRejected() {
++        IotModelTemplate t1 = newTemplate();
++        t1.setId(1L);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(t1));
++        when(modelInstanceMapper.selectList(any())).thenReturn(Collections.emptyList());
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setId(20L);
++        item.setTemplateId(1L);
++        item.setDataCode("ELEC_CONS");
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(item));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.deleteTemplates(List.of(1L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("数据项"), "应提示引用类型：模板数据项引用");
++        assertTrue(e.getMessage().contains("AIR_COMPRESSOR"), "应提示引用来源：模板编码");
++        ArgumentCaptor<Wrapper<IotDataItemTemplate>> captor = ArgumentCaptor.captor();
++        verify(dataItemTemplateMapper).selectList(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("template_id"));
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除保护 - 实例与数据项引用并存时两类来源都提示")
++    void testDeleteTemplates_BothRefsCombined() {
++        IotModelTemplate t1 = newTemplate();
++        t1.setId(1L);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(t1));
++        IotModelInstance ref = new IotModelInstance();
++        ref.setId(10L);
++        ref.setInstanceCode("F01.WS01.EQ001");
++        ref.setTemplateId(1L);
++        when(modelInstanceMapper.selectList(any())).thenReturn(List.of(ref));
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setId(20L);
++        item.setTemplateId(1L);
++        item.setDataCode("ELEC_CONS");
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(item));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.deleteTemplates(List.of(1L)));
++
++        assertTrue(e.getMessage().contains("F01.WS01.EQ001"), "实例引用来源应出现在提示中");
++        assertTrue(e.getMessage().contains("AIR_COMPRESSOR"), "模板数据项引用来源应出现在提示中");
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 无引用模板逻辑删（removeByIds → deleteByIds）")
++    void testDeleteTemplates_Success() {
++        IotModelTemplate t1 = newTemplate();
++        t1.setId(1L);
++        IotModelTemplate t2 = newTemplate();
++        t2.setId(2L);
++        t2.setTemplateCode("WORKSHOP");
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(t1, t2));
++        when(modelInstanceMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(Collections.emptyList());
++        when(baseMapper.deleteByIds(any())).thenReturn(2);
++
++        assertTrue(templateService.deleteTemplates(Arrays.asList(1L, 2L)));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<java.util.Collection<java.io.Serializable>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).deleteByIds(captor.capture());
++        assertEquals(Arrays.asList(1L, 2L), new java.util.ArrayList<>(captor.getValue()));
++    }
++
++    @Test
++    @DisplayName("删除 - 批内含不存在/已删除 id 时整批拒绝（fail-closed）")
++    void testDeleteTemplates_MissingId() {
++        IotModelTemplate t1 = newTemplate();
++        t1.setId(1L);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(t1));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.deleteTemplates(Arrays.asList(1L, 99L)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getMessage().contains("99"), "缺失 id 应在提示中");
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 空列表拒绝")
++    void testDeleteTemplates_EmptyIds() {
++        BusinessException e = assertThrows(BusinessException.class, () -> templateService.deleteTemplates(Collections.emptyList()));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).selectByIds(any());
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    // ---------- 列表 ----------
++
++    @Test
++    @DisplayName("分页查询 - 过滤条件 templateCode/templateName 模糊、nodeType/status 精确，按 id 倒序")
++    void testSelectTemplateList() {
++        Page<IotModelTemplate> expected = new Page<>(1, 10);
++        expected.setRecords(List.of(newTemplate()));
++        when(baseMapper.selectPage(any(), any())).thenReturn(expected);
++
++        IotModelTemplate query = new IotModelTemplate();
++        query.setTemplateCode("AIR");
++        query.setTemplateName("空压");
++        query.setNodeType(4);
++        query.setStatus(1);
++
++        Page<IotModelTemplate> page = templateService.selectTemplateList(expected, query);
++        assertEquals(expected, page);
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelTemplate>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("template_code"), "templateCode 应进模糊过滤");
++        assertTrue(sql.contains("template_name"), "templateName 应进模糊过滤");
++        assertTrue(sql.contains("node_type"), "nodeType 应进精确过滤");
++        assertTrue(sql.contains("status"), "status 应进精确过滤");
++        assertFalse(sql.contains("tenant_id"), "租户条件由多租户插件注入，服务层不旁路拼接");
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_iot_template_domain.sql b/resources/sql/upgrade/20261122_iot_template_domain.sql
+new file mode 100644
+index 0000000..e7452d2
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_template_domain.sql
+@@ -0,0 +1,166 @@
++-- ============================================================
++-- 存量库升级脚本：模型模板域三表 + 模板管理按钮权限种子（TASK-0011 / FEAT-0004 / REQ-0004）
++--
++-- 用途：
++--   1) 建 iot_model_template 模型模板表、iot_data_item_template 模板数据项表
++--      （DDL 逐字来自《工厂数据采集系统详细设计》V1.1 附录 A p31/p32，字形规范化不改语义）；
++--   2) 建库先行 iot_model_instance 模型实例表（附录 A p31 逐字）——实例接口/编码规则/
++--      绑定流程全部归 TASK-0012，本任务仅因「模板删除保护需引用计数查本表」而随本脚本
++--      建表；TASK-0005 数据权限组件的 selectAllForPerm 亦以本表存在为前提；
++--   3) sys_menu 登记模板管理页（sys_menu 4009「模板管理」，TASK-0055 已建）之下的
++--      六个按钮权限行（menu_type=3）：iot:template:list/query/add/edit/remove +
++--      iot:template:item:edit（模板数据项批量保存/编辑/删除三接口共用此权限点）；
++--   4) sys_role_menu 将上述六行授予超级管理员（role_id=1；照 20261121_iot_data_dict.sql 范式）。
++--
++-- 与上游差异（两处，均随上游修订清单回写详细设计攒下一版小修订）：
++--   1) iot_data_item_template 较附录 A p32 逐字 DDL 增补一列：
++--        `default_calc_period` varchar(16) DEFAULT NULL COMMENT '默认计算周期（如 MINUTE/HOUR/DAY，ADR-0011 补字段，上游漏项）'
++--      （ADR-0011 TD-0011：产品 §4.2 本有此概念、详细设计 V1.1 漏字段）；
++--   2) iot_data_item_template 较附录 A p32 逐字 DDL 增补一列：
++--        `tenant_id` bigint DEFAULT NULL COMMENT '租户 ID（§0.3 改造二统一补列，上游附录 A 漏项；空为平台预置模板数据项）'
++--      （详细设计 §0.3 改造二自身硬规则「全部 iot_ 表第一业务字段即 tenant_id」在附录 A 本表
++--      漏列——本表按 iot_ 前缀纳入 TASK-0002 TenantLineInnerInterceptor fail-closed 白名单，
++--      会话查询/写入会被注入 tenant_id 条件与补列，缺列即运行期 SQL 报错；NOT NULL 不采纳，
++--      与 §1.5 平台预置模板 tenant_id 可空口径自洽——平台预置模板的数据项同为平台级）；
++--      唯一约束仍逐字保持 uk_template_data_code (template_id, data_code)（REQ-0004 验收 3 口径），
++--      其余列与索引逐字一致，不改语义。
++--   3) iot_model_instance 的 `KEY idx_ancestors (ancestors)` 改为前缀索引
++--      `KEY idx_ancestors (ancestors(768))`（附录 A p31 原样在 MySQL 8 InnoDB 物理不可执行：
++--      utf8mb4 × varchar(1000) = 4000 字节 > 唯一/非唯一索引键长上限 3072 字节——
++--      768 字符 × 4 字节恰为 3072 上限，即 utf8mb4 最大可用前缀；ancestors 子树匹配本就按
++--      路径前缀 LIKE/FIND_IN_SET，前缀索引语义不变）。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 p21 + 本任务 brief）：
++--   iot:template:list        GET    /iot/template/list（模板分页列表）
++--   iot:template:list        GET    /iot/template/item/list?templateId=（按模板查数据项——查询共用 list 权限点）
++--   iot:template:query       GET    /iot/template/{id}（详情，可选聚合数据项清单）
++--   iot:template:add         POST   /iot/template
++--   iot:template:edit        PUT    /iot/template
++--   iot:template:remove      DELETE /iot/template/{ids}（逻辑删；有实例引用或数据项引用时拒绝）
++--   iot:template:item:edit   POST / PUT / DELETE /iot/template/item[/{ids}]（数据项批量保存/编辑/删除）
++--   （守卫：backend IotTemplateMenuPermissionGuardTest 强制六行权限码与控制器注解一一对应；
++--   SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4018-4022：TASK-0008 占用（字典按钮五行）；
++--   sys_menu id 4023：TASK-0009 占用（字典导入按钮）；
++--   本脚本占用 sys_menu id 4024-4029（模板按钮六行，parent_id=4009），连续取号。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.5/§1.6 / REQ-0004 / ADR-0011）：
++--   uk_tenant_template_code 为 (tenant_id, template_code) 物理唯一索引；tenant_id 为空
++--   表示平台预置模板（其 template_code 平台级唯一由服务层/种子数据保证，一期接口降级：
++--   接口仅允许创建租户模板，tenant_id 服务层从会话覆盖；平台预置模板走 SQL 种子）。
++--   uk_template_data_code 为 (template_id, data_code) 物理唯一索引；模板数据项
++--   data_code 必须取自业务数据字典 iot_data_dict（ADR-0003 唯一来源），字典核对用
++--   IotDataDictService.validateForTemplateRef（TASK-0010 三态校验器，TASK-0011 接线）。
++--   data_code 一经创建不可改（REQ-0004 核心规则，ADR-0008 第三档口径）。
++--   模板/数据项删除均为逻辑删（deleted=1）；模板删除保护：有实例引用
++--   （iot_model_instance.template_id）或数据项引用（iot_data_item_template.template_id）
++--   时拒绝并提示引用来源。
++--   多租户：iot_ 前缀表由 TASK-0002 TenantLineInnerInterceptor（OtTenantLineHandler 前缀规则）
++--   自动按会话租户注入条件，tenant_id 服务层从会话覆盖、禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）与 20261121_sys_tenant.sql、
++--   20261121_iot_console_menus.sql（4009 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_model_template` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '模板 ID',
++  `tenant_id` bigint DEFAULT NULL COMMENT '租户 ID，空为平台预置模板',
++  `template_code` varchar(64) NOT NULL COMMENT '模板编码',
++  `template_name` varchar(100) NOT NULL COMMENT '模板名称',
++  `node_type` tinyint NOT NULL COMMENT '节点类型 1 工厂 2 车间 3 产线 4 设备 5 组件',
++  `version` int DEFAULT '1' COMMENT '模板版本号',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `remark` varchar(500) DEFAULT NULL COMMENT '备注',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_template_code` (`tenant_id`,`template_code`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模型模板表';
++
++CREATE TABLE IF NOT EXISTS `iot_model_instance` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '实例 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `instance_code` varchar(96) NOT NULL COMMENT '实例编码（租户内唯一，路径式）',
++  `instance_name` varchar(100) NOT NULL COMMENT '实例名称',
++  `template_id` bigint DEFAULT NULL COMMENT '来源模板 ID',
++  `parent_id` bigint DEFAULT '0' COMMENT '父实例 ID',
++  `ancestors` varchar(1000) DEFAULT NULL COMMENT '祖级路径（逗号分隔 ID）',
++  `node_type` tinyint NOT NULL COMMENT '节点类型 1 工厂 2 车间 3 产线 4 设备 5 组件',
++  `dept_id` bigint DEFAULT NULL COMMENT '绑定部门 ID（数据权限锚点）',
++  `sort` int DEFAULT '0' COMMENT '排序',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_instance_code` (`tenant_id`,`instance_code`),
++  KEY `idx_tenant_parent` (`tenant_id`,`parent_id`),
++  KEY `idx_tenant_dept` (`tenant_id`,`dept_id`),
++  KEY `idx_ancestors` (`ancestors`(768))
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模型实例表';
++
++CREATE TABLE IF NOT EXISTS `iot_data_item_template` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '模板数据项 ID',
++  `tenant_id` bigint DEFAULT NULL COMMENT '租户 ID（§0.3 改造二统一补列，上游附录 A 漏项；空为平台预置模板数据项）',
++  `template_id` bigint NOT NULL COMMENT '所属模板 ID',
++  `data_code` varchar(64) NOT NULL COMMENT '数据编码',
++  `data_name` varchar(100) NOT NULL COMMENT '数据名称',
++  `category` varchar(32) DEFAULT NULL COMMENT '类别',
++  `value_kind` tinyint DEFAULT NULL COMMENT '值性质 1 瞬时 2 累计 3 增量',
++  `unit` varchar(32) DEFAULT NULL COMMENT '单位',
++  `default_source_type` tinyint DEFAULT NULL COMMENT '默认取值方式 1 绑定 2 公式 3 汇总',
++  `default_formula` varchar(2000) DEFAULT NULL COMMENT '默认公式（Aviator 语法）',
++  `agg_method` varchar(16) DEFAULT NULL COMMENT '缺省聚合 SUM/AVG/MAX/MIN',
++  `default_calc_period` varchar(16) DEFAULT NULL COMMENT '默认计算周期（如 MINUTE/HOUR/DAY，ADR-0011 补字段，上游漏项）',
++  `default_valid_min` decimal(20,6) DEFAULT NULL COMMENT '默认有效下限',
++  `default_valid_max` decimal(20,6) DEFAULT NULL COMMENT '默认有效上限',
++  `default_alarm_low` decimal(20,6) DEFAULT NULL COMMENT '默认告警低阈值',
++  `default_alarm_high` decimal(20,6) DEFAULT NULL COMMENT '默认告警高阈值',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_template_data_code` (`template_id`,`data_code`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模板数据项表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4024, 4009, 4, '模板查询', 3, NULL, NULL, NULL, 'iot:template:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4025, 4009, 4, '模板详情', 3, NULL, NULL, NULL, 'iot:template:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4026, 4009, 4, '模板新增', 3, NULL, NULL, NULL, 'iot:template:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4027, 4009, 4, '模板修改', 3, NULL, NULL, NULL, 'iot:template:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4028, 4009, 4, '模板删除', 3, NULL, NULL, NULL, 'iot:template:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4029, 4009, 4, '数据项编辑', 3, NULL, NULL, NULL, 'iot:template:item:edit', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4024), (1, 4025), (1, 4026), (1, 4027), (1, 4028), (1, 4029);
++
++-- ============================================================
++-- 执行后核对（第一条应 3 表在位、第二条应 6 行、第三条应 6 行、第四条应见 default_calc_period 列）：
++--   SHOW TABLES LIKE 'iot_model%';
++--   SHOW TABLES LIKE 'iot_data_item_template';
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4024 AND 4029;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4024 AND 4029;
++--   SHOW COLUMNS FROM iot_data_item_template LIKE 'default_calc_period';
++-- ============================================================

@@ -1,0 +1,1135 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/OpenApiCodes.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/OpenApiCodes.java
+index 3bcf114..1d505c5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/OpenApiCodes.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/OpenApiCodes.java
+@@ -49,6 +49,13 @@ public final class OpenApiCodes {
+     /** 签名头：一次性数（一期只收不验——幂等表登记 0052/后续；不参与签名串） */
+     public static final String HEADER_NONCE = "X-Nonce";
+ 
++    /**
++     * 响应头：序列截断标记（修订轮 I-4）。值 "true" = 实际行数超过对外上限 ROW_LIMIT(20000)，
++     * 本响应仅含时间窗内前 ROW_LIMIT 行（ts 升序前缀）；头缺省=未截断。体形状与 §3.5 不变，
++     * 截断标记走传输头——对外契约不允许静默丢数据，调用方需完整序列应缩小时间窗或带降采样。
++     */
++    public static final String HEADER_TRUNCATED = "X-Truncated";
++
+     /** 请求属性：验签产物（OpenApiClientIdentity），过滤器写入、控制器读取 */
+     public static final String ATTR_CLIENT_IDENTITY = "openapi.clientIdentity";
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
+index fa5e015..fe9d87a 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
+@@ -31,4 +31,12 @@ public class OpenApiProperties {
+      * Redis 点位缓存写链），读取恒未命中 → 空集如实；键前缀与载荷字段以本配置为对齐锚。
+      */
+     private String realtimeCacheKeyPrefix = "openapi:realtime:";
++
++    /**
++     * 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填 Redis 的键
++     * 必须短 TTL 过期——键过期即回源最新一条，杜绝 ingest 停写后旧值长期充当「实时值」、
++     * 以及查询过的 fullKey（含已删数据项）在 Redis 无限累积（BUG-0053 同危害类）。
++     * &lt;=0 视为误配，回落默认 60 并由调用方 WARN。
++     */
++    private long realtimeCacheTtlSeconds = 60;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+index 48f1fd3..4b65dc3 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiController.java
+@@ -3,7 +3,9 @@ package net.otlab.admin.module.openapi.controller;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
+ import net.otlab.core.annotation.Anonymous;
+ import net.otlab.admin.module.openapi.OpenApiCodes;
+ import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
+@@ -63,7 +65,7 @@ public class OpenApiController {
+         return Result.success(queryService.itemsRealtime(requireIdentity(request), split(fullKeys)));
+     }
+ 
+-    @Operation(summary = "历史曲线（原始粒度跨度≤7 天，超限须带 interval 降采样）")
++    @Operation(summary = "历史曲线（原始粒度跨度≤7 天，超限须带 interval 降采样；行数超对外上限时响应头 X-Truncated: true）")
+     @GetMapping("/items/history")
+     public Result<List<OpenApiHistoryPointVO>> itemsHistory(
+             @RequestParam("fullKey") String fullKey,
+@@ -71,29 +73,49 @@ public class OpenApiController {
+             @RequestParam("end") Long end,
+             @RequestParam(value = "interval", required = false) String interval,
+             @RequestParam(value = "agg", required = false) String agg,
+-            HttpServletRequest request) {
+-        return Result.success(queryService.itemsHistory(requireIdentity(request), fullKey, start, end, interval, agg));
++            HttpServletRequest request, HttpServletResponse response) {
++        OpenApiPage<OpenApiHistoryPointVO> page = queryService.itemsHistory(
++                requireIdentity(request), fullKey, start, end, interval, agg);
++        markTruncated(page, response);
++        return Result.success(page.rows());
+     }
+ 
+-    @Operation(summary = "指标查询（value 与 yoy/mom 伴随值，上期无数据 null+compareNote）")
++    @Operation(summary = "指标查询（value 与 yoy/mom 伴随值，上期无数据 null+compareNote；行数超对外上限时响应头 X-Truncated: true）")
+     @GetMapping("/metrics/query")
+     public Result<List<OpenApiMetricVO>> metricsQuery(
+             @RequestParam(value = "metricCodes", required = false) String metricCodes,
+             @RequestParam("period") String period,
+             @RequestParam("start") Long start,
+             @RequestParam("end") Long end,
+-            HttpServletRequest request) {
+-        return Result.success(queryService.metricsQuery(requireIdentity(request), split(metricCodes), period, start, end));
++            HttpServletRequest request, HttpServletResponse response) {
++        OpenApiPage<OpenApiMetricVO> page = queryService.metricsQuery(
++                requireIdentity(request), split(metricCodes), period, start, end);
++        markTruncated(page, response);
++        return Result.success(page.rows());
+     }
+ 
+-    @Operation(summary = "点位原始数据查询（只查不算，跨度≤31 天）")
++    @Operation(summary = "点位原始数据查询（只查不算，跨度≤31 天；行数超对外上限时响应头 X-Truncated: true）")
+     @GetMapping("/points/history")
+     public Result<List<OpenApiHistoryPointVO>> pointsHistory(
+             @RequestParam("pointCode") String pointCode,
+             @RequestParam("start") Long start,
+             @RequestParam("end") Long end,
+-            HttpServletRequest request) {
+-        return Result.success(queryService.pointsHistory(requireIdentity(request), pointCode, start, end));
++            HttpServletRequest request, HttpServletResponse response) {
++        OpenApiPage<OpenApiHistoryPointVO> page = queryService.pointsHistory(
++                requireIdentity(request), pointCode, start, end);
++        markTruncated(page, response);
++        return Result.success(page.rows());
++    }
++
++    /**
++     * 截断标记（修订轮 I-4）：行数超对外上限（ROW_LIMIT=20000）时以响应头
++     * {@code X-Truncated: true} 携带——对外契约不允许静默丢数据；未截断不设头
++     * （头缺省即 false 语义）。
++     */
++    private void markTruncated(OpenApiPage<?> page, HttpServletResponse response) {
++        if (page != null && page.truncated()) {
++            response.setHeader(OpenApiCodes.HEADER_TRUNCATED, "true");
++        }
+     }
+ 
+     @Operation(summary = "模型与数据项字典同步（本期路由占位：全量字典空实现，增量语义归 TASK-0054）")
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+index 30c6003..f3e888b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+@@ -6,6 +6,7 @@ import net.otlab.admin.module.openapi.dto.OpenApiDictSyncVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiMetricVO;
+ import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
+ 
+ import java.util.List;
+ import java.util.Map;
+@@ -43,25 +44,29 @@ public interface OpenApiQueryService {
+      * GET /openapi/v1/items/history：历史曲线（fullKey 单目标；interval=降采样粒度、
+      * agg=SUM/AVG/MAX/MIN；原始粒度跨度上限 7 天，超限必须带 interval——超限 400）。
+      * scope 外 6003；数据不存在返回空集。
++     *
++     * <p>返回 {@link OpenApiPage}：行数超过对外上限（ROW_LIMIT=20000）时 truncated=true、
++     * rows 为时间窗内前 20000 行——控制器以响应头 {@code X-Truncated: true} 向调用方标记
++     * （修订轮 I-4，对外契约不允许静默丢数据）。
+      */
+-    List<OpenApiHistoryPointVO> itemsHistory(OpenApiClientIdentity identity, String fullKey,
+-                                             Long startMs, Long endMs, String interval, String agg);
++    OpenApiPage<OpenApiHistoryPointVO> itemsHistory(OpenApiClientIdentity identity, String fullKey,
++                                                    Long startMs, Long endMs, String interval, String agg);
+ 
+     /**
+      * GET /openapi/v1/metrics/query：指标查询（period 必填 HOUR/DAY/MONTH/YEAR）；
+      * 返回 value 与 yoy/mom 伴随值（上期无数据 null + compareNote）。scope 外键裁剪；
+-     * 本期计算引擎未交付 → 空集占位（契约就位）。
++     * 本期计算引擎未交付 → 空集占位（契约就位）。截断标记语义同 items/history。
+      */
+-    List<OpenApiMetricVO> metricsQuery(OpenApiClientIdentity identity, List<String> metricCodes,
+-                                       String period, Long startMs, Long endMs);
++    OpenApiPage<OpenApiMetricVO> metricsQuery(OpenApiClientIdentity identity, List<String> metricCodes,
++                                              String period, Long startMs, Long endMs);
+ 
+     /**
+      * GET /openapi/v1/points/history：点位原始数据（只查不算，跨度上限 31 天——超限 400）。
+      * scope 判定走 bound_instance 实例分支（中台 deptIds 恒空集，增补第 8 条）；
+-     * scope 外 6003；数据不存在返回空集。
++     * scope 外 6003；数据不存在返回空集。截断标记语义同 items/history。
+      */
+-    List<OpenApiHistoryPointVO> pointsHistory(OpenApiClientIdentity identity, String pointCode,
+-                                              Long startMs, Long endMs);
++    OpenApiPage<OpenApiHistoryPointVO> pointsHistory(OpenApiClientIdentity identity, String pointCode,
++                                                     Long startMs, Long endMs);
+ 
+     /**
+      * GET /openapi/v1/dict/sync：模型与数据项字典同步（appKey 有效即可——不走 scope）。
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+index 091106c..f0ab57c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+@@ -21,6 +21,7 @@ import net.otlab.admin.module.openapi.mapper.OpenApiPointMapper;
+ import net.otlab.admin.module.openapi.mapper.OpenApiPointRow;
+ import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
+ import net.otlab.admin.module.openapi.service.OpenApiQueryService;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
+ import net.otlab.admin.module.openapi.support.OpenApiRealtimeStore;
+ import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
+ import net.otlab.core.exception.BusinessException;
+@@ -171,8 +172,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     // ---------- 3) items/history ----------
+ 
+     @Override
+-    public List<OpenApiHistoryPointVO> itemsHistory(OpenApiClientIdentity identity, String fullKey,
+-                                                    Long startMs, Long endMs, String interval, String agg) {
++    public OpenApiPage<OpenApiHistoryPointVO> itemsHistory(OpenApiClientIdentity identity, String fullKey,
++                                                           Long startMs, Long endMs, String interval, String agg) {
+         if (StrUtil.isBlank(fullKey)) {
+             throw paramError("fullKey 不能为空");
+         }
+@@ -197,7 +198,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         List<OpenApiItemRow> rows = itemMapper.selectByFullKeysForTenant(identity.getTenantId(), List.of(fullKey));
+         if (rows.isEmpty()) {
+             // 数据不存在类返回空集（REQ-0027 验收 1：与 scope 外 6003 相区分——不给全租户键枚举探测面）
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         requireInstanceVisible(identity, rows.get(0).getInstanceId(), "fullKey");
+         return timeseriesClient.queryItemHistory(identity.getTenantId(), tenantCode(identity.getTenantId()),
+@@ -207,8 +208,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     // ---------- 4) metrics/query ----------
+ 
+     @Override
+-    public List<OpenApiMetricVO> metricsQuery(OpenApiClientIdentity identity, List<String> metricCodes,
+-                                              String period, Long startMs, Long endMs) {
++    public OpenApiPage<OpenApiMetricVO> metricsQuery(OpenApiClientIdentity identity, List<String> metricCodes,
++                                                     String period, Long startMs, Long endMs) {
+         List<String> codes = normalizeKeys(metricCodes);
+         if (codes.isEmpty()) {
+             throw paramError("metricCodes 不能为空");
+@@ -221,7 +222,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         VisibleScope scope = resolveScope(identity);
+         List<OpenApiMetricRow> rows = metricMapper.selectByCodesForTenant(identity.getTenantId(), codes);
+         if (rows.isEmpty()) {
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         // §3.5「scope + 指标 dept 双重限定」在对外调用方路径坍缩为实例分支（增补第 8 条：
+         // 中台 deptIds 恒空集）；scope 外键裁剪（集合形态授权裁剪语义）
+@@ -236,16 +237,19 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         String tenantCode = tenantCode(identity.getTenantId());
+         Map<Long, String> instanceCodeById = loadInstanceCodes(identity, instanceIds);
+         List<OpenApiMetricVO> result = new ArrayList<>();
++        boolean truncated = false;
+         for (String code : codes) {
+             OpenApiMetricRow metric = byCode.get(code);
+             if (metric == null || !scope.instanceIds().contains(metric.getInstanceId())) {
+                 continue;
+             }
+-            result.addAll(timeseriesClient.queryMetrics(identity.getTenantId(), tenantCode,
++            OpenApiPage<OpenApiMetricVO> page = timeseriesClient.queryMetrics(identity.getTenantId(), tenantCode,
+                     metric.getMetricCode(), instanceCodeById.get(metric.getInstanceId()),
+-                    normalizedPeriod, startMs, endMs, null));
++                    normalizedPeriod, startMs, endMs, null);
++            result.addAll(page.rows());
++            truncated = truncated || page.truncated();
+         }
+-        return result;
++        return new OpenApiPage<>(result, truncated);
+     }
+ 
+     /** 指标归属实例编码回显（§3.5 示例 instanceCode 字段；一次批量载入） */
+@@ -263,8 +267,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     // ---------- 5) points/history ----------
+ 
+     @Override
+-    public List<OpenApiHistoryPointVO> pointsHistory(OpenApiClientIdentity identity, String pointCode,
+-                                                     Long startMs, Long endMs) {
++    public OpenApiPage<OpenApiHistoryPointVO> pointsHistory(OpenApiClientIdentity identity, String pointCode,
++                                                            Long startMs, Long endMs) {
+         if (StrUtil.isBlank(pointCode)) {
+             throw paramError("pointCode 不能为空");
+         }
+@@ -275,7 +279,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         }
+         List<OpenApiPointRow> rows = pointMapper.selectByCodesForTenant(identity.getTenantId(), List.of(pointCode));
+         if (rows.isEmpty()) {
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         OpenApiPointRow point = rows.get(0);
+         // 中台点位条件仅实例分支（增补第 8 条 fail-closed）：bound_instance_id NULL=不可见
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiPage.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiPage.java
+new file mode 100644
+index 0000000..a903782
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiPage.java
+@@ -0,0 +1,25 @@
++package net.otlab.admin.module.openapi.support;
++
++import java.util.List;
++
++/**
++ * 时序查询页（修订轮 I-4）：数据行 + 截断标记——对外序列不允许静默丢数据。
++ *
++ * <p>客户端每次查询以 {@code LIMIT ROW_LIMIT+1} 取数（fetch-one-extra 检测法）：
++ * 命中行数 &gt; ROW_LIMIT 即截断事实成立，置 truncated=true 并收敛到前 ROW_LIMIT 行；
++ * 控制器将截断标记以响应头 {@code X-Truncated: true} 携带（体形状与 §3.5 保持一致，
++ * 标记走传输头、不破坏体契约），javadoc 与契约注释同步声明。
++ *
++ * @param <T>        行类型（OpenApiHistoryPointVO / OpenApiMetricVO）
++ * @param rows       数据行（截断时恰为 ROW_LIMIT 行）
++ * @param truncated  是否发生截断（true=实际行数超过对外上限，仅返回上限内前缀；
++ *                   调用方如需完整序列应缩小时间窗或带降采样粒度）
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record OpenApiPage<T>(List<T> rows, boolean truncated) {
++
++    public OpenApiPage {
++        rows = rows == null ? List.of() : List.copyOf(rows);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStore.java
+index 6d8c0eb..7dac3ed 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStore.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStore.java
+@@ -8,6 +8,8 @@ import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
+ import net.otlab.core.module.redis.RedisService;
+ import org.springframework.stereotype.Component;
+ 
++import java.util.concurrent.TimeUnit;
++
+ /**
+  * 实时值读取器（TASK-0051，REQ-0027：优先读 Redis，未命中回源 TDengine 最新一条并回填）。
+  *
+@@ -25,6 +27,9 @@ import org.springframework.stereotype.Component;
+ @Component
+ public class OpenApiRealtimeStore {
+ 
++    /** 回填 TTL 误配（&lt;=0）兜底秒数——与配置默认一致（修订轮 I-3） */
++    static final long DEFAULT_BACKFILL_TTL_SECONDS = 60;
++
+     private final RedisService redisService;
+     private final OpenApiProperties properties;
+     private final OpenApiTimeseriesClient timeseriesClient;
+@@ -67,14 +72,17 @@ public class OpenApiRealtimeStore {
+         }
+     }
+ 
+-    /** TDengine 回源命中后回填 Redis（契约值形态 JSON v/q/ts；失败吞错） */
++    /** TDengine 回源命中后回填 Redis（契约值形态 JSON v/q/ts；带短 TTL——修订轮 I-3：键过期即回源，杜绝永不过期键；失败吞错） */
+     private void backfill(Long tenantId, String fullKey, OpenApiRealtimeItemVO value) {
+         try {
+-            JSONObject json = new JSONObject();
+-            json.set("v", value.getV());
+-            json.set("q", value.getQ());
+-            json.set("ts", value.getTs());
+-            redisService.setCacheObject(redisKey(tenantId, fullKey), json);
++            // 值载体用普通 Map（RedisTemplate Jackson 序列化面最稳；读取侧对 Map/JSONObject/String 均宽容解析）
++            java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
++            payload.put("v", value.getV());
++            payload.put("q", value.getQ());
++            payload.put("ts", value.getTs());
++            long ttl = properties.getRealtimeCacheTtlSeconds() > 0
++                    ? properties.getRealtimeCacheTtlSeconds() : DEFAULT_BACKFILL_TTL_SECONDS;
++            redisService.setCacheObject(redisKey(tenantId, fullKey), payload, ttl, TimeUnit.SECONDS);
+         } catch (Exception e) {
+             log.warn("[OPENAPI] 实时值 Redis 回填失败（不阻断响应）fullKey={}", fullKey, e);
+         }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
+index 05a73e2..acb5b47 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClient.java
+@@ -44,6 +44,17 @@ import java.util.regex.Pattern;
+  * fail-soft 空集并 WARN——不拼不可信字面量进 SQL）；tenant_id/时间窗为数值参数直接拼接
+  * （无注入面）。
+  *
++ * <p><b>行数上限与截断契约（修订轮 I-4）</b>：单次查询对外行数上限 {@link #ROW_LIMIT}
++ * （20000），服务端以 LIMIT ROW_LIMIT+1 取数（fetch-one-extra 检测法）——命中行数超上限
++ * 即截断事实成立，返回 {@link OpenApiPage#truncated()}=true 并收敛到前 ROW_LIMIT 行
++ * （按 ts 升序前缀，即时间窗内的最早 ROW_LIMIT 行）；控制器将标记以响应头
++ * {@code X-Truncated: true} 携带（体形状与 §3.5 不变，标记走传输头），调用方如需完整
++ * 序列应缩小时间窗或带降采样粒度——对外契约不允许静默丢数据。
++ *
++ * <p><b>「最新一条」口径（修订轮 I-2）</b>：{@link #queryItemLatest} 以
++ * {@code ORDER BY ts DESC LIMIT 1} 取首行——真实最新值；不允许「升序取尾」形态
++ * （行数超限时尾行是旧值，realtime 回源将永久返回历史点）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -51,8 +62,14 @@ import java.util.regex.Pattern;
+ @Component
+ public class OpenApiTimeseriesClient {
+ 
+-    /** 单次查询行数保护上限（防全量放大；降采样策略细化归 0068 联调） */
+-    static final int ROW_LIMIT = 20000;
++    /**
++     * 单次查询对外行数上限（防全量放大；修订轮 I-4：超出即截断标记，不静默丢数据）。
++     * 降采样策略细化归 0068 联调。
++     */
++    public static final int ROW_LIMIT = 20000;
++
++    /** 取数上限（fetch-one-extra：多取 1 行仅为截断事实判定，多取的行不对外返回） */
++    static final int FETCH_LIMIT = ROW_LIMIT + 1;
+ 
+     /** 编码字面量白名单（full_key/point_code/metric_code/period：字母/数字/下划线/点） */
+     private static final Pattern SAFE_CODE = Pattern.compile("[A-Za-z0-9_.]+");
+@@ -81,19 +98,19 @@ public class OpenApiTimeseriesClient {
+      * 数据项历史序列（st_item_value，full_key 标签过滤）。
+      *
+      * @param interval 降采样粒度（null=原始粒度）；agg 聚合 SUM/AVG/MAX/MIN（interval 非空时必填）
+-     * @return 数据点序列（ts/_wstart 升序）；查询失败/无数据/编码不安全均为空列表（fail-soft）
++     * @return 数据点页（ts/_wstart 升序；截断见类注释 I-4 契约）；查询失败/无数据/编码不安全均为空页（fail-soft）
+      */
+-    public List<OpenApiHistoryPointVO> queryItemHistory(Long tenantId, String tenantCode,
+-                                                        String fullKey, Long startMs, Long endMs,
+-                                                        String interval, String agg) {
++    public OpenApiPage<OpenApiHistoryPointVO> queryItemHistory(Long tenantId, String tenantCode,
++                                                               String fullKey, Long startMs, Long endMs,
++                                                               String interval, String agg) {
+         if (!safeContext(tenantId, tenantCode) || !SAFE_CODE.matcher(nullToBlank(fullKey)).matches()) {
+             log.warn("[OPENAPI-TS] fail-soft 空集：st_item_value 查询上下文不安全（编码白名单外或租户缺失）");
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         boolean downsample = interval != null && !interval.isBlank();
+         if (downsample && (!safeInterval(interval) || !SAFE_AGGS.contains(safeAgg(agg)))) {
+             log.warn("[OPENAPI-TS] fail-soft 空集：降采样参数白名单外（interval/agg），不拼接进查询");
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         final String sql;
+         if (downsample) {
+@@ -101,68 +118,84 @@ public class OpenApiTimeseriesClient {
+                     + " FROM " + database(tenantCode) + ".st_item_value"
+                     + " WHERE tenant_id = " + tenantId + " AND full_key = '" + fullKey + "'"
+                     + " AND ts >= " + startMs + " AND ts <= " + endMs
+-                    + " INTERVAL(" + interval + ") LIMIT " + ROW_LIMIT;
++                    + " INTERVAL(" + interval + ") LIMIT " + FETCH_LIMIT;
+         } else {
+             sql = "SELECT ts, value, quality FROM " + database(tenantCode) + ".st_item_value"
+                     + " WHERE tenant_id = " + tenantId + " AND full_key = '" + fullKey + "'"
+                     + " AND ts >= " + startMs + " AND ts <= " + endMs
+-                    + " ORDER BY ts ASC LIMIT " + ROW_LIMIT;
++                    + " ORDER BY ts ASC LIMIT " + FETCH_LIMIT;
+         }
+-        return queryPoints(sql);
++        return toPointPage(executeQuietly(sql));
+     }
+ 
+     /**
+-     * 点位原始历史（st_point_num / st_point_state 按 value_type 选表——只查不算，§3.5）
++     * 点位原始历史（st_point_num / st_point_state 按 value_type 选表——只查不算，§3.5）。
++     * 截断契约同类注释 I-4。
+      */
+-    public List<OpenApiHistoryPointVO> queryPointHistory(Long tenantId, String tenantCode,
+-                                                         String pointCode, String valueType,
+-                                                         Long startMs, Long endMs) {
++    public OpenApiPage<OpenApiHistoryPointVO> queryPointHistory(Long tenantId, String tenantCode,
++                                                                String pointCode, String valueType,
++                                                                Long startMs, Long endMs) {
+         if (!safeContext(tenantId, tenantCode) || !SAFE_CODE.matcher(nullToBlank(pointCode)).matches()) {
+             log.warn("[OPENAPI-TS] fail-soft 空集：点位查询上下文不安全（编码白名单外或租户缺失）");
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         String stable = "state".equalsIgnoreCase(valueType) ? "st_point_state" : "st_point_num";
+         String sql = "SELECT ts, value, quality FROM " + database(tenantCode) + "." + stable
+                 + " WHERE tenant_id = " + tenantId + " AND point_code = '" + pointCode + "'"
+                 + " AND ts >= " + startMs + " AND ts <= " + endMs
+-                + " ORDER BY ts ASC LIMIT " + ROW_LIMIT;
+-        return queryPoints(sql);
++                + " ORDER BY ts ASC LIMIT " + FETCH_LIMIT;
++        return toPointPage(executeQuietly(sql));
+     }
+ 
+     /**
+-     * 数据项实时值回源（st_item_value 最新一条——REQ-0027：Redis 未命中回源并回填）
++     * 数据项实时值回源（st_item_value 最新一条——REQ-0027：Redis 未命中回源并回填）。
++     *
++     * <p>修订轮 I-2：{@code ORDER BY ts DESC LIMIT 1} 取首行=真实最新值（升序取尾在
++     * 行数超限时返回旧值，禁止）。
+      */
+     public OpenApiRealtimeItemVO queryItemLatest(Long tenantId, String tenantCode, String fullKey) {
+-        List<OpenApiHistoryPointVO> rows = queryItemHistory(
+-                tenantId, tenantCode, fullKey, 0L, System.currentTimeMillis(), null, null);
+-        return rows.isEmpty() ? null
+-                : new OpenApiRealtimeItemVO(rows.get(rows.size() - 1).getV(), rows.get(rows.size() - 1).getQ(),
+-                        rows.get(rows.size() - 1).getTs());
++        if (!safeContext(tenantId, tenantCode) || !SAFE_CODE.matcher(nullToBlank(fullKey)).matches()) {
++            log.warn("[OPENAPI-TS] fail-soft 空集：实时值回源上下文不安全（编码白名单外或租户缺失）");
++            return null;
++        }
++        String sql = "SELECT ts, value, quality FROM " + database(tenantCode) + ".st_item_value"
++                + " WHERE tenant_id = " + tenantId + " AND full_key = '" + fullKey + "'"
++                + " ORDER BY ts DESC LIMIT 1";
++        JsonNode rows = executeQuietly(sql);
++        if (rows == null || !rows.isArray() || rows.isEmpty()
++                || !rows.get(0).isArray() || rows.get(0).size() < 3) {
++            return null;
++        }
++        JsonNode row = rows.get(0);
++        return new OpenApiRealtimeItemVO(nodeDouble(row.get(1)), nodeInt(row.get(2)), parseTimestamp(row.get(0)));
+     }
+ 
+     /**
+      * 指标序列（st_metric_value，metric_code + period 标签过滤——计算引擎写入方
+-     * FEAT-0013 未交付，本期恒空集）
++     * FEAT-0013 未交付，本期恒空页）。截断契约同类注释 I-4。
+      */
+-    public List<OpenApiMetricVO> queryMetrics(Long tenantId, String tenantCode, String metricCode,
+-                                              String instanceCode, String period,
+-                                              Long startMs, Long endMs, String unit) {
++    public OpenApiPage<OpenApiMetricVO> queryMetrics(Long tenantId, String tenantCode, String metricCode,
++                                                     String instanceCode, String period,
++                                                     Long startMs, Long endMs, String unit) {
+         if (!safeContext(tenantId, tenantCode) || !SAFE_CODE.matcher(nullToBlank(metricCode)).matches()
+                 || !SAFE_CODE.matcher(nullToBlank(period)).matches()) {
+             log.warn("[OPENAPI-TS] fail-soft 空集：st_metric_value 查询上下文不安全");
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
+         String sql = "SELECT ts, value, yoy, mom FROM " + database(tenantCode) + ".st_metric_value"
+                 + " WHERE tenant_id = " + tenantId + " AND metric_code = '" + metricCode + "'"
+                 + " AND period = '" + period + "'"
+                 + " AND ts >= " + startMs + " AND ts <= " + endMs
+-                + " ORDER BY ts ASC LIMIT " + ROW_LIMIT;
++                + " ORDER BY ts ASC LIMIT " + FETCH_LIMIT;
+         JsonNode rows = executeQuietly(sql);
+         if (rows == null || !rows.isArray()) {
+-            return List.of();
++            return new OpenApiPage<>(List.of(), false);
+         }
++        boolean truncated = rows.size() > ROW_LIMIT;
++        int kept = truncated ? ROW_LIMIT : rows.size();
+         List<OpenApiMetricVO> result = new ArrayList<>();
+-        for (JsonNode row : rows) {
++        for (int i = 0; i < kept; i++) {
++            JsonNode row = rows.get(i);
+             if (!row.isArray() || row.size() < 4) {
+                 continue;
+             }
+@@ -183,7 +216,7 @@ public class OpenApiTimeseriesClient {
+             }
+             result.add(vo);
+         }
+-        return result;
++        return new OpenApiPage<>(result, truncated);
+     }
+ 
+     // ---------- 内部：0023 同款执行与 fail-soft ----------
+@@ -193,13 +226,16 @@ public class OpenApiTimeseriesClient {
+         return agg == null ? "" : agg.trim().toUpperCase(Locale.ROOT);
+     }
+ 
+-    private List<OpenApiHistoryPointVO> queryPoints(String sql) {
+-        JsonNode rows = executeQuietly(sql);
++    /** 行页装配（修订轮 I-4）：fetch-one-extra 截断判定 + 收敛到对外上限 */
++    private List<OpenApiHistoryPointVO> toPointRows(JsonNode rows) {
++        List<OpenApiHistoryPointVO> points = new ArrayList<>();
+         if (rows == null || !rows.isArray()) {
+-            return List.of();
++            return points;
+         }
+-        List<OpenApiHistoryPointVO> points = new ArrayList<>();
+-        for (JsonNode row : rows) {
++        boolean truncated = rows.size() > ROW_LIMIT;
++        int kept = truncated ? ROW_LIMIT : rows.size();
++        for (int i = 0; i < kept; i++) {
++            JsonNode row = rows.get(i);
+             if (!row.isArray() || row.size() < 3) {
+                 continue;
+             }
+@@ -208,6 +244,14 @@ public class OpenApiTimeseriesClient {
+         return points;
+     }
+ 
++    private OpenApiPage<OpenApiHistoryPointVO> toPointPage(JsonNode rows) {
++        if (rows == null || !rows.isArray()) {
++            return new OpenApiPage<>(List.of(), false);
++        }
++        boolean truncated = rows.size() > ROW_LIMIT;
++        return new OpenApiPage<>(toPointRows(rows), truncated);
++    }
++
+     /** REST 执行（0023 形态）：一切失败 WARN 留痕返回 null（fail-soft 空集） */
+     private JsonNode executeQuietly(String sql) {
+         try {
+@@ -257,10 +301,6 @@ public class OpenApiTimeseriesClient {
+         return interval != null && SAFE_INTERVAL.matcher(interval).matches();
+     }
+ 
+-    private static Long nodeLong(JsonNode node) {
+-        return node == null || node.isNull() ? null : node.asLong();
+-    }
+-
+     /**
+      * 时间戳宽容解析：TDengine REST 返回 ISO8601 文本（如 2026-11-22T00:00:00.000+08:00），
+      * 数值形态直接取毫秒；不可解析返回 null（空值跳过语义，不炸行）
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index d453f93..da307f1 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -37,13 +37,14 @@ ot:
+     read-timeout-ms: ${OT_TDENGINE_READ_TIMEOUT_MS:5000}       # REST 读超时
+   dataperm:
+     subtree-max: ${OT_DATAPERM_SUBTREE_MAX:5000}   # 子树展开上限（TASK-0005 / ADR-0016 裁决 1）：步骤 4 ancestors 子树展开的实例数上限；超限截断并 WARN（[DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>），不报错不降级；<=0 视为关闭上限
++    cache-enabled: ${OT_DATAPERM_CACHE_ENABLED:true}        # 可见集合 Redis 缓存开关（TASK-0006，默认 true）：false 走 NoOpVisibleScopeCache 直查（测试与故障兜底）；缓存键 iot:dataperm:scope:{userId}:{roleVer}
++    cache-ttl-seconds: ${OT_DATAPERM_CACHE_TTL_SECONDS:600} # 可见集合缓存 TTL 秒数（TASK-0006，默认 600=10 分钟，FEAT-0002 业务规则）：TTL 仅兜底，主动失效由部门/角色/绑定变更点事件驱动；<=0 误配回落默认 600 并 WARN
+   openapi:
+-    # 对外数据服务（TASK-0051 /openapi/v1，brief 允许的唯一 yml 键族）
++    # 对外数据服务（TASK-0051 /openapi/v1，brief 允许的唯一 yml 键族；修订轮 I-1：本块为 ot 下顶层独立块，不得嵌进既有块）
+     replay-window-seconds: ${OT_OPENAPI_REPLAY_WINDOW_SECONDS:300}   # 防重放时间戳窗口（秒）：|服务端时间-X-Timestamp| 超此值按 6001 拒绝（brief：5 分钟）
+     rate-limit-window-seconds: ${OT_OPENAPI_RATE_LIMIT_WINDOW_SECONDS:60}   # 限流固定窗宽（秒，brief：简单固定窗 60s——RedisService.incrementWithTtl 原子 INCR+TTL，BUG-0053 口径）
+     realtime-cache-key-prefix: ${OT_OPENAPI_REALTIME_CACHE_KEY_PREFIX:openapi:realtime:}   # Redis 实时值键前缀（0068 联调契约锚）：键 = 前缀 + tenantId + ":" + fullKey，值 JSON {"v","q","ts"}；ingest 写链未交付，本期读取恒未命中 → 空集如实
+-    cache-enabled: ${OT_DATAPERM_CACHE_ENABLED:true}        # 可见集合 Redis 缓存开关（TASK-0006，默认 true）：false 走 NoOpVisibleScopeCache 直查（测试与故障兜底）；缓存键 iot:dataperm:scope:{userId}:{roleVer}
+-    cache-ttl-seconds: ${OT_DATAPERM_CACHE_TTL_SECONDS:600} # 可见集合缓存 TTL 秒数（TASK-0006，默认 600=10 分钟，FEAT-0002 业务规则）：TTL 仅兜底，主动失效由部门/角色/绑定变更点事件驱动；<=0 误配回落默认 600 并 WARN
++    realtime-cache-ttl-seconds: ${OT_OPENAPI_REALTIME_CACHE_TTL_SECONDS:60}   # 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填的键必须短 TTL 过期——键过期即回源，杜绝 ingest 停写后旧值长期充当「实时值」与键无限累积（BUG-0053 同危害类）
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/ClientScopeRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/ClientScopeRedlineTest.java
+index b849d55..b62a011 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/ClientScopeRedlineTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/ClientScopeRedlineTest.java
+@@ -284,7 +284,7 @@ class ClientScopeRedlineTest {
+ 
+         BusinessException e = assertThrows(BusinessException.class, () -> authenticatedCall(
+                 signedRequest("/openapi/v1/points/history?pointCode=P2&start=0&end=1000"),
+-                req -> controller.pointsHistory("P2", 0L, 1000L, req)));
++                req -> controller.pointsHistory("P2", 0L, 1000L, req, new org.springframework.mock.web.MockHttpServletResponse())));
+         assertEquals(6003, e.getCode(), "同部门 scope 外点位 6003（授权放大拦截）——部门分支未放行");
+         long noTenantWarns = logAppender.list.stream()
+                 .filter(ev -> ev.getLevel() == Level.WARN)
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+new file mode 100644
+index 0000000..3464412
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+@@ -0,0 +1,72 @@
++package net.otlab.admin.module.openapi.config;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.yaml.snakeyaml.Yaml;
++
++import java.io.InputStream;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * application.yml openapi 块结构回归测试（修订轮 I-1）。
++ *
++ * <p>单测不加载 Spring 配置、既有 0006 缓存装配用例只测条件绑定不测命名空间——I-1
++ * （openapi 块误插进 dataperm 块内部，ot.dataperm.cache-enabled/cache-ttl-seconds 被
++ * 语义性移入 ot.openapi.* 命名空间，TASK-0006 兜底开关静默失效）因此漏网。本测试直接
++ * 解析 application.yml 断言键的命名空间归属，锁死结构：
++ * <ul>
++ * <li>{@code ot.dataperm.cache-enabled} / {@code ot.dataperm.cache-ttl-seconds} 必须存在于
++ *     dataperm 块（0006 语义：false → NoOpVisibleScopeCache 条件装配命中）；</li>
++ * <li>{@code ot.openapi.*} 为顶层独立块，只含本任务四键，不含 dataperm 两键。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class OpenApiYmlStructureTest {
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> loadOt() throws Exception {
++        try (InputStream in = OpenApiYmlStructureTest.class.getClassLoader()
++                .getResourceAsStream("application.yml")) {
++            assertNotNull(in, "application.yml 必须在 ot-admin classpath");
++            Map<String, Object> root = new Yaml().load(in);
++            return (Map<String, Object>) root.get("ot");
++        }
++    }
++
++    @Test
++    @DisplayName("I-1 回归：ot.dataperm.cache-enabled/cache-ttl-seconds 回归 dataperm 命名空间（TASK-0006 开关生效面）")
++    void datapermKeysBackUnderDataperm() throws Exception {
++        Map<String, Object> dataperm = (Map<String, Object>) loadOt().get("dataperm");
++        assertNotNull(dataperm);
++        assertTrue(dataperm.containsKey("cache-enabled"),
++                "ot.dataperm.cache-enabled 必须存在于 dataperm 块——否则 NoOpVisibleScopeCache 的 "
++                        + "@ConditionalOnProperty 永不命中、故障兜底开关静默失效（I-1）");
++        assertTrue(dataperm.containsKey("cache-ttl-seconds"),
++                "ot.dataperm.cache-ttl-seconds 必须存在于 dataperm 块");
++        assertTrue(dataperm.containsKey("subtree-max"), "既有 subtree-max 键不因修订轮漂移");
++        assertEquals(3, dataperm.size(), "dataperm 块恰三键（subtree-max/cache-enabled/cache-ttl-seconds）——防块结构再次漂移");
++    }
++
++    @Test
++    @DisplayName("I-1 回归：ot.openapi 为顶层独立块，只含本任务四键、不含 dataperm 两键")
++    void openapiBlockTopLevelAndExclusive() throws Exception {
++        Map<String, Object> ot = loadOt();
++        Map<String, Object> openapi = (Map<String, Object>) ot.get("openapi");
++        assertNotNull(openapi, "ot.openapi 必须是 ot 顶层独立块");
++        for (String key : new String[]{"replay-window-seconds", "rate-limit-window-seconds",
++                "realtime-cache-key-prefix", "realtime-cache-ttl-seconds"}) {
++            assertTrue(openapi.containsKey(key), "ot.openapi." + key + " 必须存在（修订轮 I-3 新增回填 TTL 键）");
++        }
++        assertFalse(openapi.containsKey("cache-enabled"), "ot.openapi 不得包含 dataperm 的 cache-enabled（I-1）");
++        assertFalse(openapi.containsKey("cache-ttl-seconds"), "ot.openapi 不得包含 dataperm 的 cache-ttl-seconds（I-1）");
++        assertFalse(openapi.containsKey("subtree-max"));
++        assertEquals(4, openapi.size(), "openapi 块恰四键（防块结构漂移）");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
+index 8d6b87c..4fba54c 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImplTest.java
+@@ -16,6 +16,7 @@ import net.otlab.admin.module.openapi.mapper.OpenApiPointMapper;
+ import net.otlab.admin.module.openapi.mapper.OpenApiPointRow;
+ import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
+ import net.otlab.admin.module.openapi.service.OpenApiQueryService;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
+ import net.otlab.admin.module.openapi.support.OpenApiRealtimeStore;
+ import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
+ import net.otlab.core.exception.BusinessException;
+@@ -32,6 +33,7 @@ import java.util.Map;
+ import java.util.Set;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -311,10 +313,11 @@ class OpenApiQueryServiceImplTest {
+         scopeGrants(1L);
+         when(itemMapper.selectByFullKeysForTenant(eq(TENANT_ID), anyCollection())).thenReturn(List.of());
+ 
+-        List<OpenApiHistoryPointVO> points = service.itemsHistory(
++        OpenApiPage<OpenApiHistoryPointVO> page = service.itemsHistory(
+                 identity("{\"instanceIds\":[1]}"), "NO.SUCH", 0L, DAY, null, null);
+ 
+-        assertTrue(points.isEmpty());
++        assertFalse(page.truncated());
++        assertTrue(page.rows().isEmpty());
+         verify(timeseriesClient, never()).queryItemHistory(anyLong(), anyString(), anyString(),
+                 anyLong(), anyLong(), anyString(), anyString());
+     }
+@@ -339,13 +342,34 @@ class OpenApiQueryServiceImplTest {
+         when(itemMapper.selectByFullKeysForTenant(eq(TENANT_ID), anyCollection()))
+                 .thenReturn(List.of(item("F01.POWER", 1L)));
+         when(timeseriesClient.queryItemHistory(TENANT_ID, "default", "F01.POWER", 0L, DAY, "3600s", "AVG"))
+-                .thenReturn(List.of(new OpenApiHistoryPointVO(0L, 1.0, 0)));
++                .thenReturn(new OpenApiPage<>(List.of(new OpenApiHistoryPointVO(0L, 1.0, 0)), false));
+ 
+-        List<OpenApiHistoryPointVO> points = service.itemsHistory(
++        OpenApiPage<OpenApiHistoryPointVO> page = service.itemsHistory(
+                 identity("{\"instanceIds\":[1]}"), "F01.POWER", 0L, DAY, "3600s", "AVG");
+ 
+-        assertEquals(1, points.size());
+-        assertEquals(1.0, points.get(0).getV());
++        assertFalse(page.truncated());
++        assertEquals(1, page.rows().size());
++        assertEquals(1.0, page.rows().get(0).getV());
++    }
++
++    @Test
++    @DisplayName("history：客户端截断标记透传（修订轮 I-4——服务层不吞 truncated）")
++    void historyTruncationFlagPassthrough() {
++        scopeGrants(1L);
++        when(itemMapper.selectByFullKeysForTenant(eq(TENANT_ID), anyCollection()))
++                .thenReturn(List.of(item("F01.POWER", 1L)));
++        List<OpenApiHistoryPointVO> capped = new java.util.ArrayList<>();
++        for (int i = 0; i < OpenApiTimeseriesClient.ROW_LIMIT; i++) {
++            capped.add(new OpenApiHistoryPointVO((long) i, 0.0, 0));
++        }
++        when(timeseriesClient.queryItemHistory(anyLong(), anyString(), anyString(), anyLong(), anyLong(),
++                nullable(String.class), nullable(String.class))).thenReturn(new OpenApiPage<>(capped, true));
++
++        OpenApiPage<OpenApiHistoryPointVO> page = service.itemsHistory(
++                identity("{\"instanceIds\":[1]}"), "F01.POWER", 0L, DAY, null, null);
++
++        assertTrue(page.truncated(), "截断标记必须透传到服务层返回值（控制器据此设 X-Truncated 头）");
++        assertEquals(OpenApiTimeseriesClient.ROW_LIMIT, page.rows().size());
+     }
+ 
+     @Test
+@@ -355,12 +379,12 @@ class OpenApiQueryServiceImplTest {
+         when(itemMapper.selectByFullKeysForTenant(eq(TENANT_ID), anyCollection()))
+                 .thenReturn(List.of(item("F01.POWER", 1L)));
+         when(timeseriesClient.queryItemHistory(anyLong(), anyString(), anyString(), anyLong(), anyLong(),
+-                anyString(), anyString())).thenReturn(List.of());
++                anyString(), anyString())).thenReturn(new OpenApiPage<>(List.of(), false));
+ 
+-        List<OpenApiHistoryPointVO> points = service.itemsHistory(
++        OpenApiPage<OpenApiHistoryPointVO> page = service.itemsHistory(
+                 identity("{\"instanceIds\":[1]}"), "F01.POWER", 0L, 8 * DAY, "3600s", "AVG");
+ 
+-        assertTrue(points.isEmpty());
++        assertTrue(page.rows().isEmpty());
+         ArgumentCaptor<String> intervalCaptor = ArgumentCaptor.forClass(String.class);
+         verify(timeseriesClient).queryItemHistory(eq(TENANT_ID), eq("default"), eq("F01.POWER"),
+                 eq(0L), eq(8 * DAY), intervalCaptor.capture(), eq("AVG"));
+@@ -403,12 +427,13 @@ class OpenApiQueryServiceImplTest {
+                 .thenReturn(List.of(visible, outside));
+         when(timeseriesClient.queryMetrics(eq(TENANT_ID), eq("default"), eq("F01_WATER_AVG_DAY"),
+                 nullable(String.class), eq("DAY"), anyLong(), anyLong(), any()))
+-                .thenReturn(List.of());
++                .thenReturn(new OpenApiPage<>(List.of(), false));
+ 
+-        List<?> result = service.metricsQuery(identity("{\"instanceIds\":[1]}"),
++        OpenApiPage<?> page = service.metricsQuery(identity("{\"instanceIds\":[1]}"),
+                 List.of("F01_WATER_AVG_DAY", "F09_WATER_AVG_DAY"), "DAY", 0L, DAY);
+ 
+-        assertTrue(result.isEmpty());
++        assertFalse(page.truncated());
++        assertTrue(page.rows().isEmpty());
+         verify(timeseriesClient).queryMetrics(eq(TENANT_ID), eq("default"), eq("F01_WATER_AVG_DAY"),
+                 nullable(String.class), eq("DAY"), anyLong(), anyLong(), any());
+         verify(timeseriesClient, never()).queryMetrics(eq(TENANT_ID), eq("default"), eq("F09_WATER_AVG_DAY"),
+@@ -432,7 +457,7 @@ class OpenApiQueryServiceImplTest {
+         scopeGrants(1L);
+         when(pointMapper.selectByCodesForTenant(eq(TENANT_ID), anyCollection())).thenReturn(List.of());
+ 
+-        assertTrue(service.pointsHistory(identity("{\"instanceIds\":[1]}"), "NO.SUCH", 0L, DAY).isEmpty());
++        assertTrue(service.pointsHistory(identity("{\"instanceIds\":[1]}"), "NO.SUCH", 0L, DAY).rows().isEmpty());
+         verifyNoInteractions(timeseriesClient);
+     }
+ 
+@@ -487,12 +512,12 @@ class OpenApiQueryServiceImplTest {
+         point.setStatus(1);
+         when(pointMapper.selectByCodesForTenant(eq(TENANT_ID), anyCollection())).thenReturn(List.of(point));
+         when(timeseriesClient.queryPointHistory(TENANT_ID, "default", "P1", "state", 0L, DAY))
+-                .thenReturn(List.of(new OpenApiHistoryPointVO(0L, 1.0, 0)));
++                .thenReturn(new OpenApiPage<>(List.of(new OpenApiHistoryPointVO(0L, 1.0, 0)), false));
+ 
+-        List<OpenApiHistoryPointVO> points = service.pointsHistory(
++        OpenApiPage<OpenApiHistoryPointVO> page = service.pointsHistory(
+                 identity("{\"instanceIds\":[1]}"), "P1", 0L, DAY);
+ 
+-        assertEquals(1, points.size());
++        assertEquals(1, page.rows().size());
+         verify(timeseriesClient).queryPointHistory(TENANT_ID, "default", "P1", "state", 0L, DAY);
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStoreTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStoreTest.java
+new file mode 100644
+index 0000000..68e28f6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiRealtimeStoreTest.java
+@@ -0,0 +1,116 @@
++package net.otlab.admin.module.openapi.support;
++
++import net.otlab.admin.module.openapi.config.OpenApiProperties;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.core.module.redis.RedisService;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.concurrent.TimeUnit;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 实时值读取器单测（修订轮 I-3）：Redis 优先 → 回源 → 回填带 TTL。
++ *
++ * <p>I-3 契约：回填键必须带短 TTL（默认 60s，ot.openapi.realtime-cache-ttl-seconds 配置化）
++ * ——键过期即回源最新一条，杜绝 ingest 停写后旧值长期充当「实时值」与查询过的 fullKey
++ * 在 Redis 无限累积（BUG-0053 同危害类——直写无 TTL 的 SET 产生永不过期键）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class OpenApiRealtimeStoreTest {
++
++    private static final Long TENANT_ID = 1L;
++    private static final String TENANT_CODE = "default";
++    private static final String FULL_KEY = "F01.POWER";
++    private static final OpenApiRealtimeItemVO LATEST = new OpenApiRealtimeItemVO(412.6, 0, 1763712005000L);
++
++    @Mock
++    private RedisService redisService;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        when(redisService.getCacheObject("openapi:realtime:1:F01.POWER")).thenReturn(null);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private OpenApiRealtimeStore store(OpenApiProperties props, OpenApiTimeseriesClient ts) {
++        return new OpenApiRealtimeStore(redisService, props, ts);
++    }
++
++    @Test
++    @DisplayName("I-3：Redis 未命中 → TDengine 回源命中 → 回填键带 TTL 60s（默认配置）")
++    void backfillWithTtl() {
++        OpenApiTimeseriesClient ts = mock(OpenApiTimeseriesClient.class);
++        when(ts.queryItemLatest(TENANT_ID, TENANT_CODE, FULL_KEY)).thenReturn(LATEST);
++
++        OpenApiRealtimeItemVO result = store(new OpenApiProperties(), ts).read(TENANT_ID, TENANT_CODE, FULL_KEY);
++
++        assertEquals(LATEST.getTs(), result.getTs());
++        ArgumentCaptor<Long> ttlCaptor = ArgumentCaptor.forClass(Long.class);
++        verify(redisService).setCacheObject(eq("openapi:realtime:1:F01.POWER"), any(),
++                ttlCaptor.capture(), eq(TimeUnit.SECONDS));
++        assertEquals(60L, ttlCaptor.getValue().longValue(), "回填键 TTL 必须 60s（默认配置——键过期即回源）");
++    }
++
++    @Test
++    @DisplayName("I-3：TTL 误配（<=0）回落默认 60s（不允许永不过期键）")
++    void backfillTtlFallbackOnBadConfig() {
++        OpenApiProperties props = new OpenApiProperties();
++        props.setRealtimeCacheTtlSeconds(0);
++        OpenApiTimeseriesClient ts = mock(OpenApiTimeseriesClient.class);
++        when(ts.queryItemLatest(TENANT_ID, TENANT_CODE, FULL_KEY)).thenReturn(LATEST);
++
++        store(props, ts).read(TENANT_ID, TENANT_CODE, FULL_KEY);
++
++        verify(redisService).setCacheObject(eq("openapi:realtime:1:F01.POWER"), any(),
++                eq(60L), eq(TimeUnit.SECONDS));
++    }
++
++    @Test
++    @DisplayName("Redis 命中 → 不回源不回填（I-3 键过期即回源的另一面）")
++    void cacheHitSkipsSource() {
++        when(redisService.getCacheObject("openapi:realtime:1:F01.POWER"))
++                .thenReturn(new OpenApiRealtimeItemVO(1.0, 0, 1763712000000L));
++        OpenApiTimeseriesClient ts = mock(OpenApiTimeseriesClient.class);
++
++        OpenApiRealtimeItemVO result = store(new OpenApiProperties(), ts).read(TENANT_ID, TENANT_CODE, FULL_KEY);
++
++        assertEquals(1.0, result.getV());
++        verify(ts, never()).queryItemLatest(any(), anyString(), anyString());
++        verify(redisService, never()).setCacheObject(anyString(), any(), any(), any(TimeUnit.class));
++    }
++
++    @Test
++    @DisplayName("回源未命中（TDengine 空集）→ 不回填、返回 null")
++    void noBackfillWhenSourceEmpty() {
++        OpenApiTimeseriesClient ts = mock(OpenApiTimeseriesClient.class);
++        when(ts.queryItemLatest(TENANT_ID, TENANT_CODE, FULL_KEY)).thenReturn(null);
++
++        assertNull(store(new OpenApiProperties(), ts).read(TENANT_ID, TENANT_CODE, FULL_KEY));
++
++        verify(redisService, never()).setCacheObject(anyString(), any(), any(), eq(TimeUnit.SECONDS));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClientTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClientTest.java
+new file mode 100644
+index 0000000..6b4ede0
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/support/OpenApiTimeseriesClientTest.java
+@@ -0,0 +1,193 @@
++package net.otlab.admin.module.openapi.support;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import net.otlab.admin.module.iot.tdengine.TdengineProperties;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.ByteArrayOutputStream;
++import java.io.InputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 时序数据客户端单测（修订轮 I-2/I-4，内置 fake TDengine REST——JDK HttpServer）。
++ *
++ * <p>覆盖两处评审缺陷的真实执行路径：
++ * <ul>
++ * <li><b>I-2</b>：queryItemLatest 的 SQL 必须 {@code ORDER BY ts DESC LIMIT 1}——行数超限
++ *     场景下「最新值」取真实最新行（旧实现升序取尾，超 20000 行后 realtime 回源永久返回
++ *     第 20000 条旧值）；fake 服务按收到的 SQL 形态应答并回录 SQL 供断言；</li>
++ * <li><b>I-4</b>：LIMIT ROW_LIMIT+1 fetch-one-extra 截断判定——超限返回 truncated=true 且
++ *     收敛到前 ROW_LIMIT 行，未超限 truncated=false，不静默丢数据。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class OpenApiTimeseriesClientTest {
++
++    private static final Long TENANT_ID = 1L;
++    private static final String TENANT_CODE = "default";
++    private static final String FULL_KEY = "F01.POWER";
++
++    private HttpServer server;
++    private OpenApiTimeseriesClient client;
++
++    /** fake TDengine 收到的最后一条 SQL（应答形态按此路由） */
++    private final AtomicReference<String> lastSql = new AtomicReference<>();
++
++    @BeforeEach
++    void setUp() throws Exception {
++        server = HttpServer.create(new InetSocketAddress(0), 0);
++        server.createContext("/rest/sql", exchange -> {
++            String sql = readBody(exchange);
++            lastSql.set(sql);
++            byte[] response = responseFor(sql).getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().set("Content-Type", "application/json");
++            exchange.sendResponseHeaders(200, response.length);
++            exchange.getResponseBody().write(response);
++            exchange.close();
++        });
++        server.start();
++        TdengineProperties props = new TdengineProperties();
++        props.setBaseUrl("http://localhost:" + server.getAddress().getPort());
++        props.setReadTimeoutMs(5000);
++        client = new OpenApiTimeseriesClient(props);
++    }
++
++    @AfterEach
++    void tearDown() {
++        server.stop(0);
++    }
++
++    private static String readBody(HttpExchange exchange) {
++        try (InputStream in = exchange.getRequestBody(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            byte[] buffer = new byte[4096];
++            int n;
++            while ((n = in.read(buffer)) > 0) {
++                out.write(buffer, 0, n);
++            }
++            return out.toString(StandardCharsets.UTF_8);
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    /** 按 SQL 形态路由应答：DESC LIMIT 1 → 最新单行；ASC LIMIT → 行数由用例预设 */
++    private volatile int historyRowCount = 0;
++
++    private String responseFor(String sql) {
++        if (sql.contains("ORDER BY ts DESC")) {
++            // fake 数据面：全表 ts 范围 [1..60000]，最新 ts=60000（升序取尾在 LIMIT 20000 下会拿到 ts=20000 旧值）
++            return "{\"code\":0,\"data\":[[60000,123.4,0]]}";
++        }
++        // st_metric_value 行宽 4（ts/value/yoy/mom），其余行宽 3（ts/value/quality）
++        int width = sql.contains("yoy") ? 4 : 3;
++        StringBuilder sb = new StringBuilder("{\"code\":0,\"data\":[");
++        for (int i = 1; i <= historyRowCount; i++) {
++            if (i > 1) {
++                sb.append(',');
++            }
++            sb.append('[').append(i).append(',').append(i * 1.0);
++            for (int c = 2; c < width; c++) {
++                sb.append(",0");
++            }
++            sb.append(']');
++        }
++        return sb.append("]}").toString();
++    }
++
++    // ---------- I-2：最新值必须真是最新 ----------
++
++    @Test
++    @DisplayName("I-2：queryItemLatest 生成 ORDER BY ts DESC LIMIT 1，返回最新 ts 行")
++    void queryItemLatestUsesDescendingSql() {
++        OpenApiRealtimeItemVO latest = client.queryItemLatest(TENANT_ID, TENANT_CODE, FULL_KEY);
++
++        assertNotNull(latest);
++        assertEquals(60000L, latest.getTs(), "必须取 DESC 首行=真实最新行（I-2：升序取尾在超限时返回旧值）");
++        assertEquals(123.4, latest.getV());
++        assertEquals(0, latest.getQ());
++        String sql = lastSql.get();
++        assertNotNull(sql);
++        assertTrue(sql.contains("ORDER BY ts DESC LIMIT 1"), "回源 SQL 必须降序取 1 行：" + sql);
++    }
++
++    @Test
++    @DisplayName("I-2：回源上下文不安全（编码白名单外）→ fail-soft null")
++    void queryItemLatestUnsafeContext() {
++        assertNull(client.queryItemLatest(TENANT_ID, TENANT_CODE, "BAD KEY!"));
++    }
++
++    // ---------- I-4：截断标记 ----------
++
++    @Test
++    @DisplayName("I-4：行数超 ROW_LIMIT → truncated=true 且收敛到前 ROW_LIMIT 行（fetch-one-extra）")
++    void historyOverLimitTruncated() {
++        historyRowCount = OpenApiTimeseriesClient.ROW_LIMIT + 1; // fake 侧恰好超限 1 行
++
++        OpenApiPage<OpenApiHistoryPointVO> page = client.queryItemHistory(
++                TENANT_ID, TENANT_CODE, FULL_KEY, 0L, 100000L, null, null);
++
++        assertTrue(page.truncated(), "取回 ROW_LIMIT+1 行=截断事实成立");
++        assertEquals(OpenApiTimeseriesClient.ROW_LIMIT, page.rows().size(), "对外只返回上限内前缀");
++        assertEquals(1L, page.rows().get(0).getTs(), "升序前缀（时间窗内最早行）");
++        assertEquals(20000L, page.rows().get(page.rows().size() - 1).getTs());
++        String sql = lastSql.get();
++        assertTrue(sql.contains("LIMIT " + (OpenApiTimeseriesClient.ROW_LIMIT + 1)),
++                "SQL 以 fetch-one-extra 取数供截断判定：" + sql);
++    }
++
++    @Test
++    @DisplayName("I-4：行数未超限 → truncated=false 全量返回")
++    void historyWithinLimitNotTruncated() {
++        historyRowCount = 100;
++
++        OpenApiPage<OpenApiHistoryPointVO> page = client.queryItemHistory(
++                TENANT_ID, TENANT_CODE, FULL_KEY, 0L, 100000L, null, null);
++
++        assertFalse(page.truncated());
++        assertEquals(100, page.rows().size());
++    }
++
++    @Test
++    @DisplayName("I-4：points/history 与 metrics/query 同契约（超限截断标记）")
++    void pointsAndMetricsTruncation() {
++        historyRowCount = OpenApiTimeseriesClient.ROW_LIMIT + 1;
++
++        OpenApiPage<OpenApiHistoryPointVO> points = client.queryPointHistory(
++                TENANT_ID, TENANT_CODE, "P1", "num", 0L, 100000L);
++        assertTrue(points.truncated());
++        assertEquals(OpenApiTimeseriesClient.ROW_LIMIT, points.rows().size());
++
++        OpenApiPage<net.otlab.admin.module.openapi.dto.OpenApiMetricVO> metrics = client.queryMetrics(
++                TENANT_ID, TENANT_CODE, "M1", "F01", "DAY", 0L, 100000L, null);
++        assertTrue(metrics.truncated());
++        assertEquals(OpenApiTimeseriesClient.ROW_LIMIT, metrics.rows().size());
++    }
++
++    // ---------- fail-soft 回归 ----------
++
++    @Test
++    @DisplayName("降采样参数白名单外 → fail-soft 空页（不拼接进 SQL）")
++    void downsampleWhitelist() {
++        OpenApiPage<OpenApiHistoryPointVO> page = client.queryItemHistory(
++                TENANT_ID, TENANT_CODE, FULL_KEY, 0L, 100000L, "7x", "AVG");
++        assertFalse(page.truncated());
++        assertTrue(page.rows().isEmpty());
++    }
++}

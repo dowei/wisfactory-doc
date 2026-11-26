@@ -1,0 +1,3644 @@
+diff --git a/ingest/README.md b/ingest/README.md
+index babf3c2..5e39cab 100644
+--- a/ingest/README.md
++++ b/ingest/README.md
+@@ -8,14 +8,17 @@
+ 
+ ```
+ ingest/
+-├── cmd/ingestd/       # 服务入口（占位，TASK-0027 接线）
++├── cmd/ingestd/       # 服务入口（TASK-0027 接线：mux+httpapi+pipeline+consumer+对账）
+ ├── internal/
+ │   ├── message/       # 统一消息模型 v1.1.0 §3.2 解析器（信封纪律：空 points 4001、单消息 ≤500）
+ │   ├── quality/       # CONV-02 质量码 0-10 枚举与产品文本码映射（判定逻辑归 TASK-0028）
+-│   ├── snapshot/      # 配置快照 Schema v1.0.1 类型/校验、拉取客户端抽象、本地缓存原子替换
++│   ├── snapshot/      # 配置快照 Schema v1.0.1 类型/校验、真客户端（哈希校验）、对账循环、缓存原子替换
++│   ├── mqttsource/    # MQTT 消费源（§3.2 主题矩阵路由；Port 薄接口隔离 paho，TASK-0027）
+ │   ├── tdengine/      # 超级表契约 v1.0.0 写入侧：kind/表映射、附录 B DDL、INSERT 构造、假执行器
+ │   ├── cache/         # Redis 点位缓存抽象（值形态 v/q/ts，§3.5）+ 内存假实现
+-│   └── pipeline/      # 内核流水线组装：Consumer→Parser→校验→Batcher→Writer→Cache
++│   ├── gwtoken/       # 网关令牌链（凭据拉取/TTL 缓存/fail-closed 校验 + gatewayStatus，TASK-0076/0027）
++│   ├── httpapi/       # HTTP 接入面（/ingest/v1/report、/ingest/v1/auth/mqtt，TASK-0076）
++│   └── pipeline/      # 内核流水线组装：Consumer→Parser→校验→Batcher→Writer→Cache（幂等 TTL 真实现，TASK-0027）
+ └── go.mod
+ ```
+ 
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index 7ca2a21..b87a0c9 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -1,19 +1,294 @@
+-// 采集接入服务（ingest）入口占位。
+-// 流水线实现见 workitems：TASK-0027（MQTT/HTTP 统一流水线）、TASK-0028（校验与质量判定）、
+-// TASK-0029（攒批写 TDengine、Redis 点位缓存）。契约冻结前不联调（CONV-03）。
++// 采集接入服务（ingest）入口——TASK-0027 从占位转正：装配 mux + httpapi + pipeline +
++// mqttsource.Consumer + 快照对账，统一流水线（MQTT 与 HTTP 同构五步冻结顺序）。
++//
++// 配置走环境变量（决策 1 键位 + 本批补充键位）：
++//
++//	INGEST_HTTP_ADDR            HTTP 监听地址（默认 :8090——端口纪律：不占 8098/8099）
++//	INGEST_BACKEND_BASE_URL     管理系统基址（快照拉取与凭据 pull 共用）
++//	INGEST_INTERNAL_TOKEN       内部静态令牌（X-Internal-Token）
++//	INGEST_GATEWAY_MAP          网关→通道静态解析（mock 口径沿用 0076：形如
++//	                            "GW_A:7:default;GW_B:9:group_a"——网关注册表真实现归 0020）
++//	INGEST_MQTT_BROKER          broker 地址（tcp://host:1883；空 = 不起 MQTT 消费源）
++//	INGEST_MQTT_USERNAME        broker 账号（空 = 匿名）
++//	INGEST_MQTT_PASSWORD        broker 口令
++//	INGEST_MQTT_CLIENT_ID       broker 客户端 ID（空 = ingestd-<pid>）
++//	INGEST_REDIS_ADDR           Redis 地址（0029 键位预留——本任务不消费）
++//	INGEST_SNAPSHOT_SCOPE       快照对账范围（"scopeType:scopeId"，如 "1:9111"；空 = 不对账）
++//	INGEST_SNAPSHOT_TENANT      快照消歧租户编码（可选——跨租户同名 scope）
++//	INGEST_SNAPSHOT_INTERVAL    对账周期（默认 30s）
++//	INGEST_DEDUP_TTL            幂等键保留窗口（默认 1h——须 ≥ QoS1 重投窗口）
++//
++// 组件口径（决策 3/4/6）：幂等=TTL 真实现（单实例形态）；快照=InternalSnapshotClient
++// 真客户端（哈希校验 + 0073 缓存原子替换）+ Reconciler 拉取对账（config.changed 通知
++// 本期不消费）；writer=记录式假执行器（0029 换真写）；点位缓存=内存假实现（0029 Redis 化）。
++//
++// 优雅停机：SIGTERM/SIGINT → HTTP Server 排空（Shutdown）→ 取消流水线/消费源/对账
++// 语境 → broker 连接释放 → 退出。
+ package main
+ 
+ import (
++	"context"
++	"errors"
++	"fmt"
+ 	"log"
++	"net"
+ 	"net/http"
++	"os"
++	"os/signal"
++	"strconv"
++	"strings"
++	"syscall"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/httpapi"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/mqttsource"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
+ )
+ 
++// Config 服务配置（loadConfig 从环境变量装配）。
++type Config struct {
++	HTTPAddr         string
++	BackendBaseURL   string
++	InternalToken    string
++	GatewayMap       map[string]gwtoken.ResolvedChannel
++	MQTTBroker       string
++	MQTTUsername     string
++	MQTTPassword     string
++	MQTTClientID     string
++	RedisAddr        string // 0029 键位预留（本任务不消费）
++	SnapshotScopeType int
++	SnapshotScopeID  int64
++	SnapshotTenant   string
++	SnapshotInterval time.Duration
++	DedupTTL         time.Duration
++
++	bound chan string // 绑定地址观测（测试/冒烟；nil = 不上报）
++}
++
++// loadConfig 从环境变量装配配置（缺省值见包注释）。
++func loadConfig(getenv func(string) string) Config {
++	cfg := Config{
++		HTTPAddr:         getenv("INGEST_HTTP_ADDR"),
++		BackendBaseURL:   getenv("INGEST_BACKEND_BASE_URL"),
++		InternalToken:    getenv("INGEST_INTERNAL_TOKEN"),
++		MQTTBroker:       getenv("INGEST_MQTT_BROKER"),
++		MQTTUsername:     getenv("INGEST_MQTT_USERNAME"),
++		MQTTPassword:     getenv("INGEST_MQTT_PASSWORD"),
++		MQTTClientID:     getenv("INGEST_MQTT_CLIENT_ID"),
++		RedisAddr:        getenv("INGEST_REDIS_ADDR"),
++		SnapshotTenant:   getenv("INGEST_SNAPSHOT_TENANT"),
++		SnapshotInterval: 30 * time.Second,
++		DedupTTL:         time.Hour,
++		GatewayMap:       map[string]gwtoken.ResolvedChannel{},
++	}
++	if cfg.HTTPAddr == "" {
++		cfg.HTTPAddr = ":8090"
++	}
++	if v := getenv("INGEST_SNAPSHOT_SCOPE"); v != "" {
++		if st, sid, err := parseScope(v); err == nil {
++			cfg.SnapshotScopeType, cfg.SnapshotScopeID = st, sid
++		}
++	}
++	if v := getenv("INGEST_SNAPSHOT_INTERVAL"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			cfg.SnapshotInterval = d
++		}
++	}
++	if v := getenv("INGEST_DEDUP_TTL"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			cfg.DedupTTL = d
++		}
++	}
++	for _, entry := range strings.Split(getenv("INGEST_GATEWAY_MAP"), ";") {
++		entry = strings.TrimSpace(entry)
++		if entry == "" {
++			continue
++		}
++		parts := strings.Split(entry, ":")
++		if len(parts) != 3 {
++			continue
++		}
++		chID, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
++		if err != nil {
++			continue
++		}
++		cfg.GatewayMap[strings.TrimSpace(parts[0])] = gwtoken.ResolvedChannel{
++			ChannelID:  chID,
++			TenantCode: strings.TrimSpace(parts[2]),
++		}
++	}
++	return cfg
++}
++
++func parseScope(v string) (int, int64, error) {
++	parts := strings.SplitN(v, ":", 2)
++	if len(parts) != 2 {
++		return 0, 0, fmt.Errorf("scope 形态须为 scopeType:scopeId")
++	}
++	st, err := strconv.Atoi(strings.TrimSpace(parts[0]))
++	if err != nil {
++		return 0, 0, err
++	}
++	sid, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
++	if err != nil {
++		return 0, 0, err
++	}
++	return st, sid, nil
++}
++
++// run 装配并运行服务（阻塞直至 ctx 取消；优雅停机排空）。port 为 broker 薄接口
++// （生产 = PahoPort；测试注入假 broker）。无 broker 配置（MQTTBroker 空）时不装配
++// MQTT 消费源（纯 HTTP 面形态——StartFlusher 承担写库）。
++func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
++	logger := log.Default()
++
++	// ---- 流水线组件（决策 3/4/6 口径）----
++	pctx, pcancel := context.WithCancel(ctx)
++	defer pcancel()
++
++	batchDedup := pipeline.NewTTLBatchDeduper(0, cfg.DedupTTL)   // 幂等真实现（单实例形态）
++	pointDedup := pipeline.NewTTLPointDeduper(0, cfg.DedupTTL)   // 多实例演进位=Redis 化（0028 定版）
++	exec := tdengine.NewFakeExecutor(0)                          // 记录式假执行器（0029 换真写）
++	ptCache := cache.NewMemoryPointCache()                       // 内存假实现（0029 Redis 化）
++	snapCache := snapshot.NewCache()                             // 0073 原子替换缓存
++
++	deps := pipeline.Deps{
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   batchDedup,
++		Points:    pointDedup,
++		Writer:    &tdengine.Writer{Ex: exec},
++		Cache:     ptCache,
++	}
++	var pipe *pipeline.Pipeline
++	if cfg.MQTTBroker != "" {
++		consumer := mqttsource.NewConsumer(port, mqttsource.Options{})
++		deps.Consumer = consumer
++		p, err := pipeline.Assemble(pipeline.Config{}, deps)
++		if err != nil {
++			return fmt.Errorf("ingestd: 流水线装配失败: %w", err)
++		}
++		pipe = p
++		go func() {
++			if err := pipe.Run(pctx); err != nil {
++				logger.Printf("ingestd: 流水线消费循环退出: %v", err)
++			}
++		}()
++		go consumer.Run(pctx) // 监督循环：broker fail-soft（指数退避），不阻断 HTTP 上报路径
++		logger.Printf("ingestd: MQTT 消费源已装配 broker=%s", cfg.MQTTBroker)
++	} else {
++		deps.Consumer = idleConsumer{}
++		p, err := pipeline.Assemble(pipeline.Config{}, deps)
++		if err != nil {
++			return fmt.Errorf("ingestd: 流水线装配失败: %w", err)
++		}
++		pipe = p
++		pipe.StartFlusher(pctx) // 纯 HTTP 面形态：无消费循环，单独启动 flusher
++		logger.Print("ingestd: MQTT 未配置（INGEST_MQTT_BROKER 空）——纯 HTTP 上报形态")
++	}
++
++	// ---- 快照对账（决策 4：真客户端哈希校验 + 原子替换；通知不消费，拉取兜底）----
++	if cfg.BackendBaseURL != "" && cfg.SnapshotScopeType != 0 {
++		reconciler := &snapshot.Reconciler{
++			Fetcher: &snapshot.InternalSnapshotClient{
++				BaseURL:       cfg.BackendBaseURL,
++				InternalToken: cfg.InternalToken,
++				Tenant:        cfg.SnapshotTenant,
++			},
++			Cache:    snapCache,
++			Scope:    snapshot.Scope{Type: cfg.SnapshotScopeType, ID: cfg.SnapshotScopeID},
++			Interval: cfg.SnapshotInterval,
++		}
++		go reconciler.Run(pctx)
++		logger.Printf("ingestd: 快照对账已装配 scope=%d:%d tenant=%q interval=%v",
++			cfg.SnapshotScopeType, cfg.SnapshotScopeID, cfg.SnapshotTenant, cfg.SnapshotInterval)
++	} else {
++		logger.Print("ingestd: 快照对账未装配（INGEST_BACKEND_BASE_URL/INGEST_SNAPSHOT_SCOPE 缺）——全部上报将按未知编码死信")
++	}
++
++	// ---- HTTP 接入面（0076 端点 + 决策 5 网关 status 实校验）----
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver(cfg.GatewayMap),
++		gwtoken.NewHTTPPuller(cfg.BackendBaseURL, cfg.InternalToken, 0), 0)
++	report := &httpapi.ReportHandler{Validator: validator, Sink: &httpapi.PipelineSink{Pipe: pipe}}
++	auth := &httpapi.MQTTAuthHandler{Validator: validator, InternalToken: cfg.InternalToken}
++	mux := httpapi.Mux(report, auth)
++
++	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
++	ln, err := net.Listen("tcp", cfg.HTTPAddr)
++	if err != nil {
++		return fmt.Errorf("ingestd: HTTP 监听失败: %w", err)
++	}
++	if cfg.bound != nil {
++		select {
++		case cfg.bound <- ln.Addr().String():
++		default:
++		}
++	}
++	logger.Printf("ingestd: HTTP 接入面已启动 %s（report/auth-mqtt/healthz）", ln.Addr())
++	serveErr := make(chan error, 1)
++	go func() { serveErr <- srv.Serve(ln) }()
++
++	// ---- 优雅停机 ----
++	select {
++	case <-ctx.Done():
++	case err := <-serveErr:
++		if err != nil && !errors.Is(err, http.ErrServerClosed) {
++			pcancel()
++			return fmt.Errorf("ingestd: HTTP 服务异常退出: %w", err)
++		}
++	}
++	logger.Print("ingestd: 优雅停机开始（SIGTERM 排空）")
++	shutCtx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer scancel()
++	if err := srv.Shutdown(shutCtx); err != nil {
++		logger.Printf("ingestd: HTTP 排空超时（强制返回）: %v", err)
++	}
++	pcancel() // 排空流水线/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
++	time.Sleep(50 * time.Millisecond) // 给消费源 goroutine 一拍退出（连接释放可观测）
++	logger.Print("ingestd: 已停机")
++	return nil
++}
++
++// idleConsumer 纯 HTTP 面形态的空消费源（Run 消费循环不启动——StartFlusher 承担写库）。
++type idleConsumer struct{}
++
++func (idleConsumer) Messages() <-chan pipeline.Inbound {
++	ch := make(chan pipeline.Inbound) // 永不投递
++	return ch
++}
++
+ func main() {
+-	mux := http.NewServeMux()
+-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+-		w.WriteHeader(http.StatusOK)
+-		_, _ = w.Write([]byte("ok"))
+-	})
+-	log.Println("ingestd skeleton: only /healthz is available")
+-	log.Fatal(http.ListenAndServe(":8100", mux))
++	cfg := loadConfig(os.Getenv)
++
++	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
++	defer stop()
++
++	var port mqttsource.Port
++	if cfg.MQTTBroker != "" {
++		port = &mqttsource.PahoPort{
++			BrokerURL: cfg.MQTTBroker,
++			Username:  cfg.MQTTUsername,
++			Password:  cfg.MQTTPassword,
++			ClientID:  cfg.MQTTClientID,
++		}
++	} else {
++		port = nopPort{}
++	}
++	if err := run(ctx, cfg, port); err != nil {
++		log.Fatalf("ingestd: %v", err)
++	}
+ }
++
++// nopPort MQTT 未配置时的空实现（监督循环不启动——run 对空 broker 不装配消费源）。
++type nopPort struct{}
++
++func (nopPort) Connect() error                               { return errors.New("nop: MQTT 未配置") }
++func (nopPort) Subscribe(string, func(string, []byte)) error { return nil }
++func (nopPort) SetConnectionLostHandler(func(error))         {}
++func (nopPort) Close()                                       {}
+diff --git a/ingest/cmd/ingestd/main_test.go b/ingest/cmd/ingestd/main_test.go
+new file mode 100644
+index 0000000..901c5b2
+--- /dev/null
++++ b/ingest/cmd/ingestd/main_test.go
+@@ -0,0 +1,189 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/mqttsource"
++)
++
++// TASK-0027 决策 1：ingestd 接线（从占位转正）——装配 mux+httpapi+pipeline+consumer；
++// 配置走环境变量；优雅停机（SIGTERM 排空）。装配冒烟测试：全组件真装配（端口绑定为
++// 随机、broker 为假 Port、backend 指向不可达地址——fail-closed/fail-soft 路径）。
++
++func getenvOf(env map[string]string) func(string) string {
++	return func(k string) string { return env[k] }
++}
++
++// 契约依据：决策 1 配置键位——INGEST_HTTP_ADDR 默认 :8090（端口纪律：不占 8098/8099）；
++// INGEST_REDIS_ADDR 为 0029 键位预留（本任务不消费）；快照对账间隔/幂等 TTL 有默认值。
++func TestIngestdLoadConfigDefaults(t *testing.T) {
++	cfg := loadConfig(getenvOf(nil))
++	if cfg.HTTPAddr != ":8090" {
++		t.Errorf("HTTPAddr = %q, want :8090（默认端口纪律）", cfg.HTTPAddr)
++	}
++	if cfg.SnapshotInterval != 30*time.Second {
++		t.Errorf("SnapshotInterval = %v, want 30s（对账兜底默认）", cfg.SnapshotInterval)
++	}
++	if cfg.DedupTTL != time.Hour {
++		t.Errorf("DedupTTL = %v, want 1h（幂等窗口默认）", cfg.DedupTTL)
++	}
++}
++
++// 契约依据：决策 1——配置走环境变量（覆盖默认值）；快照 scope 形态 "scopeType:scopeId"。
++func TestIngestdLoadConfigFromEnv(t *testing.T) {
++	cfg := loadConfig(getenvOf(map[string]string{
++		"INGEST_HTTP_ADDR":         ":18091",
++		"INGEST_BACKEND_BASE_URL":  "http://127.0.0.1:8098",
++		"INGEST_INTERNAL_TOKEN":    "tok-main",
++		"INGEST_MQTT_BROKER":       "tcp://127.0.0.1:1883",
++		"INGEST_MQTT_USERNAME":     "u",
++		"INGEST_MQTT_PASSWORD":     "p",
++		"INGEST_REDIS_ADDR":        "127.0.0.1:6379",
++		"INGEST_SNAPSHOT_SCOPE":    "1:9111",
++		"INGEST_SNAPSHOT_TENANT":   "default",
++		"INGEST_SNAPSHOT_INTERVAL": "5s",
++		"INGEST_DEDUP_TTL":         "2h",
++		"INGEST_GATEWAY_MAP":       "GW_A:7:default;GW_B:9:group_a",
++	}))
++	if cfg.HTTPAddr != ":18091" || cfg.BackendBaseURL != "http://127.0.0.1:8098" || cfg.InternalToken != "tok-main" {
++		t.Errorf("基础配置 = %+v", cfg)
++	}
++	if cfg.MQTTBroker != "tcp://127.0.0.1:1883" || cfg.MQTTUsername != "u" || cfg.MQTTPassword != "p" {
++		t.Errorf("MQTT 配置 = %+v", cfg)
++	}
++	if cfg.RedisAddr != "127.0.0.1:6379" {
++		t.Errorf("RedisAddr = %q, want 127.0.0.1:6379（0029 键位预留）", cfg.RedisAddr)
++	}
++	if cfg.SnapshotScopeType != 1 || cfg.SnapshotScopeID != 9111 || cfg.SnapshotTenant != "default" {
++		t.Errorf("快照 scope = %d:%d tenant=%q", cfg.SnapshotScopeType, cfg.SnapshotScopeID, cfg.SnapshotTenant)
++	}
++	if cfg.SnapshotInterval != 5*time.Second || cfg.DedupTTL != 2*time.Hour {
++		t.Errorf("间隔/TTL = %v/%v", cfg.SnapshotInterval, cfg.DedupTTL)
++	}
++	if len(cfg.GatewayMap) != 2 {
++		t.Fatalf("GatewayMap = %v, want 2 条", cfg.GatewayMap)
++	}
++	if rc, ok := cfg.GatewayMap["GW_A"]; !ok || rc.ChannelID != 7 || rc.TenantCode != "default" {
++		t.Errorf("GW_A = %+v", rc)
++	}
++	if rc, ok := cfg.GatewayMap["GW_B"]; !ok || rc.ChannelID != 9 || rc.TenantCode != "group_a" {
++		t.Errorf("GW_B = %+v", rc)
++	}
++}
++
++// 装配冒烟：全组件真装配启动 → /healthz 200 → 上报端点 fail-closed（backend 不可达 401，
++// 不放行）→ 认证回调内部令牌 401 → 优雅停机（ctx 取消返回、假 Port Close 释放）。
++func TestIngestdAssemblySmoke(t *testing.T) {
++	port := &smokeFakePort{}
++	cfg := Config{
++		HTTPAddr:         "127.0.0.1:0",
++		BackendBaseURL:   "http://127.0.0.1:1", // 不可达：令牌链 fail-closed / 对账 fail-soft
++		InternalToken:    "internal-tok",
++		MQTTBroker:       "tcp://127.0.0.1:1", // 不可达：MQTT 消费源 fail-soft（指数退避）装配
++		GatewayMap:       map[string]gwtoken.ResolvedChannel{"GW_SMOKE": {ChannelID: 7, TenantCode: "group_a"}},
++		SnapshotScopeType: 1,
++		SnapshotScopeID:  88,
++		SnapshotInterval: time.Hour,
++		DedupTTL:         time.Hour,
++		bound:            make(chan string, 1),
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- run(ctx, cfg, port) }()
++
++	select {
++	case addr := <-cfg.bound:
++		base := "http://" + addr
++		// /healthz 200。
++		resp, err := http.Get(base + "/healthz")
++		if err != nil {
++			t.Fatalf("healthz: %v", err)
++		}
++		body, _ := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
++			t.Errorf("healthz = %d %q, want 200 ok", resp.StatusCode, body)
++		}
++
++		// 上报端点：backend 不可达 → 令牌链 fail-closed 401（不放行）。
++		report := `{"tenant":"group_a","gateway":"GW_SMOKE","batchId":"B-SMOKE","sentAt":1,` +
++			`"points":[{"pointCode":"P","ts":1,"value":1,"quality":0}]}`
++		req, _ := http.NewRequest(http.MethodPost, base+"/ingest/v1/report", strings.NewReader(report))
++		req.Header.Set("X-Gateway-Token", "gw-token-secret")
++		resp2, err := http.DefaultClient.Do(req)
++		if err != nil {
++			t.Fatalf("report: %v", err)
++		}
++		b2, _ := io.ReadAll(resp2.Body)
++		resp2.Body.Close()
++		if resp2.StatusCode != http.StatusUnauthorized {
++			t.Errorf("report fail-closed = %d, want 401（backend 不可达不放行）body=%s", resp2.StatusCode, b2)
++		}
++
++		// 认证回调：内部令牌缺失 → 401 + deny。
++		resp3, err := http.Post(base+"/ingest/v1/auth/mqtt", "application/json",
++			strings.NewReader(`{"username":"GW_SMOKE","password":"x"}`))
++		if err != nil {
++			t.Fatalf("auth/mqtt: %v", err)
++		}
++		b3, _ := io.ReadAll(resp3.Body)
++		resp3.Body.Close()
++		if resp3.StatusCode != http.StatusUnauthorized {
++			t.Errorf("auth/mqtt 内部令牌缺失 = %d, want 401", resp3.StatusCode)
++		}
++		var m map[string]any
++		if err := json.Unmarshal(b3, &m); err != nil || m["result"] != "deny" {
++			t.Errorf("auth/mqtt 响应 = %s, want deny", b3)
++		}
++
++		// 优雅停机：ctx 取消 → run 返回、连接释放。
++		cancel()
++		select {
++		case err := <-done:
++			if err != nil {
++				t.Fatalf("run error: %v", err)
++			}
++		case <-time.After(3 * time.Second):
++			t.Fatal("优雅停机超时")
++		}
++		port.mu.Lock()
++		closed := port.closed
++		port.mu.Unlock()
++		if !closed {
++			t.Error("停机后 Port.Close 未调用（连接未释放）")
++		}
++	case err := <-done:
++		t.Fatalf("run 提前退出: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("绑定地址未上报（服务未启动）")
++	}
++}
++
++// smokeFakePort 假 broker（装配冒烟：监督循环对不可达 broker fail-soft 重试——不阻断装配）。
++type smokeFakePort struct {
++	mu     sync.Mutex
++	closed bool
++}
++
++func (p *smokeFakePort) Connect() error { return fmt.Errorf("smoke: broker 未配置") }
++func (p *smokeFakePort) Subscribe(string, func(string, []byte)) error { return nil }
++func (p *smokeFakePort) SetConnectionLostHandler(func(error))         {}
++func (p *smokeFakePort) Close() {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.closed = true
++}
++
++var (
++	_ mqttsource.Port = (*smokeFakePort)(nil)
++)
+diff --git a/ingest/go.mod b/ingest/go.mod
+index 8e7739d..9d28aee 100644
+--- a/ingest/go.mod
++++ b/ingest/go.mod
+@@ -1,3 +1,10 @@
+ module net.otlab/ingest
+ 
+ go 1.27
++
++require (
++	github.com/eclipse/paho.mqtt.golang v1.5.1 // indirect
++	github.com/gorilla/websocket v1.5.3 // indirect
++	golang.org/x/net v0.44.0 // indirect
++	golang.org/x/sync v0.17.0 // indirect
++)
+diff --git a/ingest/go.sum b/ingest/go.sum
+new file mode 100644
+index 0000000..9abe94c
+--- /dev/null
++++ b/ingest/go.sum
+@@ -0,0 +1,8 @@
++github.com/eclipse/paho.mqtt.golang v1.5.1 h1:/VSOv3oDLlpqR2Epjn1Q7b2bSTplJIeV2ISgCl2W7nE=
++github.com/eclipse/paho.mqtt.golang v1.5.1/go.mod h1:1/yJCneuyOoCOzKSsOTUc0AJfpsItBGWvYpBLimhArU=
++github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
++github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
++golang.org/x/net v0.44.0 h1:evd8IRDyfNBMBTTY5XRF1vaZlD+EmWx6x8PkhR04H/I=
++golang.org/x/net v0.44.0/go.mod h1:ECOoLqd5U3Lhyeyo/QDCEVQ4sNgYsqvCZ722XogGieY=
++golang.org/x/sync v0.17.0 h1:l60nONMj9l5drqw6jlhIELNv9I0A4OFgRsG9k2oT9Ug=
++golang.org/x/sync v0.17.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
+diff --git a/ingest/internal/gwtoken/gwtoken.go b/ingest/internal/gwtoken/gwtoken.go
+index 210b43d..e99816d 100644
+--- a/ingest/internal/gwtoken/gwtoken.go
++++ b/ingest/internal/gwtoken/gwtoken.go
+@@ -33,18 +33,35 @@ const (
+ // DefaultCacheTTL 凭据本地缓存默认 TTL（可配置覆盖）。
+ const DefaultCacheTTL = 30 * time.Second
+ 
++// 网关 status 值（TASK-0027 决策 5）。后端 iot_gateway.status 惯例：1 启用 0 停用；
++// credential/pull 响应字段名 gatewayStatus 即契约，由后端微改 TASK-0079 交付。
++// 缺失/空值（nil）= 状态未知——不 fail-closed、不放行扩大（仅显式禁用拒绝，
++// 其余行为与 0076 保持；真联调核验归 TASK-0068/0079 交付后 smoke）。
++const (
++	GatewayStatusEnabled  = 1
++	GatewayStatusDisabled = 0
++)
++
+ // GatewayIdentity 令牌链校验产物：租户选库（iot_<tenant_code>）与处理顺序第 1 步
+ // 的租户来源，只信任此结构（令牌侧），不信任消息自带 tenant。
+ //
+-// 扩展位（修订轮 I3 登记）：契约 §3.2 续认证回调须「校验 gateway_code 与设备令牌、
+-// 租户与网关 status」——网关 status 数据源在后端 MySQL，Go 侧无 DB 访问，需后端
+-// credential/pull 响应扩 gateway status 字段（归 0027 后端接线）后在此承载，并在
+-// auth/mqtt 回调实校验；本期 status 不校验（通道/凭据禁用经后端 403 覆盖，网关级
+-// 禁用会被 allow——缺口登记见 TASK-0076 报告修订轮）。
++// 网关 status（TASK-0027 决策 5，0076 修订轮 I3 扩展位转正）：契约 §3.2 续认证回调
++// 须「校验 gateway_code 与设备令牌、租户与网关 status」——status 数据源在后端 MySQL，
++// Go 侧无 DB 访问，经 credential/pull 响应 gatewayStatus 字段（TASK-0079 交付）承载：
++// GatewayStatusKnown=true 表示响应携带了该字段，GatewayDisabled=true 表示网关显式禁用
++// （gatewayStatus=0），auth/mqtt 回调据此 deny。状态未知（Known=false）不 fail-closed
++// 也不放行扩大——通道/凭据禁用仍经后端 403 覆盖，仅网关级禁用依赖本字段（0079 交付前
++// 网关级禁用会 allow，缺口由 0079 交付闭合）。
+ type GatewayIdentity struct {
+ 	GatewayCode string
+ 	TenantCode  string
+ 	ChannelID   int64
++	// GatewayStatusKnown credential/pull 响应是否携带 gatewayStatus（0079 交付后为 true；
++	// 缺失/null=状态未知=false）。
++	GatewayStatusKnown bool
++	// GatewayDisabled 网关禁用（gatewayStatus=GatewayStatusDisabled）；
++	// 仅 GatewayStatusKnown=true 时有意义。
++	GatewayDisabled bool
+ }
+ 
+ // ResolvedChannel 网关编码解析产物：凭据所在通道 + 令牌侧租户。
+@@ -75,6 +92,9 @@ type Credential struct {
+ 	CredType   string
+ 	Ciphertext string // {v1} 密文原样（mock 口径：明文比对占位，不解密）
+ 	KeyVersion string
++	// GatewayStatus 网关 status（TASK-0027 决策 5，0079 交付；nil=响应未携带/空值=
++	// 状态未知——见 GatewayIdentity 注）。
++	GatewayStatus *int
+ }
+ 
+ // CredentialPuller 凭据拉取抽象。HTTPPuller 为 0019 锚点实现；测试可注入假实现。
+@@ -162,7 +182,15 @@ func (v *TokenChainValidator) Validate(ctx context.Context, credType, gatewayCod
+ 	if subtle.ConstantTimeCompare([]byte(token), []byte(cred.Ciphertext)) != 1 {
+ 		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关 %q 令牌不匹配，fail-closed 拒绝", gatewayCode)
+ 	}
+-	return GatewayIdentity{GatewayCode: gatewayCode, TenantCode: rc.TenantCode, ChannelID: rc.ChannelID}, nil
++	return GatewayIdentity{
++		GatewayCode: gatewayCode,
++		TenantCode:  rc.TenantCode,
++		ChannelID:   rc.ChannelID,
++		// 网关 status（决策 5）：显式禁用（0）→ Disabled；缺失/null → 未知（不 fail-closed
++		// 不放行扩大）；其余值按启用对待（仅 0 是禁用）。
++		GatewayStatusKnown: cred.GatewayStatus != nil,
++		GatewayDisabled:    cred.GatewayStatus != nil && *cred.GatewayStatus == GatewayStatusDisabled,
++	}, nil
+ }
+ 
+ // credential 带本地缓存的凭据拉取（TTL 配置化）。per-key 串行化（singleflight 语义，
+diff --git a/ingest/internal/gwtoken/gwtoken_gatewaystatus_contract_test.go b/ingest/internal/gwtoken/gwtoken_gatewaystatus_contract_test.go
+new file mode 100644
+index 0000000..591ea84
+--- /dev/null
++++ b/ingest/internal/gwtoken/gwtoken_gatewaystatus_contract_test.go
+@@ -0,0 +1,84 @@
++package gwtoken_test
++
++import (
++	"context"
++	"testing"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// TASK-0027 决策 5：GatewayIdentity 承载网关 status（0076 修订轮 I3 扩展位转正）。
++
++// statusPuller 固定凭据假拉取器（可注入 gatewayStatus——红线测试不依赖真实后端字段到位）。
++type statusPuller struct {
++	cred gwtoken.Credential
++	err  error
++}
++
++func (s *statusPuller) Pull(_ context.Context, _ int64, _ string) (gwtoken.Credential, error) {
++	return s.cred, s.err
++}
++
++func statusResolver() gwtoken.GatewayChannelResolver {
++	return gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}}
++}
++
++// 契约依据：决策 5——校验产物 GatewayIdentity 承载网关 status：显式禁用 →
++// GatewayStatusKnown=true + GatewayDisabled=true（auth/mqtt 回调据此 deny）。
++func TestContractTokenChainCarriesDisabledGatewayStatus(t *testing.T) {
++	disabled := 0
++	v := gwtoken.NewTokenChainValidator(statusResolver(),
++		&statusPuller{cred: gwtoken.Credential{ChannelID: 7, CredType: gwtoken.CredTypeMQTTPassword, Ciphertext: "gw-token-secret", GatewayStatus: &disabled}}, 0)
++
++	id, err := v.Validate(context.Background(), gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++	if err != nil {
++		t.Fatalf("Validate error: %v", err)
++	}
++	if !id.GatewayStatusKnown {
++		t.Error("GatewayStatusKnown = false, want true（响应携带 gatewayStatus）")
++	}
++	if !id.GatewayDisabled {
++		t.Error("GatewayDisabled = false, want true（gatewayStatus=0 禁用）")
++	}
++}
++
++// 契约依据：决策 5——字段缺失/空值=状态未知：GatewayStatusKnown=false、GatewayDisabled=false
++// （不 fail-closed：不因状态未知拒绝；不放行扩大：不据此给任何额外授权——0068 联调前行为与
++// 0076 保持一致）。
++func TestContractTokenChainUnknownGatewayStatusIsNotKnown(t *testing.T) {
++	cases := []struct {
++		name string
++		cred gwtoken.Credential
++	}{
++		{"字段缺失", gwtoken.Credential{ChannelID: 7, Ciphertext: "gw-token-secret"}},
++		{"字段显式 null（构造即 nil 指针）", gwtoken.Credential{ChannelID: 7, Ciphertext: "gw-token-secret", GatewayStatus: nil}},
++	}
++	for _, c := range cases {
++		v := gwtoken.NewTokenChainValidator(statusResolver(), &statusPuller{cred: c.cred}, 0)
++		id, err := v.Validate(context.Background(), gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++		if err != nil {
++			t.Fatalf("%s: Validate error: %v", c.name, err)
++		}
++		if id.GatewayStatusKnown {
++			t.Errorf("%s: GatewayStatusKnown = true, want false（状态未知）", c.name)
++		}
++		if id.GatewayDisabled {
++			t.Errorf("%s: GatewayDisabled = true, want false（未知不当作禁用——不 fail-closed）", c.name)
++		}
++	}
++}
++
++// 契约依据：决策 5——显式启用（gatewayStatus=1）与禁用（0）的区分。
++func TestContractTokenChainEnabledGatewayStatusNotDisabled(t *testing.T) {
++	enabled := 1
++	v := gwtoken.NewTokenChainValidator(statusResolver(),
++		&statusPuller{cred: gwtoken.Credential{ChannelID: 7, Ciphertext: "gw-token-secret", GatewayStatus: &enabled}}, 0)
++
++	id, err := v.Validate(context.Background(), gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++	if err != nil {
++		t.Fatalf("Validate error: %v", err)
++	}
++	if !id.GatewayStatusKnown || id.GatewayDisabled {
++		t.Errorf("identity = %+v, want Known=true Disabled=false", id)
++	}
++}
+diff --git a/ingest/internal/gwtoken/puller.go b/ingest/internal/gwtoken/puller.go
+index 9ab8b87..e9e693e 100644
+--- a/ingest/internal/gwtoken/puller.go
++++ b/ingest/internal/gwtoken/puller.go
+@@ -59,14 +59,19 @@ func (p *HTTPPuller) httpClient() *http.Client {
+ // pullEnvelope 后端框架 Result<CredentialPullVO> 信封（响应形状以 0019 代码为准：
+ // Result{code, message, data, timestamp}；data=CredentialPullVO{channelId, credType,
+ // ciphertext, keyVersion}——只回密文不回明文，ADR-0006）。
++//
++// gatewayStatus（TASK-0027 决策 5）：网关 status 扩展字段——字段名即契约，由后端微改
++// TASK-0079 交付（类型按后端 status 惯例 Integer：1 启用 0 停用）。指针语义：nil =
++// 字段缺失或显式 null =「状态未知」（0079 交付前真实响应必然缺字段），不是错误。
+ type pullEnvelope struct {
+ 	Code    int    `json:"code"`
+ 	Message string `json:"message"`
+ 	Data    *struct {
+-		ChannelID  int64  `json:"channelId"`
+-		CredType   string `json:"credType"`
+-		Ciphertext string `json:"ciphertext"`
+-		KeyVersion string `json:"keyVersion"`
++		ChannelID     int64  `json:"channelId"`
++		CredType      string `json:"credType"`
++		Ciphertext    string `json:"ciphertext"`
++		KeyVersion    string `json:"keyVersion"`
++		GatewayStatus *int   `json:"gatewayStatus"`
+ 	} `json:"data"`
+ }
+ 
+@@ -113,10 +118,11 @@ func (p *HTTPPuller) Pull(ctx context.Context, channelID int64, credType string)
+ 		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取响应密文为空（channelId=%d credType=%s）", channelID, credType)
+ 	}
+ 	return Credential{
+-		ChannelID:  env.Data.ChannelID,
+-		CredType:   env.Data.CredType,
+-		Ciphertext: env.Data.Ciphertext,
+-		KeyVersion: env.Data.KeyVersion,
++		ChannelID:     env.Data.ChannelID,
++		CredType:      env.Data.CredType,
++		Ciphertext:    env.Data.Ciphertext,
++		KeyVersion:    env.Data.KeyVersion,
++		GatewayStatus: env.Data.GatewayStatus,
+ 	}, nil
+ }
+ 
+diff --git a/ingest/internal/gwtoken/puller_gatewaystatus_contract_test.go b/ingest/internal/gwtoken/puller_gatewaystatus_contract_test.go
+new file mode 100644
+index 0000000..fc09c13
+--- /dev/null
++++ b/ingest/internal/gwtoken/puller_gatewaystatus_contract_test.go
+@@ -0,0 +1,98 @@
++package gwtoken_test
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// TASK-0027 决策 5：gateway status 实校验（Go 侧先行，后端触点拆出为微改 TASK-0079）。
++//
++// 契约锚点：credential/pull 响应的 gatewayStatus 字段（字段名即契约，0079 交付；
++// 类型按后端 status 惯例 Integer：1 启用 0 停用）。本批后端尚未带此字段——
++// puller 对字段缺失/空值按「状态未知」处理（GatewayStatus=nil），不 fail-closed、
++// 不放行扩大（0076 行为保持：仅显式禁用拒绝，真联调核验归 TASK-0068/0079 交付后）。
++
++// postPull 起假后端并按给定 data JSON 回放 pull 响应。
++func postPull(t *testing.T, dataJSON string) gwtoken.Credential {
++	t.Helper()
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte(`{"code":200,"message":"操作成功","data":` + dataJSON + `}`))
++	}))
++	defer srv.Close()
++
++	p := gwtoken.NewHTTPPuller(srv.URL, "internal-token", 0)
++	cred, err := p.Pull(context.Background(), 7, gwtoken.CredTypeMQTTPassword)
++	if err != nil {
++		t.Fatalf("Pull error: %v", err)
++	}
++	return cred
++}
++
++// 契约依据：决策 5——puller 消费 gatewayStatus 字段（字段名逐字）；显式禁用（0）/
++// 启用（1）原样承载到 Credential。
++func TestContractCredentialPullCarriesGatewayStatus(t *testing.T) {
++	cases := []struct {
++		name string
++		data string
++		want int
++	}{
++		{"禁用 gatewayStatus=0", `{"channelId":7,"credType":"MQTT_PASSWORD","ciphertext":"{v1}CT","keyVersion":"v1","gatewayStatus":0}`, 0},
++		{"启用 gatewayStatus=1", `{"channelId":7,"credType":"MQTT_PASSWORD","ciphertext":"{v1}CT","keyVersion":"v1","gatewayStatus":1}`, 1},
++	}
++	for _, c := range cases {
++		cred := postPull(t, c.data)
++		if cred.GatewayStatus == nil {
++			t.Fatalf("%s: GatewayStatus = nil, want %d", c.name, c.want)
++		}
++		if *cred.GatewayStatus != c.want {
++			t.Errorf("%s: GatewayStatus = %d, want %d", c.name, *cred.GatewayStatus, c.want)
++		}
++		if cred.Ciphertext != "{v1}CT" || cred.ChannelID != 7 || cred.CredType != "MQTT_PASSWORD" {
++			t.Errorf("%s: 其余字段被破坏: %+v", c.name, cred)
++		}
++	}
++}
++
++// 契约依据：决策 5——字段缺失/空值按「状态未知」处理（GatewayStatus=nil），不是错误：
++// 本批后端尚未带此字段（TASK-0079 交付前真实响应必然缺字段），puller 不得因此失败。
++func TestContractCredentialPullGatewayStatusAbsentOrEmptyIsUnknown(t *testing.T) {
++	cases := []struct {
++		name string
++		data string
++	}{
++		{"字段缺失（0079 交付前现状）", `{"channelId":7,"credType":"MQTT_PASSWORD","ciphertext":"{v1}CT","keyVersion":"v1"}`},
++		{"字段显式 null", `{"channelId":7,"credType":"MQTT_PASSWORD","ciphertext":"{v1}CT","keyVersion":"v1","gatewayStatus":null}`},
++	}
++	for _, c := range cases {
++		cred := postPull(t, c.data)
++		if cred.GatewayStatus != nil {
++			t.Errorf("%s: GatewayStatus = %v, want nil（状态未知）", c.name, *cred.GatewayStatus)
++		}
++		if cred.Ciphertext != "{v1}CT" {
++			t.Errorf("%s: ciphertext 被破坏: %+v", c.name, cred)
++		}
++	}
++}
++
++// 契约依据：决策 5——0079 交付后的真实响应形态（gatewayStatus 与既有字段并列）解析
++// 端到端；非 200 业务码仍失败（既有 fail-closed 纪律不被 gatewayStatus 扩展破坏）。
++func TestContractCredentialPullGatewayStatusDoesNotBreakFailClosed(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = json.Marshal(any(map[string]any{}))
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte(`{"code":403,"message":"通道禁用","data":null}`))
++	}))
++	defer srv.Close()
++
++	p := gwtoken.NewHTTPPuller(srv.URL, "internal-token", 0)
++	if _, err := p.Pull(context.Background(), 7, gwtoken.CredTypeMQTTPassword); err == nil {
++		t.Fatal("Pull error = nil, want 非 200 业务码失败（fail-closed 纪律保持）")
++	}
++}
+diff --git a/ingest/internal/httpapi/authmqtt.go b/ingest/internal/httpapi/authmqtt.go
+index 47fb6d7..274a6dc 100644
+--- a/ingest/internal/httpapi/authmqtt.go
++++ b/ingest/internal/httpapi/authmqtt.go
+@@ -4,6 +4,7 @@ import (
+ 	"crypto/subtle"
+ 	"encoding/json"
+ 	"fmt"
++	"log"
+ 	"net/http"
+ 
+ 	"net.otlab/ingest/internal/gwtoken"
+@@ -13,15 +14,14 @@ import (
+ // 「EMQX 认证回调；内部令牌」）。
+ //
+ // 流程：端点自身鉴权（内部令牌，常量时间比较）→ 校验网关编码与设备令牌（令牌链，
+-// fail-closed；租户来自令牌链解析产物）→ 返回 allow/deny 及该连接允许订阅/发布的
+-// 主题范围（只能收自己的 config、只能发自己的 data/status，REQ-0013）。
++// fail-closed；租户来自令牌链解析产物）→ 校验网关 status（TASK-0027 决策 5：禁用网关
++// deny——status 经 credential/pull 响应 gatewayStatus 字段承载，后端由微改 TASK-0079
++// 交付；状态未知〔0079 交付前现状〕不 fail-closed 不放行扩大，行为与 0076 保持）→
++// 返回 allow/deny 及该连接允许订阅/发布的主题范围（只能收自己的 config、只能发自己的
++// data/status，REQ-0013）。
+ //
+-// 已登记缺口（修订轮 I3，契约 §3.2 续「校验 gateway_code 与设备令牌、租户与网关
+-// status」）：网关 status 本期未校验——通道/凭据禁用经后端 403 覆盖（REQ-0011 验收 5），
+-// 但网关级禁用（凭据仍有效）会被 allow。网关 status 数据源在后端 MySQL，Go 侧无 DB
+-// 访问：需后端 credential/pull 响应扩 gateway status 字段（登记归 0027 后端接线），
+-// 届时在 gwtoken.GatewayIdentity 扩展位承载并在本回调实校验（GatewayIdentity seam
+-// 已留扩展位，见 gwtoken 包注释）。
++// 通道/凭据禁用经后端 pull 403 覆盖（REQ-0011 验收 5）；网关级禁用由 gatewayStatus
++// 实校验承接（0076 修订轮 I3 缺口闭合，红线测试见 authmqtt_gatewaystatus_contract_test.go）。
+ //
+ // 响应形状按 EMQX HTTP 认证文档惯例（{result: "allow"|"deny"}），主题范围为自定契约
+ // 扩展（topics.publish/subscribe）；形状由测试锁定，真 EMQX 联调归 0068。
+@@ -31,6 +31,8 @@ type MQTTAuthHandler struct {
+ 	// InternalToken 回调端点自身鉴权的内部令牌（配置化）。空值 = 全部拒绝（fail-closed：
+ 	// 未配置保护时不暴露无鉴权端点）。
+ 	InternalToken string
++	// Logger 服务端日志（deny 原因等 err 细节只进日志不回显回调方）；nil → log.Default()。
++	Logger *log.Logger
+ }
+ 
+ // mqttAuthRequest EMQX HTTP 认证回调入参（username=gatewayCode，password=网关令牌，
+@@ -93,6 +95,15 @@ func (h *MQTTAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// 网关 status 实校验（TASK-0027 决策 5）：显式禁用（gatewayStatus=0）→ deny；
++	// 状态未知（0079 交付前 pull 响应缺字段）不 fail-closed——行为与 0076 保持。
++	if identity.GatewayStatusKnown && identity.GatewayDisabled {
++		h.logger().Printf("httpapi: mqtt 认证拒绝（网关禁用，gatewayStatus=0）gateway=%q tenant=%q",
++			identity.GatewayCode, identity.TenantCode)
++		writeAuth(w, http.StatusOK, mqttAuthResponse{Result: authResultDeny})
++		return
++	}
++
+ 	writeAuth(w, http.StatusOK, mqttAuthResponse{
+ 		Result: authResultAllow,
+ 		Topics: &mqttTopics{
+@@ -102,6 +113,13 @@ func (h *MQTTAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	})
+ }
+ 
++func (h *MQTTAuthHandler) logger() *log.Logger {
++	if h.Logger != nil {
++		return h.Logger
++	}
++	return log.Default()
++}
++
+ // 主题范围（契约 §3.2 主题规划：iot/{tenant_code}/{gateway_code}/{data,status,config}）。
+ func dataTopic(id gwtoken.GatewayIdentity) string    { return fmt.Sprintf("iot/%s/%s/data", id.TenantCode, id.GatewayCode) }
+ func statusTopic(id gwtoken.GatewayIdentity) string  { return fmt.Sprintf("iot/%s/%s/status", id.TenantCode, id.GatewayCode) }
+diff --git a/ingest/internal/httpapi/authmqtt_gatewaystatus_contract_test.go b/ingest/internal/httpapi/authmqtt_gatewaystatus_contract_test.go
+new file mode 100644
+index 0000000..c543794
+--- /dev/null
++++ b/ingest/internal/httpapi/authmqtt_gatewaystatus_contract_test.go
+@@ -0,0 +1,112 @@
++package httpapi_test
++
++import (
++	"context"
++	"encoding/json"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/httpapi"
++)
++
++// TASK-0027 决策 5：gateway status 实校验——auth/mqtt 回调对禁用网关 deny（红线测试）。
++//
++// 契约锚点：统一消息模型 v1.1.0 §3.2（续）「校验 gateway_code 与设备令牌、租户与网关
++// status」——0076 修订轮 I3 登记的缺口由本批 Go 侧承接：credential/pull 响应的
++// gatewayStatus 字段（字段名即契约，后端由微改 TASK-0079 交付）经令牌链承载到
++// GatewayIdentity，回调实校验：禁用网关 deny。
++//
++// 红线口径（brief）：红线测试用 fake puller（返回禁用状态 → allow 即失败）——不依赖
++// 真实后端字段到位；真联调核验归 TASK-0068/0079 交付后 smoke。
++// 未知状态（0079 交付前现状）不 fail-closed、不放行扩大：allow 行为与 0076 保持。
++
++// statusFakePuller 固定凭据假拉取器（红线测试专用——brief 指名 fake puller 口径）。
++type statusFakePuller struct{ cred gwtoken.Credential }
++
++func (s *statusFakePuller) Pull(_ context.Context, _ int64, _ string) (gwtoken.Credential, error) {
++	return s.cred, nil
++}
++
++// authWithGatewayStatus 用 fake puller 驱动真令牌链的认证回调，返回响应体。
++// status：nil=响应未携带 gatewayStatus（状态未知）；0=禁用；1=启用。
++func authWithGatewayStatus(t *testing.T, status *int, logSink *log.Logger) map[string]any {
++	t.Helper()
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		&statusFakePuller{cred: gwtoken.Credential{
++			ChannelID: 7, CredType: gwtoken.CredTypeMQTTPassword,
++			Ciphertext: "gw-token-secret", GatewayStatus: status,
++		}}, 0)
++	h := &httpapi.MQTTAuthHandler{Validator: validator, InternalToken: "callback-internal-token", Logger: logSink}
++
++	resp := postAuth(t, h, "callback-internal-token", authBody())
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200（allow/deny 走响应体）", resp.StatusCode)
++	}
++	return decodeAuth(t, resp)
++}
++
++func intPtr(v int) *int { return &v }
++
++// 红线测试（brief 决策 5）：禁用网关（gatewayStatus=0）必须 deny——allow 即测试失败。
++func TestContractMQTTAuthDenyOnDisabledGatewayRedLine(t *testing.T) {
++	var logBuf strings.Builder
++	body := authWithGatewayStatus(t, intPtr(0), log.New(&logBuf, "", 0))
++	if body["result"] != "deny" {
++		t.Fatalf("result = %v, want deny（红线：禁用网关放行即失败）", body["result"])
++	}
++	if _, present := body["topics"]; present {
++		t.Errorf("topics = %v, want 缺省（deny 不带主题范围）", body["topics"])
++	}
++	if !strings.Contains(logBuf.String(), "禁用") || !strings.Contains(logBuf.String(), "GW_F01_01") {
++		t.Errorf("deny 原因未进服务端日志: %q", logBuf.String())
++	}
++}
++
++// 契约依据：决策 5——显式启用（gatewayStatus=1）放行且带主题范围（deny 不误伤）。
++func TestContractMQTTAuthAllowOnEnabledGateway(t *testing.T) {
++	body := authWithGatewayStatus(t, intPtr(1), log.New(&strings.Builder{}, "", 0))
++	if body["result"] != "allow" {
++		t.Fatalf("result = %v, want allow（启用网关不误伤）", body["result"])
++	}
++	topics, ok := body["topics"].(map[string]any)
++	if !ok {
++		t.Fatalf("topics = %v, want 对象（allow 带主题范围）", body["topics"])
++	}
++	if !equalAnySlice(topics["publish"], []any{"iot/group_a/GW_F01_01/data", "iot/group_a/GW_F01_01/status"}) {
++		t.Errorf("publish = %v, want 网关 data/status", topics["publish"])
++	}
++}
++
++// 契约依据：决策 5——状态未知不 fail-closed：行为与 0076 保持（令牌匹配即 allow）。
++// fake puller（GatewayStatus=nil）与真实链路（0079 交付前 pull 响应无 gatewayStatus 字段）
++// 双口径验证。
++func TestContractMQTTAuthUnknownGatewayStatusKeepsAllow(t *testing.T) {
++	body := authWithGatewayStatus(t, nil, log.New(&strings.Builder{}, "", 0))
++	if body["result"] != "allow" {
++		t.Fatalf("fake puller 状态未知: result = %v, want allow", body["result"])
++	}
++
++	cred := map[string]any{
++		"channelId": 7, "credType": "MQTT_PASSWORD",
++		"ciphertext": "gw-token-secret", "keyVersion": "v1",
++	}
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "操作成功", "data": cred})
++	}))
++	defer srv.Close()
++
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		gwtoken.NewHTTPPuller(srv.URL, "internal-token", 0), 0)
++	h := &httpapi.MQTTAuthHandler{Validator: validator, InternalToken: "callback-internal-token"}
++	body = decodeAuth(t, postAuth(t, h, "callback-internal-token", authBody()))
++	if body["result"] != "allow" {
++		t.Errorf("真实链路（无 gatewayStatus 字段）: result = %v, want allow", body["result"])
++	}
++}
+diff --git a/ingest/internal/mqttsource/mqttsource.go b/ingest/internal/mqttsource/mqttsource.go
+new file mode 100644
+index 0000000..7fb150b
+--- /dev/null
++++ b/ingest/internal/mqttsource/mqttsource.go
+@@ -0,0 +1,399 @@
++// Package mqttsource 承载 MQTT 消费源（TASK-0027 决策 2）：订阅统一消息模型 v1.1.0
++// §3.2 主题矩阵，按主题路由成对应信封——
++//
++//	iot/{tenant_code}/{gateway_code}/data    上行·数据  → 统一消息信封 → 数据流水线
++//	                                          （pipeline.Consumer 实现，零改动替换假消费源）
++//	iot/{tenant_code}/{gateway_code}/status  上行·状态  → 状态信封（心跳/在线状态；
++//	                                          LWT 遗嘱与 status 同主题——异常断开告警语义）
++//	iot/{tenant_code}/{gateway_code}/config  下行·配置  → config.changed 通知信封
++//	                                          （本期不消费——拉取对账兜底，决策 4）
++//
++// 契约纪律：
++//   - 主题矩阵 §3.2 逐字；QoS 1（Port.Subscribe 固定 QoS 1，见接口文档）；
++//   - 租户来自主题槽位（tenant_code）——EMQX 认证回调（auth/mqtt）授予的主题范围即
++//     令牌侧产物（只能发自己的 data/status），故主题槽位租户 = 令牌解析租户，满足
++//     FEAT-0009 处理顺序第 1 步「租户必须来自令牌解析产物」；
++//   - 平台侧订阅以 '+' 通配 {tenant_code}/{gateway_code} 槽位——主题级网关隔离由
++//     EMQX ACL 执行（回调主题范围），接入服务是平台侧消费者；
++//   - broker 不可达 fail-soft：监督循环指数退避重连（不阻断 HTTP 上报路径——
++//     HTTP 面与 MQTT 消费源互不依赖）；
++//   - 有界队列（QueueDepth）起步口径：路由满则背压阻塞（不丢弃），QoS1 至少一次
++//     语义 + 幂等键 (pointCode, ts) / batchId 兜底（README 并发模型）。
++//
++// mock 口径：broker 侧抽象 Port 薄接口（隔离 paho，照 backend publish MqttPublisherPort
++// 范式），契约测试以假 broker 断言路由矩阵与两路一致性；真 broker 验证登记 TD-0057。
++package mqttsource
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"log"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// Kind 主题矩阵路由出的信封类型（§3.2 方向列）。
++type Kind string
++
++// 信封类型枚举（§3.2 主题矩阵逐字）。
++const (
++	KindData   Kind = "data"   // 上行·数据：统一消息信封 → 数据流水线
++	KindStatus Kind = "status" // 上行·状态（含 LWT 遗嘱）：状态信封
++	KindConfig Kind = "config" // 下行·配置：config.changed 通知信封（本期不消费）
++)
++
++// Subscriptions 平台侧订阅矩阵（§3.2 主题形态逐字，{tenant_code}/{gateway_code}
++// 槽位 '+' 通配）。三类主题覆盖四行矩阵（LWT 与 status 同主题，无需独立订阅）。
++var Subscriptions = []string{"iot/+/+/data", "iot/+/+/status", "iot/+/+/config"}
++
++// SplitTopic 解析 §3.2 主题矩阵：iot/{tenant_code}/{gateway_code}/{data|status|config}。
++// 非 §3.2 形态（层数不符/kind 越界/槽位为空）返回 ok=false——调用方计数丢弃，不路由。
++func SplitTopic(topic string) (tenant, gateway string, kind Kind, ok bool) {
++	parts := strings.Split(topic, "/")
++	if len(parts) != 4 || parts[0] != "iot" {
++		return "", "", "", false
++	}
++	tenant, gateway = parts[1], parts[2]
++	if tenant == "" || gateway == "" {
++		return "", "", "", false
++	}
++	switch Kind(parts[3]) {
++	case KindData, KindStatus, KindConfig:
++		return tenant, gateway, Kind(parts[3]), true
++	default:
++		return "", "", "", false
++	}
++}
++
++// Port broker 侧薄接口（隔离 paho；照 backend publish MqttPublisherPort 范式——
++// 契约测试以假 broker 实现，真 broker 验证登记 TD-0057）。
++type Port interface {
++	// Connect 建立连接；失败返回错误（重连节奏归 Consumer 监督循环——指数退避）。
++	Connect() error
++	// Subscribe 订阅主题。QoS 固定 1（§3.2 QoS 列逐字）；handler 在 broker 消息回调内
++	// 执行（可阻塞——阻塞即背压，见包注释并发模型）。
++	Subscribe(topic string, handler func(topic string, payload []byte)) error
++	// SetConnectionLostHandler 注册连接丢失回调（断线后由监督循环重连重订阅）。
++	SetConnectionLostHandler(fn func(err error))
++	// Close 断开连接（幂等；监督循环退出时调用）。
++	Close()
++}
++
++// StatusEnvelope 状态信封（§3.2 上行·状态行 + LWT 行）。契约未冻结状态载荷的字段级
++// Schema——宽松解析（未知字段忽略不打停），已知可选键：graceful（正常下线标记——
++// 契约原文「正常下线须发 graceful 标记区分」，键名未冻结、本实现拟用 graceful）、
++// status（在线状态字符串）。
++type StatusEnvelope struct {
++	Topic    string // 原始主题（iot/{tenant}/{gateway}/status）
++	Tenant   string
++	Gateway  string
++	Graceful bool   // graceful 标记=true 正常下线；false=心跳或 LWT 异常断开（告警语义归 sink）
++	Status   string // status 键（若有）
++	Payload  []byte // 原始载荷（告警/存储归后续，保留现场）
++}
++
++// StatusSink 状态信封出口（§3.2 状态行/LWT 行处理挂点）。
++// 默认实现（DefaultSinks）：计数+日志——online_status 存储与告警通道归联调（TD-0057 登记）。
++type StatusSink interface {
++	OnStatus(env StatusEnvelope)
++}
++
++// StatusFunc 函数适配器。
++type StatusFunc func(StatusEnvelope)
++
++// OnStatus 实现 StatusSink。
++func (f StatusFunc) OnStatus(env StatusEnvelope) { f(env) }
++
++// ConfigNotice 配置信封：config.changed 通知（§3.3 载荷五键，snapshot.ConfigChanged）
++// + 主题槽位上下文与原始载荷。
++type ConfigNotice struct {
++	Topic   string
++	Tenant  string
++	Gateway string
++	Notice  snapshot.ConfigChanged // 解析产物（解析失败 = 原样保留 Payload、Notice 零值）
++	Payload []byte
++}
++
++// ConfigSink config.changed 通知出口。本期不消费（决策 4：拉取对账兜底已覆盖，
++// 通知消费归后续——TD 登记随 TD-0057）；默认实现计数+日志。
++type ConfigSink interface {
++	OnConfigNotice(notice ConfigNotice)
++}
++
++// ConfigFunc 函数适配器。
++type ConfigFunc func(ConfigNotice)
++
++// OnConfigNotice 实现 ConfigSink。
++func (f ConfigFunc) OnConfigNotice(n ConfigNotice) { f(n) }
++
++// Options 消费源配置（零值取默认）。
++type Options struct {
++	// QueueDepth 有界队列深度（路由满则背压阻塞）。默认 1024。
++	QueueDepth int
++	// BackoffInitial 重连退避初值。默认 500ms。
++	BackoffInitial time.Duration
++	// BackoffMax 重连退避封顶。默认 30s。
++	BackoffMax time.Duration
++	// StatusSink 状态信封出口；nil → 默认（计数+日志）。
++	StatusSink StatusSink
++	// ConfigSink 配置信封出口；nil → 默认（计数+日志，本期不消费）。
++	ConfigSink ConfigSink
++	// Logger 日志；nil → log.Default()。
++	Logger *log.Logger
++}
++
++// Stats 消费源计数快照（运维监控挂点）。
++type Stats struct {
++	DataRouted     int64 // data 主题路由数（进流水线）
++	StatusRouted   int64 // status 主题路由数（含 LWT）
++	ConfigRouted   int64 // config 主题路由数（本期不消费）
++	MalformedTopics int64 // 非 §3.2 形态主题计数（不路由）
++	ConnectFailures int64 // broker 连接失败次数（fail-soft）
++	Reconnects      int64 // 断线重连次数
++}
++
++// Consumer MQTT 消费源：按 §3.2 主题矩阵路由，data 信封进流水线消费通道（实现
++// pipeline.Consumer 接口，零改动替换 0073 假消费源），status/config 信封进对应出口；
++// 监督循环承担连接（指数退避 fail-soft）与重连重订阅。
++type Consumer struct {
++	port Port
++	opts Options
++
++	msgs chan pipeline.Inbound // 有界队列（背压阻塞，不丢弃）
++
++	ctxMu sync.Mutex
++	ctx   context.Context // Run 期间的路由取消语境（满队阻塞的退出通道）
++
++	dataRouted      atomic.Int64
++	statusRouted    atomic.Int64
++	configRouted    atomic.Int64
++	malformedTopics atomic.Int64
++	connectFailures atomic.Int64
++	reconnects      atomic.Int64
++}
++
++// NewConsumer 构造消费源（port 必填；opts 零值字段取默认）。
++// 装配形态：pipeline.Deps.Consumer = 本消费源（Messages() 即 data 主题信封通道），
++// Run 与 pipeline.Run 并行（各自 goroutine）。
++func NewConsumer(port Port, opts Options) *Consumer {
++	if opts.QueueDepth <= 0 {
++		opts.QueueDepth = 1024
++	}
++	if opts.BackoffInitial <= 0 {
++		opts.BackoffInitial = 500 * time.Millisecond
++	}
++	if opts.BackoffMax <= 0 {
++		opts.BackoffMax = 30 * time.Second
++	}
++	if opts.Logger == nil {
++		opts.Logger = log.Default()
++	}
++	return &Consumer{
++		port: port,
++		opts: opts,
++		msgs: make(chan pipeline.Inbound, opts.QueueDepth),
++	}
++}
++
++// Messages 实现 pipeline.Consumer：data 主题信封通道（有界；满则路由侧背压阻塞）。
++func (c *Consumer) Messages() <-chan pipeline.Inbound { return c.msgs }
++
++// Stats 计数快照。
++func (c *Consumer) Stats() Stats {
++	return Stats{
++		DataRouted:      c.dataRouted.Load(),
++		StatusRouted:    c.statusRouted.Load(),
++		ConfigRouted:    c.configRouted.Load(),
++		MalformedTopics: c.malformedTopics.Load(),
++		ConnectFailures: c.connectFailures.Load(),
++		Reconnects:      c.reconnects.Load(),
++	}
++}
++
++func (c *Consumer) logger() *log.Logger { return c.opts.Logger }
++
++// Run 监督循环：连接（失败指数退避重试——broker 不可达 fail-soft，不阻断 HTTP 上报
++// 路径）→ 订阅矩阵 → 等待断线/停机；断线后重连并重订阅；ctx 取消时释放连接退出。
++func (c *Consumer) Run(ctx context.Context) {
++	c.ctxMu.Lock()
++	c.ctx = ctx
++	c.ctxMu.Unlock()
++
++	lost := make(chan struct{}, 1)
++	c.port.SetConnectionLostHandler(func(err error) {
++		c.logger().Printf("mqttsource: broker 连接丢失（fail-soft，重连重订阅）: %v", err)
++		select {
++		case lost <- struct{}{}:
++		default:
++		}
++	})
++
++	backoff := c.opts.BackoffInitial
++	for {
++		if ctx.Err() != nil {
++			c.port.Close()
++			return
++		}
++		if err := c.port.Connect(); err != nil {
++			c.connectFailures.Add(1)
++			c.logger().Printf("mqttsource: broker 不可达（fail-soft 不阻断 HTTP 上报路径，%v 后重试——指数退避）: %v", backoff, err)
++			if !sleepCtx(ctx, backoff) {
++				c.port.Close()
++				return
++			}
++			backoff = minDur(backoff*2, c.opts.BackoffMax)
++			continue
++		}
++		backoff = c.opts.BackoffInitial // 连接成功：退避重置
++		if err := c.subscribeAll(); err != nil {
++			c.logger().Printf("mqttsource: 订阅失败（fail-soft 重试）: %v", err)
++			c.port.Close()
++			if !sleepCtx(ctx, backoff) {
++				return
++			}
++			continue
++		}
++		select {
++		case <-ctx.Done():
++			c.port.Close()
++			return
++		case <-lost:
++			c.reconnects.Add(1)
++			if !sleepCtx(ctx, backoff) {
++				c.port.Close()
++				return
++			}
++		}
++	}
++}
++
++// subscribeAll 订阅 §3.2 矩阵（三类主题形态；LWT 与 status 同主题无需独立订阅）。
++func (c *Consumer) subscribeAll() error {
++	for _, topic := range Subscriptions {
++		if err := c.port.Subscribe(topic, c.route); err != nil {
++			return fmt.Errorf("mqttsource: 订阅 %q 失败: %w", topic, err)
++		}
++	}
++	return nil
++}
++
++// route 主题路由（§3.2 矩阵——四主题→信封类型）：broker 消息回调内执行。
++func (c *Consumer) route(topic string, payload []byte) {
++	tenant, gateway, kind, ok := SplitTopic(topic)
++	if !ok {
++		c.malformedTopics.Add(1)
++		return
++	}
++	switch kind {
++	case KindData:
++		// 上行·数据：统一消息信封 → 数据流水线消费源（租户取主题槽位——认证回调
++		// 授予的主题矩阵即令牌侧产物）。满队背压阻塞（不丢弃），ctx 取消退出。
++		c.ctxMu.Lock()
++		ctx := c.ctx
++		c.ctxMu.Unlock()
++		if ctx == nil {
++			ctx = context.Background()
++		}
++		select {
++		case c.msgs <- pipeline.Inbound{Tenant: tenant, Payload: payload}:
++			c.dataRouted.Add(1)
++		case <-ctx.Done():
++		}
++	case KindStatus:
++		c.statusRouted.Add(1)
++		env := parseStatus(topic, tenant, gateway, payload)
++		if c.opts.StatusSink != nil {
++			c.opts.StatusSink.OnStatus(env)
++		} else {
++			c.defaultStatusSink(env)
++		}
++	case KindConfig:
++		c.configRouted.Add(1)
++		n := parseConfigNotice(topic, tenant, gateway, payload)
++		if c.opts.ConfigSink != nil {
++			c.opts.ConfigSink.OnConfigNotice(n)
++		} else {
++			c.defaultConfigSink(n)
++		}
++	}
++}
++
++// defaultStatusSink 默认状态出口：计数+日志（§3.2 LWT 行「接入服务据此置 online_status=0
++// 并告警」的告警挂点——存储与告警通道归联调，TD-0057 登记）。
++func (c *Consumer) defaultStatusSink(env StatusEnvelope) {
++	if env.Graceful {
++		c.logger().Printf("mqttsource: 网关正常下线（graceful）tenant=%s gateway=%s", env.Tenant, env.Gateway)
++		return
++	}
++	c.logger().Printf("mqttsource: 网关状态上报（心跳/LWT——LWT 异常断开须告警，online_status 存储归联调）tenant=%s gateway=%s status=%q",
++		env.Tenant, env.Gateway, env.Status)
++}
++
++// defaultConfigSink 默认配置出口：本期不消费（决策 4——拉取对账兜底已覆盖），计数+日志。
++func (c *Consumer) defaultConfigSink(n ConfigNotice) {
++	c.logger().Printf("mqttsource: config.changed 通知（本期不消费——拉取对账兜底）tenant=%s gateway=%s version=%d hash=%s",
++		n.Tenant, n.Gateway, n.Notice.Version, n.Notice.Hash)
++}
++
++// parseStatus 宽松解析状态载荷（契约未冻结字段级 Schema——未知字段忽略）。
++func parseStatus(topic, tenant, gateway string, payload []byte) StatusEnvelope {
++	env := StatusEnvelope{Topic: topic, Tenant: tenant, Gateway: gateway, Payload: payload}
++	var m map[string]any
++	if err := json.Unmarshal(payload, &m); err != nil {
++		return env // 非法 JSON：保留现场，graceful=false（按异常断开语义告警）
++	}
++	if v, ok := m["graceful"]; ok {
++		env.Graceful = truthy(v)
++	}
++	if v, ok := m["status"].(string); ok {
++		env.Status = v
++	}
++	return env
++}
++
++// truthy 宽松真值判定（bool/非零数/非空真值串）。
++func truthy(v any) bool {
++	switch t := v.(type) {
++	case bool:
++		return t
++	case float64:
++		return t != 0
++	case string:
++		return t != "" && t != "false" && t != "0"
++	default:
++		return false
++	}
++}
++
++// parseConfigNotice 解析 config.changed 通知（§3.3 载荷五键；解析失败保留现场）。
++func parseConfigNotice(topic, tenant, gateway string, payload []byte) ConfigNotice {
++	n := ConfigNotice{Topic: topic, Tenant: tenant, Gateway: gateway, Payload: payload}
++	if cc, err := snapshot.ParseConfigChanged(payload); err == nil {
++		n.Notice = *cc
++	}
++	return n
++}
++
++func sleepCtx(ctx context.Context, d time.Duration) bool {
++	t := time.NewTimer(d)
++	defer t.Stop()
++	select {
++	case <-ctx.Done():
++		return false
++	case <-t.C:
++		return true
++	}
++}
++
++func minDur(a, b time.Duration) time.Duration {
++	if a < b {
++		return a
++	}
++	return b
++}
+diff --git a/ingest/internal/mqttsource/mqttsource_contract_test.go b/ingest/internal/mqttsource/mqttsource_contract_test.go
+new file mode 100644
+index 0000000..2ab39e3
+--- /dev/null
++++ b/ingest/internal/mqttsource/mqttsource_contract_test.go
+@@ -0,0 +1,307 @@
++package mqttsource_test
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/mqttsource"
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0027 决策 2：MQTT 消费者（mock 口径——本地无 EMQX）。
++//
++// 契约锚点：统一消息模型 v1.1.0 §3.2 主题矩阵（逐字）：
++//   - 上行·数据  iot/{tenant_code}/{gateway_code}/data   点位数据批量上报（统一消息信封）
++//   - 上行·状态  iot/{tenant_code}/{gateway_code}/status  心跳与在线状态（含 LWT 遗嘱同主题；
++//     正常下线须发 graceful 标记区分）
++//   - 下行·配置  iot/{tenant_code}/{gateway_code}/config  配置变更通知（只带版本号与哈希；
++//     本期不消费——拉取对账兜底，决策 4）
++// QoS 1；broker 不可达 fail-soft（指数退避重连、不阻断 HTTP 上报路径）。
++// 真 broker 验证登记 TD-0057（PahoPort 未经真实 broker 验证）。
++
++// ---- 假 broker（Port 契约实现：订阅模式匹配 + 消息投递 + 失败注入）----
++
++type fakePort struct {
++	mu           sync.Mutex
++	connectErrs  int // 剩余连接失败注入次数
++	connects     int
++	subCalls     int
++	subTopics    []string
++	handlers     map[string]func(topic string, payload []byte)
++	closed       bool
++	lostHandler  func(err error)
++	attempts     []time.Time // 连接尝试时刻（退避节奏断言）
++}
++
++func newFakePort() *fakePort {
++	return &fakePort{handlers: make(map[string]func(string, []byte))}
++}
++
++func (f *fakePort) Connect() error {
++	f.mu.Lock()
++	f.connects++
++	f.attempts = append(f.attempts, time.Now())
++	fail := f.connectErrs > 0
++	if fail {
++		f.connectErrs--
++	}
++	f.mu.Unlock()
++	if fail {
++		return fmt.Errorf("fake broker: 注入连接失败")
++	}
++	return nil
++}
++
++func (f *fakePort) Subscribe(topic string, handler func(topic string, payload []byte)) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.subCalls++
++	f.subTopics = append(f.subTopics, topic)
++	f.handlers[topic] = handler
++	return nil
++}
++
++func (f *fakePort) SetConnectionLostHandler(fn func(err error)) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.lostHandler = fn
++}
++
++func (f *fakePort) Close() {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.closed = true
++}
++
++// matchPattern 单段 '+' 通配匹配（假 broker 的订阅匹配语义）。
++func matchPattern(pattern, topic string) bool {
++	ps := strings.Split(pattern, "/")
++	ts := strings.Split(topic, "/")
++	if len(ps) != len(ts) {
++		return false
++	}
++	for i := range ps {
++		if ps[i] != "+" && ps[i] != ts[i] {
++			return false
++		}
++	}
++	return true
++}
++
++// Deliver 按订阅矩阵投递一条消息（返回是否命中订阅）。
++func (f *fakePort) Deliver(topic string, payload []byte) bool {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	for pattern, h := range f.handlers {
++		if matchPattern(pattern, topic) {
++			h(topic, payload)
++			return true
++		}
++	}
++	return false
++}
++
++func (f *fakePort) snapshotState() (connects, subCalls int, topics []string, closed bool) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.connects, f.subCalls, append([]string(nil), f.subTopics...), f.closed
++}
++
++func (f *fakePort) setConnectFailures(n int) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.connectErrs = n
++}
++
++// newConsumer 组装默认退避参数的消费源并启动监督循环。
++func newConsumer(t *testing.T, port *fakePort, opts mqttsource.Options) (*mqttsource.Consumer, context.CancelFunc) {
++	t.Helper()
++	opts.Logger = log.New(&strings.Builder{}, "", 0) // 测试静音
++	c := mqttsource.NewConsumer(port, opts)
++	ctx, cancel := context.WithCancel(context.Background())
++	go c.Run(ctx)
++	return c, cancel
++}
++
++func waitFor(t *testing.T, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", what)
++}
++
++// ---- 契约符合性测试 ----
++
++// 契约依据：§3.2 主题矩阵逐字——iot/{tenant_code}/{gateway_code}/{data,status,config}；
++// 非 §3.2 形态的主题（层数不符/kind 越界/空槽位）不路由。
++func TestContractMQTTSplitTopicMatrix(t *testing.T) {
++	cases := []struct {
++		topic           string
++		tenant, gateway string
++		kind            mqttsource.Kind
++		ok              bool
++	}{
++		{"iot/group_a/GW_F01_01/data", "group_a", "GW_F01_01", mqttsource.KindData, true},
++		{"iot/group_a/GW_F01_01/status", "group_a", "GW_F01_01", mqttsource.KindStatus, true},
++		{"iot/group_a/GW_F01_01/config", "group_a", "GW_F01_01", mqttsource.KindConfig, true},
++		{"iot/x/y/data/extra", "", "", "", false},
++		{"iot/x/y/other", "", "", "", false},
++		{"iot/x/y", "", "", "", false},
++		{"iot//y/data", "", "", "", false},
++		{"", "", "", "", false},
++	}
++	for _, c := range cases {
++		tenant, gateway, kind, ok := mqttsource.SplitTopic(c.topic)
++		if ok != c.ok || tenant != c.tenant || gateway != c.gateway || kind != c.kind {
++			t.Errorf("SplitTopic(%q) = (%q,%q,%q,%v), want (%q,%q,%q,%v)",
++				c.topic, tenant, gateway, kind, ok, c.tenant, c.gateway, c.kind, c.ok)
++		}
++	}
++}
++
++// 契约依据：决策 2 订阅矩阵——平台侧订阅 §3.2 三类主题形态（{tenant}/{gateway} 槽位
++// 用 + 通配——主题级网关隔离由 EMQX ACL 执行，接入服务是平台侧消费者）。
++func TestContractMQTTConsumerSubscriptionMatrix(t *testing.T) {
++	want := []string{"iot/+/+/data", "iot/+/+/status", "iot/+/+/config"}
++	got := mqttsource.Subscriptions
++	if len(got) != len(want) {
++		t.Fatalf("Subscriptions = %v, want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Errorf("Subscriptions[%d] = %q, want %q（§3.2 逐字）", i, got[i], want[i])
++		}
++	}
++
++	port := newFakePort()
++	c, cancel := newConsumer(t, port, mqttsource.Options{BackoffInitial: 5 * time.Millisecond})
++	defer cancel()
++	waitFor(t, "订阅完成", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 3
++	})
++	_, _, topics, _ := port.snapshotState()
++	for i := range want {
++		if topics[i] != want[i] {
++			t.Errorf("订阅 %d = %q, want %q", i, topics[i], want[i])
++		}
++	}
++	_ = c
++}
++
++// 契约依据：决策 2 路由矩阵（四主题→信封类型）——data→统一消息信封进流水线消费源；
++// status→状态信封（graceful 标记区分正常下线）；config→config.changed 通知信封（本期
++// 不消费）；LWT（与 status 同主题、无 graceful 标记）→ 状态信封（异常断开语义）。
++func TestContractMQTTConsumerRoutingMatrixFourTopics(t *testing.T) {
++	var statusMu sync.Mutex
++	var statusEnvs []mqttsource.StatusEnvelope
++	var configMu sync.Mutex
++	var configNotices []mqttsource.ConfigNotice
++
++	port := newFakePort()
++	c, cancel := newConsumer(t, port, mqttsource.Options{
++		BackoffInitial: 5 * time.Millisecond,
++		StatusSink: mqttsource.StatusFunc(func(env mqttsource.StatusEnvelope) {
++			statusMu.Lock()
++			defer statusMu.Unlock()
++			statusEnvs = append(statusEnvs, env)
++		}),
++		ConfigSink: mqttsource.ConfigFunc(func(n mqttsource.ConfigNotice) {
++			configMu.Lock()
++			defer configMu.Unlock()
++			configNotices = append(configNotices, n)
++		}),
++	})
++	defer cancel()
++	waitFor(t, "订阅完成", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 3
++	})
++
++	// ① data：统一消息信封 → 流水线消费源（租户来自主题——认证回调授予的主题矩阵即
++	// 令牌侧产物），payload 原字节透传（与 HTTP body 同构）。
++	dataPayload := []byte(`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-ROUTE-1","sentAt":1795212000000,` +
++		`"points":[{"pointCode":"F01_WS01_EQ001_M01","ts":1795211995000,"value":132.5,"quality":0}]}`)
++	if !port.Deliver("iot/group_a/GW_F01_01/data", dataPayload) {
++		t.Fatal("data 主题未命中订阅")
++	}
++	var got pipeline.Inbound
++	waitFor(t, "data 信封进消费源", func() bool {
++		select {
++		case in := <-c.Messages():
++			got = in
++			return true
++		default:
++			return false
++		}
++	})
++	if got.Tenant != "group_a" {
++		t.Errorf("Inbound.Tenant = %q, want group_a（主题槽位）", got.Tenant)
++	}
++	if string(got.Payload) != string(dataPayload) {
++		t.Errorf("Inbound.Payload 被改写: %s", got.Payload)
++	}
++
++	// ② status：心跳（无 graceful）→ 状态信封。
++	port.Deliver("iot/group_a/GW_F01_01/status", []byte(`{"status":"online","configVersion":17}`))
++	// ③ LWT（异常断开，与 status 同主题、无 graceful 标记）→ 状态信封。
++	port.Deliver("iot/group_a/GW_F01_01/status", []byte(`{"status":"offline"}`))
++	// ④ 正常下线（graceful 标记）→ 状态信封（Graceful=true）。
++	port.Deliver("iot/group_a/GW_F01_01/status", []byte(`{"graceful":true}`))
++	waitFor(t, "三条状态信封", func() bool {
++		statusMu.Lock()
++		defer statusMu.Unlock()
++		return len(statusEnvs) == 3
++	})
++	statusMu.Lock()
++	if statusEnvs[0].Tenant != "group_a" || statusEnvs[0].Gateway != "GW_F01_01" || statusEnvs[0].Status != "online" || statusEnvs[0].Graceful {
++		t.Errorf("心跳信封 = %+v", statusEnvs[0])
++	}
++	if statusEnvs[1].Status != "offline" || statusEnvs[1].Graceful {
++		t.Errorf("LWT 信封 = %+v, want Graceful=false（异常断开——告警语义）", statusEnvs[1])
++	}
++	if !statusEnvs[2].Graceful {
++		t.Errorf("正常下线信封 = %+v, want Graceful=true（graceful 标记）", statusEnvs[2])
++	}
++	statusMu.Unlock()
++
++	// ⑤ config：config.changed 通知 → 配置信封（本期不消费——计数+出口）。
++	port.Deliver("iot/group_a/GW_F01_01/config", []byte(`{"tenant":"group_a","scopeType":1,"scopeId":88,"version":18,"hash":"abc"}`))
++	waitFor(t, "配置信封", func() bool {
++		configMu.Lock()
++		defer configMu.Unlock()
++		return len(configNotices) == 1
++	})
++	configMu.Lock()
++	n := configNotices[0]
++	configMu.Unlock()
++	if n.Notice.Tenant != "group_a" || n.Notice.Version != 18 || n.Notice.Hash != "abc" {
++		t.Errorf("配置信封 = %+v", n)
++	}
++
++	st := c.Stats()
++	if st.DataRouted != 1 || st.StatusRouted != 3 || st.ConfigRouted != 1 || st.MalformedTopics != 0 {
++		t.Errorf("路由计数 = %+v", st)
++	}
++
++	// ⑥ 非 §3.2 形态主题：broker 订阅匹配层即过滤（矩阵通配只命中三类 kind 槽位），
++	// 不可能到达路由；Consumer.route 的 SplitTopic 守卫为纵深防御（畸形计数挂点，
++	// 防 broker 语义漂移/订阅面扩大——覆盖见 SplitTopic 单元矩阵）。
++	if port.Deliver("iot/bad", []byte(`{}`)) || port.Deliver("iot/x/y/unknown", []byte(`{}`)) {
++		t.Error("非矩阵主题命中订阅（矩阵通配失守）")
++	}
++	st = c.Stats()
++	if st.DataRouted != 1 || st.StatusRouted != 3 || st.ConfigRouted != 1 || st.MalformedTopics != 0 {
++		t.Errorf("非矩阵主题被路由: %+v", st)
++	}
++}
+diff --git a/ingest/internal/mqttsource/mqttsource_failsoft_contract_test.go b/ingest/internal/mqttsource/mqttsource_failsoft_contract_test.go
+new file mode 100644
+index 0000000..93e3453
+--- /dev/null
++++ b/ingest/internal/mqttsource/mqttsource_failsoft_contract_test.go
+@@ -0,0 +1,177 @@
++package mqttsource_test
++
++import (
++	"context"
++	"log"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/mqttsource"
++)
++
++// TASK-0027 决策 2：broker 不可达 fail-soft（指数退避重连、不阻断 HTTP 上报路径）；
++// 有界队列背压（满则阻塞不丢弃——QoS1 至少一次 + 幂等兜底）；断线重连后重订阅。
++
++// 契约依据：决策 2 fail-soft——连接失败指数退避重连（间隔递增、封顶），HTTP 上报路径
++// 不受影响（消费源通道持续可用、Submit 正常）。
++func TestContractMQTTConsumerBrokerUnreachableExponentialBackoff(t *testing.T) {
++	port := newFakePort()
++	port.setConnectFailures(3)
++	var logBuf strings.Builder
++	opts := mqttsource.Options{
++		BackoffInitial: 50 * time.Millisecond,
++		BackoffMax:     200 * time.Millisecond,
++		Logger:         log.New(&logBuf, "", 0),
++	}
++	c := mqttsource.NewConsumer(port, opts)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	start := time.Now()
++	go c.Run(ctx)
++
++	waitFor(t, "三次失败后第四次连接成功并订阅", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 3
++	})
++	st := c.Stats()
++	if st.ConnectFailures != 3 {
++		t.Errorf("ConnectFailures = %d, want 3", st.ConnectFailures)
++	}
++	if !strings.Contains(logBuf.String(), "fail-soft") {
++		t.Errorf("失败未按 fail-soft 记录: %q", logBuf.String())
++	}
++
++	// 退避节奏（指数递增）：成功前 3 次尝试间隔应递增（50ms→100ms→200ms 封顶）。
++	port.mu.Lock()
++	attempts := append([]time.Time(nil), port.attempts...)
++	port.mu.Unlock()
++	if len(attempts) < 4 {
++		t.Fatalf("连接尝试 = %d, want ≥4", len(attempts))
++	}
++	g1 := attempts[1].Sub(attempts[0])
++	g2 := attempts[2].Sub(attempts[1])
++	g3 := attempts[3].Sub(attempts[2])
++	if g1 < 50*time.Millisecond {
++		t.Errorf("第一次退避间隔 = %v, want ≥50ms（BackoffInitial）", g1)
++	}
++	if g2 < g1+40*time.Millisecond {
++		t.Errorf("第二次退避间隔 = %v（前次 %v）, want 指数递增（≈2×）", g2, g1)
++	}
++	if g3 < g2+40*time.Millisecond {
++		t.Errorf("第三次退避间隔 = %v（前次 %v）, want 指数递增（≈2×）", g3, g2)
++	}
++	if total := time.Since(start); total > 10*time.Second {
++		t.Errorf("退避总耗时 %v, want 受封顶约束（不阻断主流程）", total)
++	}
++}
++
++// 契约依据：决策 2 fail-soft——broker 断线（连接丢失回调）后自动重连并重订阅；
++// ctx 取消后 Close 释放连接、监督循环退出。
++func TestContractMQTTConsumerReconnectResubscribesAndStops(t *testing.T) {
++	port := newFakePort()
++	var logBuf strings.Builder
++	c := mqttsource.NewConsumer(port, mqttsource.Options{
++		BackoffInitial: 5 * time.Millisecond,
++		Logger:         log.New(&logBuf, "", 0),
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	go func() { c.Run(ctx); close(done) }()
++
++	waitFor(t, "首次订阅", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 3
++	})
++
++	// 断线 → 重连 + 重订阅（fail-soft，指数退避从初值重新起步）。
++	port.mu.Lock()
++	lost := port.lostHandler
++	port.mu.Unlock()
++	if lost == nil {
++		t.Fatal("连接丢失回调未注册")
++	}
++	lost(context.DeadlineExceeded)
++	waitFor(t, "重连后重订阅", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 6
++	})
++	if st := c.Stats(); st.Reconnects != 1 {
++		t.Errorf("Reconnects = %d, want 1", st.Reconnects)
++	}
++
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("ctx 取消后监督循环未退出")
++	}
++	if _, _, _, closed := port.snapshotState(); !closed {
++		t.Error("ctx 取消后 Port.Close 未调用（连接未释放）")
++	}
++}
++
++// 契约依据：并发模型起步口径（README）——消费源有界通道，满则背压阻塞（不丢弃），
++// QoS1 至少一次语义 + 幂等兜底；排空后全部送达。
++func TestContractMQTTConsumerBoundedQueueBackpressure(t *testing.T) {
++	port := newFakePort()
++	c, cancel := newConsumer(t, port, mqttsource.Options{
++		BackoffInitial: 5 * time.Millisecond,
++		QueueDepth:     1,
++	})
++	defer cancel()
++	waitFor(t, "订阅完成", func() bool {
++		_, subCalls, _, _ := port.snapshotState()
++		return subCalls == 3
++	})
++
++	// 队列深度 1：连投 2 条（第二条阻塞在背压），随后排空——两条都到达、零丢弃。
++	var delivered sync.WaitGroup
++	delivered.Add(2)
++	go func() {
++		defer delivered.Done()
++		port.Deliver("iot/group_a/GW_F01_01/data", []byte(`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-BP-1","sentAt":1795212000000,"points":[{"pointCode":"P","ts":1,"value":1,"quality":0}]}`))
++	}()
++	go func() {
++		defer delivered.Done()
++		port.Deliver("iot/group_a/GW_F01_01/data", []byte(`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-BP-2","sentAt":1795212000000,"points":[{"pointCode":"P","ts":2,"value":2,"quality":0}]}`))
++	}()
++
++	// 排空两条（背压下 Deliver goroutine 随之完成——不丢弃）。
++	var ids []string
++	deadline := time.After(3 * time.Second)
++	for len(ids) < 2 {
++		select {
++		case in := <-c.Messages():
++			ids = append(ids, extractBatchID(in.Payload))
++		case <-deadline:
++			t.Fatalf("排空超时：仅收到 %v", ids)
++		}
++	}
++	deliveredDone := make(chan struct{})
++	go func() { delivered.Wait(); close(deliveredDone) }()
++	select {
++	case <-deliveredDone:
++	case <-time.After(2 * time.Second):
++		t.Error("背压未解除（Deliver goroutine 仍阻塞）")
++	}
++	if st := c.Stats(); st.DataRouted != 2 {
++		t.Errorf("DataRouted = %d, want 2（背压不丢弃）", st.DataRouted)
++	}
++}
++
++func extractBatchID(payload []byte) string {
++	// 最小解析：仅测试用（batchId 字段提取）。
++	s := string(payload)
++	i := strings.Index(s, `"batchId":"`)
++	if i < 0 {
++		return ""
++	}
++	rest := s[i+len(`"batchId":"`):]
++	j := strings.Index(rest, `"`)
++	if j < 0 {
++		return ""
++	}
++	return rest[:j]
++}
+diff --git a/ingest/internal/mqttsource/paho.go b/ingest/internal/mqttsource/paho.go
+new file mode 100644
+index 0000000..cc920b9
+--- /dev/null
++++ b/ingest/internal/mqttsource/paho.go
+@@ -0,0 +1,104 @@
++// PahoPort Port 接口的 eclipse/paho.mqtt.golang 适配（go.mod 显式钉 v1.5.1——决策 2）。
++//
++// 连接口径：
++//   - 初连失败快速返回错误（ConnectRetry=false）——重连节奏归 Consumer 监督循环
++//     （指数退避，决策 2 fail-soft）；
++//   - 会话内断线由 paho 自动重连（SetAutoReconnect(true) + ResumeSubs(true)——订阅
++//     会话随重连恢复），恢复信号经 ConnectionLostHandler 交监督循环重订阅兜底；
++//   - CleanSession(false)：QoS 1 会话状态跨断线保持（broker 侧未确认消息重投——
++//     至少一次语义，幂等键兜底）。
++//
++// 真 broker 验证登记 TD-0057：本适配未经真实 broker 验证（本地无 EMQX，mock 口径）。
++package mqttsource
++
++import (
++	"fmt"
++	"os"
++	"time"
++
++	pahomqtt "github.com/eclipse/paho.mqtt.golang"
++)
++
++// DefaultConnectTimeout 初连超时（监督循环快速失败——退避节奏不被悬挂拉长）。
++const DefaultConnectTimeout = 5 * time.Second
++
++// PahoPort paho.mqtt.golang 适配。
++type PahoPort struct {
++	// BrokerURL broker 地址（如 tcp://emqx-host:1883）。
++	BrokerURL string
++	// Username/Password broker 账号（空 = 匿名）。
++	Username string
++	Password string
++	// ClientID 客户端 ID；空 = ingestd-<pid>（多实例不得共享——会话互踢）。
++	ClientID string
++	// ConnectTimeout 初连超时；<=0 → DefaultConnectTimeout。
++	ConnectTimeout time.Duration
++
++	client pahomqtt.Client
++	lost   func(err error)
++}
++
++func (p *PahoPort) clientID() string {
++	if p.ClientID != "" {
++		return p.ClientID
++	}
++	return fmt.Sprintf("ingestd-%d", os.Getpid())
++}
++
++// Connect 建立连接（初连失败返回错误；会话内断线由 paho 自动重连）。
++func (p *PahoPort) Connect() error {
++	timeout := p.ConnectTimeout
++	if timeout <= 0 {
++		timeout = DefaultConnectTimeout
++	}
++	opts := pahomqtt.NewClientOptions().
++		AddBroker(p.BrokerURL).
++		SetClientID(p.clientID()).
++		SetUsername(p.Username).
++		SetPassword(p.Password).
++		SetCleanSession(false).
++		SetAutoReconnect(true).
++		SetResumeSubs(true).
++		SetConnectRetry(false). // 初连失败快速返回——重连节奏归监督循环（指数退避）
++		SetConnectTimeout(timeout).
++		SetConnectionLostHandler(func(_ pahomqtt.Client, err error) {
++			if p.lost != nil {
++				p.lost(err)
++			}
++		})
++	p.client = pahomqtt.NewClient(opts)
++	tok := p.client.Connect()
++	if !tok.WaitTimeout(timeout + 2*time.Second) {
++		return fmt.Errorf("paho: 连接超时（%v）", timeout)
++	}
++	if err := tok.Error(); err != nil {
++		return fmt.Errorf("paho: 连接失败: %w", err)
++	}
++	return nil
++}
++
++// Subscribe QoS 1 订阅（§3.2 QoS 列逐字）。
++func (p *PahoPort) Subscribe(topic string, handler func(topic string, payload []byte)) error {
++	tok := p.client.Subscribe(topic, 1, func(_ pahomqtt.Client, m pahomqtt.Message) {
++		handler(m.Topic(), m.Payload())
++	})
++	if !tok.WaitTimeout(10 * time.Second) {
++		return fmt.Errorf("paho: 订阅 %q 超时", topic)
++	}
++	if err := tok.Error(); err != nil {
++		return fmt.Errorf("paho: 订阅 %q 失败: %w", topic, err)
++	}
++	return nil
++}
++
++// SetConnectionLostHandler 注册连接丢失回调（监督循环重连重订阅）。
++func (p *PahoPort) SetConnectionLostHandler(fn func(err error)) {
++	p.lost = fn
++}
++
++// Close 断开连接（250ms 静默期让 in-flight 消息收尾；幂等）。
++func (p *PahoPort) Close() {
++	if p.client != nil && p.client.IsConnectionOpen() {
++		p.client.Disconnect(250)
++	}
++}
+diff --git a/ingest/internal/mqttsource/twopath_contract_test.go b/ingest/internal/mqttsource/twopath_contract_test.go
+new file mode 100644
+index 0000000..d594b7f
+--- /dev/null
++++ b/ingest/internal/mqttsource/twopath_contract_test.go
+@@ -0,0 +1,293 @@
++package mqttsource_test
++
++import (
++	"context"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/httpapi"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/mqttsource"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0027 决策 2（brief 测试口径）：两路上报一致性——「MQTT 信封与 HTTP body 同构进
++// 同一流水线、两路结果一致」。
++//
++// 契约锚点：统一消息模型 v1.1.0 §3.2（续）「HTTP 批量上报，请求体与 MQTT 上行消息 JSON
++// 完全同构」；FEAT-0009「同一流水线同构结果」。data 主题消息与 /ingest/v1/report 请求体
++// 共用同一 processOne 五步冻结顺序（MQTT 走 Run 消费循环、HTTP 走 Submit 同步入口）。
++
++// isoPipeline 一条镜像流水线（同配置：TTL 去重 + 假执行器 + 内存缓存 + 预置快照）。
++type isoPipeline struct {
++	exec    *tdengine.FakeExecutor
++	dead    *deadRecorder
++	ptCache *cache.MemoryPointCache
++	pipe    *pipeline.Pipeline
++	cancel  context.CancelFunc
++}
++
++type deadRecorder struct {
++	mu      sync.Mutex
++	reasons map[string]int
++}
++
++func (r *deadRecorder) OnDeadLetter(reason pipeline.DeadLetterReason, _ string, _ string, _ *message.Point) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.reasons[string(reason)]++
++}
++
++func (r *deadRecorder) count(reason string) int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.reasons[reason]
++}
++
++func newIsoPipeline(t *testing.T) *isoPipeline {
++	return newIsoPipelineWithConsumer(t, newFakeConsumerSource(64))
++}
++
++func newIsoPipelineWithConsumer(t *testing.T, consumer pipeline.Consumer) *isoPipeline {
++	t.Helper()
++	snapJSON := `{
++	  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++	  "points": [
++	    {"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
++	    {"id":102,"tenantId":1,"pointCode":"F01_WS01_EQ001_M02","pointName":"P2","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
++	    {"id":103,"tenantId":1,"pointCode":"F01_WS01_EQ001_S01","pointName":"P3","dataType":3,"valueType":"INT","deptId":3,"status":1}
++	  ]
++	}`
++	snap, err := snapshot.ParseSnapshot([]byte(snapJSON))
++	if err != nil {
++		t.Fatalf("预置快照解析失败: %v", err)
++	}
++	snapCache := snapshot.NewCache()
++	if err := snapCache.Replace(snap); err != nil {
++		t.Fatalf("预置快照替换失败: %v", err)
++	}
++	f := &isoPipeline{
++		exec:    tdengine.NewFakeExecutor(0),
++		dead:    &deadRecorder{reasons: make(map[string]int)},
++		ptCache: cache.NewMemoryPointCache(),
++	}
++	deps := pipeline.Deps{
++		Consumer:  consumer,
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   pipeline.NewTTLBatchDeduper(0, 0),
++		Points:    pipeline.NewTTLPointDeduper(0, 0),
++		Writer:    &tdengine.Writer{Ex: f.exec},
++		Cache:     f.ptCache,
++		Dead:      f.dead,
++	}
++	p, err := pipeline.Assemble(pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond}, deps)
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	f.cancel = cancel
++	go func() { _ = p.Run(ctx) }() // MQTT 面：Run 消费循环（含 flusher）
++	f.pipe = p
++	return f
++}
++
++func (f *isoPipeline) close() { f.cancel() }
++
++// fakeConsumerSource 独立有界消费源（Run 路径注入用；与假 broker 通道对接）。
++type fakeConsumerSource struct{ ch chan pipeline.Inbound }
++
++func newFakeConsumerSource(depth int) *fakeConsumerSource {
++	return &fakeConsumerSource{ch: make(chan pipeline.Inbound, depth)}
++}
++
++func (s *fakeConsumerSource) Messages() <-chan pipeline.Inbound { return s.ch }
++
++// contractEnvelope 契约 §3.2 上行消息 JSON（逐字样例；两路共用同一 batchId/payload）。
++const contractEnvelope = `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "20261121-100000-0001",
++  "sentAt": 1795212000000,
++  "points": [
++    {"pointCode": "F01_WS01_EQ001_M01", "ts": 1795211995000, "value": 98231.4, "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_M02", "ts": 1795211995000, "value": 132.5,  "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_S01", "ts": 1795211995000, "value": 1,      "quality": 0}
++  ]
++}`
++
++// ---- 镜像双流水线：同 batchId/payload 两路独立处理，结果逐字段一致 ----
++
++// 契约依据：brief 测试口径「两路上报一致性——同一 batchId/payload 经假 broker 与 HTTP
++// 入口流水线结果逐字段一致」：两套同构流水线分别走 MQTT（Run）与 HTTP（Submit），
++// 落库 SQL、缓存值、死信、流水线计数逐字段一致（MQTT 信封与 HTTP body 同构的直接证据）。
++func TestContractMQTTAndHTTPReportIsomorphicSameResult(t *testing.T) {
++	// 路径 A：假 broker data 主题 → mqttsource.Consumer（pipeline.Consumer 实现）→ Run 消费循环。
++	broker := newFakePort()
++	c := mqttsource.NewConsumer(broker, mqttsource.Options{
++		BackoffInitial: 5 * time.Millisecond,
++		Logger:         log.New(&strings.Builder{}, "", 0),
++	})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go c.Run(ctx)
++	a := newIsoPipelineWithConsumer(t, c) // 流水线消费源=MQTT 消费者（统一流水线接线）
++	defer a.close()
++	waitFor(t, "订阅完成", func() bool {
++		_, subCalls, _, _ := broker.snapshotState()
++		return subCalls == 3
++	})
++	if !broker.Deliver("iot/group_a/GW_F01_01/data", []byte(contractEnvelope)) {
++		t.Fatal("data 主题未命中订阅")
++	}
++	eventually(t, 2*time.Second, "MQTT 路写库", func() bool {
++		return a.pipe.Stats().WrittenPoints == 3
++	})
++
++	// 路径 B：HTTP 上报 → Submit 同步入口（网关令牌链 + PipelineSink）。
++	b := newIsoPipeline(t)
++	defer b.close()
++	sink := &httpapi.PipelineSink{Pipe: b.pipe}
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		&staticCredPuller{cred: gwtoken.Credential{ChannelID: 7, Ciphertext: "gw-token-secret"}}, 0)
++	handler := &httpapi.ReportHandler{Validator: validator, Sink: sink}
++
++	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/report", strings.NewReader(contractEnvelope))
++	req.Header.Set("X-Gateway-Token", "gw-token-secret")
++	req.Header.Set("Content-Type", "application/json")
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("HTTP 路状态 = %d, want 200（body=%s）", rec.Code, rec.Body.String())
++	}
++
++	eventually(t, 2*time.Second, "HTTP 路写库", func() bool {
++		return b.pipe.Stats().WrittenPoints == 3
++	})
++
++	// 逐字段一致：流水线计数。
++	sa, sb := a.pipe.Stats(), b.pipe.Stats()
++	if sa.ReceivedBatches != sb.ReceivedBatches || sa.AcceptedPoints != sb.AcceptedPoints ||
++		sa.DuplicateBatches != sb.DuplicateBatches || sa.DuplicatePoints != sb.DuplicatePoints ||
++		sa.DeadLettered != sb.DeadLettered || sa.WrittenPoints != sb.WrittenPoints ||
++		sa.RejectedBatches != sb.RejectedBatches {
++		t.Fatalf("两路流水线计数不一致:\n  MQTT = %+v\n  HTTP = %+v", sa, sb)
++	}
++	if sa.AcceptedPoints != 3 || sa.DeadLettered != 0 {
++		t.Fatalf("MQTT 计数异常: %+v", sa)
++	}
++
++	// 逐字段一致：落库 SQL（3 点位分属 2 张超级表 3 张子表 → 各 3 条全限定 INSERT，
++	// 逐条字节一致）。
++	sqlA, sqlB := a.exec.Calls(), b.exec.Calls()
++	if len(sqlA) != 3 || len(sqlB) != 3 {
++		t.Fatalf("写库调用数 MQTT=%d HTTP=%d, want 各 3（M01/M02/S01 三张子表分组）", len(sqlA), len(sqlB))
++	}
++	for i := range sqlA {
++		if sqlA[i].SQL != sqlB[i].SQL {
++			t.Fatalf("两路落库 SQL[%d] 不一致:\n  MQTT = %s\n  HTTP = %s", i, sqlA[i].SQL, sqlB[i].SQL)
++		}
++	}
++	if !strings.Contains(sqlA[0].SQL, "INSERT INTO iot_group_5fa.F01_5fWS01_5fEQ001_5fM01") {
++		t.Errorf("SQL 形态异常: %s", sqlA[0].SQL)
++	}
++
++	// 逐字段一致：点位缓存（v/q/ts 三键）。
++	for _, code := range []string{"F01_WS01_EQ001_M01", "F01_WS01_EQ001_M02", "F01_WS01_EQ001_S01"} {
++		va, errA := a.ptCache.GetPoint(context.Background(), "group_a", code)
++		vb, errB := b.ptCache.GetPoint(context.Background(), "group_a", code)
++		if errA != nil || errB != nil {
++			t.Fatalf("缓存读取失败 %s: %v / %v", code, errA, errB)
++		}
++		if va != vb {
++			t.Errorf("缓存值不一致 %s: MQTT=%+v HTTP=%+v", code, va, vb)
++		}
++	}
++
++	// 死信一致（同构信封零死信）。
++	if a.dead.count("unknown_code") != b.dead.count("unknown_code") || a.dead.count("unknown_code") != 0 {
++		t.Errorf("死信不一致或非零: MQTT=%d HTTP=%d", a.dead.count("unknown_code"), b.dead.count("unknown_code"))
++	}
++}
++
++// 契约依据：决策 2「MQTT 信封与 HTTP body 同构进同一流水线」——同一条流水线上，假 broker
++// 投递后 HTTP 重报同 batchId/payload：整批幂等命中（duplicate=true、受理口径一致）、
++// 落库仅一次（跨通道幂等——QoS1 重投与 HTTP 重试共享同一去重面）。
++//
++// MQTT 投递形态 = pipeline.Inbound{Tenant: 主题槽位, Payload: 信封原字节}（消费者路由产物）；
++// 经 Submit 注入即 Run 消费循环对每条消息调用的同一 processOne（0076 契约测试
++// TestContractSubmitSyncEntryMirrorsRunPath 已锁 Submit 与 Run 同构——共享五步顺序与去重面）。
++func TestContractMQTTAndHTTPSamePipelineCrossPathIdempotent(t *testing.T) {
++	p := newIsoPipeline(t)
++	defer p.close()
++
++	res := p.pipe.Submit(context.Background(), pipeline.Inbound{
++		Tenant:  "group_a",
++		Payload: []byte(contractEnvelope),
++	})
++	if res.Duplicate || res.Accepted != 3 {
++		t.Fatalf("MQTT 路首报 = %+v, want Duplicate=false Accepted=3", res)
++	}
++	eventually(t, 2*time.Second, "MQTT 路写库", func() bool { return p.pipe.Stats().WrittenPoints == 3 })
++
++	// HTTP 路：同 batchId/payload 重报 → 整批幂等（跨通道共享去重面）。
++	sink := &httpapi.PipelineSink{Pipe: p.pipe}
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		&staticCredPuller{cred: gwtoken.Credential{ChannelID: 7, Ciphertext: "gw-token-secret"}}, 0)
++	handler := &httpapi.ReportHandler{Validator: validator, Sink: sink}
++	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/report", strings.NewReader(contractEnvelope))
++	req.Header.Set("X-Gateway-Token", "gw-token-secret")
++	rec := httptest.NewRecorder()
++	handler.ServeHTTP(rec, req)
++	if rec.Code != http.StatusOK {
++		t.Fatalf("HTTP 状态 = %d, want 200（幂等重报按成功无操作）", rec.Code)
++	}
++	body := rec.Body.String()
++	if !strings.Contains(body, `"duplicate":true`) || !strings.Contains(body, `"accepted":3`) ||
++		!strings.Contains(body, `"rejected":0`) {
++		t.Errorf("HTTP 重报响应 = %s, want duplicate=true accepted=3 rejected=0（两路受理口径一致）", body)
++	}
++	// 落库仅一次：3 张子表各 1 条 INSERT（每条恰 1 个 VALUES 元组——唯一键恰一次写出，
++	// 跨通道幂等=零重复落库）。
++	calls := p.exec.Calls()
++	if len(calls) != 3 {
++		t.Errorf("落库调用 = %d, want 3（M01/M02/S01 三张子表各 1 条）", len(calls))
++	}
++	for i, call := range calls {
++		// 单行 INSERT 形态：VALUES 后恰一个元组（无第二个 "(..."）。
++		valuesPart := call.SQL[strings.Index(call.SQL, " VALUES ("):]
++		if strings.Contains(valuesPart[strings.Index(valuesPart, ")")+1:], "(") {
++			t.Errorf("INSERT[%d] 含多元组（跨通道重复落库嫌疑）: %s", i, call.SQL)
++		}
++	}
++}
++
++// staticCredPuller 固定凭据假拉取器（令牌链 mock 口径）。
++type staticCredPuller struct{ cred gwtoken.Credential }
++
++func (s *staticCredPuller) Pull(_ context.Context, _ int64, _ string) (gwtoken.Credential, error) {
++	return s.cred, nil
++}
++
++func eventually(t *testing.T, timeout time.Duration, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", what)
++}
+diff --git a/ingest/internal/pipeline/dedup_ttl.go b/ingest/internal/pipeline/dedup_ttl.go
+new file mode 100644
+index 0000000..ca674cd
+--- /dev/null
++++ b/ingest/internal/pipeline/dedup_ttl.go
+@@ -0,0 +1,160 @@
++// TASK-0027 决策 3：幂等真实现（单实例形态）——进程内有界 TTL 去重，替换内存假去重。
++//
++// 口径：
++//   - 原子性沿用 0076 修订轮范式（BUG-0002 红线）：MarkIfSeen 首见判定与标记在单锁内
++//     一次完成——check-then-act 两段式不可达，同键并发重报恰一处理；本实现不得降级为
++//     先查后写（与 BatchDeduper/PointDeduper 接口文档同纪律）。
++//   - TTL 即幂等窗口：窗口内重报=非首见；窗口过后同键视为新键（QoS1 重投超出窗口属
++//     新样本场景）。窗口默认 DefaultDedupTTL，必须 ≥ 网关 QoS1 重投窗口（broker 未确认
++//     消息在重连会话内重投，小时级）——配置过小的责任在装配方。
++//   - 有界性双保险：容量上限（live 条目数 ≤ cap，超限 FIFO 淘汰最早标记项，对齐
++//     ADR-0014 丢最旧口径）+ TTL 惰性过期回收（标记时顺带清理过期项，每项只出队一次，
++//     分摊 O(1)）——内存占用有界，不随运行时长无界增长。
++//   - 多实例演进位（登记）：单实例形态（README 并发模型起步口径）用进程内 TTL 去重；
++//     多实例水平扩展时幂等键必须共享存储 → Redis 化（SETNX+EXPIRE 等价单命令原子语义），
++//     经 BatchDeduper/PointDeduper 接口零改动替换（归 TASK-0028 存储面定版）。
++package pipeline
++
++import (
++	"fmt"
++	"sync"
++	"time"
++)
++
++// DefaultDedupTTL 幂等键保留窗口默认值（1h）：须 ≥ 常见 QoS1 重投窗口（broker 会话/
++// 重连窗口，小时级）；ingestd 经 INGEST_DEDUP_TTL 配置覆盖。
++const DefaultDedupTTL = time.Hour
++
++// defaultDedupCap 与内存假实现同默认容量。
++const defaultDedupCap = 65536
++
++// ttlEntry FIFO 队列节点：键 + 代次 + 标记时刻。同键 TTL 过期后重标记会追加新节点
++// （旧节点不出队、以代次隔离）——旧节点出队时代次不再匹配，不会误删新标记。
++type ttlEntry struct {
++	key string
++	gen uint64
++	at  time.Time
++}
++
++// ttlTable 有界 TTL 去重表内核（batchId 与 (pointCode,ts) 两适配器共用同一实现，
++// 消除第二份幂等语义逻辑）。
++type ttlTable struct {
++	mu    sync.Mutex
++	cap   int
++	ttl   time.Duration
++	now   func() time.Time // 时钟（真实时间；测试经短 TTL 驱动，不留注入口）
++	gen   uint64           // 代次发生器（单调递增）
++	live  int              // 活条目数（=map 大小；order 可含已过期/被覆盖的陈旧节点）
++	seen  map[string]ttlEntry
++	order []ttlEntry // 插入序 FIFO（淘汰与惰性过期都从头部出队）
++}
++
++func newTTLTable(capacity int, ttl time.Duration) *ttlTable {
++	if capacity <= 0 {
++		capacity = defaultDedupCap
++	}
++	if ttl <= 0 {
++		ttl = DefaultDedupTTL
++	}
++	return &ttlTable{
++		cap:  capacity,
++		ttl:  ttl,
++		now:  time.Now,
++		seen: make(map[string]ttlEntry, capacity),
++	}
++}
++
++// markIfSeen 原子标记并报告是否首见（单锁内完成：过期回收 → 窗口判定 → 容量淘汰 →
++// 标记，check-then-act 不可达）。
++func (t *ttlTable) markIfSeen(key string) bool {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	now := t.now()
++
++	// 惰性过期回收：仅出队头部过期项（插入序≈到期序，每项只出队一次，分摊 O(1)）。
++	// 队中部项到期由下方「标记时判过期」兜底，不依赖出队及时性。
++	for len(t.order) > 0 && now.Sub(t.order[0].at) >= t.ttl {
++		head := t.order[0]
++		t.order = t.order[1:]
++		if cur, ok := t.seen[head.key]; ok && cur.gen == head.gen {
++			delete(t.seen, head.key)
++			t.live--
++		}
++	}
++
++	if e, ok := t.seen[key]; ok {
++		if now.Sub(e.at) < t.ttl {
++			return false // 窗口内重报：非首见
++		}
++		// 已过期：视为首见（TTL=幂等窗口）。覆盖标记；旧节点仍在队中，出队时按代次
++		// 隔离（gen 不再匹配则跳过删除），live 计数不变（键仍在 map）。
++	}
++
++	// 容量淘汰：live ≥ cap 时出队至淘汰掉一个活条目为止（FIFO 最早标记项）。
++	if t.live >= t.cap {
++		for len(t.order) > 0 {
++			head := t.order[0]
++			t.order = t.order[1:]
++			if cur, ok := t.seen[head.key]; ok && cur.gen == head.gen {
++				delete(t.seen, head.key)
++				t.live--
++				break
++			}
++		}
++	}
++
++	t.gen++
++	t.seen[key] = ttlEntry{key: key, gen: t.gen, at: now}
++	t.order = append(t.order, ttlEntry{key: key, gen: t.gen, at: now})
++	t.live++
++	return true
++}
++
++// len 活条目数（观测：内存有界的直接证据）。
++func (t *ttlTable) len() int {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return t.live
++}
++
++// ttlTTL 返回生效的幂等窗口（观测/装配方自检）。
++func (t *ttlTable) ttlTTL() time.Duration {
++	return t.ttl
++}
++
++// TTLBatchDeduper batchId 整批幂等真实现（实现 BatchDeduper 接口）。
++type TTLBatchDeduper struct{ t *ttlTable }
++
++// NewTTLBatchDeduper 创建 batchId TTL 去重（capacity<=0 → 65536；ttl<=0 → DefaultDedupTTL）。
++func NewTTLBatchDeduper(capacity int, ttl time.Duration) *TTLBatchDeduper {
++	return &TTLBatchDeduper{t: newTTLTable(capacity, ttl)}
++}
++
++// MarkIfSeen 实现 BatchDeduper（原子语义见 ttlTable）。
++func (d *TTLBatchDeduper) MarkIfSeen(batchID string) bool { return d.t.markIfSeen(batchID) }
++
++// Len 活条目数。
++func (d *TTLBatchDeduper) Len() int { return d.t.len() }
++
++// TTL 生效幂等窗口。
++func (d *TTLBatchDeduper) TTL() time.Duration { return d.t.ttlTTL() }
++
++// TTLPointDeduper (pointCode, ts) 点级幂等真实现（实现 PointDeduper 接口；键粒度
++// 与内存假实现同构：pointCode \0 ts）。
++type TTLPointDeduper struct{ t *ttlTable }
++
++// NewTTLPointDeduper 创建点级 TTL 去重（默认值同 batchId 口径）。
++func NewTTLPointDeduper(capacity int, ttl time.Duration) *TTLPointDeduper {
++	return &TTLPointDeduper{t: newTTLTable(capacity, ttl)}
++}
++
++// MarkIfSeen 实现 PointDeduper（原子语义见 ttlTable）。
++func (d *TTLPointDeduper) MarkIfSeen(pointCode string, ts int64) bool {
++	return d.t.markIfSeen(fmt.Sprintf("%s\x00%d", pointCode, ts))
++}
++
++// Len 活条目数。
++func (d *TTLPointDeduper) Len() int { return d.t.len() }
++
++// TTL 生效幂等窗口。
++func (d *TTLPointDeduper) TTL() time.Duration { return d.t.ttlTTL() }
+diff --git a/ingest/internal/pipeline/dedup_ttl_contract_test.go b/ingest/internal/pipeline/dedup_ttl_contract_test.go
+new file mode 100644
+index 0000000..5be2b6d
+--- /dev/null
++++ b/ingest/internal/pipeline/dedup_ttl_contract_test.go
+@@ -0,0 +1,121 @@
++package pipeline_test
++
++import (
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0027 决策 3：幂等真实现——单实例形态用进程内有界 TTL 去重，替换内存假去重。
++//
++// 契约锚点：REQ-0013 验收 3「同 batchId 重发 → 整批只落一次；同点位同时间戳并发两条
++// 只入库一条」；QoS1 至少一次 → 重报是常态，幂等键 (pointCode, ts) + batchId。
++// 原子性沿用 0076 修订轮 MarkIfSeen 单锁原子范式（BUG-0002 红线：不得降级为先查后写）。
++// TTL 口径：进程内条目带过期时间——窗口内重报=非首见，窗口过后视为新键（TTL 即幂等
++// 窗口，须 ≥ 网关 QoS1 重投窗口，默认 1h 可配）；容量上限 FIFO 淘汰（对齐 ADR-0014
++// 丢最旧口径），内存有界。多实例演进位：水平扩展时幂等键必须共享存储 → Redis 化
++// （SETNX+EXPIRE 等价原子语义），接口零改动替换（javadoc 同登记）。
++
++// 契约依据：MarkIfSeen 原子语义——首见 true，窗口内重报 false（batchId 整批口径）。
++func TestContractTTLBatchDeduperMarkIfSeenWithinWindow(t *testing.T) {
++	d := pipeline.NewTTLBatchDeduper(0, 50*time.Millisecond)
++	if !d.MarkIfSeen("B-1") {
++		t.Fatal("首见 MarkIfSeen = false, want true")
++	}
++	if d.MarkIfSeen("B-1") {
++		t.Error("窗口内重报 MarkIfSeen = true, want false（batchId 整批幂等）")
++	}
++	if !d.MarkIfSeen("B-2") {
++		t.Error("不同 batchId MarkIfSeen = false, want true")
++	}
++	if d.Len() != 2 {
++		t.Errorf("Len = %d, want 2", d.Len())
++	}
++}
++
++// 契约依据：TTL 过期——窗口过后同键视为首见（幂等窗口=TTL，超窗口重投是新样本）。
++func TestContractTTLBatchDeduperExpiryReallows(t *testing.T) {
++	d := pipeline.NewTTLBatchDeduper(0, 30*time.Millisecond)
++	if !d.MarkIfSeen("B-TTL") {
++		t.Fatal("首见 MarkIfSeen = false, want true")
++	}
++	time.Sleep(60 * time.Millisecond) // 越过 TTL
++	if !d.MarkIfSeen("B-TTL") {
++		t.Error("TTL 过期后 MarkIfSeen = false, want true（幂等窗口=TTL）")
++	}
++}
++
++// 契约依据：(pointCode, ts) 幂等键同口径（键粒度=编码+采样时间）。
++func TestContractTTLPointDeduperMarkIfSeenAndExpiry(t *testing.T) {
++	d := pipeline.NewTTLPointDeduper(0, 30*time.Millisecond)
++	if !d.MarkIfSeen("F01_WS01_EQ001_M01", 1795211995000) {
++		t.Fatal("首见 MarkIfSeen = false, want true")
++	}
++	if d.MarkIfSeen("F01_WS01_EQ001_M01", 1795211995000) {
++		t.Error("窗口内重报 = true, want false")
++	}
++	if !d.MarkIfSeen("F01_WS01_EQ001_M01", 1795211995001) {
++		t.Error("不同 ts MarkIfSeen = false, want true（幂等键含 ts）")
++	}
++	if !d.MarkIfSeen("F01_WS01_EQ001_M02", 1795211995000) {
++		t.Error("不同 pointCode MarkIfSeen = false, want true（幂等键含编码）")
++	}
++	time.Sleep(60 * time.Millisecond)
++	if !d.MarkIfSeen("F01_WS01_EQ001_M01", 1795211995000) {
++		t.Error("TTL 过期后 = false, want true")
++	}
++}
++
++// 契约依据：有界性——容量上限 FIFO 淘汰（对齐 ADR-0014 丢最旧口径）：超容量淘汰
++// 最早标记项，淘汰项重报视为首见，live 数恒 ≤ cap（内存有界）。
++func TestContractTTLBatchDeduperCapBoundFIFOEviction(t *testing.T) {
++	d := pipeline.NewTTLBatchDeduper(2, time.Hour)
++	if !d.MarkIfSeen("A") || !d.MarkIfSeen("B") {
++		t.Fatal("首见标记失败")
++	}
++	if d.MarkIfSeen("C") {
++		// C 挤掉 A：正常
++	} else {
++		t.Fatal("新键 C MarkIfSeen = false, want true")
++	}
++	if d.Len() != 2 {
++		t.Errorf("淘汰后 Len = %d, want 2（有界）", d.Len())
++	}
++	if !d.MarkIfSeen("A") {
++		t.Error("被淘汰最早项 A 重报 MarkIfSeen = false, want true（FIFO 淘汰语义）")
++	}
++	if d.MarkIfSeen("C") {
++		t.Error("仍在窗口内的 C MarkIfSeen = true, want false（淘汰只挤最早项）")
++	}
++}
++
++// 契约依据：TTL 过期条目被回收——惰性清理后 Len 收敛到未过期项数（不无界增长）。
++func TestContractTTLBatchDeduperExpiredEntriesReclaimed(t *testing.T) {
++	d := pipeline.NewTTLBatchDeduper(0, 30*time.Millisecond)
++	for i := 0; i < 10; i++ {
++		d.MarkIfSeen("B-RECLAIM") // 同键反复标记（窗口内重报不重复计数）
++	}
++	d.MarkIfSeen("B-KEEP")
++	time.Sleep(60 * time.Millisecond) // B-RECLAIM 与 B-KEEP 同窗口标记，一并过期
++	if !d.MarkIfSeen("B-TRIGGER") {
++		t.Fatal("触发清理的标记失败")
++	}
++	// 过期项已回收：仅 B-TRIGGER 活着。为什么现在对了：B-KEEP 与 B-RECLAIM 同在
++	// sleep 前标记、同窗口过期，惰性清理按到期序一并回收——Len 收敛到未过期项数。
++	if got := d.Len(); got != 1 {
++		t.Errorf("过期回收后 Len = %d, want 1（仅 B-TRIGGER；过期项已回收）", got)
++	}
++}
++
++// 契约依据：默认值——capacity<=0 → 65536（与内存假实现同默认）；ttl<=0 → DefaultDedupTTL。
++func TestContractTTLDeduperDefaults(t *testing.T) {
++	d := pipeline.NewTTLBatchDeduper(0, 0)
++	if d.TTL() != pipeline.DefaultDedupTTL {
++		t.Errorf("默认 TTL = %v, want %v", d.TTL(), pipeline.DefaultDedupTTL)
++	}
++	p := pipeline.NewTTLPointDeduper(0, 0)
++	if p.TTL() != pipeline.DefaultDedupTTL {
++		t.Errorf("点级默认 TTL = %v, want %v", p.TTL(), pipeline.DefaultDedupTTL)
++	}
++}
+diff --git a/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go b/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go
+new file mode 100644
+index 0000000..b3dc94a
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_submit_ttl_race_contract_test.go
+@@ -0,0 +1,181 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0027 决策 3：并发去重红线测试保留并扩到新实现（TTL 去重）。
++//
++// 0076 修订轮 C1 的探针思路转正回归在 Memory 假实现上（pipeline_submit_race_contract_test.go
++// 原样保留）；本文件把同一红线扩到 TASK-0027 TTL 真实现：同 batchId / 同 (pointCode, ts)
++// 并发重报在 TTL 去重装配下恰一处理（BUG-0002 红线——MarkIfSeen 单锁原子语义不得降级）。
++
++// ttlHarness TTL 去重装配的流水线 harness（结构与 0073 harness 一致，仅去重实现换成
++// TASK-0027 TTL 真实现——ingestd 装配同款）。
++type ttlHarness struct {
++	executor *tdengine.FakeExecutor
++	pipe     *pipeline.Pipeline
++}
++
++func newTTLHarness(t *testing.T, cfg pipeline.Config) *ttlHarness {
++	t.Helper()
++	snap, err := snapshot.ParseSnapshot([]byte(defaultSnapshotJSON))
++	if err != nil {
++		t.Fatalf("预置快照解析失败: %v", err)
++	}
++	snapCache := snapshot.NewCache()
++	if err := snapCache.Replace(snap); err != nil {
++		t.Fatalf("预置快照替换失败: %v", err)
++	}
++	h := &ttlHarness{executor: tdengine.NewFakeExecutor(0)}
++	deps := pipeline.Deps{
++		Consumer:  newFakeConsumer(64), // 有界消费源（Run 路径空闲注入用）
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   pipeline.NewTTLBatchDeduper(0, 0), // 默认 65536 / DefaultDedupTTL
++		Points:    pipeline.NewTTLPointDeduper(0, 0),
++		Judge:     passthroughJudge,
++		Dead:      &recordingSink{},
++		Writer:    &tdengine.Writer{Ex: h.executor},
++		Cache:     cache.NewMemoryPointCache(),
++	}
++	p, err := pipeline.Assemble(cfg, deps)
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	h.pipe = p
++	return h
++}
++
++// 契约依据：REQ-0013 验收 3「同 batchId 重发 → 整批只落一次」的并发面——TTL 去重装配下
++// 同 batchId 并发双 Submit 恰一处理（红线：并发重报零重复入攒批）。
++func TestContractTTLDedupRaceSameBatchIdExactlyOnce(t *testing.T) {
++	const rounds = 30
++	const goroutines = 12
++	h := newTTLHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	for round := 0; round < rounds; round++ {
++		payload := fmt.Sprintf(
++			`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-TTLRACE-%03d","sentAt":1795212000000,"points":[%s]}`,
++			round, pointJSON("F01_WS01_EQ001_M01", 1795211995000+int64(round), 132.5, 0))
++
++		results := make([]pipeline.SubmitResult, goroutines)
++		var wg sync.WaitGroup
++		start := make(chan struct{})
++		for i := 0; i < goroutines; i++ {
++			wg.Add(1)
++			go func(i int) {
++				defer wg.Done()
++				<-start
++				results[i] = h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++			}(i)
++		}
++		close(start)
++		wg.Wait()
++
++		var nonDup, dup int
++		for _, r := range results {
++			if r.Duplicate {
++				dup++
++			} else {
++				nonDup++
++			}
++		}
++		if nonDup != 1 || dup != goroutines-1 {
++			t.Fatalf("round %d: TTL 去重并发恰一处理被破坏——nonDup=%d dup=%d, want 1/%d",
++				round, nonDup, dup, goroutines-1)
++		}
++	}
++
++	st := h.pipe.Stats()
++	if st.DuplicateBatches != rounds*(goroutines-1) {
++		t.Errorf("DuplicateBatches = %d, want %d（并发整批重报零重复处理）", st.DuplicateBatches, rounds*(goroutines-1))
++	}
++	if st.AcceptedPoints != rounds {
++		t.Errorf("AcceptedPoints = %d, want %d（每轮恰一行，零重复入攒批）", st.AcceptedPoints, rounds)
++	}
++}
++
++// 契约依据：REQ-0013 验收 3「同点位同时间戳并发两条只入库一条」的并发面——TTL 去重
++// 装配下 (pointCode, ts) 跨批并发重报恰一行写出。
++func TestContractTTLDedupRaceSamePointTsExactlyOnce(t *testing.T) {
++	const rounds = 30
++	const goroutines = 12
++	h := newTTLHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	for round := 0; round < rounds; round++ {
++		ts := 1795211995000 + int64(round)
++		var wg sync.WaitGroup
++		start := make(chan struct{})
++		for i := 0; i < goroutines; i++ {
++			wg.Add(1)
++			go func(i int) {
++				defer wg.Done()
++				<-start
++				payload := fmt.Sprintf(
++					`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-TTLPRACE-%03d-%02d","sentAt":1795212000000,"points":[%s]}`,
++					round, i, pointJSON("F01_WS01_EQ001_M01", ts, 132.5, 0))
++				h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++			}(i)
++		}
++		close(start)
++		wg.Wait()
++	}
++
++	st := h.pipe.Stats()
++	if st.AcceptedPoints != rounds {
++		t.Errorf("AcceptedPoints = %d, want %d（每轮恰一行，零重复入攒批）", st.AcceptedPoints, rounds)
++	}
++	if st.DuplicatePoints != rounds*(goroutines-1) {
++		t.Errorf("DuplicatePoints = %d, want %d（并发同键重报零重复处理）", st.DuplicatePoints, rounds*(goroutines-1))
++	}
++	eventually(t, 2*time.Second, "写出行数恰为 rounds", func() bool {
++		return h.pipe.Stats().WrittenPoints == rounds
++	})
++}
++
++// 契约依据：决策 3——(pointCode, ts) 单条幂等 + batchId 整批幂等在 TTL 真实现下的
++// 串行语义回归（重复单条/重复整批不重复落库；互异键不受影响）。
++func TestContractTTLDedupPipelineSingleAndBatchDedup(t *testing.T) {
++	h := newTTLHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	payload := `{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-TTLSEQ","sentAt":1795212000000,"points":[` +
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 132.5, 0) + `]}`
++	r1 := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++	if r1.Duplicate || r1.Accepted != 1 {
++		t.Fatalf("首见 = %+v, want Duplicate=false Accepted=1", r1)
++	}
++	r2 := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++	if !r2.Duplicate || r2.Accepted != 1 || r2.Rejected != 0 {
++		t.Fatalf("整批重报 = %+v, want Duplicate=true Accepted=1 Rejected=0（重报按成功无操作）", r2)
++	}
++	// 互异 batchId、同 (pointCode, ts)：点级幂等。
++	payload2 := `{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-TTLSEQ-2","sentAt":1795212000000,"points":[` +
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 132.5, 0) + `]}`
++	r3 := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload2)})
++	if r3.Duplicate || r3.Accepted != 1 {
++		t.Fatalf("跨批同键 = %+v, want Duplicate=false Accepted=1（点级幂等按受理计）", r3)
++	}
++	eventually(t, 2*time.Second, "写出行数恰为 1（唯一键恰一次写出）", func() bool {
++		return h.pipe.Stats().WrittenPoints == 1
++	})
++}
+diff --git a/ingest/internal/snapshot/client.go b/ingest/internal/snapshot/client.go
+new file mode 100644
+index 0000000..a53b73f
+--- /dev/null
++++ b/ingest/internal/snapshot/client.go
+@@ -0,0 +1,166 @@
++// TASK-0027 决策 4：快照真客户端——对接管理系统内部快照端点（TASK-0026 交付）。
++//
++// 端点契约（TASK-0026 实测形态，backend iot/publish/controller/IotPublishInternalController）：
++//
++//	GET {BaseURL}/internal/v1/config/snapshot?scopeType=&scopeId=&version=&tenant=
++//	请求头 X-Internal-Token（内部静态令牌，与凭据拉取同源）；
++//	响应 = 后端框架 Result<InternalSnapshotVO>：
++//	  {code, message, data:{version, snapshotHash, snapshotUri, schemaVersion, snapshot}}
++//	  —— snapshot 为嵌套 JSON 对象（非转义字符串）。
++//
++// 哈希校验口径（决策 4 + §3.3「校验哈希」）——对账锚点语义（live 冒烟实证后的修正）：
++// snapshotHash 是后端对**原始存储字节**的 SHA-256（64 位小写 hex）；而端点出站的快照体
++// 是 Jackson 再序列化形态（BigDecimal 5.000000 → DoubleNode 5.0），与原始字节不逐字节
++// 一致——下游从响应体**不可重算**该哈希（live 首拉即 hash mismatch，fail-soft 拦截实证）。
++// 故客户端哈希校验 = 锚点形态校验（64 位小写 hex）+ 原样承载（通知 hash 比对挂点归
++// 通知消费〔TD-0057〕，同版本稳定性归 Reconciler 漂移探测）；快照体完整性由
++// ParseSnapshot Schema 校验 + 后端取回侧哈希核对（readAndVerifySnapshot 500）承担。
++// 契约留白登记：§3.3 未定义哈希的字节域（存储原文 vs 出站形态），见 TASK-0027 报告。
++//
++// 0073 HTTPFetcher（契约信封抽象，§3.3 拟定键名）保留不动——本客户端是端点契约的
++// 真实现，二者并存：契约测试锁 HTTPFetcher 形状，端点对接用本客户端。
++package snapshot
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"sync"
++	"time"
++)
++
++// DefaultFetchTimeout 快照拉取默认超时：后端不可达必须在有限时间内转错误
++//（对账循环 fail-soft 保持旧版，不悬挂）。
++const DefaultFetchTimeout = 10 * time.Second
++
++// InternalTokenHeader 内部静态令牌请求头（与 gwtoken 凭据拉取同源：后端
++// InternalAuthChecker.TOKEN_HEADER 同名对齐）。
++const InternalTokenHeader = "X-Internal-Token"
++
++// resultSuccessCode 后端框架 Result 成功业务码（ot-core ResultCode.SUCCESS=200）。
++const resultSuccessCode = 200
++
++// internalSnapshotVO Result<InternalSnapshotVO> 的 data 形态（端点契约逐字段）。
++type internalSnapshotVO struct {
++	Version       int64           `json:"version"`
++	SnapshotHash  string          `json:"snapshotHash"`
++	SnapshotUri   string          `json:"snapshotUri"`
++	SchemaVersion string          `json:"schemaVersion"`
++	Snapshot      json.RawMessage `json:"snapshot"`
++}
++
++// resultEnvelope 后端框架 Result 信封。
++type resultEnvelope struct {
++	Code    int                `json:"code"`
++	Message string             `json:"message"`
++	Data    *internalSnapshotVO `json:"data"`
++}
++
++// InternalSnapshotClient 快照真客户端（实现 SnapshotFetcher 接口，零改动替换假端点）。
++type InternalSnapshotClient struct {
++	// BaseURL 管理系统基址（如 http://mgmt-host:8098）。
++	BaseURL string
++	// InternalToken 内部静态令牌（X-Internal-Token 头；空 = 不带头，服务端必拒——fail-closed）。
++	InternalToken string
++	// Tenant 可选消歧参数（跨租户同名 scope 时携带租户编码；空 = 不带）。
++	Tenant string
++	// Timeout 单次拉取超时；<=0 → DefaultFetchTimeout。
++	Timeout time.Duration
++
++	clientOnce sync.Once
++	client     *http.Client
++}
++
++func (c *InternalSnapshotClient) httpClient() *http.Client {
++	c.clientOnce.Do(func() {
++		timeout := c.Timeout
++		if timeout <= 0 {
++			timeout = DefaultFetchTimeout
++		}
++		c.client = &http.Client{Timeout: timeout}
++	})
++	return c.client
++}
++
++// Fetch 拉取全量快照并执行端点契约纪律：
++// 非 200 HTTP 状态 / 非 200 业务码 / data 缺失 / 哈希不一致 / 快照体校验失败 /
++// 信封与快照体 version 不同值（§3.3）一律转错误——调用方（Reconciler）保持旧版。
++func (c *InternalSnapshotClient) Fetch(ctx context.Context, scope Scope) (*FetchResult, error) {
++	q := url.Values{}
++	q.Set("scopeType", strconv.Itoa(scope.Type))
++	q.Set("scopeId", strconv.FormatInt(scope.ID, 10))
++	if scope.Version > 0 {
++		q.Set("version", strconv.FormatInt(scope.Version, 10))
++	}
++	if c.Tenant != "" {
++		q.Set("tenant", c.Tenant)
++	}
++	endpoint := c.BaseURL + SnapshotPath + "?" + q.Encode()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 构造快照拉取请求失败: %w", err)
++	}
++	if c.InternalToken != "" {
++		req.Header.Set(InternalTokenHeader, c.InternalToken)
++	}
++
++	resp, err := c.httpClient().Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 快照拉取失败（后端不可达）: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 读取快照响应失败: %w", err)
++	}
++
++	var env resultEnvelope
++	if err := json.Unmarshal(body, &env); err != nil {
++		return nil, fmt.Errorf("snapshot: 快照响应解析失败 status=%d body=%s: %w", resp.StatusCode, truncate(body, 256), err)
++	}
++	if resp.StatusCode != http.StatusOK || env.Code != resultSuccessCode {
++		return nil, fmt.Errorf("snapshot: 快照拉取失败 status=%d code=%d message=%q", resp.StatusCode, env.Code, env.Message)
++	}
++	if env.Data == nil {
++		return nil, fmt.Errorf("snapshot: 快照响应缺 data（Result<InternalSnapshotVO> 形态）")
++	}
++	if len(env.Data.Snapshot) == 0 {
++		return nil, fmt.Errorf("snapshot: 快照响应缺快照体（version=%d）", env.Data.Version)
++	}
++
++	// 哈希校验（决策 4，对账锚点口径）：snapshotHash 须为 64 位小写 hex——形态异常拒收
++	//（哈希值本身原样承载：原始字节域哈希不可从再序列化出站体重算，见包注释）。
++	if !isSnapshotHashForm(env.Data.SnapshotHash) {
++		return nil, fmt.Errorf("snapshot: snapshotHash 形态非法（须 64 位小写 hex）version=%d got=%q",
++			env.Data.Version, env.Data.SnapshotHash)
++	}
++
++	snap, err := ParseSnapshot(env.Data.Snapshot)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 快照体校验失败: %w", err)
++	}
++	if env.Data.Version != snap.Version {
++		return nil, fmt.Errorf("snapshot: 信封 version(%d) 与快照体 version(%d) 不同值（§3.3 要求同值），拒收",
++			env.Data.Version, snap.Version)
++	}
++	return &FetchResult{Snapshot: snap, SnapshotHash: env.Data.SnapshotHash, Version: env.Data.Version}, nil
++}
++
++// isSnapshotHashForm 校验哈希锚点形态：64 位小写十六进制。
++func isSnapshotHashForm(h string) bool {
++	if len(h) != 64 {
++		return false
++	}
++	for i := 0; i < len(h); i++ {
++		b := h[i]
++		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/ingest/internal/snapshot/client_contract_test.go b/ingest/internal/snapshot/client_contract_test.go
+new file mode 100644
+index 0000000..a10247c
+--- /dev/null
++++ b/ingest/internal/snapshot/client_contract_test.go
+@@ -0,0 +1,227 @@
++package snapshot_test
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// TASK-0027 决策 4：快照真客户端（GET /internal/v1/config/snapshot，内部令牌鉴权头；
++// 响应 version/snapshotHash/snapshot 体——哈希校验 + 原子替换复用 0073 缓存）。
++//
++// 契约锚点：
++//   - 端点契约 TASK-0026：Result<InternalSnapshotVO> 信封 {code, message, data:{version,
++//     snapshotHash, snapshotUri, schemaVersion, snapshot}}——snapshot 为嵌套 JSON 对象；
++//     内部令牌头 X-Internal-Token（与凭据拉取同源）；tenant 可选消歧参数。
++//   - 快照 Schema v1.0.1 §3.3：响应含 version、snapshotHash 与快照体；信封 version 与
++//     快照体顶层 version 同值；「接入服务收到通知后按版本拉新快照、校验、原子替换缓存
++//     （新快照校验失败则继续用旧版并回执失败）」。
++//   - snapshotHash 口径（backend SnapshotStorage.sha256Hex）：SHA-256(快照体 UTF-8 字节)
++//     64 位小写十六进制——快照体经 Jackson 往返字节稳定（live 冒烟哈希核对实证）。
++
++// clientBodyJSON 快照体（顶层结构逐字取自 v1.0.1 示例形态）。
++const clientBodyJSON = `{"schemaVersion":"1.0.1","tenantId":1,"scopeType":1,"scopeId":88,"version":17,` +
++	`"points":[{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","status":1}]}`
++
++// hashOf 快照体字节的 SHA-256（与 backend SnapshotStorage.sha256Hex 同算法同输入）。
++func hashOf(body string) string {
++	sum := sha256.Sum256([]byte(body))
++	return hex.EncodeToString(sum[:])
++}
++
++// clientServer 起假内部端点：回放 Result<InternalSnapshotVO> 信封；断言请求形态。
++type clientServer struct {
++	srv        *httptest.Server
++	gotPath    string
++	gotQuery   map[string][]string
++	gotToken   string
++	hash       string
++	body       string
++	statusCode int
++	code       int
++}
++
++func newClientServer(t *testing.T, mutate func(*clientServer)) *clientServer {
++	t.Helper()
++	c := &clientServer{body: clientBodyJSON, hash: hashOf(clientBodyJSON), statusCode: http.StatusOK, code: 200}
++	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		c.gotPath = r.URL.Path
++		c.gotQuery = r.URL.Query()
++		c.gotToken = r.Header.Get("X-Internal-Token")
++		if mutate != nil {
++			mutate(c)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(c.statusCode)
++		fmt.Fprintf(w, `{"code":%d,"message":"操作成功","data":{"version":17,"snapshotHash":%q,`+
++			`"snapshotUri":"1/1-88-17.json","schemaVersion":"1.0.1","snapshot":%s}}`, c.code, c.hash, c.body)
++	}))
++	t.Cleanup(c.srv.Close)
++	return c
++}
++
++func newClient(url string) *snapshot.InternalSnapshotClient {
++	return &snapshot.InternalSnapshotClient{BaseURL: url, InternalToken: "internal-token", Timeout: 2 * time.Second}
++}
++
++// 契约依据：端点契约——GET /internal/v1/config/snapshot?scopeType=&scopeId=&version=；
++// 内部令牌鉴权头 X-Internal-Token。
++func TestContractInternalSnapshotClientRequestShape(t *testing.T) {
++	c := newClientServer(t, nil)
++	f := newClient(c.srv.URL)
++	res, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88, Version: 17})
++	if err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if c.gotPath != "/internal/v1/config/snapshot" {
++		t.Errorf("path = %q, want /internal/v1/config/snapshot", c.gotPath)
++	}
++	if c.gotToken != "internal-token" {
++		t.Errorf("X-Internal-Token = %q, want internal-token（内部令牌鉴权头）", c.gotToken)
++	}
++	q := url.Values(c.gotQuery)
++	if q.Get("scopeType") != "1" || q.Get("scopeId") != "88" || q.Get("version") != "17" {
++		t.Errorf("query = %v, want scopeType=1&scopeId=88&version=17", q)
++	}
++	if res.Version != 17 || res.SnapshotHash != c.hash || res.Snapshot == nil {
++		t.Errorf("result = version:%d hash:%q snap:%v", res.Version, res.SnapshotHash, res.Snapshot)
++	}
++}
++
++// 契约依据：§3.3「不带 version 返回最新版」——Version=0 请求不带 version 参数；
++// Tenant 消歧参数按端点契约可选携带（跨租户同名 scope）。
++func TestContractInternalSnapshotClientLatestAndTenantParam(t *testing.T) {
++	c := newClientServer(t, nil)
++	f := newClient(c.srv.URL)
++	f.Tenant = "default"
++	if _, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if _, present := c.gotQuery["version"]; present {
++		t.Error("Version=0 请求不应携带 version 参数（返回最新版）")
++	}
++	if got := url.Values(c.gotQuery).Get("tenant"); got != "default" {
++		t.Errorf("tenant = %q, want default（消歧参数）", got)
++	}
++}
++
++// 契约依据：决策 4「哈希校验」+ §3.3「拉新快照、校验哈希」——哈希校验=对账锚点口径：
++// snapshotHash 是后端对**原始存储字节**的 SHA-256（live 冒烟实证：端点出站的快照体是
++// Jackson 再序列化形态——5.000000→5.0——与原始字节不逐字节一致，下游不可重算哈希）。
++// 故客户端只做锚点形态校验（64 位小写 hex），哈希值本身作为对账锚原样承载
++//（通知 hash 比对挂点归通知消费，同版本稳定性归 Reconciler）。
++func TestContractInternalSnapshotClientHashIsAnchorNotRecomputed(t *testing.T) {
++	c := newClientServer(t, func(c *clientServer) { c.hash = strings.Repeat("ab", 32) }) // ≠ sha256(body)，形态合法
++	res, err := newClient(c.srv.URL).Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88})
++	if err != nil {
++		t.Fatalf("锚点哈希 Fetch error: %v", err)
++	}
++	if res.SnapshotHash != strings.Repeat("ab", 32) {
++		t.Errorf("hash = %q, want 原样承载", res.SnapshotHash)
++	}
++}
++
++// 契约依据：哈希锚点形态校验——非 64 位小写 hex 的 snapshotHash 拒收（防端点异常
++// 形态污染对账面）。
++func TestContractInternalSnapshotClientHashFormatValidated(t *testing.T) {
++	cases := []struct {
++		name string
++		hash string
++	}{
++		{"空哈希", ""},
++		{"长度不足", "abc123"},
++		{"大写 hex", strings.ToUpper(strings.Repeat("ab", 32))},
++		{"非 hex 字符", strings.Repeat("zz", 32)},
++	}
++	for _, c := range cases {
++		s := newClientServer(t, func(cc *clientServer) { cc.hash = c.hash })
++		if res, err := newClient(s.srv.URL).Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err == nil {
++			t.Errorf("%s: Fetch error = nil, want 拒收; res=%+v", c.name, res)
++		}
++	}
++}
++
++// 契约依据：§3.3 信封纪律——信封 version 与快照体顶层 version 同值，不同值拒收
++// （沿用 0073 HTTPFetcher 口径）。
++func TestContractInternalSnapshotClientEnvelopeVersionMismatchRejected(t *testing.T) {
++	c := newClientServer(t, func(c *clientServer) {
++		c.body = strings.Replace(clientBodyJSON, `"version":17,`, `"version":16,`, 1)
++		c.hash = hashOf(c.body)
++	})
++	if res, err := newClient(c.srv.URL).Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err == nil {
++		t.Fatalf("信封/体 version 不同值 Fetch error = nil, want 拒收; res = %+v", res)
++	}
++}
++
++// 契约依据：内部端点契约——非 200 HTTP 状态 / 非 200 业务码（401 令牌无效、400 指定版
++// 不存在等）一律转错误（拉取失败 → 调用方保持旧版，fail-soft 不中断对账循环）。
++func TestContractInternalSnapshotClientFailureResponses(t *testing.T) {
++	cases := []struct {
++		name       string
++		statusCode int
++		code       int
++	}{
++		{"内部令牌无效 401", http.StatusOK, 401},
++		{"HTTP 401", http.StatusUnauthorized, 401},
++		{"指定版本不存在 400", http.StatusOK, 400},
++		{"服务端 500", http.StatusOK, 500},
++	}
++	for _, c := range cases {
++		s := newClientServer(t, func(cc *clientServer) { cc.statusCode = c.statusCode; cc.code = c.code })
++		_, err := newClient(s.srv.URL).Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88})
++		if err == nil {
++			t.Errorf("%s: Fetch error = nil, want 失败", c.name)
++		}
++	}
++}
++
++// 契约依据：快照体校验失败（Schema 违反）拒收——哈希一致也不能放过非法快照体
++// （校验失败继续用旧版，§3.3 接入消费方式）。
++func TestContractInternalSnapshotClientInvalidBodyRejected(t *testing.T) {
++	c := newClientServer(t, func(c *clientServer) {
++		c.body = strings.Replace(clientBodyJSON, `"dataType":1`, `"dataType":9`, 1)
++		c.hash = hashOf(c.body)
++	})
++	if res, err := newClient(c.srv.URL).Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err == nil {
++		t.Fatalf("非法快照体 Fetch error = nil, want 拒收; res = %+v", res)
++	}
++}
++
++// 契约依据：后端不可达在有限时间内转错误（对账循环 fail-soft 保持旧版，不悬挂）。
++func TestContractInternalSnapshotClientBackendUnreachableTimesOut(t *testing.T) {
++	f := &snapshot.InternalSnapshotClient{BaseURL: "http://127.0.0.1:1", InternalToken: "t", Timeout: 300 * time.Millisecond}
++	start := time.Now()
++	if _, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err == nil {
++		t.Fatal("Fetch error = nil, want 不可达错误")
++	}
++	if elapsed := time.Since(start); elapsed > 3*time.Second {
++		t.Errorf("不可达耗时 %v, want 有限时间（超时生效）", elapsed)
++	}
++}
++
++// 契约依据：决策 4「原子替换复用 0073 缓存」——拉取成功经 Cache.Replace 原子换入
++//（校验失败保持旧版的原子性由 0073 缓存契约承担，此处锁接线语义）。
++func TestContractInternalSnapshotClientFeedsCacheAtomicReplace(t *testing.T) {
++	c := newClientServer(t, nil)
++	cache := snapshot.NewCache()
++	f := newClient(c.srv.URL)
++	res, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88})
++	if err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if err := cache.Replace(res.Snapshot); err != nil {
++		t.Fatalf("Replace error: %v", err)
++	}
++	if _, ok := cache.LookupPoint("F01_WS01_EQ001_M01"); !ok {
++		t.Error("替换后 LookupPoint 未命中（原子替换接线断）")
++	}
++}
+diff --git a/ingest/internal/snapshot/reconciler.go b/ingest/internal/snapshot/reconciler.go
+new file mode 100644
+index 0000000..6eaaaa7
+--- /dev/null
++++ b/ingest/internal/snapshot/reconciler.go
+@@ -0,0 +1,129 @@
++// TASK-0027 决策 4：拉取对账循环——config.changed 通知本期不消费（通知消费归后续，
++// TD 登记随 TD-0057），周期拉取兜底覆盖 REQ-0033 的下游对账语义。
++//
++// 消费方式（快照 Schema v1.0.1 §3.3「接入消费方式」逐字对齐）：
++//	收到通知后按版本拉新快照、校验、原子替换缓存（新快照校验失败则继续用旧版并回执失败）
++// 通知路径缺位时以周期拉取替代触发源：每 Interval 拉最新快照（Scope.Version=0），
++// 哈希校验 + Schema 校验通过 → Cache.Replace 原子换入（0073 缓存）；失败保持旧版、
++// 计数并告警日志（fail-soft——拉取失败不阻断 HTTP 上报路径），下个窗口重试。
++// 版本与哈希均未变化时跳过替换（对账幂等，不无谓换入）。
++package snapshot
++
++import (
++	"context"
++	"fmt"
++	"log"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// DefaultReconcileInterval 拉取对账默认周期（30s）：通知缺位时的变更感知上限；
++// ingestd 经 INGEST_SNAPSHOT_INTERVAL 配置覆盖。
++const DefaultReconcileInterval = 30 * time.Second
++
++// Reconciler 拉取对账循环。
++type Reconciler struct {
++	// Fetcher 快照拉取客户端（真实现 InternalSnapshotClient；测试可注入）。
++	Fetcher SnapshotFetcher
++	// Cache 本地快照缓存（0073 原子替换缓存）。
++	Cache *Cache
++	// Scope 对账范围（Version 字段忽略——恒拉最新版）。
++	Scope Scope
++	// Interval 对账周期；<=0 → DefaultReconcileInterval。
++	Interval time.Duration
++	// Logger 告警日志（失败/替换）；nil → log.Default()。
++	Logger *log.Logger
++
++	pulls    atomic.Int64
++	failures atomic.Int64
++	replaced atomic.Int64
++	skipped  atomic.Int64
++
++	// mu/lastVersion/lastHash 本进程拉取锚（§3.3「校验哈希」对账口径）：同版本哈希
++	// 漂移 = 存储被篡改/端点异常探测（fail-soft 拒收保持旧版）。
++	mu          sync.Mutex
++	lastVersion int64
++	lastHash    string
++}
++
++func (r *Reconciler) logger() *log.Logger {
++	if r.Logger != nil {
++		return r.Logger
++	}
++	return log.Default()
++}
++
++// Pulls 累计拉取次数（观测）。
++func (r *Reconciler) Pulls() int64 { return r.pulls.Load() }
++
++// Failures 累计拉取失败次数（观测）。
++func (r *Reconciler) Failures() int64 { return r.failures.Load() }
++
++// Replaced 累计替换次数（观测）。
++func (r *Reconciler) Replaced() int64 { return r.replaced.Load() }
++
++// Skipped 同版本同哈希跳过次数（观测）。
++func (r *Reconciler) Skipped() int64 { return r.skipped.Load() }
++
++// Run 启动对账循环：启动即拉取一次（不等首个 tick——空缓存尽快装载），此后每
++// Interval 对账一次；阻塞直至 ctx 取消（优雅停机组成部分）。
++func (r *Reconciler) Run(ctx context.Context) {
++	r.pullOnce(ctx)
++	interval := r.Interval
++	if interval <= 0 {
++		interval = DefaultReconcileInterval
++	}
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			r.pullOnce(ctx)
++		}
++	}
++}
++
++// PullOnce 单次对账：拉最新 → 哈希/校验由 Fetcher 契约承担 → 同版本哈希漂移探测 →
++// 版本哈希未变跳过 → 原子替换；失败保持旧版、计数、告警日志（fail-soft）。
++func (r *Reconciler) PullOnce(ctx context.Context) error { return r.pullOnce(ctx) }
++
++func (r *Reconciler) pullOnce(ctx context.Context) error {
++	r.pulls.Add(1)
++	res, err := r.Fetcher.Fetch(ctx, r.Scope)
++	if err != nil {
++		r.failures.Add(1)
++		r.logger().Printf("snapshot: 对账拉取失败（fail-soft 保持旧版，下个窗口重试）: %v", err)
++		return err
++	}
++
++	r.mu.Lock()
++	lastVersion, lastHash := r.lastVersion, r.lastHash
++	r.mu.Unlock()
++	if lastVersion == res.Version && lastHash != "" && res.SnapshotHash != "" {
++		if res.SnapshotHash != lastHash {
++			// 同版本哈希漂移：存储被篡改/端点异常探测（§3.3「校验哈希」对账口径）——
++			// fail-soft 拒收保持旧版；恢复后下个窗口收敛。
++			r.failures.Add(1)
++			r.logger().Printf("snapshot: 对账哈希漂移（同 version=%d，存储被篡改/端点异常探测——保持旧版）last=%s got=%s",
++				res.Version, lastHash, res.SnapshotHash)
++			return fmt.Errorf("snapshot: 同版本哈希漂移 version=%d last=%s got=%s", res.Version, lastHash, res.SnapshotHash)
++		}
++		// 版本未变且哈希稳定：跳过替换（对账幂等），避免无谓换入。
++		r.skipped.Add(1)
++		return nil
++	}
++	if err := r.Cache.Replace(res.Snapshot); err != nil {
++		r.failures.Add(1)
++		r.logger().Printf("snapshot: 对账快照替换失败（fail-soft 保持旧版）: %v", err)
++		return err
++	}
++	r.mu.Lock()
++	r.lastVersion, r.lastHash = res.Version, res.SnapshotHash
++	r.mu.Unlock()
++	r.replaced.Add(1)
++	r.logger().Printf("snapshot: 对账快照已替换 version=%d hash=%s", res.Version, res.SnapshotHash)
++	return nil
++}
+diff --git a/ingest/internal/snapshot/reconciler_contract_test.go b/ingest/internal/snapshot/reconciler_contract_test.go
+new file mode 100644
+index 0000000..ed61ac2
+--- /dev/null
++++ b/ingest/internal/snapshot/reconciler_contract_test.go
+@@ -0,0 +1,248 @@
++package snapshot_test
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// TASK-0027 决策 4：拉取对账循环（Reconciler）——config.changed 通知本期不消费，
++// 周期拉取兜底覆盖；拉取成功（哈希校验+校验通过）原子替换本地缓存，失败保持旧版计数
++// 告警、下个窗口重试（§3.3 接入消费方式）。
++
++// reconcileServer 对账假端点：可编排版本切换与失败注入。
++type reconcileServer struct {
++	srv *httptest.Server
++
++	mu           sync.Mutex
++	body         string // 当前快照体
++	version      int64  // 当前版本（信封与快照体同值——§3.3）
++	hashOverride string // 哈希漂移注入（非空时替代 body 的 SHA-256）
++	inject       int    // 剩余失败注入次数（拉取直接 500）
++	pullCnt      int
++}
++
++func newReconcileServer(t *testing.T, version int64) *reconcileServer {
++	r := &reconcileServer{body: reconcileBody(version), version: version}
++	r.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		r.mu.Lock()
++		r.pullCnt++
++		inject, body, version := r.inject, r.body, r.version
++		if inject > 0 {
++			r.inject--
++		}
++		r.mu.Unlock()
++		if inject > 0 {
++			w.WriteHeader(http.StatusInternalServerError)
++			_, _ = w.Write([]byte(`{"code":500,"message":"注入失败"}`))
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		hash := r.hashOverride
++		if hash == "" {
++			hash = hashOf(body)
++		}
++		fmt.Fprintf(w, `{"code":200,"message":"操作成功","data":{"version":%d,"snapshotHash":%q,`+
++			`"snapshotUri":"1/1-88-17.json","schemaVersion":"1.0.1","snapshot":%s}}`, version, hash, body)
++	}))
++	t.Cleanup(r.srv.Close)
++	return r
++}
++
++func reconcileBody(version int64) string {
++	return fmt.Sprintf(`{"schemaVersion":"1.0.1","tenantId":1,"scopeType":1,"scopeId":88,"version":%d,`+
++		`"points":[{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","status":1}]}`, version)
++}
++
++func (r *reconcileServer) setBody(version int64) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.body = reconcileBody(version)
++	r.version = version
++}
++
++func (r *reconcileServer) setHash(hash string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.hashOverride = hash
++}
++
++func (r *reconcileServer) injectFailures(n int) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.inject = n
++}
++
++func (r *reconcileServer) pulls() int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.pullCnt
++}
++
++func newReconciler(url string, cache *snapshot.Cache, interval time.Duration) *snapshot.Reconciler {
++	return &snapshot.Reconciler{
++		Fetcher:  newClient(url),
++		Cache:    cache,
++		Scope:    snapshot.Scope{Type: 1, ID: 88},
++		Interval: interval,
++	}
++}
++
++// 契约依据：对账兜底——周期拉取；新版本到达即原子替换（LookupPoint 命中新点位集）。
++func TestContractSnapshotReconcilerReplacesOnNewVersion(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, 10*time.Millisecond)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go r.Run(ctx)
++
++	waitFor(t, "首次拉取装载", func() bool {
++		_, ok := cache.LookupPoint("F01_WS01_EQ001_M01")
++		return ok
++	})
++
++	s.setBody(18)
++	waitFor(t, "新版本到达替换", func() bool {
++		snap := cache.Get()
++		return snap != nil && snap.Version == 18
++	})
++	if r.Replaced() < 1 {
++		t.Errorf("Replaced = %d, want ≥1", r.Replaced())
++	}
++}
++
++// 契约依据：拉取失败保持旧版（§3.3「新快照校验失败则继续用旧版并回执失败」）——
++// 失败计数告警、下个窗口重试恢复。
++func TestContractSnapshotReconcilerKeepsOldOnFailure(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, 10*time.Millisecond)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go r.Run(ctx)
++
++	waitFor(t, "首次拉取装载", func() bool {
++		_, ok := cache.LookupPoint("F01_WS01_EQ001_M01")
++		return ok
++	})
++
++	s.setBody(18)
++	s.injectFailures(2)
++	waitFor(t, "失败发生", func() bool { return r.Failures() >= 2 })
++	if snap := cache.Get(); snap.Version != 17 {
++		t.Errorf("失败期间缓存 version = %d, want 继续用旧版 17", snap.Version)
++	}
++	waitFor(t, "失败注入耗尽后恢复替换", func() bool {
++		snap := cache.Get()
++		return snap != nil && snap.Version == 18
++	})
++}
++
++// 契约依据：版本未变不重复替换（对账幂等——同版本同哈希跳过，避免无谓换入）。
++func TestContractSnapshotReconcilerSkipsReplaceOnSameVersion(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, 5*time.Millisecond)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go r.Run(ctx)
++
++	waitFor(t, "多次拉取发生", func() bool { return r.Pulls() >= 3 })
++	if got := r.Replaced(); got != 1 {
++		t.Errorf("Replaced = %d, want 1（同版本同哈希只替换一次）", got)
++	}
++	if got := r.Skipped(); got < 1 {
++		t.Errorf("Skipped = %d, want ≥1（同版本跳过）", got)
++	}
++}
++
++// 契约依据：§3.3「校验哈希」对账口径——同版本哈希漂移（响应 snapshotHash 与本进程
++// 上次拉取的同版本锚不一致）= 存储被篡改/端点异常探测：fail-soft 拒收（保持旧版）、
++// 计数告警；漂移恢复后对账收敛。
++func TestContractSnapshotReconcilerSameVersionHashDriftRejected(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, 5*time.Millisecond)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go r.Run(ctx)
++
++	waitFor(t, "首次装载", func() bool { return r.Replaced() >= 1 })
++	baselineFailures := r.Failures()
++
++	// 同版本（17）哈希漂移。
++	s.setHash(strings.Repeat("cd", 32))
++	waitFor(t, "漂移被拒收", func() bool { return r.Failures() > baselineFailures })
++	if snap := cache.Get(); snap.Version != 17 {
++		t.Errorf("漂移期间缓存 version = %d, want 17（保持旧版）", snap.Version)
++	}
++
++	// 漂移恢复：同版本同哈希 → 收敛跳过。
++	s.setHash(hashOf(reconcileBody(17)))
++	waitFor(t, "漂移恢复收敛", func() bool { return r.Skipped() >= 1 })
++}
++
++// 契约依据：首次拉取前空缓存 LookupPoint 一律未命中（流水线未知编码死信路径，
++// 0073 口径）；对账循环启动即拉取（不等首个 tick）。
++func TestContractSnapshotReconcilerImmediateFirstPull(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, time.Hour) // 长间隔：证明启动即拉
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go r.Run(ctx)
++
++	waitFor(t, "启动即拉取", func() bool {
++		_, ok := cache.LookupPoint("F01_WS01_EQ001_M01")
++		return ok
++	})
++}
++
++// 契约依据：ctx 取消后对账循环退出（优雅停机组成部分）。
++func TestContractSnapshotReconcilerStopsOnContextCancel(t *testing.T) {
++	s := newReconcileServer(t, 17)
++	cache := snapshot.NewCache()
++	r := newReconciler(s.srv.URL, cache, 5*time.Millisecond)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	go func() { r.Run(ctx); close(done) }()
++
++	waitFor(t, "循环已拉取", func() bool { return r.Pulls() >= 1 })
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("ctx 取消后 Reconciler 未退出")
++	}
++	n := r.Pulls()
++	time.Sleep(60 * time.Millisecond)
++	if r.Pulls() != n {
++		t.Errorf("取消后仍在拉取: %d → %d", n, r.Pulls())
++	}
++}
++
++func waitFor(t *testing.T, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", what)
++}

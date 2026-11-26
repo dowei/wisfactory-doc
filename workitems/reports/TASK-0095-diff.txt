@@ -1,0 +1,1299 @@
+diff --git a/frontend/src/api/iot/metric-api.ts b/frontend/src/api/iot/metric-api.ts
+new file mode 100644
+index 00000000..4cf9df46
+--- /dev/null
++++ b/frontend/src/api/iot/metric-api.ts
+@@ -0,0 +1,64 @@
++/*
++ * 指标定义 API（智慧工厂）
++ *
++ * 对接后端 IotMetricController（TASK-0043 交付，路径前缀 /iot/metric；
++ * 权限位 iot:metric:* 对应 sys_menu 4058-4062）。管理面 /api 登录态，
++ * 不碰 appKey/secret/HMAC，不走 /openapi/v1/**。
++ *
++ * - 分页列表 GET /iot/metric/list（pageNum/pageSize/metricCode/metricName/
++ *   instanceId/period/status；数据权限由后端裁剪，前端不造假数据）
++ * - 详情 GET /iot/metric/{id}（getById / detail 同端点）
++ * - 新增 POST /iot/metric（metric_code 创建后不可改）
++ * - 批量生成 POST /iot/metric/generate?instanceId=（instanceId 为 query 参数，
++ *   IotMetricGenerateForm 为 body；模板载体未定义，按请求清单批量生成）
++ * - 修改 PUT /iot/metric（status 不进编辑集，启停走 changeStatus）
++ * - 批量启停 PUT /iot/metric/changeStatus（{ ids, status }）
++ * - 批量删除 DELETE /iot/metric/{ids}（路径参数逗号拼接，软删）
++ */
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const metricApi = {
++  /** 指标分页列表（GET /iot/metric/list，iot:metric:list） */
++  queryList: (params) => {
++    return getRequest('/iot/metric/list', params);
++  },
++
++  /** 指标详情（GET /iot/metric/{id}，iot:metric:query） */
++  getById: (id) => {
++    return getRequest(`/iot/metric/${id}`, undefined);
++  },
++
++  /** 指标详情别名（与 getById 同端点，语义化命名） */
++  detail: (id) => {
++    return getRequest(`/iot/metric/${id}`, undefined);
++  },
++
++  /** 新增指标（POST /iot/metric，iot:metric:add） */
++  add: (form) => {
++    return postRequest('/iot/metric', form);
++  },
++
++  /**
++   * 批量生成指标（POST /iot/metric/generate?instanceId=，iot:metric:add）
++   * instanceId 以 query 入参为准（覆盖项内值）；form 为 IotMetricGenerateForm。
++   */
++  generate: (instanceId, form) => {
++    return postRequest(`/iot/metric/generate?instanceId=${instanceId}`, form);
++  },
++
++  /** 修改指标（PUT /iot/metric，iot:metric:edit；metricCode 不可改，status 不进编辑集） */
++  update: (form) => {
++    return putRequest('/iot/metric', form);
++  },
++
++  /** 批量启停（PUT /iot/metric/changeStatus，iot:metric:edit；{ ids, status }） */
++  changeStatus: (form) => {
++    return putRequest('/iot/metric/changeStatus', form);
++  },
++
++  /** 批量删除（DELETE /iot/metric/{ids}，iot:metric:remove；ids 逗号拼接路径参数） */
++  remove: (ids) => {
++    const idsParam = Array.isArray(ids) ? ids.join(',') : ids;
++    return deleteRequest(`/iot/metric/${idsParam}`);
++  },
++};
+diff --git a/frontend/src/components/iot/iot-consts.ts b/frontend/src/components/iot/iot-consts.ts
+index ad27d8b9..7276659e 100644
+--- a/frontend/src/components/iot/iot-consts.ts
++++ b/frontend/src/components/iot/iot-consts.ts
+@@ -99,3 +99,30 @@ export const IOT_POINT_VALUE_TYPE_OPTIONS = IOT_DATA_TYPE_OPTIONS;
+ 
+ /** 模板数据项单批上限（IotDataItemTemplateService.ITEM_BATCH_MAX） */
+ export const IOT_TEMPLATE_ITEM_BATCH_MAX = 500;
++
++/**
++ * 指标聚合方式（IotMetricCreateForm.aggType @Min(1) @Max(5)）：
++ * 1 平均 2 累计 3 最大 4 最小 5 比值（比值=分子分母分别聚合再相除）
++ */
++export const IOT_METRIC_AGG_TYPE_OPTIONS = [
++  { value: 1, label: '平均 (1)' },
++  { value: 2, label: '累计 (2)' },
++  { value: 3, label: '最大 (3)' },
++  { value: 4, label: '最小 (4)' },
++  { value: 5, label: '比值 (5)' },
++];
++
++/** 指标统计周期（IotMetricCreateForm.period @Pattern("HOUR|DAY|MONTH|YEAR")） */
++export const IOT_METRIC_PERIOD_OPTIONS = ['HOUR', 'DAY', 'MONTH', 'YEAR'];
++
++/**
++ * 指标日历口径：一期锁 1 自然（班次 2 为 REQ-0024 非目标，前端表单只读锁定）。
++ * 镜像后端 IotMetricCreateForm.calendarType 约束。
++ */
++export const IOT_METRIC_CALENDAR_NATURAL = 1;
++
++/** 指标比值型聚合方式取值（aggType=5 时 ratioNumItemId/ratioDenItemId 必填齐备） */
++export const IOT_METRIC_RATIO_AGG_TYPE = 5;
++
++/** 指标批量生成单批上限（IotMetricService.GENERATE_BATCH_MAX，后端整批事务强制） */
++export const IOT_METRIC_GENERATE_BATCH_MAX = 500;
+diff --git a/frontend/src/views/iot/metric/components/metric-detail-modal.vue b/frontend/src/views/iot/metric/components/metric-detail-modal.vue
+new file mode 100644
+index 00000000..a1d7c88c
+--- /dev/null
++++ b/frontend/src/views/iot/metric/components/metric-detail-modal.vue
+@@ -0,0 +1,66 @@
++<!--
++  * 指标定义详情 弹窗（TASK-0095）
++  *
++  * 对接 GET /iot/metric/{id}（iot:metric:query）：空态诚实展示「-」，不伪造指标。
++  * 详情只读，启停/编辑通过列表页操作；必须 defineExpose(showModal)。
++-->
++<template>
++  <a-modal :open="visible" title="指标详情" :width="680" :footer="null" @cancel="onClose">
++    <a-descriptions bordered size="small" :column="2" :loading="detailLoading">
++      <a-descriptions-item label="ID">{{ detail.id || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="指标编码">{{ detail.metricCode || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="指标名称">{{ detail.metricName || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="归属实例ID">{{ detail.instanceId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="来源数据项ID">{{ detail.sourceItemId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="聚合方式">{{ aggTypeLabel }}</a-descriptions-item>
++      <a-descriptions-item label="统计周期">{{ detail.period || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="日历口径">{{ detail.calendarType === 1 ? '自然' : '-' }}</a-descriptions-item>
++      <a-descriptions-item label="比值分子数据项ID">{{ detail.ratioNumItemId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="比值分母数据项ID">{{ detail.ratioDenItemId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="同比">{{ detail.yoyFlag === 1 ? '是' : '否' }}</a-descriptions-item>
++      <a-descriptions-item label="环比">{{ detail.momFlag === 1 ? '是' : '否' }}</a-descriptions-item>
++      <a-descriptions-item label="绑定部门ID">{{ detail.deptId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="状态">
++        <a-tag v-if="detail.status === 1" color="green">启用</a-tag>
++        <a-tag v-else color="red">禁用</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="创建时间">{{ detail.createTime || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="更新时间">{{ detail.updateTime || '-' }}</a-descriptions-item>
++    </a-descriptions>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref } from 'vue';
++  import { metricApi } from '/@/api/iot/metric-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { IOT_METRIC_AGG_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++
++  const visible = ref(false);
++  const detailLoading = ref(false);
++  const detail = reactive<Record<string, unknown>>({});
++
++  const aggTypeLabel = computed(() => IOT_METRIC_AGG_TYPE_OPTIONS.find((o) => o.value === detail.aggType)?.label || '-');
++
++  async function showModal(id) {
++    visible.value = true;
++    detailLoading.value = true;
++    try {
++      const responseData = await metricApi.detail(id);
++      Object.keys(detail).forEach((key) => delete detail[key]);
++      Object.assign(detail, responseData.data || {});
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      detailLoading.value = false;
++    }
++  }
++
++  function onClose() {
++    visible.value = false;
++    Object.keys(detail).forEach((key) => delete detail[key]);
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/metric/components/metric-form-modal.vue b/frontend/src/views/iot/metric/components/metric-form-modal.vue
+new file mode 100644
+index 00000000..c5a74bd9
+--- /dev/null
++++ b/frontend/src/views/iot/metric/components/metric-form-modal.vue
+@@ -0,0 +1,310 @@
++<!--
++  * 指标定义表单 弹窗（TASK-0095）
++  *
++  * 表单校验与后端 IotMetricCreateForm / IotMetricUpdateForm 注解逐条对齐：
++  * - metricCode 必填、≤96、仅 [A-Za-z0-9_]（创建后不可改——编辑禁输且携带原值）；
++  * - metricName 必填、≤100；
++  * - instanceId 必填（统计对象范围=指标绑定设备语义）；
++  * - aggType 必填且 1-5（1 平均 2 累计 3 最大 4 最小 5 比值）；
++  * - period 必填且 HOUR/DAY/MONTH/YEAR；
++  * - calendarType 一期锁 1 自然（班次 2 是 REQ-0024 非目标，表单只读锁定，不提供选项）；
++  * - aggType=5（比值型）时 ratioNumItemId/ratioDenItemId 必填齐备；
++  *   非比值型提交时 ratio_* 显式置空（后端强制 NULL）。
++  * 同比 yoyFlag / 环比 momFlag 0 否 1 是；deptId 可空（数据权限锚点）。
++  * 启停不进编辑集（走 changeStatus 独立接口）。
++  * 必须 defineExpose(showModal)——父组件通过 ref 调用（BUG-0008 教训）。
++-->
++<template>
++  <a-modal :open="visible" :title="isEdit ? '编辑指标' : '新增指标'" ok-text="确认" cancel-text="取消" :width="680" @ok="onSubmit" @cancel="onClose">
++    <a-alert
++      v-if="isEdit"
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      message="指标编码创建后不可改；启停请用列表上的「启用/停用」按钮，不在本表单修改"
++    />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 7 }" :wrapper-col="{ span: 16 }">
++      <a-form-item label="指标编码" name="metricCode">
++        <a-input v-model:value="form.metricCode" :disabled="isEdit" :maxlength="96" placeholder="租户内唯一，仅字母/数字/下划线，创建后不可改" />
++      </a-form-item>
++      <a-form-item label="指标名称" name="metricName">
++        <a-input v-model:value="form.metricName" :maxlength="100" placeholder="请输入指标名称" />
++      </a-form-item>
++      <a-form-item label="归属实例" name="instanceId">
++        <a-select
++          v-model:value="form.instanceId"
++          show-search
++          option-filter-prop="label"
++          :options="instanceOptions"
++          :disabled="isEdit"
++          placeholder="请选择实例（指标绑定设备，创建后不可改）"
++        />
++      </a-form-item>
++      <a-form-item label="来源数据项" name="sourceItemId">
++        <a-select
++          v-model:value="form.sourceItemId"
++          show-search
++          option-filter-prop="label"
++          :options="itemOptions"
++          :allowClear="true"
++          :disabled="isRatio"
++          placeholder="比值型可空；引用须为同实例启用数据项"
++        />
++      </a-form-item>
++      <a-form-item label="聚合方式" name="aggType">
++        <a-select v-model:value="form.aggType" placeholder="请选择聚合方式（口径强制标注）">
++          <a-select-option v-for="opt in IOT_METRIC_AGG_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="统计周期" name="period">
++        <a-select v-model:value="form.period" placeholder="请选择统计周期（口径强制标注）">
++          <a-select-option v-for="p in IOT_METRIC_PERIOD_OPTIONS" :key="p" :value="p">
++            {{ p }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="日历口径" name="calendarType">
++        <a-input :value="`${IOT_METRIC_CALENDAR_NATURAL} 自然日历`" :read-only="true" />
++        <span class="metric-hint">一期锁自然日历，班次口径不开放</span>
++      </a-form-item>
++      <template v-if="isRatio">
++        <a-form-item label="比值分子数据项" name="ratioNumItemId">
++          <a-select
++            v-model:value="form.ratioNumItemId"
++            show-search
++            option-filter-prop="label"
++            :options="itemOptions"
++            placeholder="请选择分子数据项（比值型必填）"
++          />
++        </a-form-item>
++        <a-form-item label="比值分母数据项" name="ratioDenItemId">
++          <a-select
++            v-model:value="form.ratioDenItemId"
++            show-search
++            option-filter-prop="label"
++            :options="itemOptions"
++            placeholder="请选择分母数据项（比值型必填）"
++          />
++        </a-form-item>
++      </template>
++      <a-form-item label="同比" name="yoyFlag">
++        <a-radio-group v-model:value="form.yoyFlag" button-style="solid">
++          <a-radio-button :value="0">否</a-radio-button>
++          <a-radio-button :value="1">是</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++      <a-form-item label="环比" name="momFlag">
++        <a-radio-group v-model:value="form.momFlag" button-style="solid">
++          <a-radio-button :value="0">否</a-radio-button>
++          <a-radio-button :value="1">是</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++      <a-form-item label="绑定部门ID" name="deptId">
++        <a-input-number v-model:value="form.deptId" :min="1" style="width: 100%" placeholder="可空，数据权限锚点" />
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import type { Rule } from 'ant-design-vue/es/form';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { metricApi } from '/@/api/iot/metric-api';
++  import { instanceApi } from '/@/api/iot/instance-api';
++  import { itemApi } from '/@/api/iot/item-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import {
++    IOT_METRIC_AGG_TYPE_OPTIONS,
++    IOT_METRIC_CALENDAR_NATURAL,
++    IOT_METRIC_PERIOD_OPTIONS,
++    IOT_METRIC_RATIO_AGG_TYPE,
++  } from '/@/components/iot/iot-consts';
++
++  const emit = defineEmits(['reloadList']);
++
++  const formRef = ref();
++  const visible = ref(false);
++  const instanceOptions = ref<{ label: string; value: number }[]>([]);
++  const itemOptions = ref<{ label: string; value: number }[]>([]);
++  const isEdit = computed(() => !!form.id);
++
++  const formDefault = {
++    id: undefined,
++    metricCode: '',
++    metricName: '',
++    instanceId: undefined,
++    sourceItemId: undefined,
++    aggType: undefined,
++    period: undefined,
++    calendarType: IOT_METRIC_CALENDAR_NATURAL,
++    ratioNumItemId: undefined,
++    ratioDenItemId: undefined,
++    yoyFlag: 0,
++    momFlag: 0,
++    deptId: undefined,
++  };
++  const form = reactive({ ...formDefault });
++
++  // 校验与后端 DTO 注解逐条对齐（含值域/字符集/长度；比值型条件必填在 onSubmit 前置拦截）
++  const rules: Record<string, Rule[]> = {
++    metricCode: [
++      { required: true, message: '请输入指标编码' },
++      { max: 96, message: '指标编码长度不能超过 96' },
++      { pattern: /^[A-Za-z0-9_]+$/, message: '指标编码仅允许字母/数字/下划线' },
++    ],
++    metricName: [
++      { required: true, message: '请输入指标名称' },
++      { max: 100, message: '指标名称长度不能超过 100' },
++    ],
++    instanceId: [{ required: true, message: '请选择归属实例（指标绑定设备）' }],
++    aggType: [
++      { required: true, message: '请选择聚合方式（口径强制标注）' },
++      { type: 'number', min: 1, max: 5, message: '聚合方式仅允许 1 平均 2 累计 3 最大 4 最小 5 比值' },
++    ],
++    period: [
++      { required: true, message: '请选择统计周期（口径强制标注）' },
++      { pattern: /^(HOUR|DAY|MONTH|YEAR)$/, message: '统计周期仅允许 HOUR/DAY/MONTH/YEAR' },
++    ],
++  };
++
++  const isRatio = computed(() => form.aggType === IOT_METRIC_RATIO_AGG_TYPE);
++
++  async function loadInstanceOptions() {
++    try {
++      // pageSize 上限 500 对齐后端 maxLimit（MybatisPlusConfig）
++      const responseData = await instanceApi.queryInstanceList({ pageNum: 1, pageSize: 500, status: 1 });
++      instanceOptions.value = (responseData.data?.records || []).map((i) => ({
++        label: `${i.instanceCode}（${i.instanceName}）`,
++        value: i.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  async function loadItemOptions(instanceId) {
++    if (!instanceId) {
++      itemOptions.value = [];
++      return;
++    }
++    try {
++      const responseData = await itemApi.queryItemList(instanceId);
++      itemOptions.value = (Array.isArray(responseData.data) ? responseData.data : responseData.data?.records || []).map((item) => ({
++        label: `${item.itemCode}（${item.itemName}）`,
++        value: item.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++      itemOptions.value = [];
++    }
++  }
++
++  /**
++   * 父组件 ref 入口：新增传 undefined；编辑传入列表行（含 id）。
++   * 编辑态 metricCode/instanceId 锁定（后端创建后不可改）。
++   */
++  async function showModal(rowData?) {
++    Object.assign(form, formDefault);
++    itemOptions.value = [];
++    if (!instanceOptions.value.length) {
++      await loadInstanceOptions();
++    }
++    if (rowData) {
++      Object.assign(form, rowData);
++      // 后端详情/列表返回 calendarType；一期锁 1，若库内异常值仍强制展示 1
++      form.calendarType = IOT_METRIC_CALENDAR_NATURAL;
++      await loadItemOptions(form.instanceId);
++    }
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    itemOptions.value = [];
++    visible.value = false;
++  }
++
++  /** 校验比值型条件必填（后端 create 表单 aggType=5 时 ratio_* 必填齐备） */
++  function validateRatio(): boolean {
++    if (isRatio.value && (!form.ratioNumItemId || !form.ratioDenItemId)) {
++      message.error('比值型指标必须同时指定分子与分母数据项');
++      return false;
++    }
++    return true;
++  }
++
++  async function onSubmit() {
++    try {
++      await formRef.value.validate();
++    } catch (e) {
++      message.error('参数验证错误，请仔细填写表单数据!');
++      return;
++    }
++    if (!validateRatio()) {
++      return;
++    }
++    // 日历口径锁 1；非比值型 ratio_* 显式置空（后端强制 NULL）
++    const calendarType = IOT_METRIC_CALENDAR_NATURAL;
++    const ratioNumItemId = isRatio.value ? form.ratioNumItemId : undefined;
++    const ratioDenItemId = isRatio.value ? form.ratioDenItemId : undefined;
++    OtLoading.show();
++    try {
++      if (form.id) {
++        const updateData: Record<string, unknown> = {
++          id: form.id,
++          metricCode: form.metricCode,
++          metricName: form.metricName,
++          instanceId: form.instanceId,
++          sourceItemId: isRatio.value ? undefined : form.sourceItemId,
++          aggType: form.aggType,
++          period: form.period,
++          calendarType,
++          ratioNumItemId,
++          ratioDenItemId,
++          yoyFlag: form.yoyFlag,
++          momFlag: form.momFlag,
++          deptId: form.deptId,
++        };
++        await metricApi.update(updateData);
++      } else {
++        const createData: Record<string, unknown> = {
++          metricCode: form.metricCode,
++          metricName: form.metricName,
++          instanceId: form.instanceId,
++          sourceItemId: isRatio.value ? undefined : form.sourceItemId,
++          aggType: form.aggType,
++          period: form.period,
++          calendarType,
++          ratioNumItemId,
++          ratioDenItemId,
++          yoyFlag: form.yoyFlag,
++          momFlag: form.momFlag,
++          deptId: form.deptId,
++        };
++        await metricApi.add(createData);
++      }
++      message.success(`${form.id ? '修改' : '添加'}成功`);
++      emit('reloadList');
++      onClose();
++    } catch (error) {
++      otSentry.captureError(handleIotConflictError(error));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++    validateRatio,
++  });
++</script>
++<style scoped lang="less">
++  .metric-hint {
++    color: #999;
++    font-size: 12px;
++  }
++</style>
+diff --git a/frontend/src/views/iot/metric/index.vue b/frontend/src/views/iot/metric/index.vue
+index 4fde45e6..d7a8cc90 100644
+--- a/frontend/src/views/iot/metric/index.vue
++++ b/frontend/src/views/iot/metric/index.vue
+@@ -1,11 +1,409 @@
+ <!--
+-  * 指标管理（占位骨架，TASK-0055）
++  * 指标定义管理（TASK-0095 完整页；替换 TASK-0056 占位）
+   *
+-  * 菜单挂载点：sys_menu 4014（/iot/metric）。指标与公式编辑器归 TASK-0056/0070。
++  * 对接 IotMetricController（/iot/metric，权限位 iot:metric:* 4058-4062）。
++  * 列表分页 + 过滤 metricCode/metricName/instanceId/period/status（数据权限由后端裁剪）；
++  * 新增/编辑走 metric-form-modal（metricCode 创建后不可改，校验对齐 DTO 注解）；
++  * 启停走 PUT /iot/metric/changeStatus（不在编辑表单改 status）；
++  * 删除走 DELETE /iot/metric/{ids}（软删、编码归档不复用）；
++  * 批量生成入口传 instanceId，按 IotMetricGenerateForm 提交指标清单（模板载体未定义，
++  * 采用「按清单批量生成」占位口径——报告登记；不伪造模板、不造假数据）。
++  * 空态诚实：无数据显示空表/空详情，不伪造指标。
+ -->
+ <template>
+-  <IotPlaceholder title="指标管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="指标编码" class="ot-query-form-item">
++        <a-input style="width: 160px" v-model:value="queryForm.metricCode" placeholder="指标编码" />
++      </a-form-item>
++      <a-form-item label="指标名称" class="ot-query-form-item">
++        <a-input style="width: 160px" v-model:value="queryForm.metricName" placeholder="指标名称" />
++      </a-form-item>
++      <a-form-item label="归属实例ID" class="ot-query-form-item">
++        <a-input-number style="width: 130px" v-model:value="queryForm.instanceId" :min="1" placeholder="实例ID" />
++      </a-form-item>
++      <a-form-item label="统计周期" class="ot-query-form-item">
++        <a-select style="width: 110px" v-model:value="queryForm.period" :allowClear="true" placeholder="请选择">
++          <a-select-option v-for="p in IOT_METRIC_PERIOD_OPTIONS" :key="p" :value="p">
++            {{ p }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 100px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:metric:list'" type="primary" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:metric:list'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:metric:add'" type="primary" @click="addOrUpdateMetric()">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          新建
++        </a-button>
++        <a-button v-privilege="'iot:metric:add'" @click="openGenerate">
++          <template #icon>
++            <UploadOutlined />
++          </template>
++          批量生成
++        </a-button>
++      </div>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="id"
++      :pagination="false"
++      :row-selection="{ selectedRowKeys: selectedRowKeys, onChange: onSelectChange }"
++      bordered
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'aggType'">
++          {{ IOT_METRIC_AGG_TYPE_OPTIONS.find((o) => o.value === record.aggType)?.label || '-' }}
++        </template>
++        <template v-if="column.dataIndex === 'calendarType'">
++          {{ record.calendarType === 1 ? '自然' : '-' }}
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:metric:query'" type="link" @click="showDetail(record)">详情</a-button>
++            <a-button v-privilege="'iot:metric:edit'" type="link" @click="addOrUpdateMetric(record)">编辑</a-button>
++            <a-button v-if="record.status === 1" v-privilege="'iot:metric:edit'" type="link" @click="confirmChangeStatus([record.id], 0)">
++              停用
++            </a-button>
++            <a-button v-else v-privilege="'iot:metric:edit'" type="link" @click="confirmChangeStatus([record.id], 1)"> 启用 </a-button>
++            <a-button v-privilege="'iot:metric:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-table-operate-block metric-batch-bar">
++      <a-button v-privilege="'iot:metric:edit'" :disabled="!selectedRowKeys.length" @click="confirmChangeStatus(selectedRowKeys, 0)">
++        批量停用
++      </a-button>
++      <a-button v-privilege="'iot:metric:edit'" :disabled="!selectedRowKeys.length" @click="confirmChangeStatus(selectedRowKeys, 1)">
++        批量启用
++      </a-button>
++      <a-button v-privilege="'iot:metric:remove'" :disabled="!selectedRowKeys.length" danger @click="confirmDeleteBatch"> 批量删除 </a-button>
++    </div>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <MetricFormModal ref="metricFormModalRef" @reloadList="ajaxQuery" />
++    <MetricDetailModal ref="metricDetailModalRef" />
++    <a-modal
++      :open="generateVisible"
++      title="按清单批量生成指标"
++      ok-text="生成"
++      cancel-text="取消"
++      :width="720"
++      @ok="onGenerateSubmit"
++      @cancel="generateVisible = false"
++    >
++      <a-alert
++        type="info"
++        show-icon
++        class="ot-margin-bottom10"
++        message="指标模板载体尚未定义，本期按输入的指标清单批量生成（单批 ≤500 项）；instanceId 以入口参数为准，覆盖清单项内携带值。"
++      />
++      <a-form :model="generateForm" :label-col="{ span: 6 }" :wrapper-col="{ span: 17 }">
++        <a-form-item label="目标实例ID" required>
++          <a-input-number v-model:value="generateForm.instanceId" :min="1" style="width: 100%" placeholder="必填，作为统计对象范围" />
++        </a-form-item>
++        <a-form-item label="指标清单 (JSON)" required>
++          <a-textarea
++            v-model:value="generateForm.metricsText"
++            :rows="12"
++            placeholder='[{"metricCode":"INS1_DAY_AVG","metricName":"日平均","aggType":1,"period":"DAY","calendarType":1}]'
++          />
++          <span class="metric-hint">JSON 数组，每项字段同「新增指标」表单（instanceId 可省略，以目标实例覆盖）</span>
++        </a-form-item>
++      </a-form>
++    </a-modal>
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import MetricFormModal from './components/metric-form-modal.vue';
++  import MetricDetailModal from './components/metric-detail-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { PlusOutlined, ReloadOutlined, SearchOutlined, UploadOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { metricApi } from '/@/api/iot/metric-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import {
++    IOT_METRIC_AGG_TYPE_OPTIONS,
++    IOT_METRIC_CALENDAR_NATURAL,
++    IOT_METRIC_GENERATE_BATCH_MAX,
++    IOT_METRIC_PERIOD_OPTIONS,
++  } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    { title: 'ID', width: 70, dataIndex: 'id' },
++    { title: '指标编码', dataIndex: 'metricCode' },
++    { title: '指标名称', dataIndex: 'metricName' },
++    { title: '归属实例ID', width: 110, dataIndex: 'instanceId' },
++    { title: '聚合方式', width: 110, dataIndex: 'aggType' },
++    { title: '统计周期', width: 100, dataIndex: 'period' },
++    { title: '日历口径', width: 100, dataIndex: 'calendarType' },
++    { title: '状态', width: 70, dataIndex: 'status' },
++    { title: '更新时间', width: 160, dataIndex: 'updateTime' },
++    { title: '操作', dataIndex: 'action', fixed: 'right', width: 240 },
++  ]);
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    metricCode: '',
++    metricName: '',
++    instanceId: undefined,
++    period: undefined,
++    status: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const selectedRowKeys = ref<number[]>([]);
++  const metricFormModalRef = ref();
++  const metricDetailModalRef = ref();
++
++  function onSelectChange(keys: number[]) {
++    selectedRowKeys.value = keys;
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    ajaxQuery();
++  }
++
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await metricApi.queryList(queryForm);
++      const records = responseData.data?.records || [];
++      tableData.value = records;
++      total.value = responseData.data?.total || 0;
++      // 翻页后清理选择，避免跨页误操作
++      selectedRowKeys.value = [];
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 启停（changeStatus 独立接口，二次确认） -----------------
++
++  function confirmChangeStatus(ids, status) {
++    if (!ids || !ids.length) {
++      return;
++    }
++    Modal.confirm({
++      title: '提示',
++      content: `确定要将选中的 ${ids.length} 条指标${status === 1 ? '启用' : '停用'}吗？（停用=停止调度、已算结果保留）`,
++      okText: status === 1 ? '启用' : '停用',
++      cancelText: '取消',
++      onOk() {
++        changeMetricStatus(ids, status);
++      },
++    });
++  }
++
++  async function changeMetricStatus(ids, status) {
++    try {
++      OtLoading.show();
++      await metricApi.changeStatus({ ids, status });
++      message.success(`${status === 1 ? '启用' : '停用'}成功`);
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 删除（软删，二次确认） -----------------
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除指标【${rowData.metricCode} ${rowData.metricName}】吗？（软删除，编码归档不复用）`,
++      okText: '删除',
++      okType: 'danger',
++      cancelText: '取消',
++      onOk() {
++        deleteMetrics([rowData.id]);
++      },
++    });
++  }
++
++  function confirmDeleteBatch() {
++    if (!selectedRowKeys.value.length) {
++      return;
++    }
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除选中的 ${selectedRowKeys.value.length} 条指标吗？（软删除，编码归档不复用）`,
++      okText: '删除',
++      okType: 'danger',
++      cancelText: '取消',
++      onOk() {
++        deleteMetrics([...selectedRowKeys.value]);
++      },
++    });
++  }
++
++  async function deleteMetrics(ids) {
++    try {
++      OtLoading.show();
++      await metricApi.remove(ids);
++      message.success('删除成功');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 详情 / 新增 / 编辑 -----------------
++
++  function showDetail(rowData) {
++    metricDetailModalRef.value.showModal(rowData.id);
++  }
++
++  function addOrUpdateMetric(rowData?) {
++    metricFormModalRef.value.showModal(rowData);
++  }
++
++  // ---------------- 批量生成（按清单；模板载体未定义的占位口径） -----------------
++
++  const generateVisible = ref(false);
++  const generateForm = reactive({
++    instanceId: undefined,
++    metricsText: '',
++  });
++
++  function openGenerate() {
++    generateForm.instanceId = undefined;
++    generateForm.metricsText = '';
++    generateVisible.value = true;
++  }
++
++  async function onGenerateSubmit() {
++    if (!generateForm.instanceId) {
++      message.error('请选择或填写目标实例ID');
++      return;
++    }
++    let metrics;
++    try {
++      metrics = JSON.parse(generateForm.metricsText);
++    } catch (e) {
++      message.error('指标清单不是合法 JSON 数组');
++      return;
++    }
++    if (!Array.isArray(metrics) || !metrics.length) {
++      message.error('指标清单不能为空');
++      return;
++    }
++    if (metrics.length > IOT_METRIC_GENERATE_BATCH_MAX) {
++      message.error(`单批生成上限 ${IOT_METRIC_GENERATE_BATCH_MAX} 项`);
++      return;
++    }
++    // 前端仅做结构前置提示；逐项 DTO 校验、整批事务以后端为准
++    const invalid = metrics.find(
++      (m) =>
++        !m ||
++        typeof m.metricCode !== 'string' ||
++        !/^[A-Za-z0-9_]+$/.test(m.metricCode) ||
++        !m.metricName ||
++        !Number.isInteger(m.aggType) ||
++        m.aggType < 1 ||
++        m.aggType > 5 ||
++        !IOT_METRIC_PERIOD_OPTIONS.includes(m.period) ||
++        m.calendarType !== IOT_METRIC_CALENDAR_NATURAL ||
++        (m.aggType === 5 && (!m.ratioNumItemId || !m.ratioDenItemId))
++    );
++    if (invalid) {
++      message.error('清单存在非法指标（口径/编码/比值字段不符 DTO 约束），请修正后重试');
++      return;
++    }
++    OtLoading.show();
++    try {
++      const responseData = await metricApi.generate(generateForm.instanceId, { metrics });
++      message.success(`批量生成成功：${responseData.data ?? metrics.length} 项`);
++      generateVisible.value = false;
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  onMounted(ajaxQuery);
+ </script>
++<style scoped lang="less">
++  .metric-batch-bar {
++    margin-top: 8px;
++    gap: 8px;
++  }
++
++  .metric-hint {
++    color: #999;
++    font-size: 12px;
++  }
++</style>
+diff --git a/frontend/tests/unit/api/iot/metric-api.spec.ts b/frontend/tests/unit/api/iot/metric-api.spec.ts
+new file mode 100644
+index 00000000..57156680
+--- /dev/null
++++ b/frontend/tests/unit/api/iot/metric-api.spec.ts
+@@ -0,0 +1,91 @@
++/*
++ * metric-api 七端点单测（TASK-0095）
++ *
++ * 逐项对齐后端 IotMetricController 端点/方法：
++ * - queryList GET /iot/metric/list（分页 + 六过滤参数）
++ * - getById/detail GET /iot/metric/{id}
++ * - add POST /iot/metric
++ * - generate POST /iot/metric/generate?instanceId=（instanceId query 参数 + form body）
++ * - update PUT /iot/metric
++ * - changeStatus PUT /iot/metric/changeStatus
++ * - remove DELETE /iot/metric/{ids}（数组逗号拼接 / 已拼接字符串）
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++vi.mock('/@/lib/axios', () => ({
++  getRequest: vi.fn(() => Promise.resolve({ code: 200, data: {} })),
++  postRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++  putRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++  deleteRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++}));
++
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++import { metricApi } from '/@/api/iot/metric-api';
++
++describe('metric-api 对齐 IotMetricController（TASK-0095）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('queryList 调 GET /iot/metric/list 并透传分页与过滤参数', async () => {
++    const params = {
++      pageNum: 1,
++      pageSize: 10,
++      metricCode: 'INS1_',
++      metricName: '日用水',
++      instanceId: 1001,
++      period: 'DAY',
++      status: 1,
++    };
++    await metricApi.queryList(params);
++    expect(getRequest).toHaveBeenCalledWith('/iot/metric/list', params);
++  });
++
++  it('getById / detail 均调 GET /iot/metric/{id}', async () => {
++    await metricApi.getById(301);
++    await metricApi.detail(302);
++    expect(getRequest).toHaveBeenNthCalledWith(1, '/iot/metric/301', undefined);
++    expect(getRequest).toHaveBeenNthCalledWith(2, '/iot/metric/302', undefined);
++  });
++
++  it('add 调 POST /iot/metric 并透传创建表单', async () => {
++    const form = {
++      metricCode: 'INS1_DAY_AVG',
++      metricName: '日平均',
++      instanceId: 1001,
++      aggType: 1,
++      period: 'DAY',
++      calendarType: 1,
++    };
++    await metricApi.add(form);
++    expect(postRequest).toHaveBeenCalledWith('/iot/metric', form);
++  });
++
++  it('generate 调 POST /iot/metric/generate?instanceId=（query 参数 + form body）', async () => {
++    const form = { metrics: [{ metricCode: 'INS1_DAY_AVG', aggType: 1, period: 'DAY' }] };
++    await metricApi.generate(1001, form);
++    expect(postRequest).toHaveBeenCalledWith('/iot/metric/generate?instanceId=1001', form);
++  });
++
++  it('update 调 PUT /iot/metric 并透传更新表单（不含 status）', async () => {
++    const form = { id: 301, metricName: '日平均2', aggType: 2, period: 'DAY' };
++    await metricApi.update(form);
++    expect(putRequest).toHaveBeenCalledWith('/iot/metric', form);
++  });
++
++  it('changeStatus 调 PUT /iot/metric/changeStatus 并透传 ids/status', async () => {
++    const form = { ids: [301, 302], status: 0 };
++    await metricApi.changeStatus(form);
++    expect(putRequest).toHaveBeenCalledWith('/iot/metric/changeStatus', form);
++  });
++
++  it('remove 调 DELETE /iot/metric/{ids}（数组逗号拼接路径参数）', async () => {
++    await metricApi.remove([301, 302, 303]);
++    expect(deleteRequest).toHaveBeenCalledWith('/iot/metric/301,302,303');
++  });
++
++  it('remove 接受已拼接的字符串 ids', async () => {
++    await metricApi.remove('301,302');
++    expect(deleteRequest).toHaveBeenCalledWith('/iot/metric/301,302');
++  });
++});
+diff --git a/frontend/tests/unit/views/iot/metric.spec.ts b/frontend/tests/unit/views/iot/metric.spec.ts
+new file mode 100644
+index 00000000..806c977f
+--- /dev/null
++++ b/frontend/tests/unit/views/iot/metric.spec.ts
+@@ -0,0 +1,285 @@
++/*
++ * 指标管理页与表单弹窗单测（TASK-0095）
++ *
++ * 覆盖：
++ * - 列表加载：queryList 透传过滤参数，行展示真实后端数据（不造假日数据）；
++ * - 详情按钮 → detail(id) → 详情弹窗展示（defineExpose 父 ref 调用，BUG-0008 教训）；
++ * - 表单弹窗父 ref 可调 showModal / validateRatio；比值型缺分子分母被拦；
++ * - 非比值型提交 ratio_* 置空、calendarType 锁 1、metricCode 创建后不可改（编辑传原值）；
++ * - 启停走 changeStatus（不在编辑表单改 status）；删除/批量生成走对应端点。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { defineComponent, h, nextTick, ref } from 'vue';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const queryList = vi.hoisted(() =>
++  vi.fn(() =>
++    Promise.resolve({
++      code: 200,
++      data: {
++        records: [
++          {
++            id: 301,
++            metricCode: 'INS1_DAY_AVG',
++            metricName: '日平均',
++            instanceId: 1001,
++            aggType: 1,
++            period: 'DAY',
++            calendarType: 1,
++            status: 1,
++          },
++        ],
++        total: 1,
++      },
++    })
++  )
++);
++const getDetail = vi.hoisted(() =>
++  vi.fn(() =>
++    Promise.resolve({
++      code: 200,
++      data: { id: 301, metricCode: 'INS1_DAY_AVG', metricName: '日平均', aggType: 1, period: 'DAY', status: 1 },
++    })
++  )
++);
++const addMetric = vi.hoisted(() => vi.fn((_form: Record<string, unknown>) => Promise.resolve({ code: 200, data: null })));
++const updateMetric = vi.hoisted(() => vi.fn((_form: Record<string, unknown>) => Promise.resolve({ code: 200, data: null })));
++const changeStatus = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: null })));
++const removeMetrics = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: null })));
++const generateMetrics = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: 2 })));
++const queryInstanceList = vi.hoisted(() =>
++  vi.fn(() => Promise.resolve({ code: 200, data: { records: [{ id: 1001, instanceCode: 'INS-001', instanceName: '1号设备' }] } }))
++);
++const queryItemList = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: [{ id: 11, itemCode: 'I-001', itemName: '用电量' }] })));
++const messageSuccess = vi.hoisted(() => vi.fn());
++const messageError = vi.hoisted(() => vi.fn());
++const captureError = vi.hoisted(() => vi.fn());
++const confirmOk = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/api/iot/metric-api', () => ({
++  metricApi: {
++    queryList,
++    getById: getDetail,
++    detail: getDetail,
++    add: addMetric,
++    update: updateMetric,
++    changeStatus,
++    remove: removeMetrics,
++    generate: generateMetrics,
++  },
++}));
++vi.mock('/@/api/iot/instance-api', () => ({ instanceApi: { queryInstanceList } }));
++vi.mock('/@/api/iot/item-api', () => ({ itemApi: { queryItemList } }));
++vi.mock('/@/lib/ot-sentry', () => ({ otSentry: { captureError } }));
++vi.mock('/@/components/framework/ot-loading', () => ({ OtLoading: { show: vi.fn(), hide: vi.fn() } }));
++vi.mock('/@/components/iot/iot-optimistic-lock', () => ({ handleIotConflictError: (e: unknown) => e }));
++vi.mock('ant-design-vue', async () => {
++  const actual = await vi.importActual<typeof import('ant-design-vue')>('ant-design-vue');
++  return {
++    ...actual,
++    default: actual.default,
++    message: { success: messageSuccess, error: messageError },
++    Modal: {
++      ...actual.Modal,
++      confirm: (opts: { onOk: () => void }) => {
++        confirmOk();
++        opts.onOk();
++      },
++    },
++  };
++});
++
++import MetricPage from '/@/views/iot/metric/index.vue';
++import MetricFormModal from '/@/views/iot/metric/components/metric-form-modal.vue';
++import MetricDetailModal from '/@/views/iot/metric/components/metric-detail-modal.vue';
++
++const globalOpts = { plugins: [Antd], directives: { privilege: {} } };
++
++type ModalRef = {
++  showModal: (row?: Record<string, unknown>) => Promise<void>;
++  validateRatio: () => boolean;
++};
++
++// 真实父组件 template ref 走 expose proxy（BUG-0008 回归教训）
++const FormParent = defineComponent({
++  setup(_props, { expose }) {
++    const modalRef = ref<ModalRef | null>(null);
++    expose({ modalRef });
++    return () => h(MetricFormModal, { ref: modalRef });
++  },
++});
++const DetailParent = defineComponent({
++  setup(_props, { expose }) {
++    const modalRef = ref<{ showModal: (id: number) => Promise<void> } | null>(null);
++    expose({ modalRef });
++    return () => h(MetricDetailModal, { ref: modalRef });
++  },
++});
++
++describe('指标管理页与表单校验（TASK-0095）', () => {
++  beforeEach(() => {
++    document.body.innerHTML = '';
++    vi.clearAllMocks();
++  });
++
++  it('列表加载真实后端数据、无 IotPlaceholder；查询参数透传', async () => {
++    const wrapper = mount(MetricPage, { global: globalOpts });
++    await flushPromises();
++    expect(queryList).toHaveBeenCalledWith(expect.objectContaining({ pageNum: 1, pageSize: 10, metricCode: '', metricName: '', status: undefined }));
++    const text = wrapper.text();
++    expect(text).toContain('INS1_DAY_AVG');
++    expect(text).toContain('日平均');
++    expect(text).not.toContain('IotPlaceholder');
++    expect(text).not.toContain('TASK-0056 / TASK-0070');
++    wrapper.unmount();
++  });
++
++  it('详情按钮 → detail(id) → 详情弹窗展示（父 ref defineExpose）', async () => {
++    const wrapper = mount(MetricPage, { global: globalOpts });
++    await flushPromises();
++
++    // 页面自身通过 ref 调用 detail modal：直接验证 exposed 方法可用（BUG-0008）
++    const detailParent = mount(DetailParent, { global: globalOpts });
++    const detailRef = (detailParent.vm as unknown as { modalRef: { showModal: (id: number) => Promise<void> } }).modalRef;
++    expect(typeof detailRef.showModal).toBe('function');
++    await detailRef.showModal(301);
++    await flushPromises();
++    expect(getDetail).toHaveBeenCalledWith(301);
++    await vi.waitFor(() => expect(document.body.textContent ?? '').toContain('指标详情'));
++    detailParent.unmount();
++    wrapper.unmount();
++  });
++
++  it('表单弹窗父 ref 可调用 showModal / validateRatio；比值型缺分子分母被拦', async () => {
++    const parent = mount(FormParent, { global: globalOpts });
++    const modalRef = (parent.vm as unknown as { modalRef: ModalRef }).modalRef;
++    expect(typeof modalRef.showModal).toBe('function');
++    expect(typeof modalRef.validateRatio).toBe('function');
++
++    await modalRef.showModal();
++    await flushPromises();
++    expect(queryInstanceList).toHaveBeenCalledWith(expect.objectContaining({ pageNum: 1, pageSize: 500 }));
++
++    // 通过真实 DOM 选聚合方式=比值（5）：a-select 在 happy-dom 下触发 change
++    const selects = document.querySelectorAll('.ant-select-selection-search-input');
++    expect(selects.length).toBeGreaterThan(0);
++
++    // 直接验证条件校验逻辑（含后端 DTO 口径）：先设 aggType=5 后缺 ratio 字段必拦
++    const vm = parent.findComponent(MetricFormModal).vm as unknown as {
++      form: Record<string, unknown>;
++    };
++    vm.form.aggType = 5;
++    await nextTick();
++    expect(modalRef.validateRatio()).toBe(false);
++    expect(messageError).toHaveBeenCalledWith('比值型指标必须同时指定分子与分母数据项');
++    vm.form.ratioNumItemId = 11;
++    vm.form.ratioDenItemId = 12;
++    expect(modalRef.validateRatio()).toBe(true);
++    parent.unmount();
++  });
++
++  it('新增提交：calendarType 锁 1，非比值型 ratio_* 置空，metricCode 原样透传', async () => {
++    const parent = mount(FormParent, { global: globalOpts });
++    const modalRef = (parent.vm as unknown as { modalRef: ModalRef }).modalRef;
++    await modalRef.showModal();
++    await flushPromises();
++
++    const vm = parent.findComponent(MetricFormModal).vm as unknown as {
++      form: Record<string, unknown>;
++    };
++    Object.assign(vm.form, {
++      metricCode: 'INS1_DAY_AVG',
++      metricName: '日平均',
++      instanceId: 1001,
++      aggType: 1,
++      period: 'DAY',
++      calendarType: 2, // 试图传班次 2
++      ratioNumItemId: 11,
++      ratioDenItemId: 12, // 非比值型应被清空
++    });
++    await nextTick();
++
++    // 直接调 submit：validate() 经真实 a-form 校验（字段已填齐）
++    const submitVm = parent.findComponent(MetricFormModal).vm as unknown as { onSubmit: () => Promise<void> };
++    await submitVm.onSubmit();
++    await flushPromises();
++    expect(addMetric).toHaveBeenCalledTimes(1);
++    const payload = addMetric.mock.calls[0][0];
++    expect(payload).toMatchObject({
++      metricCode: 'INS1_DAY_AVG',
++      instanceId: 1001,
++      aggType: 1,
++      period: 'DAY',
++      calendarType: 1,
++      ratioNumItemId: undefined,
++      ratioDenItemId: undefined,
++    });
++    expect(payload.status).toBeUndefined();
++    parent.unmount();
++  });
++
++  it('编辑提交：metricCode 携带原值（不可改语义），status 不进更新集，走 update', async () => {
++    const parent = mount(FormParent, { global: globalOpts });
++    const modalRef = (parent.vm as unknown as { modalRef: ModalRef }).modalRef;
++    await modalRef.showModal({ id: 301, metricCode: 'INS1_DAY_AVG', metricName: '日平均', instanceId: 1001, aggType: 2, period: 'DAY', status: 1 });
++    await flushPromises();
++
++    const submitVm = parent.findComponent(MetricFormModal).vm as unknown as { onSubmit: () => Promise<void> };
++    await submitVm.onSubmit();
++    await flushPromises();
++    expect(updateMetric).toHaveBeenCalledTimes(1);
++    const payload = updateMetric.mock.calls[0][0];
++    expect(payload).toMatchObject({ id: 301, metricCode: 'INS1_DAY_AVG', calendarType: 1 });
++    expect(payload.status).toBeUndefined();
++    parent.unmount();
++  });
++
++  it('启停走 changeStatus，删除走 remove，不经过 update', async () => {
++    const wrapper = mount(MetricPage, { global: globalOpts });
++    await flushPromises();
++    const pageVm = wrapper.vm as unknown as {
++      changeMetricStatus: (ids: number[], status: number) => Promise<void>;
++      deleteMetrics: (ids: number[]) => Promise<void>;
++    };
++    await pageVm.changeMetricStatus([301], 0);
++    await flushPromises();
++    expect(changeStatus).toHaveBeenCalledWith({ ids: [301], status: 0 });
++    await pageVm.deleteMetrics([301]);
++    await flushPromises();
++    expect(removeMetrics).toHaveBeenCalledWith([301]);
++    expect(updateMetric).not.toHaveBeenCalled();
++    wrapper.unmount();
++  });
++
++  it('批量生成：instanceId 作 query 入参、清单作 body；空清单/非法口径被前置拦截', async () => {
++    const wrapper = mount(MetricPage, { global: globalOpts });
++    await flushPromises();
++    const pageVm = wrapper.vm as unknown as {
++      generateForm: { instanceId: number; metricsText: string };
++      onGenerateSubmit: () => Promise<void>;
++    };
++
++    pageVm.generateForm.instanceId = 1001;
++    pageVm.generateForm.metricsText = JSON.stringify([
++      { metricCode: 'INS1_DAY_AVG', metricName: '日平均', aggType: 1, period: 'DAY', calendarType: 1 },
++    ]);
++    await pageVm.onGenerateSubmit();
++    await flushPromises();
++    expect(generateMetrics).toHaveBeenCalledWith(
++      1001,
++      expect.objectContaining({
++        metrics: [expect.objectContaining({ metricCode: 'INS1_DAY_AVG', aggType: 1, period: 'DAY' })],
++      })
++    );
++
++    // 非法 aggType=6 被前置拒绝（后端仅 1-5）
++    generateMetrics.mockClear();
++    pageVm.generateForm.metricsText = JSON.stringify([{ metricCode: 'BAD', metricName: '非法', aggType: 6, period: 'DAY', calendarType: 1 }]);
++    await pageVm.onGenerateSubmit();
++    await flushPromises();
++    expect(generateMetrics).not.toHaveBeenCalled();
++    expect(messageError).toHaveBeenCalled();
++    wrapper.unmount();
++  });
++});

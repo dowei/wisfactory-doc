@@ -1,0 +1,58 @@
+diff --git a/frontend/src/views/display/metrics/index.vue b/frontend/src/views/display/metrics/index.vue
+index b82ab57..b3e8dab 100644
+--- a/frontend/src/views/display/metrics/index.vue
++++ b/frontend/src/views/display/metrics/index.vue
+@@ -120,8 +120,16 @@
+   });
+ 
+   function valueOf(metric: DisplayMetric): MetricValueRow | null {
+-    // metric_code 租户内唯一（uk_tenant_metric_code）；结果表按 metricCode 定位本期行（与结果表同数）
+-    return valueRows.value.find((r) => r.metricCode === metric.metricCode) ?? null;
++    // metric_code 租户内唯一（uk_tenant_metric_code）；读数口查 366 天窗（含去年对比行），
++    // 后端按 ts ASC 返回同码多行——必须取最大 ts 行（本期行）喂给卡片，不能取首行（I-1）。
++    // 本期行 ts 一定晚于去年同期对比行，与 metric-utils 的 comparisonTs 识别口径一致；
++    // 仅按 metricCode 定位（保持既有口径，不引入 period/instance 约束），同源不现算。
++    let latest: MetricValueRow | null = null;
++    for (const row of valueRows.value) {
++      if (row.metricCode !== metric.metricCode) continue;
++      if (latest == null || row.ts > latest.ts) latest = row;
++    }
++    return latest;
+   }
+ 
+   function completenessOf(metric: DisplayMetric): number | null {
+diff --git a/frontend/tests/unit/display/metrics-board-read-ports.spec.ts b/frontend/tests/unit/display/metrics-board-read-ports.spec.ts
+index d805882..e87ebe8 100644
+--- a/frontend/tests/unit/display/metrics-board-read-ports.spec.ts
++++ b/frontend/tests/unit/display/metrics-board-read-ports.spec.ts
+@@ -75,6 +75,30 @@ describe('指标看板接真值读口（TASK-0089 D3）', () => {
+     wrapper.unmount();
+   });
+ 
++  it('同 metricCode 多行 ts 升序（去年对比行在前）→ 本期值取最大 ts 行，不取首行旧值（I-1）', async () => {
++    const lastYearDate = new Date(TS);
++    lastYearDate.setFullYear(lastYearDate.getFullYear() - 1);
++    const lastYearTs = lastYearDate.getTime();
++    // 后端 ORDER BY ts ASC：去年对比行在前、本期行在后——旧版 .find() 会取到去年旧值
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: lastYearTs, value: 123.4, yoy: null, mom: null, unit: 'kWh' },
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: 0.083, mom: -0.021, unit: 'kWh' },
++    ]);
++    metricCompleteness.mockResolvedValue({ available: false, reason: '无源', rows: [] });
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++
++    const text = wrapper.text();
++    // 卡片本期值与伴随值同源取「本期行」（value 与 ts 都是本期的）
++    expect(text).toContain('412.6');
++    expect(text).toContain('+8.3%');
++    expect(text).toContain('-2.1%');
++    // 不显示一年前对比行的旧值
++    expect(text).not.toContain('123.4');
++    expect(text).not.toContain('+0.0%'); // 去年行无 yoy/mom 伴随值
++    wrapper.unmount();
++  });
++
+   it('null 伴随值保持空态，不冒充 0', async () => {
+     metricValues.mockResolvedValue([
+       { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: 0.083, mom: -0.021, unit: 'kWh' },

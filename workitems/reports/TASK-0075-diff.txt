@@ -1,0 +1,436 @@
+commit 9754e0ef47709fbd0fec0edd1d6cd7cd3f1d034c
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 02:18:23 2026 +0800
+
+    fix(system): sys_operate_log 身份三列（user_id/user_type/user_name）可空化，未认证操作尝试留痕不再丢日志（TASK-0075，BUG-0003，TC-0024 先红后绿）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/aspect/OperateLogAspect.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/aspect/OperateLogAspect.java
+index 71ca9a1..ce911fb 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/aspect/OperateLogAspect.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/aspect/OperateLogAspect.java
+@@ -129,8 +129,8 @@ public class OperateLogAspect {
+                 entity.setUserAgent(request.getHeader("User-Agent"));
+             }
+ 
+-            // 5. 用户信息
+-            fillUserInfo(entity);
++            // 5. 用户信息（未认证态身份列留空仍落库，尽力记尝试用户名——BUG-0003）
++            fillUserInfo(entity, joinPoint);
+ 
+             // 6. 请求参数（REQ-0015：落库前对敏感字段名值脱敏，防止新增/编辑实体的明文手机号/邮箱入库）
+             if (annotation.saveParam()) {
+@@ -167,18 +167,30 @@ public class OperateLogAspect {
+      * 填充用户信息和审计字段
+      * 注意：操作日志是在异步线程中写入的，因此必须在主线程中把 BaseEntity 的审计字段全部填好，
+      * 不能依赖异步线程里的 MetaObjectHandler（拿不到 Sa-Token 登录上下文）
++     * <p>
++     * BUG-0003：未认证态不再因身份列为空而丢日志——sys_operate_log 身份三列
++     * （user_id/user_type/user_name）已改 NULL 可空，未认证操作尝试以身份列 NULL 落库
++     * （user_name 尽力记登录尝试用户名，取不到不造数），认证失败恰是最该留痕的操作尝试。
+      */
+-    private void fillUserInfo(SysOperateLog entity) {
++    private void fillUserInfo(SysOperateLog entity, JoinPoint joinPoint) {
+         // 先补全 BaseEntity 的审计字段（异步线程中无法通过 MetaObjectHandler 填充）
+         LocalDateTime now = LocalDateTime.now();
+         entity.setCreateTime(now);
+         entity.setUpdateTime(now);
+         entity.setDeleted(0);
+ 
++        boolean login;
++        try {
++            login = StpUtil.isLogin();
++        } catch (Exception e) {
++            // 无 sa-token 上下文等异常场景按未认证处理：身份留空仍落库，不因取身份失败丢日志
++            login = false;
++        }
++        if (!login) {
++            entity.setUserName(resolveAttemptUserName(joinPoint));
++            return;
++        }
+         try {
+-            if (!StpUtil.isLogin()) {
+-                return;
+-            }
+             Long userId = StpUtil.getLoginIdAsLong();
+             entity.setUserId(userId);
+             entity.setCreateBy(userId);
+@@ -197,7 +209,44 @@ public class OperateLogAspect {
+                 }
+             }
+         } catch (Exception e) {
+-            // 未登录或获取用户信息失败时忽略
++            // 已认证但获取用户信息失败时忽略：身份列留空（列已可空）仍落库
++        }
++    }
++
++    /**
++     * 未认证态尽力提取尝试用户名（BUG-0003）：登录失败场景请求参数中通常携带 username 尝试值。
++     * 从切面已捕获的方法参数 JSON 中提取 username 字段（多参数时逐个查找）；
++     * 取不到（无参数 / 无 username 字段 / 序列化失败 / 值为空）返回 null，不造数。
++     * 提取过程全程兜底，绝不影响操作日志落库主流程。
++     */
++    private String resolveAttemptUserName(JoinPoint joinPoint) {
++        try {
++            String json = getRequestParams(joinPoint);
++            if (StrUtil.isBlank(json)) {
++                return null;
++            }
++            List<cn.hutool.json.JSONObject> candidates = new ArrayList<>();
++            if (cn.hutool.json.JSONUtil.isTypeJSON(json)) {
++                cn.hutool.json.JSON parsed = cn.hutool.json.JSONUtil.parse(json);
++                if (parsed instanceof cn.hutool.json.JSONObject) {
++                    candidates.add((cn.hutool.json.JSONObject) parsed);
++                } else if (parsed instanceof cn.hutool.json.JSONArray) {
++                    for (Object o : (cn.hutool.json.JSONArray) parsed) {
++                        if (o instanceof cn.hutool.json.JSONObject) {
++                            candidates.add((cn.hutool.json.JSONObject) o);
++                        }
++                    }
++                }
++            }
++            for (cn.hutool.json.JSONObject obj : candidates) {
++                String name = obj.getStr("username", null);
++                if (StrUtil.isNotBlank(name)) {
++                    return StrUtil.sub(name, 0, 500);
++                }
++            }
++            return null;
++        } catch (Exception e) {
++            return null;
+         }
+     }
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysOperateLog.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysOperateLog.java
+index 9cd6e78..b44f1f7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysOperateLog.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/system/entity/SysOperateLog.java
+@@ -26,13 +26,13 @@ public class SysOperateLog extends BaseEntity {
+     @TableId(type = IdType.AUTO)
+     private Long id;
+ 
+-    /** 用户id */
++    /** 用户id（可空：未认证操作尝试无登录身份，BUG-0003） */
+     private Long userId;
+ 
+-    /** 用户类型 */
++    /** 用户类型（可空：未认证操作尝试无用户类型，BUG-0003） */
+     private Integer userType;
+ 
+-    /** 用户名称 */
++    /** 用户名称（未认证态记登录尝试用户名，取不到为空，BUG-0003） */
+     private String userName;
+ 
+     /** 部门id */
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/system/aspect/OperateLogAspectTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/aspect/OperateLogAspectTest.java
+new file mode 100644
+index 0000000..fb314ec
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/system/aspect/OperateLogAspectTest.java
+@@ -0,0 +1,243 @@
++package net.otlab.admin.module.system.aspect;
++
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.system.entity.SysDept;
++import net.otlab.admin.module.system.entity.SysOperateLog;
++import net.otlab.admin.module.system.entity.SysUser;
++import net.otlab.admin.module.system.entity.dto.LoginDTO;
++import net.otlab.admin.module.system.service.OperateLogService;
++import net.otlab.admin.module.system.service.SysDeptService;
++import net.otlab.admin.module.system.service.SysUserService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.utils.OtIpUtils;
++import org.aspectj.lang.JoinPoint;
++import org.aspectj.lang.reflect.MethodSignature;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.mock.web.MockHttpServletRequest;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.web.context.request.RequestContextHolder;
++import org.springframework.web.context.request.ServletRequestAttributes;
++
++import java.lang.reflect.Method;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 操作日志切面单元测试（BUG-0003：未认证态操作日志落库 user_id=null）
++ *
++ * <p>BUG-0003 修复语义：未认证态触发带 @OperateLog 的失败请求时，操作日志不再因身份列为空
++ * 而写库失败丢弃——身份三列（user_id/user_type/user_name）落库为 null（列已可空），
++ * user_name 尽力记登录尝试用户名（取不到不造数）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class OperateLogAspectTest {
++
++    /** 注解宿主（供反射取真实 @OperateLog Method） */
++    static class DummyController {
++        @OperateLog(title = "用户登录(测试)", businessType = BusinessType.OTHER)
++        public void loginTest(LoginDTO loginDTO) {
++        }
++
++        @OperateLog(title = "用户登录(测试)", businessType = BusinessType.OTHER)
++        public void loginTestNoUsername(String tag) {
++        }
++    }
++
++    private OperateLogAspect aspect;
++    private AutoCloseable mocks;
++    private MockedStatic<StpUtil> stpUtil;
++    private MockedStatic<OtIpUtils> otIpUtils;
++
++    @Mock
++    private OperateLogService operateLogService;
++
++    @Mock
++    private SysUserService sysUserService;
++
++    @Mock
++    private SysDeptService sysDeptService;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        aspect = new OperateLogAspect();
++        ReflectionTestUtils.setField(aspect, "operateLogService", operateLogService);
++        ReflectionTestUtils.setField(aspect, "sysUserService", sysUserService);
++        ReflectionTestUtils.setField(aspect, "sysDeptService", sysDeptService);
++
++        stpUtil = Mockito.mockStatic(StpUtil.class);
++        // IP 工具打桩：单测环境无 ip2region 数据文件，避免 ERROR 日志噪音（断言不依赖地区值）
++        otIpUtils = Mockito.mockStatic(OtIpUtils.class);
++        otIpUtils.when(() -> OtIpUtils.getClientIp(any())).thenReturn("127.0.0.1");
++        otIpUtils.when(() -> OtIpUtils.getRegion(any())).thenReturn("");
++
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        request.setRequestURI("/auth/login/test");
++        request.setMethod("POST");
++        request.addHeader("User-Agent", "JUnit-Agent");
++        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        RequestContextHolder.resetRequestAttributes();
++        if (stpUtil != null) {
++            stpUtil.close();
++        }
++        if (otIpUtils != null) {
++            otIpUtils.close();
++        }
++        if (mocks != null) {
++            mocks.close();
++        }
++    }
++
++    /** 构造切面入参：joinPoint 指向 dummy 方法，args 为方法实参 */
++    private JoinPoint joinPoint(String methodName, Object... args) throws Exception {
++        Method method = DummyController.class.getMethod(methodName, parameterTypesOf(methodName));
++        MethodSignature signature = Mockito.mock(MethodSignature.class);
++        when(signature.getMethod()).thenReturn(method);
++        JoinPoint joinPoint = Mockito.mock(JoinPoint.class);
++        when(joinPoint.getSignature()).thenReturn(signature);
++        when(joinPoint.getTarget()).thenReturn(new DummyController());
++        when(joinPoint.getArgs()).thenReturn(args);
++        return joinPoint;
++    }
++
++    private Class<?>[] parameterTypesOf(String methodName) throws Exception {
++        for (Method m : DummyController.class.getDeclaredMethods()) {
++            if (m.getName().equals(methodName)) {
++                return m.getParameterTypes();
++            }
++        }
++        throw new IllegalArgumentException(methodName);
++    }
++
++    private SysOperateLog capturedEntity() {
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        return captor.getValue();
++    }
++
++    @Test
++    @DisplayName("BUG-0003：未认证态登录失败 → 身份列 null 落库 + user_name 记尝试用户名（不再写库失败丢日志）")
++    void testUnauthenticatedRecordsAttemptUserName() throws Exception {
++        stpUtil.when(StpUtil::isLogin).thenReturn(false);
++        LoginDTO dto = new LoginDTO();
++        dto.setUsername("probeUser");
++        dto.setPassword("probePass123");
++
++        aspect.doBefore();
++        aspect.doAfterThrowing(joinPoint("loginTest", dto),
++                new BusinessException("auth.testLoginDevOnly"));
++
++        SysOperateLog log = capturedEntity();
++        // 身份三列：user_id/user_type 为 null（列已可空），user_name 记尝试用户名
++        assertNull(log.getUserId(), "未认证态 user_id=null 落库");
++        assertNull(log.getUserType(), "未认证态 user_type=null");
++        assertNull(log.getCreateBy(), "未认证态 createBy=null");
++        assertEquals("probeUser", log.getUserName(), "user_name 记登录尝试用户名");
++        // 失败记录语义（既有口径不变）
++        assertEquals(Integer.valueOf(0), log.getStatus());
++        assertTrue(log.getFailReason().contains("auth.testLoginDevOnly"));
++        // 尝试上下文可追溯
++        assertEquals("/auth/login/test", log.getUrl());
++        assertEquals("POST", log.getRequestMethod());
++        assertEquals("用户登录(测试)", log.getModule());
++        assertEquals(BusinessType.OTHER.getCode(), log.getBusinessType().intValue());
++        assertEquals("127.0.0.1", log.getIp());
++        assertEquals("JUnit-Agent", log.getUserAgent());
++        assertTrue(log.getParam().contains("probeUser"), "请求参数含尝试用户名");
++        assertNotNull(log.getMethod());
++        // 异步线程写库，审计字段必须请求线程填好（既有口径不变）
++        assertNotNull(log.getCreateTime());
++        assertNotNull(log.getUpdateTime());
++        assertEquals(Integer.valueOf(0), log.getDeleted());
++        assertNotNull(log.getCostTime());
++    }
++
++    @Test
++    @DisplayName("BUG-0003：未认证态无可提取参数（无参）→ user_name=null 不造数，日志仍落库")
++    void testUnauthenticatedWithoutArgsKeepsUserNameNull() throws Exception {
++        stpUtil.when(StpUtil::isLogin).thenReturn(false);
++
++        aspect.doBefore();
++        aspect.doAfterThrowing(joinPoint("loginTest"),
++                new BusinessException("auth.testLoginDevOnly"));
++
++        SysOperateLog log = capturedEntity();
++        assertNull(log.getUserId());
++        assertNull(log.getUserName(), "无参数可提取时不造数");
++        assertEquals(Integer.valueOf(0), log.getStatus());
++        assertEquals("/auth/login/test", log.getUrl());
++        // 身份列全空仍进入 saveOperateLog——修复前该实体 INSERT 撞 NOT NULL 约束（红），修复后可空（绿）
++        assertNotNull(log.getCreateTime());
++    }
++
++    @Test
++    @DisplayName("BUG-0003：未认证态参数无 username 字段 → user_name=null 不造数")
++    void testUnauthenticatedWithoutUsernameFieldKeepsUserNameNull() throws Exception {
++        stpUtil.when(StpUtil::isLogin).thenReturn(false);
++
++        aspect.doBefore();
++        aspect.doAfterThrowing(joinPoint("loginTestNoUsername", "just-a-tag"),
++                new BusinessException("auth.testLoginDevOnly"));
++
++        SysOperateLog log = capturedEntity();
++        assertNull(log.getUserId());
++        assertNull(log.getUserName(), "参数无 username 字段时不造数");
++        assertEquals(Integer.valueOf(0), log.getStatus());
++    }
++
++    @Test
++    @DisplayName("认证态行为回归（既有行为不变）：user_id=1 + 用户/部门信息齐备")
++    void testAuthenticatedBehaviorUnchanged() throws Exception {
++        stpUtil.when(StpUtil::isLogin).thenReturn(true);
++        stpUtil.when(StpUtil::getLoginIdAsLong).thenReturn(1L);
++        SysUser user = new SysUser();
++        user.setId(1L);
++        user.setUsername("admin");
++        user.setUserType(1);
++        user.setDeptId(3L);
++        when(sysUserService.getById(1L)).thenReturn(user);
++        SysDept dept = new SysDept();
++        dept.setId(3L);
++        dept.setDeptName("研发部");
++        when(sysDeptService.getById(3L)).thenReturn(dept);
++        LoginDTO dto = new LoginDTO();
++        dto.setUsername("admin");
++
++        aspect.doBefore();
++        aspect.doAfterThrowing(joinPoint("loginTest", dto),
++                new BusinessException("auth.testLoginDevOnly"));
++
++        SysOperateLog log = capturedEntity();
++        assertEquals(Long.valueOf(1L), log.getUserId());
++        assertEquals("admin", log.getUserName());
++        assertEquals(Integer.valueOf(1), log.getUserType());
++        assertEquals(Long.valueOf(3L), log.getDeptId());
++        assertEquals("研发部", log.getDeptName());
++        assertEquals(Long.valueOf(1L), log.getCreateBy());
++        assertEquals(Long.valueOf(1L), log.getUpdateBy());
++        assertEquals(Integer.valueOf(0), log.getStatus());
++        assertTrue(log.getFailReason().contains("auth.testLoginDevOnly"));
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_operate_log_identity_nullable.sql b/resources/sql/upgrade/20261122_operate_log_identity_nullable.sql
+new file mode 100644
+index 0000000..77249f1
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_operate_log_identity_nullable.sql
+@@ -0,0 +1,58 @@
++-- ============================================================
++-- 存量库升级脚本：sys_operate_log 身份三列改可空（TASK-0075 / BUG-0003）
++--
++-- 用途（BUG-0003 修复方案①逐字口径的落实）：
++--   未认证态触发带 @OperateLog 的失败请求（如 prod /auth/login/test 拒绝、登录失败路径）时，
++--   OperateLog 切面取不到登录身份，MyBatis Plus 按 NOT_NULL 策略把身份列从 INSERT 列清单整体
++--   省略（2026-11-22 02:09:43 prod 实测复现报错 SQL 佐证），INSERT 撞 NOT NULL 无默认值约束：
++--   `Field 'user_id' doesn't have a default value` → 操作日志写入失败丢弃，审计留痕缺失。
++--
++--   实测报错 SQL 的列清单不含 user_id/user_type/user_name 三列（三者均 NOT NULL 无默认值，
++--   01_base.sql 439-443 行），故只放宽 user_id 一列 INSERT 仍会撞 user_type/user_name——
++--   三列一并改 NULL 可空，一次放宽到位：
++--     user_id   bigint      NOT NULL → NULL（未认证操作尝试无登录身份，user_id=NULL 落库）
++--     user_type int         NOT NULL → NULL（未认证操作尝试无用户类型）
++--     user_name varchar(500)NOT NULL → NULL（切面尽力记登录尝试用户名，取不到不造数）
++--   字符集/长度等其余列属性保持 01_base.sql 原口径不变（user_name 保持 utf8mb4_general_ci）。
++--
++-- 01_base.sql 不改（TASK-0075 风险核对第 2 行）：存量库与新库统一由本增量脚本放宽；
++--   全新库按部署口径执行 01_base.sql + 全部 upgrade 脚本后，与本脚本口径一致。
++--
++-- 兼容性核对（TASK-0075 风险核对第 2 行，全库 grep sys_operate_log 证据见任务报告）：
++--   写入点仅 OperateLogAspect / PermissionDeniedAuditListener 两处（均已在请求线程把审计字段
++--   填好，身份列未认证态留空）；查询页 sys_operate_log 列表按 user_name/部门/业务类型/状态
++--   筛选且均为可选项，OperateLogServiceImpl#selectMyList 的 user_id 等值筛选只在已认证态触发
++--   （未认证行 user_id=NULL 天然不入该结果），既有查询兼容。
++--   登录失败日志已有独立 LoginLogService（两日志不混存口径不变）。
++--
++-- 适用环境：
++--   已执行 01_base.sql（sys_operate_log 身份三列为 NOT NULL 原口径）的存量库及全新库。
++--
++-- 幂等口径：
++--   以 information_schema.COLUMNS.IS_NULLABLE 判存——已是 NULL 可空（IS_NULLABLE='YES'）
++--   则跳过（MySQL 8.0 无 MODIFY IF 语法，用条件化存储过程实现）。重复执行不报错、
++--   不重复 MODIFY。可安全重复执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块——存储过程体内的分号必须写在一行内（不得行尾出现），
++--   故 CREATE PROCEDURE 全部压缩为单行；语句前不得挂 -- 注释行（执行器逐行剥除 -- 行，
++--   说明文字全部集中在本头部与文件尾）。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++DROP PROCEDURE IF EXISTS ot_ol_nullable;
++CREATE PROCEDURE ot_ol_nullable(IN cn VARCHAR(64), IN ddl VARCHAR(1000)) BEGIN DECLARE n INT DEFAULT 0; SELECT COUNT(*) INTO n FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_operate_log' AND COLUMN_NAME = cn AND IS_NULLABLE = 'NO'; IF n > 0 THEN SET @s = ddl; PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st; END IF; END;
++CALL ot_ol_nullable('user_id', 'ALTER TABLE `sys_operate_log` MODIFY COLUMN `user_id` bigint NULL COMMENT ''用户id（BUG-0003：未认证操作尝试无登录身份，可空落库）''');
++CALL ot_ol_nullable('user_type', 'ALTER TABLE `sys_operate_log` MODIFY COLUMN `user_type` int NULL COMMENT ''用户类型（BUG-0003：未认证操作尝试无用户类型，可空）''');
++CALL ot_ol_nullable('user_name', 'ALTER TABLE `sys_operate_log` MODIFY COLUMN `user_name` varchar(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NULL COMMENT ''用户名称（BUG-0003：未认证态记登录尝试用户名，取不到为空）''');
++DROP PROCEDURE IF EXISTS ot_ol_nullable;
++
++-- ============================================================
++-- 执行后核对（验收）：
++--   SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_TYPE FROM information_schema.COLUMNS
++--    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sys_operate_log'
++--      AND COLUMN_NAME IN ('user_id','user_type','user_name')
++--   → 三行 IS_NULLABLE 均应为 YES（user_id bigint / user_type int /
++--     user_name varchar(500) 且字符集不变）
++-- ============================================================

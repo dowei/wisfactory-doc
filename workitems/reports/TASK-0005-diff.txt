@@ -1,0 +1,2386 @@
+commit 384d58fa50446713940820ed68c60d5fad817dc2
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 00:56:06 2026 +0800
+
+    feat(iot): 数据权限翻译组件（六步）实现，ADR-0016 七项裁决驱动（TASK-0005）
+    
+    - 六步翻译：data_scope 并集 → 部门集合 → 实例锚点 → ancestors 子树展开（上限截断+WARN）→ 条件拼装 → 缓存接缝（VisibleScopeCache + NoOp，Redis 归 TASK-0006）
+    - 自包含设计：dataperm 包内自带只读 Mapper（sys_user/sys_role/sys_user_role/sys_dept/sys_role_dept/iot_model_instance 全参数化 @Select），不调框架 DataScopeService、不依赖 iot 业务服务；多租户消费会话上下文由插件注入
+    - 条件拼装三态：配置类 instance_id IN [OR create_by=me]、点位类 dept_id IN OR bound_instance_id IN、时序类 instance_id IN（scope=4 无贡献）；NULL 结构性 fail-closed 不特判（裁决 6）
+    - TDengine 下推渲染器：契约标签 instance_key/dept_id（裁决 7），编码单引号转义
+    - 中台 scope JSON 三态：null/空=默认拒绝、subtree=false 精确、subtree=true 复用步骤 3-4 展开（裁决 5）
+    - 越权策略常量 SCOPE_EMPTY/SCOPE_FORBIDDEN + isDetailAccess 形态判定（裁决 2，本任务不接线）
+    - 配置 ot.dataperm.subtree-max 默认 5000（裁决 1）；单测 65 例覆盖五种 scope/多角色并集/前缀陷阱/截断 WARN 格式/scope JSON 三态/NULL 归类
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategy.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategy.java
+new file mode 100644
+index 0000000..6242f72
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategy.java
+@@ -0,0 +1,78 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import java.util.Locale;
++import java.util.Set;
++
++/**
++ * 越权拒绝策略常量与接口形态判定辅助（TASK-0005，ADR-0016 裁决 2）。
++ *
++ * <p>裁决 2 定版：空结果 vs 403 按接口形态判定而非逐个枚举——GET 集合类（/list、/tree、
++ * /history、/curve、/realtime 等集合语义）越权返回空集（SCOPE_EMPTY）；GET 单对象类
++ * （/{id}、/{code} 详情）越权返回 403（SCOPE_FORBIDDEN）。接口实现按形态选用常量，
++ * 未来新增接口自动归类，无需维护接口清单。
++ *
++ * <p>本任务只提供常量与判定辅助，不接线任何端点；最终选择权在接口实现
++ * （TASK-0007 红线用例按本裁决构造）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class DataPermAccessStrategy {
++
++    /**
++     * 越权拒绝策略（二选一，按接口形态）
++     */
++    public enum DenyStrategy {
++        /** 集合语义接口：越权返回空集（数据不存在口径） */
++        SCOPE_EMPTY,
++        /** 单对象语义接口：越权返回 403（4xx 错误码口径，含数据权限不命中） */
++        SCOPE_FORBIDDEN
++    }
++
++    /**
++     * 集合语义尾段词表（裁决 2 五例 + 同族动词）。这是<b>形态词表</b>而非接口清单——
++     * 新增接口只要尾段落在集合语义即自动归 SCOPE_EMPTY，无需登记。
++     */
++    private static final Set<String> COLLECTION_TAIL_KEYWORDS = Set.of(
++            "list", "tree", "history", "curve", "realtime",
++            "page", "export", "count", "stat", "stats", "options");
++
++    private DataPermAccessStrategy() {
++    }
++
++    /**
++     * 按接口形态判定是否单对象（详情类）访问——组件提供的判定辅助，最终选择权在接口实现。
++     *
++     * <p>判定规则：取路径最后一个非空段（剥离查询串、大小写不敏感）——
++     * 命中集合语义词表 → false（SCOPE_EMPTY）；其余（数字 id、路径式编码、占位符、
++     * 无法识别形态）→ true（SCOPE_FORBIDDEN，fail-closed：403 是更明确的拒绝方向）。
++     *
++     * @param resource 接口路径（如 /api/v1/iot/instance/{code}），允许 null/空白（按详情类处理）
++     */
++    public static boolean isDetailAccess(String resource) {
++        String tail = tailSegment(resource);
++        if (tail == null) {
++            return true;
++        }
++        return !COLLECTION_TAIL_KEYWORDS.contains(tail);
++    }
++
++    /**
++     * 剥离查询串后取最后一个非空路径段，小写归一；无可用段返回 null
++     */
++    private static String tailSegment(String resource) {
++        if (resource == null) {
++            return null;
++        }
++        int query = resource.indexOf('?');
++        String path = query >= 0 ? resource.substring(0, query) : resource;
++        String[] segments = path.split("/");
++        for (int i = segments.length - 1; i >= 0; i--) {
++            String segment = segments[i].trim();
++            if (!segment.isEmpty()) {
++                return segment.toLowerCase(Locale.ROOT);
++            }
++        }
++        return null;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssembler.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssembler.java
+new file mode 100644
+index 0000000..213e174
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssembler.java
+@@ -0,0 +1,144 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.springframework.stereotype.Component;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++/**
++ * 步骤 5：查询条件拼装（TASK-0005，ADR-0016 裁决 2/3/4/6）。
++ *
++ * <p>按表类别三态，渲染结果为<b>条件片段</b>（不含 WHERE）供消费方拼 SQL / 传入
++ * MyBatis-Plus wrapper apply：
++ * <ul>
++ * <li><b>配置类</b>（iot_ 配置表管理面列表：字典/模板/实例/点位/网关/通道/指标等）——
++ *     {@code instance_id IN (可见集)}，存在 scope=4 角色时追加 {@code OR create_by = 当前用户}
++ *     分支（裁决 3/4：最终条件 = (instance_id ∈ 并集) OR (create_by=me，仅配置类)）；
++ *     无实例锚点的表（如字典）传 null 列名，只承载 create_by 语义；</li>
++ * <li><b>点位类</b>——{@code dept_id IN (部门集) OR bound_instance_id IN (可见集)}；
++ *     点位列表同时属配置类对象，scope=4 追加 create_by 分支（裁决 3）；</li>
++ * <li><b>时序类</b>（数据项/指标/曲线查询）——仅 {@code instance_id IN (可见集)}；
++ *     scope=4 无贡献（时序值没有 create_by，TD-0044）。</li>
++ * </ul>
++ *
++ * <p>返回值约定：{@code null} = allTenant 无需追加条件；{@code "1 = 0"} = 无任何可见性
++ * （fail-closed，返回空列表而非全量）；其余为条件片段。
++ *
++ * <p>NULL 归类（裁决 6）为结构性满足：只渲染 IN 比较、绝不渲染 IS NULL/IS NOT NULL
++ * 分支——SQL NULL 不命中任何 IN，未绑部门行对非 scope=1 天然不可见，不做特判。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class DataPermConditionAssembler {
++
++    /** 零可见性 fail-closed 片段：恒假条件，消费方直接 AND 拼接 */
++    public static final String FAIL_CLOSED = "1 = 0";
++
++    private static final String OR = " OR ";
++
++    /**
++     * 配置类条件：{@code instance_id IN (并集)} [OR {@code create_by = userId}]。
++     *
++     * @param scope            resolve 产物
++     * @param userId           当前用户 id（create_by 分支取值；中台场景无本人语义传 null）
++     * @param instanceIdColumn 实例 id 列名（如 "instance_id"；实例表自身传 "id"；
++     *                         无实例锚点的表传 null——只承载 create_by 语义）
++     * @param createByColumn   创建人列名（如 "create_by"）
++     */
++    public String configCondition(VisibleScope scope, Long userId, String instanceIdColumn, String createByColumn) {
++        if (scope == null) {
++            return FAIL_CLOSED;
++        }
++        if (scope.allTenant()) {
++            return null;
++        }
++        List<String> disjuncts = new ArrayList<>();
++        if (instanceIdColumn != null && !scope.instanceIds().isEmpty()) {
++            disjuncts.add(instanceIdColumn + " IN (" + joinSorted(scope.instanceIds()) + ")");
++        }
++        if (createByColumn != null && scope.createByOnly() && userId != null) {
++            disjuncts.add(createByColumn + " = " + userId);
++        }
++        // 有实例锚点的表：零可见性 fail-closed；无锚点表（列名 null）不产出任何数据权限条件
++        return joinDisjuncts(disjuncts, instanceIdColumn != null);
++    }
++
++    /**
++     * 点位类条件：{@code dept_id IN (部门集)} OR {@code bound_instance_id IN (可见集)}
++     * [OR {@code create_by = userId}]。
++     *
++     * <p>两个 IN 列均无 IS NULL 特判（裁决 6）：scope=1 全租户不做过滤（未绑部门行对
++     * 租户管理员可见）；其余 scope 下 NULL 行两条件皆不命中=不可见（fail-closed）。
++     *
++     * @param scope                resolve 产物
++     * @param userId               当前用户 id（scope=4 点位列表按 create_by 过滤，裁决 3）
++     * @param deptIdColumn         部门列名（如 "dept_id"）
++     * @param boundInstanceIdColumn 绑定实例列名（如 "bound_instance_id"）
++     * @param createByColumn       创建人列名（如 "create_by"）
++     */
++    public String pointCondition(VisibleScope scope, Long userId, String deptIdColumn,
++                                 String boundInstanceIdColumn, String createByColumn) {
++        if (scope == null) {
++            return FAIL_CLOSED;
++        }
++        if (scope.allTenant()) {
++            return null;
++        }
++        List<String> disjuncts = new ArrayList<>();
++        if (deptIdColumn != null && !scope.deptIds().isEmpty()) {
++            disjuncts.add(deptIdColumn + " IN (" + joinSorted(scope.deptIds()) + ")");
++        }
++        if (boundInstanceIdColumn != null && !scope.instanceIds().isEmpty()) {
++            disjuncts.add(boundInstanceIdColumn + " IN (" + joinSorted(scope.instanceIds()) + ")");
++        }
++        if (createByColumn != null && scope.createByOnly() && userId != null) {
++            disjuncts.add(createByColumn + " = " + userId);
++        }
++        return joinDisjuncts(disjuncts, true);
++    }
++
++    /**
++     * 时序类条件：仅 {@code instance_id IN (可见集)}——scope=4 无贡献（不追加 create_by，
++     * TD-0044：时序值没有 create_by，硬套只会出错）。
++     *
++     * @param scope            resolve 产物
++     * @param instanceIdColumn 实例 id 列名（如 "instance_id"）
++     */
++    public String timeseriesCondition(VisibleScope scope, String instanceIdColumn) {
++        if (scope == null) {
++            return FAIL_CLOSED;
++        }
++        if (scope.allTenant()) {
++            return null;
++        }
++        if (instanceIdColumn == null || scope.instanceIds().isEmpty()) {
++            return FAIL_CLOSED;
++        }
++        return instanceIdColumn + " IN (" + joinSorted(scope.instanceIds()) + ")";
++    }
++
++    /**
++     * 单分支裸片段（供 AND 拼接）；多分支加括号按 OR 合并；零分支按 failClosed 参数
++     * 返回 {@code 1 = 0}（有锚点表）或 null（无锚点表不承载权限过滤）
++     */
++    private String joinDisjuncts(List<String> disjuncts, boolean failClosedWhenEmpty) {
++        if (disjuncts.isEmpty()) {
++            return failClosedWhenEmpty ? FAIL_CLOSED : null;
++        }
++        if (disjuncts.size() == 1) {
++            return disjuncts.get(0);
++        }
++        return disjuncts.stream().collect(Collectors.joining(OR, "(", ")"));
++    }
++
++    /**
++     * id 升序渲染（确定性输出，利于 SQL 复用与断言）
++     */
++    private String joinSorted(Set<Long> ids) {
++        return ids.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermDeptRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermDeptRow.java
+new file mode 100644
+index 0000000..4f92c81
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermDeptRow.java
+@@ -0,0 +1,19 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.Data;
++
++/**
++ * 数据权限组件内部行对象：sys_dept 祖级路径（scope=2 下级部门展开用）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DataPermDeptRow {
++
++    /** 部门 id（sys_dept.id） */
++    private Long id;
++
++    /** 祖级路径，逗号分隔 id 列表（如 0,1,5）；前缀匹配不递归查库 */
++    private String ancestors;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermInstanceRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermInstanceRow.java
+new file mode 100644
+index 0000000..d282684
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermInstanceRow.java
+@@ -0,0 +1,28 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.Data;
++
++/**
++ * 数据权限组件内部行对象：iot_model_instance 权限锚点行（详细设计 §1.5）。
++ *
++ * <p>实例是数据权限的锚点：每个实例绑一个部门，用户可见范围最终翻译为可见实例集合。
++ * ancestors 逗号分隔 id 路径，子树展开靠它做元素级（路径前缀）匹配，不递归查库。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DataPermInstanceRow {
++
++    /** 实例 id（iot_model_instance.id） */
++    private Long id;
++
++    /** 实例编码（租户内唯一，路径式 F01、F01.WS01、F01.WS01.EQ001）；TDengine 标签 instance_key 的取值 */
++    private String instanceCode;
++
++    /** 绑定部门 id（sys_dept.id，数据权限命中关键字段；DEFAULT NULL，必填由服务层校验——开放点 10 归 TASK-0012） */
++    private Long deptId;
++
++    /** 祖级路径，逗号分隔 id 列表，仿 sys_dept.ancestors */
++    private String ancestors;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java
+new file mode 100644
+index 0000000..b3f022d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermProperties.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * 数据权限组件配置（TASK-0005，配置键 {@code ot.dataperm.*}，ADR-0016 裁决 1）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.dataperm")
++public class DataPermProperties {
++
++    /**
++     * 子树展开上限（默认 5000 实例，ADR-0016 裁决 1）：步骤 4 ancestors 子树展开的
++     * 实例数上限，超限<b>截断并 WARN</b>（不报错不降级——权限组件故障不得阻断业务查询），
++     * 截断按 ancestors 路径序保近端实例；WARN 格式
++     * {@code [DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>}。
++     * {@code <=0} 视为关闭上限（误配 0 不得造成全量不可见）。
++     */
++    private int subtreeMax = 5000;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermRoleRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermRoleRow.java
+new file mode 100644
+index 0000000..5c8f239
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermRoleRow.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import lombok.Data;
++
++/**
++ * 数据权限组件内部行对象：sys_role 启用角色（join sys_user_role）——组件自包含，
++ * 不复用 system 模块实体，保证未来可整体迁出为共享模块（TASK-0051 前）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class DataPermRoleRow {
++
++    /** 角色 id（sys_role.id） */
++    private Long id;
++
++    /** 数据权限 1全部 2本部门及下属 3本部门 4仅本人 5自定义（与 DataScopeEnum 一致） */
++    private Integer dataScope;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java
+new file mode 100644
+index 0000000..244f07c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermService.java
+@@ -0,0 +1,44 @@
++package net.otlab.admin.module.iot.dataperm;
++
++/**
++ * 数据权限翻译组件入口（TASK-0005）。
++ *
++ * <p>登录用户 → 可见实例集合的统一翻译组件（详细设计 §4 六步），管理面列表、展示端、
++ * 数据服务内部查询走同一组件同一口径（禁止两处各写一套）。组件自包含：只依赖本包的
++ * 只读 Mapper 与 {@link DataPermProperties} 配置，不调用框架 DataScopeService、不依赖
++ * iot 域业务服务；多租户隔离消费会话租户上下文（TenantContext + 多租户插件），不重复实现。
++ * 未来数据服务工程立项时整体迁出为共享模块（TASK-0051 前）。
++ *
++ * <p>调用方必须在有租户上下文的会话内调用（管理面请求线程 / 数据服务验签后显式设置
++ * 租户上下文），否则多租户插件跳过注入、翻译结果不保证租户内收敛。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface DataPermService {
++
++    /**
++     * 步骤 1-6：登录用户 → 可见范围。
++     *
++     * <p>调用路径先缓存后计算（步骤 6 接缝，{@link VisibleScopeCache}）：
++     * 本期 NoOp 直查，Redis 缓存与主动失效归 TASK-0006（key=(user_id, 角色版本)，TTL 10 分钟）。
++     *
++     * @param userId 登录用户 id（sys_user.id）
++     * @return 可见范围；无角色/未知 data_scope 等场景返回全空集（fail-closed，非全租户）
++     */
++    VisibleScope resolve(Long userId);
++
++    /**
++     * 中台（对外调用方）scope 翻译——复用步骤 3-5（ADR-0016 裁决 5）。
++     *
++     * <p>数据服务验签后以 iot_api_client.scope 裁剪：scope JSON 结构
++     * {@code {"instanceIds":[...], "subtree":true}}；subtree=true 时数组内实例按步骤 4
++     * 子树展开（含上限截断），false 精确匹配；scope 为 null 或空数组 = 无任何数据权限
++     * （默认拒绝，不是全部）。展开成可见实例集合后与登录用户走完全相同的拼装与下推。
++     *
++     * @param clientId  中台调用方 id（iot_api_client.id），仅用于截断 WARN 日志的主体标识
++     * @param scopeJson iot_api_client.scope 的 JSON 串，允许 null/空白（默认拒绝）
++     * @return 可见范围；allTenant 恒 false（中台 scope 永远不是全租户）、createByOnly 恒 false（无本人语义）
++     */
++    VisibleScope resolveClientScope(Long clientId, String scopeJson);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java
+new file mode 100644
+index 0000000..27cd798
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/DataPermServiceImpl.java
+@@ -0,0 +1,296 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import com.fasterxml.jackson.databind.DeserializationFeature;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import net.otlab.core.constant.DataScopeEnum;
++import org.springframework.stereotype.Service;
++
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++/**
++ * 数据权限翻译组件六步实现（TASK-0005，口径权威 ADR-0016 七项裁决）。
++ *
++ * <p>翻译步骤（详细设计 §4.1）：
++ * <ol>
++ * <li>取用户全部启用角色的 data_scope；含 1（全部）直接标记全租户，跳过后续部门求解；</li>
++ * <li>逐 scope 求部门集合取并集——2 本部门及下属（ancestors 元素匹配）/ 3 本部门 /
++ *     5 自定义（查 sys_role_dept）；scope=4 不并入部门集合，仅置 createByOnly 标记
++ *     （ADR-0016 裁决 4）；未知 data_scope 不产出任何可见性（fail-closed）；</li>
++ * <li>部门集合 → iot_model_instance 中 dept_id 命中的实例锚点；</li>
++ * <li>锚点 ancestors 前缀展开全部后代实例，按 {@code ot.dataperm.subtree-max} 上限
++ *     截断（超限截断并 WARN，不报错不降级，ADR-0016 裁决 1）；</li>
++ * <li>拼查询条件——见 {@link DataPermConditionAssembler}（三类表形态）与
++ *     {@link TdengineTagConditionRenderer}（TDengine 标签下推）；</li>
++ * <li>缓存——{@link VisibleScopeCache} 接缝，先缓存后计算；本期 NoOp 直查，
++ *     Redis 与主动失效归 TASK-0006。</li>
++ * </ol>
++ *
++ * <p>自包含设计：只依赖本包只读 Mapper 与配置，不调用框架 DataScopeService、不依赖
++ * iot 域业务服务；多租户隔离消费会话租户上下文（插件自动注入），不重复实现。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class DataPermServiceImpl implements DataPermService {
++
++    /** 中台 scope JSON 解析器：宽容未知字段（向前兼容），结构与裁决 5 对齐 */
++    private static final ObjectMapper SCOPE_JSON = JsonMapper.builder()
++            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
++            .build();
++
++    /** 中台 scope JSON 结构（ADR-0016 裁决 5）：{"instanceIds":[...], "subtree":true} */
++    record ClientScopeSpec(List<Long> instanceIds, boolean subtree) {
++    }
++
++    private final DataPermUserMapper userMapper;
++    private final DataPermRoleMapper roleMapper;
++    private final DataPermRoleDeptMapper roleDeptMapper;
++    private final DataPermDeptMapper deptMapper;
++    private final DataPermInstanceMapper instanceMapper;
++    private final VisibleScopeCache cache;
++    private final DataPermProperties properties;
++
++    public DataPermServiceImpl(DataPermUserMapper userMapper,
++                               DataPermRoleMapper roleMapper,
++                               DataPermRoleDeptMapper roleDeptMapper,
++                               DataPermDeptMapper deptMapper,
++                               DataPermInstanceMapper instanceMapper,
++                               VisibleScopeCache cache,
++                               DataPermProperties properties) {
++        this.userMapper = userMapper;
++        this.roleMapper = roleMapper;
++        this.roleDeptMapper = roleDeptMapper;
++        this.deptMapper = deptMapper;
++        this.instanceMapper = instanceMapper;
++        this.cache = cache;
++        this.properties = properties;
++    }
++
++    @Override
++    public VisibleScope resolve(Long userId) {
++        // 步骤 6：先缓存后计算（Redis 实现与主动失效归 TASK-0006，本接缝已按缓存语义写好）
++        VisibleScope cached = cache.get(userId);
++        if (cached != null) {
++            return cached;
++        }
++        VisibleScope scope = computeUserScope(userId);
++        cache.put(userId, scope);
++        return scope;
++    }
++
++    /**
++     * 步骤 1-4 + 6：登录用户 → 可见范围
++     */
++    private VisibleScope computeUserScope(Long userId) {
++        // 步骤 1：取用户全部启用角色的 data_scope
++        List<DataPermRoleRow> roles = roleMapper.selectEnabledRolesByUserId(userId);
++        if (roles == null || roles.isEmpty()) {
++            return VisibleScope.denied();
++        }
++        boolean allTenant = roles.stream().anyMatch(r -> isScope(r, DataScopeEnum.ALL));
++        boolean hasMeRole = roles.stream().anyMatch(r -> isScope(r, DataScopeEnum.ME));
++        if (allTenant) {
++            // 步骤 1：含 data_scope=1 的角色直接标记全租户可见，跳过后续部门求解
++            return VisibleScope.allTenant(hasMeRole);
++        }
++
++        // 步骤 2：逐 scope 求部门集合后取并集（仅 scope∈{2,3,5} 产出部门；裁决 4：scope=4 不并入）
++        Set<Long> deptIds = new LinkedHashSet<>();
++        boolean needDeptTree = roles.stream().anyMatch(r -> isScope(r, DataScopeEnum.DEPARTMENT_AND_SUB));
++        List<DataPermDeptRow> deptRows = needDeptTree ? deptMapper.selectIdAncestors() : List.of();
++        // 用户部门仅 scope∈{2,3} 角色有消费方（本部门/本部门及下属档），scope=4/5 不触发该查询
++        boolean needUserDept = roles.stream()
++                .anyMatch(r -> isScope(r, DataScopeEnum.DEPARTMENT) || isScope(r, DataScopeEnum.DEPARTMENT_AND_SUB));
++        Long userDeptId = needUserDept ? userMapper.selectDeptIdByUserId(userId) : null;
++        for (DataPermRoleRow role : roles) {
++            if (isScope(role, DataScopeEnum.DEPARTMENT_AND_SUB)) {
++                if (userDeptId != null) {
++                    deptIds.add(userDeptId);
++                    for (DataPermDeptRow dept : deptRows) {
++                        if (ancestorsContains(dept.getAncestors(), userDeptId)) {
++                            deptIds.add(dept.getId());
++                        }
++                    }
++                }
++            } else if (isScope(role, DataScopeEnum.DEPARTMENT)) {
++                if (userDeptId != null) {
++                    deptIds.add(userDeptId);
++                }
++            } else if (isScope(role, DataScopeEnum.CUSTOM)) {
++                List<Long> bound = roleDeptMapper.selectDeptIdsByRoleId(role.getId());
++                if (bound != null) {
++                    deptIds.addAll(bound);
++                }
++            }
++            // scope=4（仅本人）不并入部门集合——数据查询场景空集，配置类场景由 createByOnly 标记走 create_by；
++            // 未知 data_scope 值不产出任何可见性（fail-closed，不按最松档理解）
++        }
++        if (deptIds.isEmpty()) {
++            return new VisibleScope(false, Set.of(), Set.of(), hasMeRole);
++        }
++
++        // 步骤 3+4：部门集合 → 实例锚点 → ancestors 子树展开（含上限截断）
++        Set<Long> instanceIds = resolveInstancesByDept(deptIds, userId);
++        return new VisibleScope(false, deptIds, instanceIds, hasMeRole);
++    }
++
++    @Override
++    public VisibleScope resolveClientScope(Long clientId, String scopeJson) {
++        ClientScopeSpec spec = parseClientScope(scopeJson);
++        if (spec == null || spec.instanceIds() == null || spec.instanceIds().isEmpty()) {
++            // 裁决 5：scope 为 null 或空数组 = 无任何数据权限（默认拒绝，与「为空表示无权限」一致）
++            return VisibleScope.denied();
++        }
++        List<Long> scopeIds = spec.instanceIds().stream().distinct().toList();
++        if (!spec.subtree()) {
++            // subtree=false：精确匹配，不展开子树；行集经多租户插件收敛在会话租户内
++            List<DataPermInstanceRow> rows = instanceMapper.selectByIds(scopeIds);
++            return exactScope(rows);
++        }
++        // subtree=true：与登录用户完全相同的步骤 3-5——scope 实例为锚点，ancestors 展开全部后代（含上限截断）
++        List<DataPermInstanceRow> rows = instanceMapper.selectAllForPerm();
++        Set<Long> anchorIds = rows.stream()
++                .filter(r -> scopeIds.contains(r.getId()))
++                .map(DataPermInstanceRow::getId)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        if (anchorIds.isEmpty()) {
++            return VisibleScope.denied();
++        }
++        Set<Long> visibleIds = expandSubtree(rows, anchorIds, clientId);
++        return exactScope(rows.stream().filter(r -> visibleIds.contains(r.getId())).toList());
++    }
++
++    /**
++     * 由实例行集构造中台可见范围：实例集合=行 id，部门集合=行绑定部门（点位类条件与
++     * 登录用户同构拼装的输入，dept_id 未绑行不产出部门）
++     */
++    private VisibleScope exactScope(List<DataPermInstanceRow> rows) {
++        Set<Long> ids = rows.stream().map(DataPermInstanceRow::getId)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        Set<Long> deptIds = rows.stream()
++                .map(DataPermInstanceRow::getDeptId)
++                .filter(d -> d != null)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++        return new VisibleScope(false, deptIds, ids, false);
++    }
++
++    private ClientScopeSpec parseClientScope(String scopeJson) {
++        if (scopeJson == null || scopeJson.isBlank()) {
++            return null;
++        }
++        try {
++            return SCOPE_JSON.readValue(scopeJson, ClientScopeSpec.class);
++        } catch (Exception e) {
++            // 畸形 scope 按 fail-closed 默认拒绝（与裁决 5 默认拒绝同方向），WARN 供排查配置错误
++            log.warn("[DATAPERM] client scope invalid, deny by default: {}", e.getMessage());
++            return null;
++        }
++    }
++
++    /**
++     * 步骤 3：部门集合 → 实例锚点（dept_id 命中，通常是工厂/车间节点）
++     */
++    private Set<Long> resolveInstancesByDept(Set<Long> deptIds, Long userId) {
++        List<DataPermInstanceRow> rows = instanceMapper.selectAllForPerm();
++        Set<Long> anchorIds = new LinkedHashSet<>();
++        for (DataPermInstanceRow row : rows) {
++            // dept_id=NULL 不命中锚点（结构性 fail-closed，裁决 6：不做特判）
++            if (row.getDeptId() != null && deptIds.contains(row.getDeptId())) {
++                anchorIds.add(row.getId());
++            }
++        }
++        if (anchorIds.isEmpty()) {
++            return Set.of();
++        }
++        return expandSubtree(rows, anchorIds, userId);
++    }
++
++    /**
++     * 步骤 4：锚点 ancestors 前缀展开全部后代实例，并按上限截断（ADR-0016 裁决 1）。
++     *
++     * <p>展开语义 = 元素级路径前缀匹配：后代实例的 ancestors 逗号路径中<b>整 token</b>
++     * 包含锚点 id（「0,1,11」命中锚点 1，「0,11」不命中——防字符串前缀误判），
++     * 与 sys_dept.ancestors 同范式，不递归查库。锚点本身计入可见集合。
++     *
++     * <p>截断按 ancestors 路径序（深度升序，同深按 id）保近端实例：路径序下祖先必先于
++     * 后代，截断保留的前缀对祖先闭包——不会出现「后代可见而其唯一锚点被截掉」的裂缝。
++     */
++    private Set<Long> expandSubtree(List<DataPermInstanceRow> rows, Set<Long> anchorIds, Long subjectId) {
++        List<DataPermInstanceRow> visibleRows = new ArrayList<>();
++        Set<String> anchorTokens = anchorIds.stream().map(String::valueOf).collect(Collectors.toSet());
++        for (DataPermInstanceRow row : rows) {
++            if (anchorIds.contains(row.getId()) || ancestorsHitsAny(row.getAncestors(), anchorTokens)) {
++                visibleRows.add(row);
++            }
++        }
++        int cap = properties.getSubtreeMax();
++        if (cap > 0 && visibleRows.size() > cap) {
++            visibleRows.sort(Comparator
++                    .comparingInt((DataPermInstanceRow r) -> ancestorsDepth(r.getAncestors()))
++                    .thenComparing(DataPermInstanceRow::getId));
++            visibleRows = visibleRows.subList(0, cap);
++            log.warn("[DATAPERM] subtree truncated user={} kept={} cap={}", subjectId, visibleRows.size(), cap);
++        }
++        return visibleRows.stream().map(DataPermInstanceRow::getId)
++                .collect(Collectors.toCollection(LinkedHashSet::new));
++    }
++
++    /**
++     * ancestors 逗号路径是否整 token 包含指定部门 id（元素级匹配，防前缀误判）
++     */
++    private static boolean ancestorsContains(String ancestors, Long deptId) {
++        if (ancestors == null || ancestors.isBlank()) {
++            return false;
++        }
++        String token = String.valueOf(deptId);
++        for (String part : ancestors.split(",")) {
++            if (part.trim().equals(token)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * ancestors 逗号路径是否整 token 命中任一锚点（展开用；token 预转字符串集合）
++     */
++    private static boolean ancestorsHitsAny(String ancestors, Set<String> anchorTokens) {
++        if (ancestors == null || ancestors.isBlank()) {
++            return false;
++        }
++        for (String part : ancestors.split(",")) {
++            if (anchorTokens.contains(part.trim())) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    /**
++     * ancestors 路径深度（元素数）：排序键，路径越浅实例越靠近根（近端）
++     */
++    private static int ancestorsDepth(String ancestors) {
++        if (ancestors == null || ancestors.isBlank()) {
++            return 0;
++        }
++        return ancestors.split(",").length;
++    }
++
++    private static boolean isScope(DataPermRoleRow role, DataScopeEnum expected) {
++        return role.getDataScope() != null && role.getDataScope().equals(expected.getValue());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java
+new file mode 100644
+index 0000000..b01727a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/NoOpVisibleScopeCache.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.springframework.stereotype.Component;
++
++/**
++ * 可见集合缓存的 NoOp 实现（TASK-0005 本期直查）。
++ *
++ * <p>不缓存任何结果：get 恒未命中、put/evict 空操作。resolve 调用路径的
++ * 「先缓存后计算」接缝已按缓存语义写好，TASK-0006 交付 Redis 实现后无需改动
++ * {@link DataPermServiceImpl}。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class NoOpVisibleScopeCache implements VisibleScopeCache {
++
++    @Override
++    public VisibleScope get(Long userId) {
++        return null;
++    }
++
++    @Override
++    public void put(Long userId, VisibleScope scope) {
++        // 本期直查：无缓存写入（Redis 实现归 TASK-0006）
++    }
++
++    @Override
++    public void evict(Long userId) {
++        // 本期直查：无缓存可失效
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/TdengineTagConditionRenderer.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/TdengineTagConditionRenderer.java
+new file mode 100644
+index 0000000..bf5f128
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/TdengineTagConditionRenderer.java
+@@ -0,0 +1,116 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import org.springframework.stereotype.Component;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++/**
++ * 步骤 5：TDengine 标签条件下推渲染器（TASK-0005，ADR-0016 裁决 7）。
++ *
++ * <p>标签名以超级表契约 v1.0.0（resources/contract/tdengine-super-tables.md）为准：
++ * <b>instance_key</b>（实例编码 BINARY(96)，取值 = iot_model_instance.instance_code）、
++ * <b>dept_id</b>（部门 id BIGINT）。详细设计 §4.1 的「instance_code/dept」为行文旧称，
++ * 渲染结果一律使用契约标签名（差异已留痕裁决 7）。
++ *
++ * <p>渲染结果为条件片段供消费方拼 SQL；TDengine 为库级租户隔离（库名 iot_&lt;tenant_code&gt;），
++ * tenant_id 不进条件；标签是子表级元数据不存在逐行 NULL 特判，未绑部门子表的 dept_id
++ * 标签不命中 IN（与裁决 6 结构性 fail-closed 同方向），绝不渲染 IS NULL 分支。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class TdengineTagConditionRenderer {
++
++    /** 超级表契约 v1.0.0 标签：实例编码（= instance_code 值） */
++    public static final String TAG_INSTANCE_KEY = "instance_key";
++
++    /** 超级表契约 v1.0.0 标签：绑定部门 id */
++    public static final String TAG_DEPT_ID = "dept_id";
++
++    private final DataPermInstanceMapper instanceMapper;
++
++    public TdengineTagConditionRenderer(DataPermInstanceMapper instanceMapper) {
++        this.instanceMapper = instanceMapper;
++    }
++
++    /**
++     * 时序语义下推（数据项/指标/曲线查询）：{@code instance_key IN ('编码',...)}。
++     * scope=4 无贡献——TDengine 时序无 create_by 标签，绝不渲染 create_by 分支（裁决 4）。
++     */
++    public String renderTimeseriesCondition(VisibleScope scope) {
++        if (scope == null) {
++            return DataPermConditionAssembler.FAIL_CLOSED;
++        }
++        if (scope.allTenant()) {
++            return null;
++        }
++        if (scope.instanceIds().isEmpty()) {
++            return DataPermConditionAssembler.FAIL_CLOSED;
++        }
++        List<String> codes = resolveCodesSorted(scope.instanceIds());
++        if (codes.isEmpty()) {
++            return DataPermConditionAssembler.FAIL_CLOSED;
++        }
++        return TAG_INSTANCE_KEY + " IN (" + quoted(codes) + ")";
++    }
++
++    /**
++     * 点位语义下推（原始点位数据查询）：{@code (instance_key IN (...) OR dept_id IN (...))}——
++     * 与 MySQL 点位条件（dept_id OR bound_instance_id）同构，§4.1 步骤 5「标签条件一并下推」。
++     */
++    public String renderPointCondition(VisibleScope scope) {
++        if (scope == null) {
++            return DataPermConditionAssembler.FAIL_CLOSED;
++        }
++        if (scope.allTenant()) {
++            return null;
++        }
++        List<String> disjuncts = new ArrayList<>();
++        if (!scope.instanceIds().isEmpty()) {
++            List<String> codes = resolveCodesSorted(scope.instanceIds());
++            if (!codes.isEmpty()) {
++                disjuncts.add(TAG_INSTANCE_KEY + " IN (" + quoted(codes) + ")");
++            }
++        }
++        if (!scope.deptIds().isEmpty()) {
++            disjuncts.add(TAG_DEPT_ID + " IN (" + joinSorted(scope.deptIds()) + ")");
++        }
++        if (disjuncts.isEmpty()) {
++            return DataPermConditionAssembler.FAIL_CLOSED;
++        }
++        if (disjuncts.size() == 1) {
++            return disjuncts.get(0);
++        }
++        return disjuncts.stream().collect(Collectors.joining(" OR ", "(", ")"));
++    }
++
++    /**
++     * 可见实例集合 → 去重升序编码列表（instance_key 标签取值；经多租户插件收敛在会话租户内）
++     */
++    private List<String> resolveCodesSorted(Set<Long> instanceIds) {
++        return instanceMapper.selectByIds(instanceIds).stream()
++                .map(DataPermInstanceRow::getInstanceCode)
++                .filter(code -> code != null && !code.isBlank())
++                .distinct()
++                .sorted()
++                .toList();
++    }
++
++    /**
++     * 字符串字面量单引号包裹，内部单引号翻倍转义（防片段注入，TDengine SQL 标准转义）
++     */
++    private String quoted(List<String> values) {
++        return values.stream()
++                .map(v -> "'" + v.replace("'", "''") + "'")
++                .collect(Collectors.joining(","));
++    }
++
++    private String joinSorted(Set<Long> ids) {
++        return ids.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScope.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScope.java
+new file mode 100644
+index 0000000..77d24f7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScope.java
+@@ -0,0 +1,46 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import java.util.Set;
++
++/**
++ * 可见范围值对象——六步翻译的产物（TASK-0005，ADR-0016）。
++ *
++ * <p>消费方按表类别取用：
++ * <ul>
++ * <li>{@code allTenant=true}：scope=1（全部）角色存在——不追加任何数据权限条件
++ *     （点位/实例未绑部门行对租户管理员可见，ADR-0016 裁决 6）；</li>
++ * <li>{@code deptIds}：scope∈{2,3,5} 角色产出的可见部门集合并集（ADR-0016 裁决 4——
++ *     scope=4 不并入）；点位类条件 {@code dept_id IN (...)} 的输入；</li>
++ * <li>{@code instanceIds}：步骤 3-4 产出的可见实例集合（锚点 + ancestors 子树展开，
++ *     已按 {@code ot.dataperm.subtree-max} 上限截断）；配置类/时序类条件
++ *     {@code instance_id IN (...)} 与 TDengine 下推的输入；</li>
++ * <li>{@code createByOnly}：存在 scope=4（仅本人）角色——配置类条件追加
++ *     {@code OR create_by=当前用户} 分支的开关；时序类无贡献（裁决 4，TD-0044）。</li>
++ * </ul>
++ *
++ * <p>不可变值对象：构造时做防御性拷贝，null 集合归一为空集。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record VisibleScope(boolean allTenant, Set<Long> deptIds, Set<Long> instanceIds, boolean createByOnly) {
++
++    public VisibleScope {
++        deptIds = deptIds == null ? Set.of() : Set.copyOf(deptIds);
++        instanceIds = instanceIds == null ? Set.of() : Set.copyOf(instanceIds);
++    }
++
++    /**
++     * 全租户可见（scope=1 直接标记，跳过部门/实例求解——详细设计 §4.1 步骤 1）
++     */
++    public static VisibleScope allTenant(boolean createByOnly) {
++        return new VisibleScope(true, Set.of(), Set.of(), createByOnly);
++    }
++
++    /**
++     * 无任何数据权限（无角色 / 中台 scope 空等默认拒绝场景，fail-closed）
++     */
++    public static VisibleScope denied() {
++        return new VisibleScope(false, Set.of(), Set.of(), false);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScopeCache.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScopeCache.java
+new file mode 100644
+index 0000000..6fb0e4e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/VisibleScopeCache.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.dataperm;
++
++/**
++ * 可见集合缓存接口——六步翻译的步骤 6 接缝（TASK-0005 只定义接口 + NoOp 实现）。
++ *
++ * <p>详细设计 §4.1 步骤 6：可见集合按 (user_id, 角色版本) 缓存 Redis TTL 10 分钟，
++ * 部门、角色、实例绑部门变更时主动失效。Redis 实现与失效事件归 TASK-0006；
++ * 本期 {@link NoOpVisibleScopeCache} 直查（每次 resolve 全量计算）。
++ *
++ * <p>实现约束：实现类不得抛出异常中断业务查询（缓存故障只能降级为「重新计算」，
++ * 权限组件故障不得阻断业务——与截断策略同方向）；get 返回 null 表示未命中。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface VisibleScopeCache {
++
++    /**
++     * 取用户可见范围缓存值；未命中返回 null
++     */
++    VisibleScope get(Long userId);
++
++    /**
++     * 写入用户可见范围（resolve 计算完成后回填）
++     */
++    void put(Long userId, VisibleScope scope);
++
++    /**
++     * 主动失效（部门/角色/绑定变更点调用；TASK-0006 接入）
++     */
++    void evict(Long userId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermDeptMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermDeptMapper.java
+new file mode 100644
+index 0000000..b3fbe4b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermDeptMapper.java
+@@ -0,0 +1,27 @@
++package net.otlab.admin.module.iot.dataperm.mapper;
++
++import net.otlab.admin.module.iot.dataperm.DataPermDeptRow;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.List;
++
++/**
++ * 数据权限组件自带只读 Mapper：部门祖级路径（TASK-0005，组件自包含设计）。
++ *
++ * <p>scope=2「本部门及下属」用 ancestors 做元素级匹配展开下级部门，不递归查库；
++ * 租户条件由多租户插件按会话注入（sys_dept 在白名单），逻辑删除显式声明。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface DataPermDeptMapper {
++
++    /**
++     * 取本租户全部部门 (id, ancestors)——租户内行数有限，一次载入内存匹配
++     * （与框架 DataScopeServiceImpl 同范式）
++     */
++    @Select("SELECT id, ancestors FROM sys_dept WHERE deleted = 0")
++    List<DataPermDeptRow> selectIdAncestors();
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermInstanceMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermInstanceMapper.java
+new file mode 100644
+index 0000000..270b426
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermInstanceMapper.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.dataperm.mapper;
++
++import net.otlab.admin.module.iot.dataperm.DataPermInstanceRow;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 数据权限组件自带只读 Mapper：模型实例权限锚点行（TASK-0005，组件自包含设计）。
++ *
++ * <p>iot_model_instance 为 iot_ 前缀业务表，租户条件由多租户插件按会话租户自动注入
++ * （OtTenantLineHandler 前缀规则）；逻辑删除显式声明（iot_ 业务表统一 BaseEntity
++ * 逻辑删范式，建表任务 TASK-0004 沿用）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface DataPermInstanceMapper {
++
++    /**
++     * 取本租户全部实例的权限锚点字段 (id, instance_code, dept_id, ancestors)——
++     * 步骤 3 部门命中与步骤 4 ancestors 子树展开共用一次载入，不递归查库
++     */
++    @Select("SELECT id, instance_code, dept_id, ancestors FROM iot_model_instance WHERE deleted = 0")
++    List<DataPermInstanceRow> selectAllForPerm();
++
++    /**
++     * 按 id 精确取实例行（中台 scope subtree=false 精确匹配与 TDengine 编码解析用）；
++     * 调用方保证 ids 非空（空集走空集短路，不发 IN ()）
++     */
++    @Select("<script>SELECT id, instance_code, dept_id, ancestors FROM iot_model_instance "
++            + "WHERE deleted = 0 AND id IN "
++            + "<foreach collection='ids' item='id' open='(' separator=',' close=')'>#{id}</foreach>"
++            + "</script>")
++    List<DataPermInstanceRow> selectByIds(@Param("ids") Collection<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleDeptMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleDeptMapper.java
+new file mode 100644
+index 0000000..e820e59
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleDeptMapper.java
+@@ -0,0 +1,25 @@
++package net.otlab.admin.module.iot.dataperm.mapper;
++
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.List;
++
++/**
++ * 数据权限组件自带只读 Mapper：自定义范围的角色绑定部门（TASK-0005，组件自包含设计）。
++ *
++ * <p>sys_role_dept 存自定义范围（data_scope=5）的部门集合；租户条件由多租户插件按会话注入。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface DataPermRoleDeptMapper {
++
++    /**
++     * 取角色绑定的部门 id 集合（详细设计 §4.1 步骤 2 自定义档）
++     */
++    @Select("SELECT dept_id FROM sys_role_dept WHERE role_id = #{roleId}")
++    List<Long> selectDeptIdsByRoleId(@Param("roleId") Long roleId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleMapper.java
+new file mode 100644
+index 0000000..ae1f37f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermRoleMapper.java
+@@ -0,0 +1,31 @@
++package net.otlab.admin.module.iot.dataperm.mapper;
++
++import net.otlab.admin.module.iot.dataperm.DataPermRoleRow;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.List;
++
++/**
++ * 数据权限组件自带只读 Mapper：用户启用角色（TASK-0005，组件自包含设计）。
++ *
++ * <p>只读、参数化 SQL；多租户条件由 TASK-0002 TenantLineInnerInterceptor 按会话租户
++ * 自动注入（sys_role / sys_user_role 在 OtTenantLineHandler 白名单），组件不重复实现；
++ * 逻辑删除与状态过滤在本 SQL 显式声明（自定义 @Select 不走 BaseMapper 注入逻辑）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface DataPermRoleMapper {
++
++    /**
++     * 取用户全部启用角色的数据权限档位（详细设计 §4.1 步骤 1）。
++     * 禁用角色（status=0）与已删角色（deleted=1）不参与并集。
++     */
++    @Select("SELECT r.id, r.data_scope FROM sys_role r "
++            + "INNER JOIN sys_user_role ur ON ur.role_id = r.id "
++            + "WHERE ur.user_id = #{userId} AND r.status = 1 AND r.deleted = 0")
++    List<DataPermRoleRow> selectEnabledRolesByUserId(@Param("userId") Long userId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermUserMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermUserMapper.java
+new file mode 100644
+index 0000000..24036ca
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataperm/mapper/DataPermUserMapper.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.dataperm.mapper;
++
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++/**
++ * 数据权限组件自带只读 Mapper：用户所属部门（TASK-0005，组件自包含设计）。
++ *
++ * <p>只读、参数化 SQL；租户条件由多租户插件按会话注入（sys_user 在白名单），
++ * 逻辑删除在本 SQL 显式声明。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface DataPermUserMapper {
++
++    /**
++     * 取用户绑定部门 id（scope=2/3 求部门集合的输入）；用户不存在/已删除/未绑部门返回 null
++     */
++    @Select("SELECT dept_id FROM sys_user WHERE id = #{userId} AND deleted = 0")
++    Long selectDeptIdByUserId(@Param("userId") Long userId);
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index b5260a2..5716280 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -33,6 +33,8 @@ ot:
+     password: ${OT_TDENGINE_PASSWORD:taosdata}                 # taosAdapter Basic 认证口令（默认安装值，现场部署经环境变量覆盖）
+     connect-timeout-ms: ${OT_TDENGINE_CONNECT_TIMEOUT_MS:3000} # REST 连接超时
+     read-timeout-ms: ${OT_TDENGINE_READ_TIMEOUT_MS:5000}       # REST 读超时
++  dataperm:
++    subtree-max: ${OT_DATAPERM_SUBTREE_MAX:5000}   # 子树展开上限（TASK-0005 / ADR-0016 裁决 1）：步骤 4 ancestors 子树展开的实例数上限；超限截断并 WARN（[DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>），不报错不降级；<=0 视为关闭上限
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategyTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategyTest.java
+new file mode 100644
+index 0000000..08bb763
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermAccessStrategyTest.java
+@@ -0,0 +1,74 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 数据权限翻译组件——越权拒绝策略常量与接口形态判定辅助单元测试（TASK-0005，ADR-0016 裁决 2）。
++ *
++ * <p>裁决 2 定版：按接口形态判定而非逐个枚举——GET 集合类（/list、/tree、/history、
++ * /curve、/realtime 等集合语义）越权返回空集（SCOPE_EMPTY）；GET 单对象类（/{id}、/{code}
++ * 详情）越权返回 403（SCOPE_FORBIDDEN）。组件提供判定辅助 isDetailAccess(resource)，
++ * 最终选择权在接口实现（本任务不接线，TASK-0007 红线用例消费）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermAccessStrategyTest {
++
++    // ---------- 策略常量存在性与命名（brief 契约：SCOPE_EMPTY / SCOPE_FORBIDDEN） ----------
++
++    @Test
++    @DisplayName("策略常量 - SCOPE_EMPTY / SCOPE_FORBIDDEN 按名存在")
++    void testDenyStrategyConstants_Exist() {
++        assertEquals(DataPermAccessStrategy.DenyStrategy.SCOPE_EMPTY, DataPermAccessStrategy.DenyStrategy.valueOf("SCOPE_EMPTY"));
++        assertEquals(DataPermAccessStrategy.DenyStrategy.SCOPE_FORBIDDEN, DataPermAccessStrategy.DenyStrategy.valueOf("SCOPE_FORBIDDEN"));
++        assertNotNull(DataPermAccessStrategy.DenyStrategy.values());
++    }
++
++    // ---------- 集合语义：返回空集 ----------
++
++    @Test
++    @DisplayName("isDetailAccess - 集合语义尾段（裁决 2 五例 + 同族动词）判 false")
++    void testIsDetailAccess_CollectionTails() {
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/list"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/tree"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/point/history"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/point/curve"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/point/realtime"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/page"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/metric/stat"));
++    }
++
++    @Test
++    @DisplayName("isDetailAccess - 大小写不敏感、容忍尾斜杠与查询串")
++    void testIsDetailAccess_Normalization() {
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/LIST"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/list/"));
++        assertFalse(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/list?page=2&size=10"));
++    }
++
++    // ---------- 单对象语义：返回 403 ----------
++
++    @Test
++    @DisplayName("isDetailAccess - 尾段为标识符（数字 id / 路径式编码 / 占位符）判 true")
++    void testIsDetailAccess_DetailTails() {
++        assertTrue(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/123"));
++        assertTrue(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/F01.WS01.EQ001"));
++        assertTrue(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/{code}"));
++        assertTrue(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance/123/history-curve/456"));
++    }
++
++    @Test
++    @DisplayName("isDetailAccess - 未知形态 fail-closed 判详情类（403 比空集更明确的拒绝）")
++    void testIsDetailAccess_UnknownShape_DefaultDetail() {
++        assertTrue(DataPermAccessStrategy.isDetailAccess(null));
++        assertTrue(DataPermAccessStrategy.isDetailAccess(""));
++        assertTrue(DataPermAccessStrategy.isDetailAccess("/api/v1/iot/instance"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java
+new file mode 100644
+index 0000000..cbc5957
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermClientScopeTest.java
+@@ -0,0 +1,221 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.slf4j.LoggerFactory;
++
++import java.util.Collection;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++/**
++ * 数据权限翻译组件——中台（对外调用方）scope JSON 解析单元测试（TASK-0005，ADR-0016 裁决 5）。
++ *
++ * <p>scope JSON 结构硬约束：{@code {"instanceIds":[...], "subtree":true}}——
++ * instanceIds 为实例 id 数组；subtree=true 时按步骤 4 子树展开（复用登录用户完全相同的
++ * 展开、上限截断），false 精确匹配；scope 为 null 或空数组 = 无任何数据权限（默认拒绝）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermClientScopeTest {
++
++    private static final Long CLIENT_ID = 5L;
++
++    @Mock
++    private DataPermUserMapper userMapper;
++    @Mock
++    private DataPermRoleMapper roleMapper;
++    @Mock
++    private DataPermRoleDeptMapper roleDeptMapper;
++    @Mock
++    private DataPermDeptMapper deptMapper;
++    @Mock
++    private DataPermInstanceMapper instanceMapper;
++
++    private DataPermProperties properties;
++    private DataPermServiceImpl service;
++
++    private ListAppender<ILoggingEvent> logAppender;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        properties = new DataPermProperties();
++        service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
++        logAppender = new ListAppender<>();
++        logAppender.start();
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).addAppender(logAppender);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).detachAppender(logAppender);
++        mocks.close();
++    }
++
++    private DataPermInstanceRow inst(Long id, String code, Long deptId, String ancestors) {
++        DataPermInstanceRow row = new DataPermInstanceRow();
++        row.setId(id);
++        row.setInstanceCode(code);
++        row.setDeptId(deptId);
++        row.setAncestors(ancestors);
++        return row;
++    }
++
++    private void assertDenied(VisibleScope scope) {
++        assertFalse(scope.allTenant(), "中台 scope 永远不是全租户（默认拒绝语义）");
++        assertFalse(scope.createByOnly(), "中台无「仅本人」语义");
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++    }
++
++    // ---------- 三态之一：null / 缺失 / 空数组 = 默认拒绝 ----------
++
++    @Test
++    @DisplayName("scope=null - 无任何数据权限（默认拒绝，不触达实例查询）")
++    void testClientScope_NullJson_Deny() {
++        assertDenied(service.resolveClientScope(CLIENT_ID, null));
++        verifyNoInteractions(instanceMapper);
++    }
++
++    @Test
++    @DisplayName("scope 为空白串 - 同样默认拒绝")
++    void testClientScope_BlankJson_Deny() {
++        assertDenied(service.resolveClientScope(CLIENT_ID, "   "));
++        verifyNoInteractions(instanceMapper);
++    }
++
++    @Test
++    @DisplayName("scope 空数组 - 默认拒绝（裁决 5：空数组≠全部，是拒绝）")
++    void testClientScope_EmptyInstanceIds_Deny() {
++        assertDenied(service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[],\"subtree\":true}"));
++        verifyNoInteractions(instanceMapper);
++    }
++
++    @Test
++    @DisplayName("scope 缺 instanceIds 字段 - 默认拒绝")
++    void testClientScope_MissingInstanceIds_Deny() {
++        assertDenied(service.resolveClientScope(CLIENT_ID, "{\"subtree\":false}"));
++        verifyNoInteractions(instanceMapper);
++    }
++
++    @Test
++    @DisplayName("scope 非法 JSON - fail-closed 默认拒绝")
++    void testClientScope_MalformedJson_Deny() {
++        assertDenied(service.resolveClientScope(CLIENT_ID, "not-a-json{"));
++        verifyNoInteractions(instanceMapper);
++    }
++
++    // ---------- 三态之二：subtree=false 精确匹配 ----------
++
++    @Test
++    @DisplayName("subtree=false - 按 instanceIds 精确匹配，不展开子树；deptIds 取命中实例绑定的部门")
++    void testClientScope_ExactMatch_NoSubtreeExpansion() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 11L, "0,1")));
++
++        VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1,2],\"subtree\":false}");
++
++        assertEquals(Set.of(1L, 2L), scope.instanceIds());
++        assertEquals(Set.of(10L, 11L), scope.deptIds(), "中台可见部门=可见实例绑定的部门（点位类条件与登录用户同构拼装）");
++        assertFalse(scope.allTenant());
++        assertFalse(scope.createByOnly());
++        ArgumentCaptor<Collection<Long>> idsCaptor = ArgumentCaptor.captor();
++        verify(instanceMapper).selectByIds(idsCaptor.capture());
++        assertEquals(Set.of(1L, 2L), Set.copyOf(idsCaptor.getValue()),
++                "传给精确匹配查询的 id 集合=scope 数组去重后的实例 id");
++        verify(instanceMapper, never()).selectAllForPerm();
++    }
++
++    @Test
++    @DisplayName("subtree=false - 未知扩展字段宽容解析（向前兼容，不因多余字段拒绝）")
++    void testClientScope_UnknownFields_Lenient() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(inst(1L, "F01", 10L, "0")));
++
++        VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1],\"subtree\":false,\"memo\":\"x\"}");
++
++        assertEquals(Set.of(1L), scope.instanceIds());
++    }
++
++    @Test
++    @DisplayName("subtree=false - scope 指向租户外/不存在实例：命中为空，等价拒绝（租户隔离由插件保证）")
++    void testClientScope_ExactMatch_MissingRows_Deny() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of());
++
++        assertDenied(service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[99],\"subtree\":false}"));
++    }
++
++    // ---------- 三态之三：subtree=true 与登录用户相同展开 ----------
++
++    @Test
++    @DisplayName("subtree=true - 复用步骤 4：锚点=scope 实例，ancestors 展开全部后代")
++    void testClientScope_SubtreeTrue_ExpandsDescendants() {
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2"),
++                inst(9L, "F09", 90L, "0,8")));
++
++        VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1],\"subtree\":true}");
++
++        assertEquals(Set.of(1L, 2L, 3L), scope.instanceIds(), "与登录用户完全相同的子树展开（ADR-0016 裁决 5）");
++        assertEquals(Set.of(10L, 20L, 30L), scope.deptIds(), "展开后可见实例的部门一并进入部门集合");
++        assertFalse(scope.createByOnly());
++    }
++
++    @Test
++    @DisplayName("subtree=true - 超上限截断保近端，WARN 的 subject=中台 clientId")
++    void testClientScope_SubtreeTrue_CapTruncate() {
++        properties.setSubtreeMax(2);
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2")));
++
++        VisibleScope scope = service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[1],\"subtree\":true}");
++
++        assertEquals(Set.of(1L, 2L), scope.instanceIds(), "cap=2 截断保近端");
++        verify(instanceMapper).selectAllForPerm();
++        List<String> warns = logAppender.list.stream()
++                .filter(e -> e.getLevel() == Level.WARN)
++                .map(ILoggingEvent::getFormattedMessage)
++                .toList();
++        assertEquals(List.of("[DATAPERM] subtree truncated user=5 kept=2 cap=2"), warns,
++                "中台路径截断 WARN 沿用裁决 1 格式，subject=<中台 clientId>");
++    }
++
++    @Test
++    @DisplayName("subtree=true - scope 实例在租户内不存在：无锚点，等价拒绝")
++    void testClientScope_SubtreeTrue_MissingAnchor_Deny() {
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(inst(9L, "F09", 90L, "0,8")));
++
++        assertDenied(service.resolveClientScope(CLIENT_ID, "{\"instanceIds\":[99],\"subtree\":true}"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssemblerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssemblerTest.java
+new file mode 100644
+index 0000000..c4233aa
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermConditionAssemblerTest.java
+@@ -0,0 +1,197 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 数据权限翻译组件——步骤 5 条件拼装单元测试（TASK-0005，ADR-0016 裁决 2/3/4/6）。
++ *
++ * <p>三类表形态三态（brief 定版）：配置类（instance_id IN 或 create_by 分支）/
++ * 点位类（dept_id IN OR bound_instance_id IN）/ 时序类（instance_id IN；scope=4 无贡献）。
++ * 渲染结果为条件片段供消费方拼 SQL；allTenant 返回 null（无需追加条件），
++ * 空可见集返回 {@code 1 = 0}（fail-closed）。
++ *
++ * <p>NULL 归类（裁决 6）为结构性满足：只渲染 IN 比较、绝不渲染 IS NULL / IS NOT NULL
++ * 分支——SQL NULL 不命中任何 IN，未绑部门行对非 scope=1 天然不可见。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermConditionAssemblerTest {
++
++    private final DataPermConditionAssembler assembler = new DataPermConditionAssembler();
++
++    private static final Long USER_ID = 9L;
++
++    /** scope=2 本部门及下属的非全租户典型态：部门 {10}、实例 {1,2}、无仅本人角色 */
++    private VisibleScope normal() {
++        return new VisibleScope(false, Set.of(10L), Set.of(1L, 2L), false);
++    }
++
++    /** 多角色并集混合 scope=4：部门/实例照常产出 + createByOnly 标记（裁决 4） */
++    private VisibleScope mixedWithMe() {
++        return new VisibleScope(false, Set.of(10L), Set.of(1L, 2L), true);
++    }
++
++    /** 仅本人角色独占：部门/实例皆空集（TD-0044） */
++    private VisibleScope meOnly() {
++        return new VisibleScope(false, Set.of(), Set.of(), true);
++    }
++
++    /** 无角色/零可见性：全空且无仅本人标记 */
++    private VisibleScope nothing() {
++        return new VisibleScope(false, Set.of(), Set.of(), false);
++    }
++
++    // ---------- 配置类 ----------
++
++    @Test
++    @DisplayName("配置类 - 全租户返回 null（无需追加数据权限条件）")
++    void testConfig_AllTenant_Null() {
++        assertNull(assembler.configCondition(VisibleScope.allTenant(false), USER_ID, "instance_id", "create_by"));
++    }
++
++    @Test
++    @DisplayName("配置类 - 非全租户无仅本人角色：仅 instance_id IN（裸片段，供 AND 拼接）")
++    void testConfig_InstancesOnly_Bare() {
++        String cond = assembler.configCondition(normal(), USER_ID, "instance_id", "create_by");
++        assertEquals("instance_id IN (1,2)", cond);
++    }
++
++    @Test
++    @DisplayName("配置类 - scope=4 与部门角色混合并集：instance_id IN ... OR create_by = me（裁决 4 公式）")
++    void testConfig_MixedUnion_OR_CreateBy() {
++        String cond = assembler.configCondition(mixedWithMe(), USER_ID, "instance_id", "create_by");
++        assertEquals("(instance_id IN (1,2) OR create_by = 9)", cond);
++    }
++
++    @Test
++    @DisplayName("配置类 - 仅本人角色独占：纯 create_by 过滤（TD-0044）")
++    void testConfig_MeOnly_BareCreateBy() {
++        String cond = assembler.configCondition(meOnly(), USER_ID, "instance_id", "create_by");
++        assertEquals("create_by = 9", cond);
++    }
++
++    @Test
++    @DisplayName("配置类 - 零可见性：1 = 0 fail-closed（返回空列表而非全量）")
++    void testConfig_NothingVisible_FailClosed() {
++        assertEquals("1 = 0", assembler.configCondition(nothing(), USER_ID, "instance_id", "create_by"));
++    }
++
++    @Test
++    @DisplayName("配置类 - IN 列表按 id 升序渲染（确定性输出，SQL 可复用）")
++    void testConfig_IdListSorted() {
++        VisibleScope scope = new VisibleScope(false, Set.of(10L), Set.of(3L, 1L, 2L), false);
++        assertEquals("instance_id IN (1,2,3)", assembler.configCondition(scope, USER_ID, "instance_id", "create_by"));
++    }
++
++    @Test
++    @DisplayName("配置类 - 无实例锚点表（如字典）：非仅本人不过滤返回 null；仅本人按 create_by 过滤（裁决 3）")
++    void testConfig_NoInstanceAnchor() {
++        assertNull(assembler.configCondition(normal(), USER_ID, null, "create_by"),
++                "无实例锚点的配置表（字典等）不产出 instance 过滤；非 scope=4 用户不做数据权限裁剪");
++        assertEquals("create_by = 9", assembler.configCondition(meOnly(), USER_ID, null, "create_by"),
++                "scope=4 时配置类对象按 create_by=当前用户过滤（裁决 3 适用集）");
++    }
++
++    @Test
++    @DisplayName("配置类 - scope 入参为 null 防御性 fail-closed")
++    void testConfig_NullScope_FailClosed() {
++        assertEquals("1 = 0", assembler.configCondition(null, USER_ID, "instance_id", "create_by"));
++    }
++
++    // ---------- 点位类 ----------
++
++    @Test
++    @DisplayName("点位类 - dept_id IN OR bound_instance_id IN 双条件（步骤 5 原文结构）")
++    void testPoint_TwoColumnOR() {
++        String cond = assembler.pointCondition(normal(), USER_ID, "dept_id", "bound_instance_id", "create_by");
++        assertEquals("(dept_id IN (10) OR bound_instance_id IN (1,2))", cond);
++    }
++
++    @Test
++    @DisplayName("点位类 - 混合并集带仅本人：第三分支 OR create_by = me（点位属配置类对象，裁决 3）")
++    void testPoint_MixedUnion_ThirdCreateByBranch() {
++        String cond = assembler.pointCondition(mixedWithMe(), USER_ID, "dept_id", "bound_instance_id", "create_by");
++        assertEquals("(dept_id IN (10) OR bound_instance_id IN (1,2) OR create_by = 9)", cond);
++    }
++
++    @Test
++    @DisplayName("点位类 - 仅本人角色独占：双条件空集不渲染，纯 create_by（点位列表属配置类适用集，裁决 3）")
++    void testPoint_MeOnly_CreateByOnly() {
++        String cond = assembler.pointCondition(meOnly(), USER_ID, "dept_id", "bound_instance_id", "create_by");
++        assertEquals("create_by = 9", cond);
++    }
++
++    @Test
++    @DisplayName("点位类 - 零可见性：1 = 0 fail-closed")
++    void testPoint_NothingVisible_FailClosed() {
++        assertEquals("1 = 0", assembler.pointCondition(nothing(), USER_ID, "dept_id", "bound_instance_id", "create_by"));
++    }
++
++    @Test
++    @DisplayName("点位类 - 全租户返回 null：未绑部门行对租户管理员可见（裁决 6 scope=1 不过滤）")
++    void testPoint_AllTenant_Null() {
++        assertNull(assembler.pointCondition(VisibleScope.allTenant(false), USER_ID, "dept_id", "bound_instance_id", "create_by"));
++    }
++
++    @Test
++    @DisplayName("点位类 - NULL 归类（裁决 6）：非全租户条件只含 IN 比较、绝不渲染 IS NULL 分支——" +
++            "NULL 行两条件皆不命中=结构性不可见")
++    void testPoint_NullRows_StructurallyFailClosed() {
++        String cond = assembler.pointCondition(normal(), USER_ID, "dept_id", "bound_instance_id", "create_by");
++        assertEquals("(dept_id IN (10) OR bound_instance_id IN (1,2))", cond);
++        assertFalse(cond.contains("IS NULL"), "禁止 OR dept_id IS NULL 特判（裁决 6 明文不做特判）");
++        assertFalse(cond.contains("IS NOT NULL"));
++        assertFalse(cond.toUpperCase().contains("NULL"));
++    }
++
++    @Test
++    @DisplayName("点位类 - scope 入参为 null 防御性 fail-closed")
++    void testPoint_NullScope_FailClosed() {
++        assertEquals("1 = 0", assembler.pointCondition(null, USER_ID, "dept_id", "bound_instance_id", "create_by"));
++    }
++
++    // ---------- 时序类 ----------
++
++    @Test
++    @DisplayName("时序类 - 仅 instance_id IN（可见实例集合）")
++    void testTimeseries_InstanceIdsOnly() {
++        assertEquals("instance_id IN (1,2)", assembler.timeseriesCondition(normal(), "instance_id"));
++    }
++
++    @Test
++    @DisplayName("时序类 - scope=4 无贡献：即使存在仅本人角色也不追加 create_by 分支（裁决 4）")
++    void testTimeseries_Scope4NoContribution() {
++        String cond = assembler.timeseriesCondition(mixedWithMe(), "instance_id");
++        assertEquals("instance_id IN (1,2)", cond);
++        assertFalse(cond.contains("create_by"));
++    }
++
++    @Test
++    @DisplayName("时序类 - 仅本人独占：1 = 0 空集（TD-0044：时序值没有 create_by，按无可见实例处理）")
++    void testTimeseries_MeOnly_EmptySet() {
++        assertEquals("1 = 0", assembler.timeseriesCondition(meOnly(), "instance_id"));
++    }
++
++    @Test
++    @DisplayName("时序类 - 零可见性与 null scope：1 = 0 fail-closed")
++    void testTimeseries_NothingVisible_FailClosed() {
++        assertEquals("1 = 0", assembler.timeseriesCondition(nothing(), "instance_id"));
++        assertEquals("1 = 0", assembler.timeseriesCondition(null, "instance_id"));
++    }
++
++    @Test
++    @DisplayName("时序类 - 全租户返回 null")
++    void testTimeseries_AllTenant_Null() {
++        assertNull(assembler.timeseriesCondition(VisibleScope.allTenant(true), "instance_id"),
++                "全租户短路优先于仅本人标记：无需任何过滤");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+new file mode 100644
+index 0000000..acccb61
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveScopeTest.java
+@@ -0,0 +1,322 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++/**
++ * 数据权限翻译组件——六步翻译入口 resolve 单元测试（TASK-0005，ADR-0016 裁决驱动）。
++ *
++ * <p>覆盖：五种 data_scope 各自可见集合正确；多角色并集（含 scope=4 与部门角色混合）；
++ * scope=1 直接全租户（跳过部门求解）；自定义 scope 查 sys_role_dept；无角色 fail-closed；
++ * 步骤 6 缓存接缝（先缓存后计算，NoOp 本期直查）。
++ *
++ * <p>standalone Mockito 范式：五个自包含只读 Mapper 全部 mock，不触真实库；
++ * ancestors 前缀展开的正确性在 {@link DataPermResolveSubtreeTest} 用真实字符串断言。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermResolveScopeTest {
++
++    @Mock
++    private DataPermUserMapper userMapper;
++    @Mock
++    private DataPermRoleMapper roleMapper;
++    @Mock
++    private DataPermRoleDeptMapper roleDeptMapper;
++    @Mock
++    private DataPermDeptMapper deptMapper;
++    @Mock
++    private DataPermInstanceMapper instanceMapper;
++
++    private DataPermProperties properties;
++    private DataPermServiceImpl service;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        properties = new DataPermProperties();
++        service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
++    }
++
++    private DataPermRoleRow role(Long id, Integer dataScope) {
++        DataPermRoleRow row = new DataPermRoleRow();
++        row.setId(id);
++        row.setDataScope(dataScope);
++        return row;
++    }
++
++    private DataPermDeptRow dept(Long id, String ancestors) {
++        DataPermDeptRow row = new DataPermDeptRow();
++        row.setId(id);
++        row.setAncestors(ancestors);
++        return row;
++    }
++
++    private DataPermInstanceRow inst(Long id, String code, Long deptId, String ancestors) {
++        DataPermInstanceRow row = new DataPermInstanceRow();
++        row.setId(id);
++        row.setInstanceCode(code);
++        row.setDeptId(deptId);
++        row.setAncestors(ancestors);
++        return row;
++    }
++
++    /** 部门树：10(根) → 11 → 12；另有 20/30 两棵无关子树 */
++    private void stubDeptTree() {
++        when(deptMapper.selectIdAncestors()).thenReturn(List.of(
++                dept(10L, "0"),
++                dept(11L, "0,10"),
++                dept(12L, "0,10,11"),
++                dept(20L, "0,20"),
++                dept(30L, "0,30")));
++    }
++
++    // ---------- scope=1 全部：直接全租户，跳过部门求解（步骤 1 裁决） ----------
++
++    @Test
++    @DisplayName("scope=1 - 直接全租户可见，跳过部门求解与实例求解")
++    void testScope1_AllTenant_SkipsDeptResolution() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertTrue(scope.allTenant(), "含 data_scope=1 的角色必须标记全租户可见");
++        assertFalse(scope.createByOnly());
++        assertEquals(Set.of(), scope.deptIds(), "全租户语义下部门集合不再求解（消费方不过滤）");
++        assertEquals(Set.of(), scope.instanceIds(), "全租户语义下不展开实例集合");
++        verify(userMapper, never()).selectDeptIdByUserId(any());
++        verify(deptMapper, never()).selectIdAncestors();
++        verify(instanceMapper, never()).selectAllForPerm();
++        verify(roleDeptMapper, never()).selectDeptIdsByRoleId(any());
++    }
++
++    @Test
++    @DisplayName("scope=1 与 scope=4 混合 - 全租户标记保留，仅本人标记也保留（条件拼装短路于 allTenant）")
++    void testScope1Plus4_AllTenantWithMeFlag() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1), role(2L, 4)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertTrue(scope.allTenant());
++        assertTrue(scope.createByOnly(), "任一角色 scope=4 即标记（ADR-0016 裁决 4），全租户下无实际作用但语义保留");
++    }
++
++    // ---------- scope=2 本部门及下属 ----------
++
++    @Test
++    @DisplayName("scope=2 - 用户部门本身 + ancestors 含该 id 的全部下级部门，实例锚点再展开子树")
++    void testScope2_DeptAndSub() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 2)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(10L);
++        stubDeptTree();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 11L, "0,1"),
++                inst(3L, "F02", 20L, "0,9")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertFalse(scope.allTenant());
++        assertEquals(Set.of(10L, 11L, 12L), scope.deptIds(), "本部门及下属=10 本身 + ancestors 含 10 的 11/12；20 不含");
++        assertEquals(Set.of(1L, 2L), scope.instanceIds(), "锚点=dept 命中实例 1；子树展开补入后代 2；F02(部门 20) 不可见");
++        assertFalse(scope.createByOnly());
++    }
++
++    // ---------- scope=3 本部门 ----------
++
++    @Test
++    @DisplayName("scope=3 - 仅用户部门本身（不下级部门），锚点实例子树仍整体可见")
++    void testScope3_DeptOnly() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 3)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(10L);
++        stubDeptTree();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 11L, "0,1"),
++                inst(3L, "F02", 20L, "0,9")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(10L), scope.deptIds(), "本部门=仅 dept_id 本身，不含 11/12 下级部门");
++        assertEquals(Set.of(1L, 2L), scope.instanceIds(), "锚点 1 的子树展开后 2 可见（实例是权限锚点，子树整体可见）");
++        verify(deptMapper, never()).selectIdAncestors();
++    }
++
++    // ---------- scope=4 仅本人 ----------
++
++    @Test
++    @DisplayName("scope=4 - 部门集合为空、不查实例（数据查询场景空集，ADR-0016 裁决 3/4）")
++    void testScope4_MeOnly() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 4)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertFalse(scope.allTenant());
++        assertTrue(scope.createByOnly(), "存在 scope=4 角色 → 消费方对配置类列表追加 OR create_by=me 分支");
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        verify(userMapper, never()).selectDeptIdByUserId(any());
++        verify(instanceMapper, never()).selectAllForPerm();
++        verify(roleDeptMapper, never()).selectDeptIdsByRoleId(any());
++    }
++
++    // ---------- scope=5 自定义 ----------
++
++    @Test
++    @DisplayName("scope=5 - 查 sys_role_dept 取角色绑定部门集合")
++    void testScope5_Custom_FromRoleDept() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 5)));
++        when(roleDeptMapper.selectDeptIdsByRoleId(1L)).thenReturn(List.of(20L, 30L));
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(5L, "F05", 20L, "0"),
++                inst(6L, "F06", 30L, "0"),
++                inst(7L, "F07", 10L, "0")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(20L, 30L), scope.deptIds(), "自定义范围=角色绑定的部门集合");
++        assertEquals(Set.of(5L, 6L), scope.instanceIds());
++        verify(roleDeptMapper).selectDeptIdsByRoleId(1L);
++        verify(userMapper, never()).selectDeptIdByUserId(any());
++    }
++
++    // ---------- 多角色并集（ADR-0016 裁决 4） ----------
++
++    @Test
++    @DisplayName("多角色并集 - scope=2 与 scope=5 部门集合并集，实例并集")
++    void testMultiRole_UnionOfDeptAndCustom() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 2), role(2L, 5)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(10L);
++        stubDeptTree();
++        when(roleDeptMapper.selectDeptIdsByRoleId(2L)).thenReturn(List.of(30L));
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 11L, "0,1"),
++                inst(5L, "F05", 30L, "0")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(10L, 11L, 12L, 30L), scope.deptIds(), "逐角色求部门集合后取并集");
++        assertEquals(Set.of(1L, 2L, 5L), scope.instanceIds(), "实例集合为全部锚点子树的并集");
++        assertFalse(scope.createByOnly());
++    }
++
++    @Test
++    @DisplayName("多角色并集 - scope=4 与部门角色混合：scope=4 不并入部门集合，仅标记 createByOnly（裁决 4）")
++    void testMultiRole_Mixed4AndDeptRole() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 2), role(2L, 4)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(10L);
++        stubDeptTree();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 11L, "0,1")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(10L, 11L, 12L), scope.deptIds(), "部门集合仅由 scope∈{1,2,3,5} 产出，scope=4 不并入");
++        assertEquals(Set.of(1L, 2L), scope.instanceIds());
++        assertTrue(scope.createByOnly(), "存在 scope=4 角色 → 拼装时追加 OR create_by=me 分支（仅配置类）");
++    }
++
++    // ---------- fail-closed 边界 ----------
++
++    @Test
++    @DisplayName("无角色 - 无任何数据权限（fail-closed 最小权限）")
++    void testNoRoles_FailClosed() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of());
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertFalse(scope.allTenant());
++        assertFalse(scope.createByOnly());
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        verify(userMapper, never()).selectDeptIdByUserId(any());
++    }
++
++    @Test
++    @DisplayName("未知/空 data_scope - 不产出任何可见性（fail-closed，不按最松档理解）")
++    void testUnknownScopeValue_FailClosed() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 9), role(2L, null)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertFalse(scope.allTenant());
++        assertFalse(scope.createByOnly());
++        assertEquals(Set.of(), scope.deptIds());
++        assertEquals(Set.of(), scope.instanceIds());
++        verify(instanceMapper, never()).selectAllForPerm();
++    }
++
++    // ---------- 步骤 6 缓存接缝 ----------
++
++    @Test
++    @DisplayName("缓存接缝 - 先缓存后计算：命中缓存时不触达任何 Mapper")
++    void testCacheHit_SkipsCompute() {
++        VisibleScope sentinel = VisibleScope.allTenant(false);
++        Set<Long> evicted = new HashSet<>();
++        VisibleScopeCache stubCache = new VisibleScopeCache() {
++            @Override
++            public VisibleScope get(Long userId) {
++                return sentinel;
++            }
++
++            @Override
++            public void put(Long userId, VisibleScope scope) {
++                // 命中路径不应触发 put
++            }
++
++            @Override
++            public void evict(Long userId) {
++                evicted.add(userId);
++            }
++        };
++        DataPermServiceImpl cached = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, stubCache, properties);
++
++        VisibleScope scope = cached.resolve(7L);
++
++        assertSame(sentinel, scope, "缓存命中必须原样返回缓存值（Redis 实现归 TASK-0006，接缝先立）");
++        verifyNoInteractions(roleMapper, userMapper, roleDeptMapper, deptMapper, instanceMapper);
++        assertTrue(evicted.isEmpty());
++    }
++
++    @Test
++    @DisplayName("缓存接缝 - NoOp 实现本期直查：每次 resolve 都重新计算")
++    void testNoOpCache_ComputesEveryTime() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1)));
++
++        service.resolve(7L);
++        service.resolve(7L);
++
++        verify(roleMapper, times(2)).selectEnabledRolesByUserId(7L);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java
+new file mode 100644
+index 0000000..804e079
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermResolveSubtreeTest.java
+@@ -0,0 +1,208 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleDeptMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermRoleMapper;
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermUserMapper;
++import ch.qos.logback.classic.Level;
++import ch.qos.logback.classic.Logger;
++import ch.qos.logback.classic.spi.ILoggingEvent;
++import ch.qos.logback.core.read.ListAppender;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.slf4j.LoggerFactory;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.when;
++
++/**
++ * 数据权限翻译组件——步骤 4 ancestors 子树展开与上限截断单元测试（TASK-0005，ADR-0016 裁决 1）。
++ *
++ * <p>关键断言均用真实 ancestors 字符串：元素级匹配（逗号分隔后整 token 比对），
++ * 防「0,11」被字符串前缀误判为「0,1」后代；截断按 ancestors 路径序（深度升序）保近端实例，
++ * 深度序下祖先必先于后代——截断结果对祖先闭包；WARN 日志格式为 ADR-0016 裁决 1 硬约束，
++ * 逐字符断言（可 grep）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermResolveSubtreeTest {
++
++    @Mock
++    private DataPermUserMapper userMapper;
++    @Mock
++    private DataPermRoleMapper roleMapper;
++    @Mock
++    private DataPermRoleDeptMapper roleDeptMapper;
++    @Mock
++    private DataPermDeptMapper deptMapper;
++    @Mock
++    private DataPermInstanceMapper instanceMapper;
++
++    private DataPermProperties properties;
++    private DataPermServiceImpl service;
++
++    private ListAppender<ILoggingEvent> logAppender;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        properties = new DataPermProperties();
++        service = new DataPermServiceImpl(userMapper, roleMapper, roleDeptMapper,
++                deptMapper, instanceMapper, new NoOpVisibleScopeCache(), properties);
++        logAppender = new ListAppender<>();
++        logAppender.start();
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).addAppender(logAppender);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        ((Logger) LoggerFactory.getLogger(DataPermServiceImpl.class)).detachAppender(logAppender);
++        mocks.close();
++    }
++
++    private DataPermRoleRow role(Long id, Integer dataScope) {
++        DataPermRoleRow row = new DataPermRoleRow();
++        row.setId(id);
++        row.setDataScope(dataScope);
++        return row;
++    }
++
++    private DataPermInstanceRow inst(Long id, String code, Long deptId, String ancestors) {
++        DataPermInstanceRow row = new DataPermInstanceRow();
++        row.setId(id);
++        row.setInstanceCode(code);
++        row.setDeptId(deptId);
++        row.setAncestors(ancestors);
++        return row;
++    }
++
++    /** scope=3 本部门=10 的用户；实例树 F01(id=1) 下四级链 */
++    private void stubRoleAndAnchor() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 3)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(10L);
++    }
++
++    private List<String> warnMessages() {
++        return logAppender.list.stream()
++                .filter(e -> e.getLevel() == Level.WARN)
++                .map(ILoggingEvent::getFormattedMessage)
++                .toList();
++    }
++
++    @Test
++    @DisplayName("ancestors 前缀展开 - 多级链整体可见；「0,11」不得被字符串前缀误判为 1 的后代")
++    void testAncestorsExpansion_MultiLevel_WithStringPrefixTrap() {
++        stubRoleAndAnchor();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2"),
++                inst(4L, "F01.WS01.EQ001.M01", 40L, "0,1,2,3"),
++                inst(5L, "F02", 50L, "0,8"),
++                inst(6L, "F09", 60L, "0,11")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(1L, 2L, 3L, 4L), scope.instanceIds(),
++                "锚点 1 的后代链 2/3/4 可见（四级展开）；F02(0,8) 不含 1；F09(0,11) 是 11 的子树而非 1 的——元素级匹配防字符串前缀陷阱");
++    }
++
++    @Test
++    @DisplayName("ancestors 前缀展开 - 锚点位于树中段：只展开其子树，父/兄分支不可见")
++    void testAncestorsExpansion_MidTreeAnchor() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 3)));
++        when(userMapper.selectDeptIdByUserId(7L)).thenReturn(20L);
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2"),
++                inst(9L, "F01.WS02", 21L, "0,1")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(2L, 3L), scope.instanceIds(),
++                "锚点=WS01(2)：后代 3 可见；父 F01(1) 与兄弟 WS02(9) 不可见");
++    }
++
++    @Test
++    @DisplayName("子树上限截断 - 超 cap 按 ancestors 路径序保近端实例，WARN 逐字符符合 ADR-0016 裁决 1 格式")
++    void testSubtreeCap_TruncateKeepNearest_WithExactWarnFormat() {
++        properties.setSubtreeMax(3);
++        stubRoleAndAnchor();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2"),
++                inst(4L, "F01.WS01.EQ001.M01", 40L, "0,1,2,3"),
++                inst(5L, "F01.WS01.EQ001.M01.P01", 50L, "0,1,2,3,4")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(1L, 2L, 3L), scope.instanceIds(),
++                "5 个可见实例超 cap=3：按路径深度升序保留近端 1/2/3（祖先先于后代，截断对祖先闭包）");
++        List<String> warns = warnMessages();
++        assertEquals(1, warns.size(), "截断恰好发一条 WARN");
++        assertEquals("[DATAPERM] subtree truncated user=7 kept=3 cap=3", warns.get(0),
++                "WARN 格式为 ADR-0016 裁决 1 硬约束：[DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>");
++    }
++
++    @Test
++    @DisplayName("子树上限截断 - subtree-max<=0 视为关闭上限：不截断不发 WARN")
++    void testSubtreeCap_DisabledWhenNonPositive() {
++        properties.setSubtreeMax(0);
++        stubRoleAndAnchor();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1"),
++                inst(3L, "F01.WS01.EQ001", 30L, "0,1,2")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(1L, 2L, 3L), scope.instanceIds(), "上限关闭时不截断（误配 0 不得造成全量不可见）");
++        assertEquals(List.of(), warnMessages(), "未截断不发 WARN");
++    }
++
++    @Test
++    @DisplayName("未绑部门实例 - 子树内后代经展开可见；孤立未绑行不可见（fail-closed，不特判 NULL）")
++    void testNullDeptInstance_FailClosedUnlessDescendant() {
++        stubRoleAndAnchor();
++        when(instanceMapper.selectAllForPerm()).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", null, "0,1"),
++                inst(8L, "F08", null, "0")));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertEquals(Set.of(1L, 2L), scope.instanceIds(),
++                "dept_id=NULL 的 2 经 ancestors 展开随父可见；孤立的 NULL 部门 8 不可见（结构性 fail-closed，无 NULL 特判）");
++    }
++
++    @Test
++    @DisplayName("配置默认值 - ot.dataperm.subtree-max 缺省 5000（ADR-0016 裁决 1）")
++    void testDefaultSubtreeMax_Is5000() {
++        assertEquals(5000, new DataPermProperties().getSubtreeMax());
++    }
++
++    @Test
++    @DisplayName("全租户短路 - scope=1 不触发实例展开（性能与语义双保证）")
++    void testAllTenant_NeverLoadsInstances() {
++        when(roleMapper.selectEnabledRolesByUserId(7L)).thenReturn(List.of(role(1L, 1)));
++
++        VisibleScope scope = service.resolve(7L);
++
++        assertTrue(scope.allTenant());
++        org.mockito.Mockito.verify(instanceMapper, org.mockito.Mockito.never()).selectAllForPerm();
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTagConditionRendererTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTagConditionRendererTest.java
+new file mode 100644
+index 0000000..fa76201
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataperm/DataPermTagConditionRendererTest.java
+@@ -0,0 +1,171 @@
++package net.otlab.admin.module.iot.dataperm;
++
++import net.otlab.admin.module.iot.dataperm.mapper.DataPermInstanceMapper;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 数据权限翻译组件——TDengine 标签条件下推渲染器单元测试（TASK-0005，ADR-0016 裁决 7）。
++ *
++ * <p>标签名为超级表契约 v1.0.0 硬约束：instance_key（实例编码，BINARY(96)）、dept_id（部门 id）；
++ * 详细设计 §4.1 行文旧称 instance_code/dept 一律不得出现在渲染结果中。
++ * 渲染结果为条件片段供消费方拼 SQL；编码值做单引号转义防注入。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class DataPermTagConditionRendererTest {
++
++    @Mock
++    private DataPermInstanceMapper instanceMapper;
++
++    private TdengineTagConditionRenderer renderer;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        renderer = new TdengineTagConditionRenderer(instanceMapper);
++    }
++
++    private DataPermInstanceRow inst(Long id, String code, Long deptId, String ancestors) {
++        DataPermInstanceRow row = new DataPermInstanceRow();
++        row.setId(id);
++        row.setInstanceCode(code);
++        row.setDeptId(deptId);
++        row.setAncestors(ancestors);
++        return row;
++    }
++
++    // ---------- 时序语义下推（指标/曲线/历史：instance_key IN） ----------
++
++    @Test
++    @DisplayName("时序下推 - 标签名 instance_key，编码升序渲染、单引号包裹")
++    void testTimeseries_InstanceKeyTag_SortedCodes() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1")));
++
++        String cond = renderer.renderTimeseriesCondition(
++                new VisibleScope(false, Set.of(10L), Set.of(2L, 1L), false));
++
++        assertEquals("instance_key IN ('F01','F01.WS01')", cond);
++        verify(instanceMapper).selectByIds(anyCollection());
++    }
++
++    @Test
++    @DisplayName("时序下推 - 全租户返回 null（库级租户隔离已由库名保证，无需标签过滤）")
++    void testTimeseries_AllTenant_Null() {
++        assertNull(renderer.renderTimeseriesCondition(VisibleScope.allTenant(false)));
++    }
++
++    @Test
++    @DisplayName("时序下推 - 仅本人角色：不追加 create_by（TDengine 时序无 create_by 标签，scope=4 无贡献）")
++    void testTimeseries_Scope4NoCreateBy() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1")));
++
++        String cond = renderer.renderTimeseriesCondition(
++                new VisibleScope(false, Set.of(10L), Set.of(1L, 2L), true));
++        assertEquals("instance_key IN ('F01','F01.WS01')", cond);
++        assertFalse(cond.contains("create_by"));
++    }
++
++    @Test
++    @DisplayName("时序下推 - 零可见实例：1 = 0 fail-closed")
++    void testTimeseries_NothingVisible_FailClosed() {
++        assertEquals("1 = 0", renderer.renderTimeseriesCondition(
++                new VisibleScope(false, Set.of(), Set.of(), false)));
++        assertEquals("1 = 0", renderer.renderTimeseriesCondition(null));
++    }
++
++    // ---------- 点位语义下推（原始点位数据：instance_key OR dept_id） ----------
++
++    @Test
++    @DisplayName("点位下推 - (instance_key IN ...) OR (dept_id IN ...)，与 MySQL 点位条件同构")
++    void testPoint_TagCondition_OR_Structure() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0"),
++                inst(2L, "F01.WS01", 20L, "0,1")));
++
++        String cond = renderer.renderPointCondition(
++                new VisibleScope(false, Set.of(10L, 11L), Set.of(1L, 2L), false));
++
++        assertEquals("(instance_key IN ('F01','F01.WS01') OR dept_id IN (10,11))", cond);
++    }
++
++    @Test
++    @DisplayName("点位下推 - 部门标签 dept_id 独立可渲染（编码解析为空时不产出 instance_key 分支）")
++    void testPoint_DeptOnly() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of());
++
++        String cond = renderer.renderPointCondition(
++                new VisibleScope(false, Set.of(10L), Set.of(), false));
++
++        assertEquals("dept_id IN (10)", cond);
++    }
++
++    @Test
++    @DisplayName("点位下推 - 编码含单引号时转义（'' 防片段注入）")
++    void testPoint_CodeQuoteEscaped() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F0'1", 10L, "0")));
++
++        String cond = renderer.renderPointCondition(
++                new VisibleScope(false, Set.of(), Set.of(1L), false));
++
++        assertEquals("instance_key IN ('F0''1')", cond);
++    }
++
++    @Test
++    @DisplayName("点位下推 - 全租户返回 null（未绑部门点位对租户管理员可见，裁决 6）")
++    void testPoint_AllTenant_Null() {
++        assertNull(renderer.renderPointCondition(VisibleScope.allTenant(false)));
++    }
++
++    @Test
++    @DisplayName("点位下推 - 零可见性：1 = 0；结果永不出现 IS NULL（裁决 6 不特判 NULL）")
++    void testPoint_NothingVisible_FailClosed_NoNullBranch() {
++        String cond = renderer.renderPointCondition(
++                new VisibleScope(false, Set.of(), Set.of(), false));
++        assertEquals("1 = 0", cond);
++        assertFalse(cond.toUpperCase().contains("NULL"));
++    }
++
++    // ---------- 裁决 7：标签名硬约束 ----------
++
++    @Test
++    @DisplayName("标签名硬约束 - 一律 instance_key/dept_id，禁止 §4.1 行文旧称 instance_code/dept")
++    void testTagNames_PerContract() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                inst(1L, "F01", 10L, "0")));
++
++        String ts = renderer.renderTimeseriesCondition(
++                new VisibleScope(false, Set.of(), Set.of(1L), false));
++        String pt = renderer.renderPointCondition(
++                new VisibleScope(false, Set.of(10L), Set.of(1L), false));
++
++        assertTrue(ts.contains("instance_key"));
++        assertTrue(pt.contains("instance_key"));
++        assertTrue(pt.contains("dept_id"));
++        assertFalse(ts.contains("instance_code"), "instance_code 是 MySQL 列名，不是 TDengine 标签名");
++        assertFalse(pt.contains("instance_code"));
++        assertFalse(pt.contains(" dept "), "「dept」为 §4.1 行文旧称，契约标签为 dept_id");
++    }
++}

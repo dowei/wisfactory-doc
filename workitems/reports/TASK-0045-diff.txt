@@ -1,0 +1,1647 @@
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index 8bcfa05..4d92f16 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -182,6 +182,31 @@ public class CalcEngineApplication {
+                 trace, lwt);
+     }
+ 
++    /**
++     * TASK-0045 指标聚合运行时（metric-aggregation-enabled=true 时才装配）：
++     * 自实现调度（非 XXL-Job）+ 窗口/聚合/完整度 + st_metric_value 物化写。
++     * 默认关闭——0040/0041/0042/0049 既有行为零变化。
++     */
++    @Bean
++    public net.otlab.calc.metric.MetricRuntime metricRuntime(CalcProperties properties) {
++        if (!properties.isMetricAggregationEnabled()) {
++            return null;
++        }
++        String tenant = properties.getTenant() == null || properties.getTenant().isBlank()
++                ? "default" : properties.getTenant();
++        net.otlab.calc.metric.MetricValueRecorder recorder = new net.otlab.calc.metric.MetricValueRecorder(tenant);
++        return new net.otlab.calc.metric.MetricRuntime(
++                new net.otlab.calc.metric.MetricAggregator(),
++                new net.otlab.calc.metric.MetricValueStore(),
++                properties.getMetricGraceDays() == null ? 3 : properties.getMetricGraceDays(),
++                properties.getMetricCompletenessMin() == null ? 0.8 : properties.getMetricCompletenessMin(),
++                java.time.ZoneOffset.UTC, tenant,
++                properties.getTenantId() == null ? 1L : properties.getTenantId(),
++                properties.getStatusInstanceCode() == null || properties.getStatusInstanceCode().isBlank()
++                        ? "I01" : properties.getStatusInstanceCode(),
++                recorder);
++    }
++
+     /** config.changed 订阅缝占位（TD-0057 延续登记）：本期拉取驱动，通知不消费 */
+     @Bean
+     public ConfigChangedSubscriber configChangedSubscriber() {
+@@ -200,6 +225,7 @@ public class CalcEngineApplication {
+     @Bean
+     public ApplicationRunner calcStartupRunner(SnapshotReconciler reconciler, ExecutorRuntime executorRuntime,
+                                                @org.springframework.lang.Nullable StatusEvaluatorRuntime statusRuntime,
++                                               @org.springframework.lang.Nullable net.otlab.calc.metric.MetricRuntime metricRuntime,
+                                                CalcProperties properties) {
+         return (ApplicationArguments args) -> {
+             if (properties.getBackendBaseUrl() == null || properties.getBackendBaseUrl().isBlank()) {
+@@ -223,6 +249,13 @@ public class CalcEngineApplication {
+                 statusRuntime.start();
+                 log.info("[CALC] 状态判定已启用（ResultSink 桥接 + LWT 事件输入）");
+             }
++            if (metricRuntime != null) {
++                long mtick = properties.getSchedulerTickSeconds() == null || properties.getSchedulerTickSeconds() < 1
++                        ? 60 : properties.getSchedulerTickSeconds();
++                metricRuntime.start(mtick);
++                log.info("[CALC] 指标聚合调度已启用（自实现调度，非 XXL-Job；graceDays={}）",
++                        properties.getMetricGraceDays());
++            }
+         };
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 1aeb2f6..f1519b8 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -77,6 +77,39 @@ public class CalcProperties {
+     /** 租户 id（st_item_value 六元组 tag tenant_id；默认 1） */
+     private Long tenantId = 1L;
+ 
++    /** TASK-0045 指标聚合调度总开关（默认 false——0040/0041/0042/0049 既有行为零变化） */
++    private boolean metricAggregationEnabled = false;
++
++    /** 指标窗口宽限天数（env CALC_METRIC_GRACE_DAYS，默认 3；窗口结束后宽限期内到达数据可纳入） */
++    private Integer metricGraceDays = 3;
++
++    /** 指标完整度阈值（env CALC_METRIC_COMPLETENESS_MIN，默认 0.8；低于阈值带不完整标记） */
++    private Double metricCompletenessMin = 0.8;
++
++    public boolean isMetricAggregationEnabled() {
++        return metricAggregationEnabled;
++    }
++
++    public void setMetricAggregationEnabled(boolean metricAggregationEnabled) {
++        this.metricAggregationEnabled = metricAggregationEnabled;
++    }
++
++    public Integer getMetricGraceDays() {
++        return metricGraceDays;
++    }
++
++    public void setMetricGraceDays(Integer metricGraceDays) {
++        this.metricGraceDays = metricGraceDays;
++    }
++
++    public Double getMetricCompletenessMin() {
++        return metricCompletenessMin;
++    }
++
++    public void setMetricCompletenessMin(Double metricCompletenessMin) {
++        this.metricCompletenessMin = metricCompletenessMin;
++    }
++
+     public Long getTenantId() {
+         return tenantId;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java b/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java
+new file mode 100644
+index 0000000..7d86892
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java
+@@ -0,0 +1,126 @@
++package net.otlab.calc.metric;
++
++import java.util.ArrayList;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Set;
++
++/**
++ * 指标聚合计算（TASK-0045 brief 决策 2/3）：
++ *
++ * <ul>
++ * <li>读数走已物化结果 {@link MetricValueStore}——不现算原始点（0042/0049 ResultSink 数据 + Redis）；</li>
++ * <li>小时→日→月→年逐级聚合（级联 src_type 由 {@link MetricDef} 携带，来源取下级物化结果）；</li>
++ * <li>比值型（aggType=5）分子分母分别聚合再相除（不是逐条比值再平均），分母 0 结果为空并打标记；</li>
++ * <li>平均口径：period=DAY 且 aggType=1 时「当日总量÷24」（固定 24 小时分母），≠ 对到达值取均值；</li>
++ * <li>完整度：应到周期值到达率，非 GOOD 质量码与停用项计缺失；低于阈值带不完整标记；</li>
++ * <li>无数据出无值（value=null）+ 完整度 0，不写 0 冒充（CONV-02）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricAggregator {
++
++    /**
++     * 聚合一个窗口。
++     *
++     * @param def           指标定义
++     * @param source        已物化读数源
++     * @param ts            窗口起始（写 st_metric_value.ts）
++     * @param expectedCount 应到周期值数（完整度分母；平均口径 DAY 固定传 24）
++     * @param minCompleteness 完整度阈值（默认 0.8）
++     */
++    public MetricResult aggregate(MetricDef def, MetricValueStore source, long ts,
++                                  int expectedCount, double minCompleteness) {
++        if (def.isRatio()) {
++            return aggregateRatio(def, source, ts, expectedCount, minCompleteness);
++        }
++        // 平均口径：DAY + aggType=1 固定按「当日总量÷24」——非对到达值取均值（TC-0015）。
++        // 用 expectedCount（DAY 传 24）作固定分母，区别于普通 AVG 的到达数分母。
++        if (def.aggType() == 1 && "DAY".equalsIgnoreCase(def.period())) {
++            return aggregateAverageDiv24(def, source, ts, expectedCount, minCompleteness);
++        }
++        List<Double> values = readValues(def, source);
++        int arrived = values.size();
++        double completeness = expectedCount <= 0 ? 0.0
++                : Math.min(1.0, arrived / (double) expectedCount);
++        boolean noData = arrived == 0;
++        Double value = noData ? null : aggregateValue(def, values);
++        boolean incomplete = noData || completeness < minCompleteness;
++        return new MetricResult(value, completeness, incomplete, noData, ts);
++    }
++
++    /** 从物化源读值（sourceKeys 显式键 + 同前缀级联展开——不现算、去重） */
++    private List<Double> readValues(MetricDef def, MetricValueStore source) {
++        Set<String> keys = new LinkedHashSet<>(def.sourceKeys());
++        Set<String> seen = new LinkedHashSet<>();
++        List<Double> out = new ArrayList<>();
++        for (String k : keys) {
++            // 显式键（精确存在时直接读；否则按前缀展开物化子结果）
++            Double v = source.goodValue(k);
++            if (v != null) {
++                if (seen.add(k)) {
++                    out.add(v);
++                }
++            }
++            for (java.util.Map.Entry<String, Double> e : source.allGood().entrySet()) {
++                if (e.getKey().startsWith(k) && seen.add(e.getKey())) {
++                    out.add(e.getValue());
++                }
++            }
++        }
++        return out;
++    }
++
++    /** 普通型聚合值：1 平均（总量÷24）/ 2 累计 / 3 最大 / 4 最小 */
++    private Double aggregateValue(MetricDef def, List<Double> values) {
++        double sum = values.stream().mapToDouble(Double::doubleValue).sum();
++        return switch (def.aggType()) {
++            case 1 -> values.stream().mapToDouble(Double::doubleValue).average().orElse(sum);
++            case 2 -> sum;
++            case 3 -> values.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
++            case 4 -> values.stream().mapToDouble(Double::doubleValue).min().orElse(0.0);
++            default -> throw new IllegalArgumentException("不支持的聚合类型: " + def.aggType());
++        };
++    }
++
++    /** 比值型：分子分母分别聚合再相除 */
++    private MetricResult aggregateRatio(MetricDef def, MetricValueStore source, long ts,
++                                        int expectedCount, double minCompleteness) {
++        List<Double> nums = source.goodValuesWithPrefix(def.ratioNumKey());
++        List<Double> dens = source.goodValuesWithPrefix(def.ratioDenKey());
++        int arrived = nums.size() + dens.size();
++        double completeness = expectedCount <= 0 ? 0.0
++                : Math.min(1.0, arrived / (double) expectedCount);
++        boolean noData = nums.isEmpty() && dens.isEmpty();
++        Double value;
++        if (noData) {
++            value = null;
++        } else {
++            double num = nums.stream().mapToDouble(Double::doubleValue).sum();
++            double den = dens.stream().mapToDouble(Double::doubleValue).sum();
++            value = den == 0.0 ? null : num / den;
++        }
++        boolean incomplete = noData || value == null || completeness < minCompleteness;
++        return new MetricResult(value, completeness, incomplete, noData, ts);
++    }
++
++    /**
++     * 日平均专用：总量÷24（固定分母），与「对到达值取均值」严格区分（TC-0015/REQ-0025）。
++     *
++     * @param expectedCount 应到小时数（DAY=24）
++     */
++    public MetricResult aggregateAverageDiv24(MetricDef def, MetricValueStore source, long ts,
++                                              int expectedCount, double minCompleteness) {
++        List<Double> values = readValues(def, source);
++        int arrived = values.size();
++        double completeness = expectedCount <= 0 ? 0.0
++                : Math.min(1.0, arrived / (double) expectedCount);
++        boolean noData = arrived == 0;
++        double total = values.stream().mapToDouble(Double::doubleValue).sum();
++        Double value = noData ? null : total / expectedCount;
++        boolean incomplete = noData || completeness < minCompleteness;
++        return new MetricResult(value, completeness, incomplete, noData, ts);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricDef.java b/calc/src/main/java/net/otlab/calc/metric/MetricDef.java
+new file mode 100644
+index 0000000..8488d2e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricDef.java
+@@ -0,0 +1,40 @@
++package net.otlab.calc.metric;
++
++import java.util.List;
++
++/**
++ * 指标定义（映射快照 iot_metric——TASK-0045 brief 决策 2）。
++ *
++ * @param metricCode   指标编码
++ * @param period       HOUR/DAY/MONTH/YEAR
++ * @param aggType      1 平均 2 累计 3 最大 4 最小 5 比值
++ * @param sourceKeys   来源数据项物化 fullKey 列表（普通型）
++ * @param ratioNumKey  比值型分子来源键前缀（aggType=5）
++ * @param ratioDenKey  比值型分母来源键前缀（aggType=5）
++ * @param srcType      级联层级来源标记（1 原始 / 2 公式派生 / 3 汇总 / 4 下级物化结果级联）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record MetricDef(String metricCode, String period, int aggType, List<String> sourceKeys,
++                        String ratioNumKey, String ratioDenKey, int srcType) {
++
++    /** 普通型（非比值） */
++    public MetricDef(String metricCode, String period, int aggType, List<String> sourceKeys) {
++        this(metricCode, period, aggType, sourceKeys, null, null, 1);
++    }
++
++    /** 普通型带级联 srcType */
++    public MetricDef(String metricCode, String period, int aggType, List<String> sourceKeys, int srcType) {
++        this(metricCode, period, aggType, sourceKeys, null, null, srcType);
++    }
++
++    /** 比值型（aggType=5）：分子分母分别聚合再相除 */
++    public MetricDef(String metricCode, String period, int aggType, List<String> sourceKeys,
++                     String ratioNumKey, String ratioDenKey) {
++        this(metricCode, period, aggType, sourceKeys, ratioNumKey, ratioDenKey, 1);
++    }
++
++    public boolean isRatio() {
++        return aggType == 5;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricResult.java b/calc/src/main/java/net/otlab/calc/metric/MetricResult.java
+new file mode 100644
+index 0000000..2a90c43
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricResult.java
+@@ -0,0 +1,21 @@
++package net.otlab.calc.metric;
++
++/**
++ * 指标聚合结果（TASK-0045 brief 决策 2/3）。
++ *
++ * <p>value=null 表示无值/分母 0（不写 0 冒充——CONV-02）；completeness 为应到周期值到达率；
++ * incomplete=低于阈值的「不完整」标记（不静默）；noData=窗口内无任何数据。
++ * 完整度与标记不进冻结表列（tdengine-super-tables.md v1.0.0 仅 ts/value/yoy/mom），
++ * 在内存结果与 /calc/v1/status 观测面承载（登记字面差异见报告）。
++ *
++ * @param value        聚合值（null=无值）
++ * @param completeness 到达率 0..1
++ * @param incomplete   低于阈值带不完整标记
++ * @param noData       窗口无数据
++ * @param ts           窗口起始（st_metric_value.ts=窗口起始）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record MetricResult(Double value, double completeness, boolean incomplete,
++                           boolean noData, long ts) {
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+new file mode 100644
+index 0000000..e1e1b9e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+@@ -0,0 +1,163 @@
++package net.otlab.calc.metric;
++
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * 指标聚合运行时（TASK-0045 brief 决策 5）：装配 聚合器 + 物化读数源 + 物化写 Sink + 自实现调度，
++ * 提供 /calc/v1/status 观测视图（窗口/完整度/产出数）。
++ *
++ * <p>不写 Redis 指标缓存（0053 推送/0060 看板后续直接消费 st_metric_value）。
++ * 默认关闭（metric-aggregation-enabled=false），0040/0041/0042/0049 既有行为零变化。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricRuntime {
++
++    private final MetricAggregator aggregator;
++    private final MetricValueStore source;
++    private final MetricSink sink;
++    private final MetricValueRecorder recorder;
++    private final int graceDays;
++    private final double minCompleteness;
++    private final MetricScheduler scheduler;
++    private final long tenantId;
++    private final String instanceCode;
++
++    private final AtomicLong produced = new AtomicLong();
++    private final Map<String, Object> windows = new ConcurrentHashMap<>();
++    private final Map<String, Object> lastIncompleteFlags = new ConcurrentHashMap<>();
++    private volatile Double lastCompleteness;
++    private volatile List<MetricDef> defs = List.of();
++
++    public MetricRuntime(MetricAggregator aggregator, MetricValueStore source, MetricSink sink) {
++        this(aggregator, source, sink, 3, 0.8, ZoneOffset.UTC, "t45", 1L, "I01");
++    }
++
++    public MetricRuntime(MetricAggregator aggregator, MetricValueStore source, MetricSink sink,
++                         int graceDays, double minCompleteness, ZoneId zone, String tenant) {
++        this(aggregator, source, sink, graceDays, minCompleteness, zone, tenant, 1L, "I01");
++    }
++
++    /** 生产装配用：租户与统计对象实例来自配置/快照 */
++    public MetricRuntime(MetricAggregator aggregator, MetricValueStore source, MetricSink sink,
++                         int graceDays, double minCompleteness, ZoneId zone, String tenant,
++                         long tenantId, String instanceCode) {
++        this.aggregator = aggregator;
++        this.source = source;
++        this.sink = sink;
++        this.recorder = null;
++        this.graceDays = graceDays;
++        this.minCompleteness = minCompleteness;
++        this.tenantId = tenantId;
++        this.instanceCode = instanceCode;
++        this.scheduler = new MetricScheduler(graceDays, zone, tenant);
++    }
++
++    /** 生产装配用：recorder 提供记录式写口（真 REST 故障时 live 契约断言面） */
++    public MetricRuntime(MetricAggregator aggregator, MetricValueStore source,
++                         int graceDays, double minCompleteness, ZoneId zone, String tenant,
++                         long tenantId, String instanceCode, MetricValueRecorder recorder) {
++        this.aggregator = aggregator;
++        this.source = source;
++        this.sink = new MetricSink(recorder.writer());
++        this.recorder = recorder;
++        this.graceDays = graceDays;
++        this.minCompleteness = minCompleteness;
++        this.tenantId = tenantId;
++        this.instanceCode = instanceCode;
++        this.scheduler = new MetricScheduler(graceDays, zone, tenant);
++    }
++
++    /** 装载指标定义（换图时刷新；月末/周期间隔由 scheduler 自然读取） */
++    public void setDefinitions(List<MetricDef> defs) {
++        this.defs = defs == null ? List.of() : List.copyOf(defs);
++    }
++
++    /** 启动自实现调度线程 */
++    public void start(long tickSeconds) {
++        scheduler.start(tickSeconds, this::onDue, () -> defs);
++    }
++
++    public void stop() {
++        scheduler.stop();
++    }
++
++    public MetricValueStore source() {
++        return source;
++    }
++
++    /** 窗口构造用租户编码（观测驱动口与调度统一） */
++    public String tenant() {
++        return recorder == null ? "t45" : recorder.tenantCode();
++    }
++
++    /** 按定义构造「上一已结束窗口」（观测驱动口与调度同口径） */
++    public MetricWindow previousWindow(MetricDef def, long nowMillis) {
++        return MetricWindow.previous(tenant(), def.metricCode(), def.period(), 1, nowMillis,
++                java.time.ZoneOffset.UTC);
++    }
++
++    /** 到期窗口：计算 + 物化写 + 观测登记（同 ts 覆盖写=幂等） */
++    public void onDue(MetricWindow w) {
++        MetricDef def = defs.stream()
++                .filter(d -> d.metricCode().equals(w.metricCode()))
++                .findFirst().orElse(null);
++        if (def == null) {
++            return;
++        }
++        int expected = expectedCount(def);
++        MetricResult result = "DAY".equalsIgnoreCase(def.period()) && def.aggType() == 1
++                ? aggregator.aggregateAverageDiv24(def, source, w.startMillis(), expected, minCompleteness)
++                : aggregator.aggregate(def, source, w.startMillis(), expected, minCompleteness);
++        sink.write(new MetricValue(tenantId, def.metricCode(), instanceCode, def.period(), w.calendarType(),
++                w.startMillis(), result.value(), null, null));
++        recordObservation(result, def.metricCode(), def.period());
++    }
++
++    /** 应到周期值数（完整度分母）：DAY 平均固定 24；其余按来源键数（演进位由快照应到集定版） */
++    private int expectedCount(MetricDef def) {
++        if ("DAY".equalsIgnoreCase(def.period()) && def.aggType() == 1) {
++            return 24;
++        }
++        int n = def.sourceKeys() == null ? 0 : def.sourceKeys().size();
++        return Math.max(n, 1);
++    }
++
++    /** 登记观测（测试与 live 冒烟可直接调用） */
++    public void recordObservation(MetricResult r, String metricCode, String period) {
++        produced.incrementAndGet();
++        windows.put(metricCode, Map.of(
++                "period", period,
++                "ts", r.ts(),
++                "completeness", r.completeness(),
++                "incomplete", r.incomplete(),
++                "noData", r.noData()));
++        lastIncompleteFlags.put(metricCode, r.incomplete());
++        lastCompleteness = r.completeness();
++    }
++
++    /** /calc/v1/status 观测视图：窗口/完整度/产出数 */
++    public Map<String, Object> view() {
++        Map<String, Object> v = new LinkedHashMap<>();
++        v.put("windows", Map.copyOf(windows));
++        v.put("produced", produced.get());
++        v.put("lastCompleteness", lastCompleteness);
++        v.put("lastIncompleteFlags", Map.copyOf(lastIncompleteFlags));
++        v.put("schedulerRunning", scheduler.isRunning());
++        v.put("graceDays", graceDays);
++        v.put("completenessMin", minCompleteness);
++        v.put("warnings", sink.warnings().size());
++        if (recorder != null) {
++            v.put("writes", recorder.size());
++            v.put("lastWriteSql", recorder.lastSql());
++        }
++        return v;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricScheduler.java b/calc/src/main/java/net/otlab/calc/metric/MetricScheduler.java
+new file mode 100644
+index 0000000..777d55c
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricScheduler.java
+@@ -0,0 +1,144 @@
++package net.otlab.calc.metric;
++
++import java.time.Instant;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 指标聚合调度器（TASK-0045 brief 调度裁决）：calc 自实现单线程调度（照 0041 PeriodicScheduler
++ * 范式），不引入 XXL-Job 依赖、不改 backend sys_job。
++ *
++ * <p><b>取向</b>：Spring @Scheduled 静态 cron 无法表达「按快照指标定义的周期 + 运行时换图即时生效
++ * + 月末一次 + 宽限期到期」；自实现 daemon 线程、fail-soft 异常兜底，与 SnapshotReconciler/
++ * PeriodicScheduler 同款。窗口到期（end + graceDays）触发；同窗由 windowKey 幂等去重（后算覆盖）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricScheduler {
++
++    private static final Logger log = LoggerFactory.getLogger(MetricScheduler.class);
++
++    /** 提交待算窗口的计划书（测试替身/Runtime 装配） */
++    public interface Plan {
++        void submit(MetricWindow window);
++    }
++
++    private final int graceDays;
++    private final ZoneId zone;
++    private final String tenant;
++    private final Set<String> fired = ConcurrentHashMap.newKeySet();
++    private volatile ScheduledExecutorService scheduler;
++    private long tickSeconds = 60;
++
++    public MetricScheduler(int graceDays) {
++        this(graceDays, ZoneOffset.UTC, "t45");
++    }
++
++    public MetricScheduler(int graceDays, ZoneId zone) {
++        this(graceDays, zone, "t45");
++    }
++
++    /** 生产装配用：显式租户编码参与窗口唯一键 */
++    public MetricScheduler(int graceDays, ZoneId zone, String tenant) {
++        this.graceDays = graceDays;
++        this.zone = zone;
++        this.tenant = tenant;
++    }
++
++    /** 自实现调度线程启动（tickSeconds 可配；daemon + fail-soft） */
++    public synchronized void start(long tickSeconds, Plan plan, java.util.function.Supplier<List<MetricDef>> defs) {
++        if (scheduler != null) {
++            return;
++        }
++        this.tickSeconds = Math.max(1, tickSeconds);
++        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
++            Thread t = new Thread(r, "calc-metric-scheduler");
++            t.setDaemon(true);
++            return t;
++        });
++        scheduler.scheduleAtFixedRate(() -> {
++            try {
++                tick(System.currentTimeMillis(), defs.get(), plan);
++            } catch (RuntimeException e) {
++                log.error("[CALC-METRIC-SCHED] tick 未预期异常（fail-soft，下个 tick 重试）", e);
++            }
++        }, this.tickSeconds, this.tickSeconds, TimeUnit.SECONDS);
++        log.info("[CALC-METRIC-SCHED] 指标聚合调度启动 tick={}s graceDays={}（自实现，非 XXL-Job）",
++                this.tickSeconds, graceDays);
++    }
++
++    public synchronized void stop() {
++        if (scheduler != null) {
++            scheduler.shutdownNow();
++            scheduler = null;
++            log.info("[CALC-METRIC-SCHED] 指标聚合调度已停止");
++        }
++    }
++
++    public boolean isRunning() {
++        return scheduler != null && !scheduler.isShutdown();
++    }
++
++    /**
++     * 单次调度扫描（可测试入口）：对每个指标定义，向前回溯找到最近一个「已结束且过了宽限期」
++     * 的窗口并提交；已提交窗由 windowKey 幂等去重（后算覆盖不追加）。
++     *
++     * <p>为什么要回溯：宽限期（默认 3 天）> 日窗长（1 天）时，紧邻的上一窗永远未到期，
++     * 必须向前找到 end+grace <= now 的窗。MONTH/YEAR 窗长大于宽限期，回溯一步即可。
++     */
++    public void tick(long nowMillis, List<MetricDef> defs, Plan plan) {
++        for (MetricDef def : defs) {
++            MetricWindow w = latestDueWindow(def, nowMillis);
++            if (w == null) {
++                continue;
++            }
++            String key = w.key();
++            if (!fired.add(key)) {
++                continue; // 同窗幂等：已提交过
++            }
++            log.info("[CALC-METRIC-SCHED] 窗口到期 metric={} period={} window=[{},{}) graceDays={}（自实现调度）",
++                    def.metricCode(), def.period(), w.startMillis(), w.endMillis(), graceDays);
++            plan.submit(w);
++        }
++    }
++
++    /** 从「上一窗」起向前回溯，找最近一个过宽限期的已结束窗 */
++    private MetricWindow latestDueWindow(MetricDef def, long nowMillis) {
++        MetricWindow w = MetricWindow.previous(tenant, def.metricCode(), def.period(),
++                1, nowMillis, zone);
++        // 最多回溯 400 窗（3 天宽限 / 1 小时窗 = 72 窗；留足余量，fail-closed 有界）
++        for (int i = 0; i < 400 && !w.due(nowMillis, graceDays); i++) {
++            w = shiftBack(w);
++        }
++        return w.due(nowMillis, graceDays) ? w : null;
++    }
++
++    /** 窗口前移一个自身周期（自然日历对齐） */
++    private MetricWindow shiftBack(MetricWindow w) {
++        java.time.ZonedDateTime start = Instant.ofEpochMilli(w.startMillis()).atZone(zone);
++        java.time.ZonedDateTime prevStart = switch (w.period().toUpperCase(java.util.Locale.ROOT)) {
++            case "HOUR" -> start.minusHours(1);
++            case "DAY" -> start.minusDays(1);
++            case "MONTH" -> start.minusMonths(1);
++            case "YEAR" -> start.minusYears(1);
++            default -> throw new IllegalArgumentException("不支持的指标周期: " + w.period());
++        };
++        return new MetricWindow(w.tenant(), w.metricCode(), w.period(), w.calendarType(),
++                prevStart.toInstant().toEpochMilli(), w.startMillis());
++    }
++
++    long tickSeconds() {
++        return tickSeconds;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricSink.java b/calc/src/main/java/net/otlab/calc/metric/MetricSink.java
+new file mode 100644
+index 0000000..c3df779
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricSink.java
+@@ -0,0 +1,51 @@
++package net.otlab.calc.metric;
++
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * st_metric_value 物化 Sink（brief 决策 4）：把聚合结果写物化行，失败 WARN 不阻塞（逐条隔离）。
++ *
++ * <p>无数据/分母 0（value=null）仍写一行 NULL（无值+完整度 0），不写 0 冒充（CONV-02）——
++ * 完整度与标记由 {@link MetricRuntime} 在 status 观测面承载。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricSink {
++
++    private static final Logger log = LoggerFactory.getLogger(MetricSink.class);
++
++    private final MetricValueWriter writer;
++    private final List<String> warnings = new CopyOnWriteArrayList<>();
++
++    public MetricSink(MetricValueWriter writer) {
++        this.writer = writer;
++    }
++
++    /** 便于测试构造警告列表（默认无告警） */
++    public MetricSink(MetricValueWriter writer, int graceDays, double minCompleteness) {
++        this.writer = writer;
++    }
++
++    /** 写一行物化结果；写失败 WARN 隔离，不抛、不阻塞后续 */
++    public boolean write(MetricValue v) {
++        try {
++            writer.write(v);
++            return true;
++        } catch (Exception e) {
++            String warn = "st_metric_value 写失败（WARN 不阻塞）metric=" + v.metricCode()
++                    + " ts=" + v.ts() + ": " + e.getMessage();
++            warnings.add(warn);
++            log.warn("[CALC-METRIC] {}", warn);
++            return false;
++        }
++    }
++
++    public List<String> warnings() {
++        return List.copyOf(warnings);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValue.java b/calc/src/main/java/net/otlab/calc/metric/MetricValue.java
+new file mode 100644
+index 0000000..0cfcecd
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValue.java
+@@ -0,0 +1,37 @@
++package net.otlab.calc.metric;
++
++import java.util.Objects;
++
++/**
++ * st_metric_value 物化写载荷（冻结契约 v1.0.0 逐字）：
++ * 列 ts（窗口起始）/ value / yoy / mom；标签 tenant_id / metric_code / instance_code / period。
++ *
++ * <p>calendarType 与完整度不进物理行（冻结表无此列/tag）——在 {@link MetricResult} 与
++ * /calc/v1/status 观测面承载；登记字面差异见报告。
++ *
++ * @param tenantId     租户 id（tag）
++ * @param metricCode   指标编码（tag）
++ * @param instanceCode 统计对象实例编码（tag）
++ * @param period       HOUR/DAY/MONTH/YEAR（tag）
++ * @param calendarType 日历口径（内存侧：1 自然 / 2 班次预留；不进物理 tag）
++ * @param ts           窗口起始（列）
++ * @param value        聚合值（列；null=无值写 NULL——不写 0 冒充）
++ * @param yoy          同比（列；可 null）
++ * @param mom          环比（列；可 null）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record MetricValue(long tenantId, String metricCode, String instanceCode, String period,
++                          int calendarType, long ts, Double value, Double yoy, Double mom) {
++
++    public MetricValue {
++        Objects.requireNonNull(metricCode, "metricCode");
++        Objects.requireNonNull(instanceCode, "instanceCode");
++        Objects.requireNonNull(period, "period");
++    }
++
++    /** 同 ts 覆盖写：仅 value 变化（重算幂等），窗口维度不变 */
++    public MetricValue withValue(Double newValue) {
++        return new MetricValue(tenantId, metricCode, instanceCode, period, calendarType, ts, newValue, yoy, mom);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java
+new file mode 100644
+index 0000000..0aa3edb
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java
+@@ -0,0 +1,55 @@
++package net.otlab.calc.metric;
++
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++
++/**
++ * 记录式 st_metric_value 写口（live 冒烟/契约断言面）：TDengine REST 故障期（TD-0053）不写真库，
++ * 照 0042 StorageRuntime.RecordingWriter 范式捕获 INSERT SQL + 载荷，供 /calc/v1/status 观测断言。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricValueRecorder {
++
++    private final List<MetricValue> values = new CopyOnWriteArrayList<>();
++    private final List<String> sqls = new CopyOnWriteArrayList<>();
++    private final String tenantCode;
++
++    public MetricValueRecorder(String tenantCode) {
++        this.tenantCode = tenantCode;
++    }
++
++    public String tenantCode() {
++        return tenantCode;
++    }
++
++    /** 作为 MetricValueWriter 的注入 runner（返回成功应答，SQL 被捕获） */
++    public MetricValueWriter writer() {
++        return new MetricValueWriter(sql -> {
++            sqls.add(sql);
++            return "{\"code\":0}";
++        }, tenantCode);
++    }
++
++    public void record(MetricValue v) {
++        values.add(v);
++        sqls.add(MetricValueWriter.insertSql(v, tenantCode));
++    }
++
++    public List<MetricValue> values() {
++        return List.copyOf(values);
++    }
++
++    public List<String> sqls() {
++        return List.copyOf(sqls);
++    }
++
++    public String lastSql() {
++        return sqls.isEmpty() ? null : sqls.get(sqls.size() - 1);
++    }
++
++    public int size() {
++        return sqls.size();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+new file mode 100644
+index 0000000..bc9051e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+@@ -0,0 +1,84 @@
++package net.otlab.calc.metric;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * 指标聚合读数源（TASK-0045 brief 决策 2）：读已物化结果、不现算原始点。
++ * 真实源=0042 ResultSink 数据 + Redis 点位缓存；本类提供注入缝（进程内实现，
++ * 多实例/真 Redis 回源为演进位）。
++ *
++ * <p>质量纪律：质量码 0=GOOD 计入到达率；非 0（1-10）计缺失；停用键剔除。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricValueStore {
++
++    private record Sample(double value, int quality, long ts) {}
++
++    private final Map<String, Sample> values = new ConcurrentHashMap<>();
++    private final Set<String> disabled = ConcurrentHashMap.newKeySet();
++
++    public void put(String key, double value, long ts) {
++        put(key, value, 0, ts);
++    }
++
++    public void put(String key, double value, int quality, long ts) {
++        values.put(key, new Sample(value, quality, ts));
++    }
++
++    /** 剔除停用实例/数据项（完整度分母不计） */
++    public void disable(String key) {
++        disabled.add(key);
++    }
++
++    public boolean isDisabled(String key) {
++        return disabled.contains(key);
++    }
++
++    /** 取 GOOD 值（null=无值或非 GOOD）；只从已物化结果读 */
++    public Double goodValue(String key) {
++        if (isDisabled(key)) {
++            return null;
++        }
++        Sample s = values.get(key);
++        return s != null && s.quality() == 0 ? s.value() : null;
++    }
++
++    /** 该键是否存在有效（GOOD 且未停用）物化值 */
++    public boolean hasGood(String key) {
++        return goodValue(key) != null;
++    }
++
++    /** 前缀匹配（比值型分子/分母按前缀聚合：I.NUM.* / I.DEN.*） */
++    public java.util.List<Double> goodValuesWithPrefix(String prefix) {
++        java.util.List<Double> out = new java.util.ArrayList<>();
++        if (prefix == null || prefix.isBlank()) {
++            return Collections.unmodifiableList(out); // 缺配置 fail-closed：无数据，不抛 NPE
++        }
++        values.forEach((k, s) -> {
++            if (k.startsWith(prefix) && !isDisabled(k) && s.quality() == 0) {
++                out.add(s.value());
++            }
++        });
++        return Collections.unmodifiableList(out);
++    }
++
++    public Map<String, Double> allGood() {
++        Map<String, Double> out = new java.util.LinkedHashMap<>();
++        values.forEach((k, s) -> {
++            if (!isDisabled(k) && s.quality() == 0) {
++                out.put(k, s.value());
++            }
++        });
++        return Collections.unmodifiableMap(out);
++    }
++
++    public int size() {
++        return values.size();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueWriter.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueWriter.java
+new file mode 100644
+index 0000000..5c8830e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueWriter.java
+@@ -0,0 +1,109 @@
++package net.otlab.calc.metric;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.Base64;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * st_metric_value 物化写口（TASK-0045 brief 决策 4）：taosAdapter REST，逐语句独立下发
++ * （0029 多语句信封静默空操作纪律），库名全限定，子表首写 USING TAGS。
++ *
++ * <p><b>冻结契约逐字</b>（tdengine-super-tables.md v1.0.0）：列 ts/value/yoy/mom，
++ * 标签 tenant_id / metric_code / instance_code / period（4 元组）。brief 中「calendar_type tag /
++ * 六元组 / full: 前缀」为 st_item_value 词汇——st_metric_value 无此列/标签；本写口按冻结契约
++ * 逐字落 4 元组，calendar_type/完整度由内存结果与 status 观测承载（登记字面差异见报告）。
++ *
++ * <p>同 ts 覆盖写（重算幂等）：INSERT 目标子表由 metric_code+instance_code 决定，主键 ts 即窗口起始。
++ * full_key 禁止 full: 前缀（0049 F-02）——指标行不写 full_key，metric_code 标签即定位键。
++ * 写失败上抛，由 {@link MetricSink} WARN 隔离不阻塞。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricValueWriter {
++
++    /** SQL 通道（注入缝：契约测试用假 runner 捕获 INSERT，真 impl 走 REST） */
++    @FunctionalInterface
++    public interface SqlRunner {
++        String execute(String sql) throws Exception;
++    }
++
++    private final SqlRunner runner;
++    private final String tenantCode;
++
++    public MetricValueWriter(SqlRunner runner, String tenantCode) {
++        this.runner = runner;
++        this.tenantCode = tenantCode;
++    }
++
++    /** 真 REST 通道工厂（baseUrl 如 http://192.168.31.145:6041） */
++    public static MetricValueWriter rest(String baseUrl, String tenantCode, String user, String password) {
++        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
++        String auth = "Basic " + Base64.getEncoder()
++                .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
++        SqlRunner runner = sql -> {
++            HttpRequest req = HttpRequest.newBuilder()
++                    .uri(URI.create(baseUrl + "/rest/sql"))
++                    .timeout(Duration.ofSeconds(60))
++                    .header("Authorization", auth)
++                    .header("Content-Type", "text/plain")
++                    .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
++                    .build();
++            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++            if (resp.statusCode() >= 400) {
++                throw new IllegalStateException("TDengine REST HTTP " + resp.statusCode());
++            }
++            requireTaosSuccess(resp.body());
++            return resp.body();
++        };
++        return new MetricValueWriter(runner, tenantCode);
++    }
++
++    /** taosAdapter code 解析（0049 F-01：正则容错冒号后空格，非 0/无 code fail-closed） */
++    static boolean requireTaosSuccess(String body) {
++        if (body == null || body.isBlank()) {
++            throw new IllegalStateException("TDengine 应答为空");
++        }
++        Matcher m = Pattern.compile("\"code\"\\s*:\\s*(-?\\d+)").matcher(body);
++        if (!m.find()) {
++            throw new IllegalStateException("TDengine 应答无 code: " + body.substring(0, Math.min(200, body.length())));
++        }
++        int code = Integer.parseInt(m.group(1));
++        if (code != 0) {
++            throw new IllegalStateException("TDengine 错误码 " + code + ": " + body.substring(0, Math.min(200, body.length())));
++        }
++        return true;
++    }
++
++    public void write(MetricValue v) {
++        try {
++            runner.execute(insertSql(v, tenantCode));
++        } catch (Exception e) {
++            if (e instanceof RuntimeException re) {
++                throw re;
++            }
++            throw new IllegalStateException("st_metric_value 写入失败: " + e.getMessage(), e);
++        }
++    }
++
++    /** 生成逐语句 INSERT（库名全限定；标签按冻结契约 4 元组逐字；无 full: 前缀） */
++    static String insertSql(MetricValue v, String tenantCode) {
++        String db = "iot_" + (tenantCode == null ? String.valueOf(v.tenantId()) : tenantCode);
++        String child = "D_" + v.metricCode().replaceAll("[^A-Za-z0-9_]", "_")
++                + "_" + v.instanceCode().replaceAll("[^A-Za-z0-9_]", "_");
++        String vals = v.value() == null ? "null" : String.valueOf(v.value());
++        String yoy = v.yoy() == null ? "null" : String.valueOf(v.yoy());
++        String mom = v.mom() == null ? "null" : String.valueOf(v.mom());
++        return "INSERT INTO " + db + "." + child
++                + " USING " + db + ".st_metric_value"
++                + " TAGS (" + v.tenantId() + ", '" + v.metricCode() + "', '"
++                + v.instanceCode() + "', '" + v.period() + "')"
++                + " VALUES (" + v.ts() + ", " + vals + ", " + yoy + ", " + mom + ")";
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricWindow.java b/calc/src/main/java/net/otlab/calc/metric/MetricWindow.java
+new file mode 100644
+index 0000000..63247fc
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricWindow.java
+@@ -0,0 +1,82 @@
++package net.otlab.calc.metric;
++
++import java.time.Instant;
++import java.time.ZoneId;
++import java.time.ZonedDateTime;
++import java.time.temporal.ChronoUnit;
++
++/**
++ * 指标聚合窗口（TASK-0045 brief 决策 1）：自然日历实现（HOUR/DAY/MONTH/YEAR 对齐真实日历边界，
++ * 非固定秒数）。窗口以 (tenant, metricCode, periodStart, calendarType) 唯一标识。
++ *
++ * <p>月指标月末一次产出（ADR-0010）： {@link #previous} 对 MONTH 恒返回「上一个已结束的自然月」，
++ * 不存在「本月至今」中间窗；宽限期 3 天可配（env CALC_METRIC_GRACE_DAYS）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record MetricWindow(String tenant, String metricCode, String period, int calendarType,
++                           long startMillis, long endMillis) {
++
++    /** 当前时刻所在窗口（对齐自然日历边界） */
++    public static MetricWindow forInstant(String tenant, String metricCode, String period,
++                                          int calendarType, long epochMillis, ZoneId zone) {
++        ZonedDateTime t = Instant.ofEpochMilli(epochMillis).atZone(zone);
++        ZonedDateTime start;
++        ZonedDateTime end;
++        switch (period.toUpperCase(java.util.Locale.ROOT)) {
++            case "HOUR" -> {
++                start = t.truncatedTo(ChronoUnit.HOURS);
++                end = start.plusHours(1);
++            }
++            case "DAY" -> {
++                start = t.truncatedTo(ChronoUnit.DAYS);
++                end = start.plusDays(1);
++            }
++            case "MONTH" -> {
++                start = t.withDayOfMonth(1).truncatedTo(ChronoUnit.DAYS);
++                end = start.plusMonths(1);
++            }
++            case "YEAR" -> {
++                start = t.withDayOfYear(1).truncatedTo(ChronoUnit.DAYS);
++                end = start.plusYears(1);
++            }
++            default -> throw new IllegalArgumentException("不支持的指标周期: " + period);
++        }
++        return new MetricWindow(tenant, metricCode, period, calendarType,
++                start.toInstant().toEpochMilli(), end.toInstant().toEpochMilli());
++    }
++
++    /** 上一个已结束窗口（聚合对象）；current 窗口未结束，不产出 */
++    public static MetricWindow previous(String tenant, String metricCode, String period,
++                                        int calendarType, long epochMillis, ZoneId zone) {
++        MetricWindow current = forInstant(tenant, metricCode, period, calendarType, epochMillis, zone);
++        ZonedDateTime start = Instant.ofEpochMilli(current.startMillis).atZone(zone);
++        ZonedDateTime previousStart = switch (period.toUpperCase(java.util.Locale.ROOT)) {
++            case "HOUR" -> start.minusHours(1);
++            case "DAY" -> start.minusDays(1);
++            case "MONTH" -> start.minusMonths(1);
++            case "YEAR" -> start.minusYears(1);
++            default -> throw new IllegalArgumentException("不支持的指标周期: " + period);
++        };
++        ZonedDateTime previousEnd = start;
++        return new MetricWindow(tenant, metricCode, period, calendarType,
++                previousStart.toInstant().toEpochMilli(), previousEnd.toInstant().toEpochMilli());
++    }
++
++    /** 窗口到期判据：now >= end + graceDays 天（宽限期内到达数据可纳入） */
++    public boolean due(long nowMillis, int graceDays) {
++        long dueAt = endMillis + (long) Math.max(0, graceDays) * 24L * 3600L * 1000L;
++        return nowMillis >= dueAt;
++    }
++
++    /** 月指标月末一次（ADR-0010） */
++    public boolean isMonthEndOnce() {
++        return "MONTH".equalsIgnoreCase(period);
++    }
++
++    /** 窗口唯一标识：(tenant, metricCode, periodStart, calendarType) */
++    public String key() {
++        return tenant + "|" + metricCode + "|" + startMillis + "|" + calendarType;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index 973827a..c856db6 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -32,15 +32,18 @@ public class CalcStatusController {
+     private final ExecutorRuntime executorRuntime;
+     private final StatusEvaluatorRuntime statusRuntime;
+     private final net.otlab.calc.storage.StorageRuntime storageRuntime;
++    private final net.otlab.calc.metric.MetricRuntime metricRuntime;
+ 
+     public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
+                                 ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime,
+-                                @Nullable net.otlab.calc.storage.StorageRuntime storageRuntime) {
++                                @Nullable net.otlab.calc.storage.StorageRuntime storageRuntime,
++                                @Nullable net.otlab.calc.metric.MetricRuntime metricRuntime) {
+         this.holder = holder;
+         this.reconciler = reconciler;
+         this.executorRuntime = executorRuntime;
+         this.statusRuntime = statusRuntime;
+         this.storageRuntime = storageRuntime;
++        this.metricRuntime = metricRuntime;
+     }
+ 
+     @GetMapping("/calc/v1/status")
+@@ -79,6 +82,9 @@ public class CalcStatusController {
+         if (storageRuntime != null) {
+             view.put("storage", storageRuntime.view());
+         }
++        if (metricRuntime != null) {
++            view.put("metric", metricRuntime.view());
++        }
+         return view;
+     }
+ 
+diff --git a/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java b/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java
+new file mode 100644
+index 0000000..6afe5d2
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java
+@@ -0,0 +1,68 @@
++package net.otlab.calc.web;
++
++import java.util.List;
++import java.util.Map;
++
++import net.otlab.calc.metric.MetricDef;
++import net.otlab.calc.metric.MetricRuntime;
++import net.otlab.calc.metric.MetricWindow;
++
++import org.springframework.lang.Nullable;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 指标聚合观测/驱动口（TASK-0045）：{@code GET /calc/v1/status.metric} 已在状态口暴露；
++ * 本口提供 {@code POST /calc/v1/metric/observe}——把「指标定义 + 物化值 + 目标时刻」注入运行时并
++ * 触发一次到期窗口计算（live 冒烟与演进位：真实定义由快照装载、物化值由 0042 ResultSink 回填）。
++ *
++ * <p>边界：非契约命名空间（沿用 /calc/v1/** 内网观测面，无鉴权）；不作为生产数据源入口，
++ * 仅作可观测驱动缝——真实 trigger 仍由自实现调度线程按定义周期发起。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@RestController
++public class MetricObserveController {
++
++    private final MetricRuntime runtime;
++
++    public MetricObserveController(@Nullable MetricRuntime runtime) {
++        this.runtime = runtime;
++    }
++
++    /** 观测视图（与 status.metric 同源，便于单独拉取） */
++    @GetMapping("/calc/v1/metric")
++    public Map<String, Object> view() {
++        return runtime == null ? Map.of("enabled", false) : runtime.view();
++    }
++
++    /** live 冒烟驱动：注入定义+物化值，立即触发一次到期窗计算（同 ts 覆盖写幂等） */
++    @PostMapping("/calc/v1/metric/observe")
++    public Map<String, Object> observe(@RequestBody ObserveRequest req) {
++        if (runtime == null) {
++            return Map.of("ok", false, "error", "metric-aggregation-enabled=false");
++        }
++        List<MetricDef> defs = req.definitions() == null ? List.of() : req.definitions().stream()
++                .map(d -> new MetricDef(d.metricCode(), d.period(), d.aggType(),
++                        d.sourceKeys() == null ? List.of() : d.sourceKeys(),
++                        d.ratioNumKey(), d.ratioDenKey(), d.srcType()))
++                .toList();
++        runtime.setDefinitions(defs);
++        if (req.values() != null) {
++            req.values().forEach((k, v) -> runtime.source().put(k, v, 0L));
++        }
++        long now = req.nowMillis() == null ? System.currentTimeMillis() : req.nowMillis();
++        defs.forEach(def -> runtime.onDue(runtime.previousWindow(def, now)));
++        return Map.of("ok", true, "view", runtime.view());
++    }
++
++    /** 驱动请求（冒烟载体；生产演进位由快照+ResultSink 供给） */
++    public record ObserveRequest(List<Def> definitions, Map<String, Double> values, Long nowMillis) {
++        public record Def(String metricCode, String period, int aggType, List<String> sourceKeys,
++                          String ratioNumKey, String ratioDenKey, int srcType) {
++        }
++    }
++}
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index 392d03a..d3c3f4c 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -41,3 +41,9 @@ calc:
+   operators-enabled: ${CALC_OPERATORS_ENABLED:false}
+   homogeneous-storage-enabled: ${CALC_HOMOGENEOUS_STORAGE_ENABLED:false}
+   tenant-id: ${CALC_TENANT_ID:1}
++  # TASK-0045 指标聚合调度（自实现，照 0041 PeriodicScheduler——非 XXL-Job）：默认关闭，零回归
++  metric-aggregation-enabled: ${CALC_METRIC_AGGREGATION_ENABLED:false}
++  # 指标窗口宽限天数（窗口结束后宽限期内到达数据可纳入，与 0046 迟到修正接缝）
++  metric-grace-days: ${CALC_METRIC_GRACE_DAYS:3}
++  # 完整度阈值（低于阈值结果带不完整标记，不静默）
++  metric-completeness-min: ${CALC_METRIC_COMPLETENESS_MIN:0.8}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index 2ae4cf8..0d3c2d9 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -64,4 +64,12 @@ class CalcPropertiesTest {
+         assertFalse(p.isHomogeneousStorageEnabled(), "同构写默认关闭（零回归）");
+         assertEquals(Long.valueOf(1L), p.getTenantId(), "tenant_id 默认 1");
+     }
++
++    @Test
++    void task0045MetricDefaults() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isMetricAggregationEnabled(), "指标聚合调度默认关闭（0040/0041/0042/0049 零回归）");
++        assertEquals(Integer.valueOf(3), p.getMetricGraceDays(), "宽限 3 天缺省");
++        assertEquals(Double.valueOf(0.8), p.getMetricCompletenessMin(), "完整度阈值 80% 缺省");
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/metric/MetricAggregatorContractTest.java b/calc/src/test/java/net/otlab/calc/metric/MetricAggregatorContractTest.java
+new file mode 100644
+index 0000000..a99a1ee
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/MetricAggregatorContractTest.java
+@@ -0,0 +1,130 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0045 聚合计算与完整度契约：级联 src_type、比值分子分母分别聚合再相除、平均口径总量÷24、
++ * 完整度到达率（非 GOOD 剔除、停用剔除、阈值标记）、无数据出无值+完整度 0 不写 0。
++ *
++ * <p>读数走已物化结果（MetricValueStore 注入）——不现算原始点。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricAggregatorContractTest {
++
++    /** 物化结果源（模拟 0042 ResultSink 数据 + Redis 读数）：fullKey -> 物化值样本 */
++    static MetricValueStore store(Map<String, Double> values) {
++        MetricValueStore s = new MetricValueStore();
++        values.forEach((k, v) -> s.put(k, v, 0L));
++        return s;
++    }
++
++    @Test
++    void sumAccumulateAggregatesAllChildren() {
++        MetricDef def = new MetricDef("M_SUM", "HOUR", 2, List.of("I.A", "I.B", "I.C"));
++        MetricResult r = new MetricAggregator().aggregate(def, store(Map.of(
++                "I.A", 2.0, "I.B", 4.0, "I.C", 6.0)), 1000L, 3, 0.8);
++        assertEquals(12.0, r.value(), 1e-9);
++        assertEquals(1.0, r.completeness(), 1e-9);
++        assertFalse(r.incomplete());
++    }
++
++    @Test
++    void ratioAggregatesNumeratorAndDenominatorSeparatelyThenDivides() {
++        // 比值型：分子 10+20=30，分母 2+5=7；结果=30/7；不是逐条比值(10/2+20/5)/2=(5+4)/2=4.5
++        MetricDef def = new MetricDef("M_RATIO", "HOUR", 5, List.of(), "I.NUM", "I.DEN");
++        MetricResult r = new MetricAggregator().aggregate(def, store(Map.of(
++                "I.NUM.A", 10.0, "I.NUM.B", 20.0, "I.DEN.A", 2.0, "I.DEN.B", 5.0)), 1000L, 4, 0.8);
++        assertEquals(30.0 / 7.0, r.value(), 1e-9);
++        assertFalse(r.incomplete());
++    }
++
++    @Test
++    void ratioMissingNumDenKeysFailsClosedNoDataNotThrow() {
++        // 比值型定义缺分子/分母键（配置不全）→ 无值+完整度 0，不抛 NPE（fail-closed）
++        MetricDef def = new MetricDef("M_BAD", "DAY", 5, List.of());
++        MetricResult r = new MetricAggregator().aggregate(def, store(Map.of("I.X", 1.0)), 1000L, 1, 0.8);
++        assertNull(r.value());
++        assertTrue(r.noData());
++        assertEquals(0.0, r.completeness(), 1e-9);
++    }
++
++    @Test
++    void ratioZeroDenominatorIsNoValueNotInfinity() {
++        MetricDef def = new MetricDef("M_RATIO0", "HOUR", 5, List.of(), "I.NUM", "I.DEN");
++        MetricResult r = new MetricAggregator().aggregate(def, store(Map.of(
++                "I.NUM.A", 10.0, "I.DEN.A", 0.0)), 1000L, 2, 0.8);
++        assertNull(r.value(), "分母 0 结果为空并打标记（不写 Infinity/假 0）");
++        assertTrue(r.incomplete());
++    }
++
++    @Test
++    void averageDayMetricIsTotalDiv24NotHourlyMean() {
++        // TC-0015 平均口径：24 个应到小时值中仅 23 个到达（缺 1 小时），各值=24.0。
++        // 正确：日平均小时值 = 当日总量 ÷ 24 = (23×24)/24 = 23.0（固定按应到 24 小时）
++        // 错误：小时均值再平均 = 总量 ÷ 实际到达数 = (23×24)/23 = 24.0
++        // 两者必须不同——证明口径是「总量÷24」而非「对已到达值取均值」。
++        java.util.Map<String, Double> vals = new java.util.LinkedHashMap<>();
++        for (int h = 0; h < 23; h++) {
++            vals.put("I.H" + h, 24.0); // 23 个到达小时，各 24.0；I.H23 缺失
++        }
++        // sourceKeys 给的是物化结果前缀 I.H*（24 应到小时）——从物化源展开全部到达值
++        MetricDef def = new MetricDef("M_AVG_DAY", "DAY", 1, List.of("I.H"));
++        MetricResult r = new MetricAggregator().aggregate(def, store(vals), 1000L, 24, 0.8);
++        assertEquals(23.0, r.value(), 1e-9, "日平均=当日总量÷24（应到 24 小时为固定分母）");
++        double naiveMean = vals.values().stream().mapToDouble(Double::doubleValue).average().orElse(0);
++        assertEquals(24.0, naiveMean, 1e-9, "小时均值再平均 = 总量÷到达数 = 24");
++        assertTrue(Math.abs(r.value() - naiveMean) > 1e-6,
++                "不能是小时均值再平均（23.0 ≠ 24.0）");
++        assertEquals(23.0 / 24.0, r.completeness(), 1e-9, "完整度=到达 23/应到 24");
++        assertFalse(r.incomplete(), "23/24≥80% 阈值——不误标不完整");
++    }
++
++    @Test
++    void completenessIsArrivalRateExcludingBadQualityAndDisabled() {
++        // 应到 10 个周期值：7 正常 + 2 非 GOOD + 1 停用 -> 到达 7/10 = 0.7
++        Map<String, Double> ok = new java.util.LinkedHashMap<>();
++        for (int i = 0; i < 7; i++) ok.put("I.A" + i, (double) (i + 1));
++        MetricValueStore s = store(ok);
++        s.put("I.A7", 99.0, 8, 1000L);  // 质量码 8 突变待核查 = 非 GOOD，计缺失
++        s.put("I.A8", 99.0, 3, 1000L);  // 质量码 3 断线 = 非 GOOD，计缺失
++        s.put("I.A9", 99.0, 0, 1000L);
++        s.disable("I.A9");
++        MetricDef def = new MetricDef("M_C", "HOUR", 2, List.of(
++                "I.A0","I.A1","I.A2","I.A3","I.A4","I.A5","I.A6","I.A7","I.A8","I.A9"));
++        MetricResult r = new MetricAggregator().aggregate(def, s, 1000L, 10, 0.8);
++        assertEquals(0.7, r.completeness(), 1e-9, "到达率=GOOD 数/应到数（非 GOOD 与停用剔除）");
++        assertTrue(r.incomplete(), "低于 80% 阈值带不完整标记");
++    }
++
++    @Test
++    void noDataOutputsNoValueAndZeroCompletenessNotZeroValue() {
++        MetricDef def = new MetricDef("M_EMPTY", "HOUR", 2, List.of("I.A", "I.B"));
++        MetricResult r = new MetricAggregator().aggregate(def, store(Map.of()), 1000L, 2, 0.8);
++        assertNull(r.value(), "无数据出无值——不写 0 冒充（CONV-02）");
++        assertEquals(0.0, r.completeness(), 1e-9);
++        assertTrue(r.noData());
++        assertTrue(r.incomplete());
++    }
++
++    @Test
++    void cascadeAggregationUsesSrcTypeAndMaterializedSource() {
++        // 级联：日指标由小时物化结果聚合（src_type 升级）；月由日结果聚合；年由月结果聚合。
++        // 这里用「来源前缀按级联层级」模拟：源 fullKey=SRCDAY.* 为日级物化结果
++        MetricDef day = new MetricDef("M_DAY", "DAY", 2,
++                List.of("SRCDAY.A", "SRCDAY.B"), /*srcType=*/2);
++        MetricResult r = new MetricAggregator().aggregate(day, store(Map.of(
++                "SRCDAY.A", 3.0, "SRCDAY.B", 5.0)), 1000L, 2, 0.8);
++        assertEquals(8.0, r.value(), 1e-9);
++        assertEquals(2, day.srcType(), "级联 src_type：日级来源基于已物化结果（来源标记 2=FORMULA 语义同构）");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/metric/MetricSchedulerContractTest.java b/calc/src/test/java/net/otlab/calc/metric/MetricSchedulerContractTest.java
+new file mode 100644
+index 0000000..c66c6d4
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/MetricSchedulerContractTest.java
+@@ -0,0 +1,86 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0045 调度与观测契约：calc 自实现调度（照 0041 PeriodicScheduler，不引 XXL-Job）、
++ * 窗口到期（宽限期）+ 月末一次触发；产出计数/完整度/无数据标记进入 /calc/v1/status 视图；
++ * 同窗重算幂等（后算覆盖）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricSchedulerContractTest {
++
++    static long ms(String iso) {
++        return java.time.Instant.parse(iso).toEpochMilli();
++    }
++
++    @Test
++    void schedulerCatchesUpToMostRecentDueWindowAndIdempotentWithinWindow() {
++        MetricScheduler sched = new MetricScheduler(3);
++        RecordingPlan plan = new RecordingPlan();
++        long t = ms("2026-11-24T10:00:00Z");
++        // 宽限 3 天 > 日窗长 1 天：回溯到最近一个过了宽限期的窗 [11-21,11-22)（end+3d=11-25>11-24？否）
++        // 实际最近到期窗 = end <= 11-21 00:00 → [11-20,11-21)；只提交一个最近到期窗（不回溯批量补算，归 0046）
++        sched.tick(t, List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))), plan);
++        assertEquals(1, plan.calls.size(), "启动即补算最近一个到期窗");
++        MetricWindow submitted = plan.calls.get(0);
++        assertTrue(submitted.due(t, 3), "提交窗必过宽限期");
++        assertTrue(submitted.endMillis() <= t, "提交窗必已结束");
++        // 同窗再次 tick 幂等不重复
++        sched.tick(t + 1000, List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))), plan);
++        assertEquals(1, plan.calls.size(), "同窗幂等：后算覆盖不追加新交付（窗口唯一标识）");
++    }
++
++    @Test
++    void graceZeroSubmitsImmediatelyEndedWindow() {
++        MetricScheduler sched = new MetricScheduler(0);
++        RecordingPlan plan = new RecordingPlan();
++        sched.tick(ms("2026-11-24T10:00:00Z"),
++                List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))), plan);
++        assertEquals(1, plan.calls.size());
++        MetricWindow w = plan.calls.get(0);
++        assertEquals(ms("2026-11-23T00:00:00Z"), w.startMillis(), "宽限 0：上一日窗即到期");
++    }
++
++    @Test
++    void monthWindowFiresOnceAtMonthEndNotMidMonth() {
++        MetricScheduler sched = new MetricScheduler(0);
++        RecordingPlan plan = new RecordingPlan();
++        // 月中：上一自然月窗口 [10-01, 11-01)，now=11-15 远过月末 -> 到期，触发一次
++        sched.tick(ms("2026-11-15T00:00:00Z"),
++                List.of(new MetricDef("M_MON", "MONTH", 2, List.of("I.A"))), plan);
++        assertEquals(1, plan.calls.size());
++        // 同一月内再次 tick 不重复（月末一次）
++        sched.tick(ms("2026-11-20T00:00:00Z"),
++                List.of(new MetricDef("M_MON", "MONTH", 2, List.of("I.A"))), plan);
++        assertEquals(1, plan.calls.size(), "月指标月末一次产出，月内不出中间快照（ADR-0010）");
++    }
++
++    @Test
++    void statusViewExposesWindowsCompletenessAndProducedCount() {
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(), new MetricSink(
++                new MetricValueWriter(sql -> "{\"code\":0}", "t45"), 3, 0.8));
++        rt.recordObservation(new MetricResult(12.5, 0.9, false, false, 1690000000000L), "M_AVG_DAY", "DAY");
++        rt.recordObservation(new MetricResult(null, 0.0, true, true, 1690000000000L), "M_EMPTY", "DAY");
++        var view = rt.view();
++        assertTrue(view.containsKey("windows"));
++        assertTrue(view.containsKey("produced"));
++        assertEquals(2L, ((Number) view.get("produced")).longValue());
++        assertTrue(view.get("lastCompleteness") instanceof Number);
++        assertTrue(view.get("lastIncompleteFlags") instanceof java.util.Map);
++    }
++
++    /** 调度计划记录器（测试替身：捕获待算窗口，不写真库） */
++    static final class RecordingPlan implements MetricScheduler.Plan {
++        final java.util.List<MetricWindow> calls = new java.util.ArrayList<>();
++        @Override public void submit(MetricWindow w) { calls.add(w); }
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/metric/MetricWindowContractTest.java b/calc/src/test/java/net/otlab/calc/metric/MetricWindowContractTest.java
+new file mode 100644
+index 0000000..391f535
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/MetricWindowContractTest.java
+@@ -0,0 +1,96 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.Instant;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0045 窗口生成契约：自然日历边界（HOUR/DAY/MONTH/YEAR）、月末一次、复用键唯一、
++ * 宽限期到期判据（env CALC_METRIC_GRACE_DAYS）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricWindowContractTest {
++
++    private static final ZoneId UTC = ZoneOffset.UTC;
++
++    private static long ms(String iso) {
++        return Instant.parse(iso).toEpochMilli();
++    }
++
++    @Test
++    void hourBoundaryAlignsNaturalCalendar() {
++        MetricWindow w = MetricWindow.forInstant("t45", "M1", "HOUR", 1,
++                ms("2026-11-24T10:37:21Z"), UTC);
++        assertEquals(ms("2026-11-24T10:00:00Z"), w.startMillis());
++        assertEquals(ms("2026-11-24T11:00:00Z"), w.endMillis());
++    }
++
++    @Test
++    void dayBoundaryAlignsNaturalCalendar() {
++        MetricWindow w = MetricWindow.forInstant("t45", "M1", "DAY", 1,
++                ms("2026-11-24T10:37:21Z"), UTC);
++        assertEquals(ms("2026-11-24T00:00:00Z"), w.startMillis());
++        assertEquals(ms("2026-11-25T00:00:00Z"), w.endMillis());
++    }
++
++    @Test
++    void monthBoundaryIsFirstOfMonthAndMonthEndOnce() {
++        MetricWindow w = MetricWindow.forInstant("t45", "M1", "MONTH", 1,
++                ms("2026-11-24T10:37:21Z"), UTC);
++        assertEquals(ms("2026-11-01T00:00:00Z"), w.startMillis());
++        assertEquals(ms("2026-12-01T00:00:00Z"), w.endMillis());
++        assertTrue(w.isMonthEndOnce(), "月指标月末一次产出（ADR-0010）");
++    }
++
++    @Test
++    void yearBoundaryAlignsNaturalCalendar() {
++        MetricWindow w = MetricWindow.forInstant("t45", "M1", "YEAR", 1,
++                ms("2026-11-24T10:37:21Z"), UTC);
++        assertEquals(ms("2026-01-01T00:00:00Z"), w.startMillis());
++        assertEquals(ms("2027-01-01T00:00:00Z"), w.endMillis());
++    }
++
++    @Test
++    void previousWindowIsJustEndedPeriodNotCurrentToDate() {
++        // 月中任意时刻，上一窗口恒为「上一个已结束的自然月」——无「本月至今」半成品（ADR-0010）
++        MetricWindow prev = MetricWindow.previous("t45", "M1", "MONTH", 1,
++                ms("2026-11-05T08:00:00Z"), UTC);
++        assertEquals(ms("2026-10-01T00:00:00Z"), prev.startMillis());
++        assertEquals(ms("2026-11-01T00:00:00Z"), prev.endMillis());
++        assertTrue(prev.endMillis() <= ms("2026-11-01T00:00:00Z"),
++                "产出窗口不得跨越当前月起始（月末一次，不出中间快照）");
++    }
++
++    @Test
++    void graceDaysControlsDue() {
++        // 上一日窗口 [2026-11-23 00:00, 2026-11-24 00:00)
++        MetricWindow prev = MetricWindow.previous("t45", "M1", "DAY", 1,
++                ms("2026-11-24T10:00:00Z"), UTC);
++        assertEquals(ms("2026-11-23T00:00:00Z"), prev.startMillis());
++        // 11-24 10:00 距窗末 10 小时：3 天宽限未到期；0 天宽限已到期
++        assertFalse(prev.due(ms("2026-11-24T10:00:00Z"), 3), "宽限 3 天内未到期");
++        assertTrue(prev.due(ms("2026-11-24T10:00:00Z"), 0), "宽限 0 天即时到期（次日凌晨产出）");
++        // 11-27 01:00 距窗末 > 3 天：到期
++        assertTrue(prev.due(ms("2026-11-27T01:00:00Z"), 3), "超过宽限期到期");
++    }
++
++    @Test
++    void windowKeyUniqueByTenantMetricStartAndCalendarType() {
++        MetricWindow a = new MetricWindow("t45", "M1", "DAY", 1, 1000L, 2000L);
++        MetricWindow same = new MetricWindow("t45", "M1", "DAY", 1, 1000L, 2000L);
++        MetricWindow otherCal = new MetricWindow("t45", "M1", "DAY", 2, 1000L, 2000L);
++        MetricWindow otherMetric = new MetricWindow("t45", "M2", "DAY", 1, 1000L, 2000L);
++        assertEquals(a.key(), same.key());
++        assertFalse(a.key().equals(otherCal.key()), "日历口径参与窗口唯一标识");
++        assertFalse(a.key().equals(otherMetric.key()), "指标编码参与窗口唯一标识");
++        assertTrue(a.key().contains("1000"), "窗口键含 periodStart");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/metric/TdengineMetricValueWriterContractTest.java b/calc/src/test/java/net/otlab/calc/metric/TdengineMetricValueWriterContractTest.java
+new file mode 100644
+index 0000000..f3ed310
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/TdengineMetricValueWriterContractTest.java
+@@ -0,0 +1,92 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0045 物化写 st_metric_value 契约（冻结稿 v1.0.0 逐字）：
++ * 列 ts/value/yoy/mom；标签 tenant_id / metric_code / instance_code / period（4 元组）；
++ * 子表首写 USING TAGS；库名全限定；逐语句（0029 无多语句信封）；同 ts 覆盖写（重算幂等）；
++ * full_key 不得出现在 SQL（0049 F-02：metric 表以 metric_code 标签定位，无 full: 前缀）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class TdengineMetricValueWriterContractTest {
++
++    static final class FakeRunner implements MetricValueWriter.SqlRunner {
++        final List<String> sqls = new ArrayList<>();
++        @Override public String execute(String sql) { sqls.add(sql); return "{\"code\":0}"; }
++    }
++
++    @Test
++    void insertSqlHasFourFrozenTagsInExactOrder() {
++        MetricValue v = new MetricValue(1L, "M_AVG_DAY", "I01", "DAY", 1,
++                1690000000000L, 12.5, 11.2, 10.9);
++        String sql = MetricValueWriter.insertSql(v, "t45");
++        // 库名全限定 + 子表首写 USING TAGS
++        assertTrue(sql.startsWith("INSERT INTO iot_t45.D_M_AVG_DAY_I01 USING iot_t45.st_metric_value TAGS ("), sql);
++        // 四元组标签逐值精确：tenant_id=1 / metric_code / instance_code / period
++        assertTrue(sql.contains("TAGS (1, 'M_AVG_DAY', 'I01', 'DAY')"), sql);
++        // 列 ts/value/yoy/mom 顺序与冻结契约一致
++        assertTrue(sql.endsWith("VALUES (1690000000000, 12.5, 11.2, 10.9)"), sql);
++        // 无 full: 前缀、无 full_key、无 quality/completeness 越界列（0049 F-02 + 契约冻结）
++        assertFalse(sql.contains("full"), "st_metric_value 无 full_key 概念/无 full: 前缀");
++        assertFalse(sql.contains("quality"), "冻结契约 st_metric_value 无 quality 列");
++        assertFalse(sql.contains("completeness"), "完整度不越界写冻结表——在内存结果与 status 观测");
++        assertFalse(sql.contains(";"), "逐语句：无分号多语句信封（0029）");
++    }
++
++    @Test
++    void primaryKeyColumnsAreTsOnlySameTsOverwriteIsIdempotent() {
++        MetricValue v = new MetricValue(1L, "M1", "I01", "DAY", 1, 1690000000000L, 1.0, null, null);
++        String sql1 = MetricValueWriter.insertSql(v, "t45");
++        String sql2 = MetricValueWriter.insertSql(v.withValue(2.0), "t45");
++        // 同 ts 覆盖写：两语句 INSERT 目标子表+ts 完全一致，仅 value 列不同——TDengine 主键 (ts) 覆盖语义
++        assertEquals(sql1.substring(0, sql1.indexOf("VALUES")), sql2.substring(0, sql2.indexOf("VALUES")));
++        assertTrue(sql1.endsWith("VALUES (1690000000000, 1.0, null, null)"), sql1);
++        assertTrue(sql2.endsWith("VALUES (1690000000000, 2.0, null, null)"), sql2);
++    }
++
++    @Test
++    void writerUsesPerStatementRestAndParsesTaosCode() {
++        FakeRunner runner = new FakeRunner();
++        MetricValueWriter writer = new MetricValueWriter(runner, "t45");
++        writer.write(new MetricValue(1L, "M1", "I01", "DAY", 1, 1000L, 1.0, 0.0, 0.0));
++        writer.write(new MetricValue(1L, "M2", "I02", "DAY", 1, 1000L, 2.0, 0.0, 0.0));
++        assertEquals(2, runner.sqls.size(), "逐语句：两条写=两次 REST 调用，非多语句信封");
++        assertTrue(runner.sqls.get(0).startsWith("INSERT INTO iot_t45."));
++        assertTrue(runner.sqls.get(1).contains("'M2'"));
++    }
++
++    @Test
++    void failureWarnDoesNotBlockSubsequentWrites() {
++        List<String> calls = new ArrayList<>();
++        MetricValueWriter writer = new MetricValueWriter(sql -> {
++            calls.add(sql);
++            if (sql.contains("'M_BAD'")) throw new RuntimeException("REST 6041 故障");
++            return "{\"code\":0}";
++        }, "t45");
++        // Sink 层逐条隔离：坏行 WARN 不阻塞后续行
++        MetricSink sink = new MetricSink(writer);
++        sink.write(new MetricValue(1L, "M_BAD", "I01", "DAY", 1, 1000L, 1.0, 0.0, 0.0));
++        sink.write(new MetricValue(1L, "M_OK", "I02", "DAY", 1, 1000L, 2.0, 0.0, 0.0));
++        assertEquals(2, calls.size(), "失败行 WARN 隔离，后续行继续写");
++        assertEquals(1, sink.warnings().size());
++    }
++
++    @Test
++    void taosAdapterCodeParsedFailClosed() {
++        assertTrue(MetricValueWriter.requireTaosSuccess("{\"code\":0}"));
++        org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class,
++                () -> MetricValueWriter.requireTaosSuccess("{\"code\": -1}"));
++        org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class,
++                () -> MetricValueWriter.requireTaosSuccess("no code here"));
++    }
++}

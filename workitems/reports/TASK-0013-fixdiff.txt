@@ -1,0 +1,252 @@
+commit 4d7246def32bf762ea655632e4e8060ae2661345
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 06:11:40 2026 +0800
+
+    fix(iot): 数据项生成链修订轮 I-1/I-2/M-5/M-6——展开终检封畸形 token/selfScope 收敛死键引用/剥壳键限长/公式项缺公式整批拒（TASK-0013 修订轮，评审 Critical 0/Important 2/Minor 5）
+    
+    - I-1 展开终检：展开后公式残留 { 或 } 即整批拒（PARAM_ERROR，文案含原始编码与 token 示例）——畸形/超纲 token（{ self.X } 带空格、{SELF.ELEC-X} 连字符）不匹配展开/剥壳正则的静默 fail-open 封口；编码字符集约束上推字典域不在本任务（0008 评审已登记）
+    - I-2 selfScope 只并入本批将插入项（newItems）：引用已删占用码的公式展开期即整批失败（文案指向引用编码），ref 不落悬空边
+    - M-5 剥壳绝对引用键 >180（ref_full_key varchar(180)）paramError 拒（文案含键与实际长度），不触 SQL Data-too-long
+    - M-6 source_type=2 且公式空白整批拒「公式项缺少公式: <code>」；模板域侧耦合校验仍归 FEAT-0012/0015
+    - 测试 +4 红转绿（畸形 token 两形态/死键引用/键超长/缺公式 null+空白），全量 1449 绿
+    - Minor #3/#4/#7 记 deferred（#3 事件时机归 FEAT-0012 接线裁决、#4 先权限后存在性统一、#7 接口 javadoc 同步留档）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index 7cca251..d039473 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -84,6 +84,12 @@ import java.util.stream.Collectors;
+  * 依赖图变更标记）——<b>只发布不建监听器</b>（消费方=计算引擎 FEAT-0012 未来接线，brief
+  * 口径）；零生成（无模板/模板无项/全部已存在）不发布。
+  *
++ * <p><b>修订轮防线</b>（评审 Critical 0 / Important 2 / Minor 5，必修四项）：I-1 展开终检——
++ * 展开后公式残留 {@code {} / {@code }} 即整批拒（畸形/超纲 token 静默 fail-open 封口，坏公式
++ * 不随模板批量传染）；I-2 SELF 存在性集合只并入本批将插入项（newItems）——引用已删占用码
++ * 展开期即失败，ref 不落悬空边；M-5 剥壳绝对引用键 >180 paramError 拒（不触 SQL
++ * Data-too-long）；M-6 source_type=2 且公式空白整批拒（「公式项缺少公式」）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -94,12 +100,18 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     /** 公式限长口径（与 iot_data_item DDL formula varchar(2000) 一致——展开会增长，落库前复检） */
+     private static final int MAX_LEN_FORMULA = 2000;
+ 
++    /** 被引用全键限长口径（与 iot_data_item_ref DDL ref_full_key varchar(180) 一致，修订轮 M-5） */
++    private static final int MAX_LEN_REF_FULL_KEY = 180;
++
+     /** ref_type：1 数据项（本期生成只产此类型；2 点位随绑定动作写入，归 0023） */
+     private static final int REF_TYPE_DATA_ITEM = 1;
+ 
+     /** 取值方式兜底：模板 default_source_type 可空，实例 source_type NOT NULL——未配按直绑落地 */
+     private static final int SOURCE_TYPE_BIND = 1;
+ 
++    /** 取值方式：公式（修订轮 M-6 耦合校验用——source_type=2 必须携带公式） */
++    private static final Integer SOURCE_TYPE_FORMULA = 2;
++
+     @Autowired
+     private IotModelInstanceMapper modelInstanceMapper;
+ 
+@@ -163,26 +175,35 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+         // SELF-only/无公式生成不触发父查询；顶级判定/父缺失报错都在首次需要时发生
+         IotModelInstance parent = null;
+         boolean parentResolved = false;
+-        // SELF 引用存在性集合 = 实例既有活跃项编码（占用行 deleted=0 部分）∪ 本批全部模板项编码
++        // SELF 引用存在性集合 = 实例既有活跃项编码（占用行 deleted=0 部分）∪ 本批将插入项编码
++        // （修订轮 I-2：只并入 newItems 而非全部模板编码——「已删行占用但模板在册」的编码因
++        // occupancy skip 不会在本批生成，引用它的公式若通过检查将落 formula 指向死键、ref 边
++        // ref_item_id=NULL 的静默悬空依赖；改为展开期即整批失败，文案指向引用的编码）
+         Set<String> selfScope = new LinkedHashSet<>();
+         occupiedByCode.forEach((code, row) -> {
+             if (row.getDeleted() == null || row.getDeleted() == 0) {
+                 selfScope.add(code);
+             }
+         });
+-        templateItems.forEach(t -> selfScope.add(t.getDataCode()));
++        newItems.forEach(t -> selfScope.add(t.getDataCode()));
+ 
+         // 父实例活跃项 (full_key → id)（lazy：仅 PARENT 引用存在性核对/回填需要时首查触发）
+         Map<String, Long> parentItemIdByFullKey = null;
+ 
+-        // 逐项映射 + 展开（展开失败/引用缺失即整批失败——本方法 @Transactional 整批回滚，
+-        // 触发一的实例创建同事务一并回滚）
++        // 逐项映射 + 展开（展开失败/引用缺失/畸形残留即整批失败——本方法 @Transactional 整批
++        // 回滚，触发一的实例创建同事务一并回滚）
+         List<IotDataItem> toInsert = new ArrayList<>(newItems.size());
+         Map<String, LinkedHashSet<String>> refsByCode = new LinkedHashMap<>();
+         for (IotDataItemTemplate templateItem : newItems) {
+             IotDataItem item = buildItem(instance, templateItem);
+             String templateFormula = templateItem.getDefaultFormula();
+-            if (templateFormula != null && !templateFormula.isBlank()) {
++            // 修订轮 M-6：公式项必须有公式（source_type=2 且 default_formula 空白 → 整批拒，
++            // 防 source_type=2/formula=NULL 实例项落库后计算期必然失败；fail-closed 与生成链
++            // 其他校验同纪律，模板域侧耦合校验归 FEAT-0012/0015）
++            if (SOURCE_TYPE_FORMULA.equals(templateItem.getDefaultSourceType()) && isBlank(templateFormula)) {
++                throw paramError("公式项缺少公式: " + templateItem.getDataCode());
++            }
++            if (!isBlank(templateFormula)) {
+                 if (RelativeRefExpander.containsParentRef(templateFormula) && !parentResolved) {
+                     parent = resolveParent(instance);
+                     parentResolved = true;
+@@ -205,6 +226,22 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+                                 + "（父实例 " + parent.getInstanceCode() + "，项 " + templateItem.getDataCode() + "）");
+                     }
+                 }
++                // 展开终检（修订轮 I-1）：展开后公式不得残留 { 或 }——畸形/超纲 token（如
++                // { self.X } 带空格、{SELF.ELEC-X} 非法编码字符）不匹配展开与剥壳两个正则、
++                // 不核存在性即原样残留，属坏公式，整批拒防随模板批量传染到该模板所有实例
++                // （编码字符集约束上推字典域归后续规则项，不在本任务）
++                if (outcome.expandedFormula().indexOf('{') >= 0 || outcome.expandedFormula().indexOf('}') >= 0) {
++                    throw paramError("公式包含无法识别的引用 token（展开后残留花括号）: 项 "
++                            + templateItem.getDataCode() + "，示例 " + firstResidualToken(outcome.expandedFormula()));
++                }
++                // 修订轮 M-5：剥壳后的绝对引用键 >180（ref_full_key varchar(180) 列宽）→
++                // paramError 优雅拒（文案含键与长度），不触 SQL Data-too-long 的 500 形态
++                for (String refFullKey : outcome.resolvedRefs()) {
++                    if (refFullKey.length() > MAX_LEN_REF_FULL_KEY) {
++                        throw paramError("公式引用的全键超长（上限 " + MAX_LEN_REF_FULL_KEY + "，实际 "
++                                + refFullKey.length() + "）: " + refFullKey + "（项 " + templateItem.getDataCode() + "）");
++                    }
++                }
+                 if (outcome.expandedFormula().length() > MAX_LEN_FORMULA) {
+                     throw paramError("展开后公式超长（上限 " + MAX_LEN_FORMULA + "）: 项 " + templateItem.getDataCode());
+                 }
+@@ -379,6 +416,23 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+         return target != null ? target.getId() : null;
+     }
+ 
++    /** 空白判定（与 String.isBlank 同语义；供生成循环两处判断复用） */
++    private static boolean isBlank(String value) {
++        return value == null || value.isBlank();
++    }
++
++    /** 展开终检文案用的残留 token 示例（第一个花括号段起、截 40 字符防消息过长，修订轮 I-1） */
++    private static String firstResidualToken(String formula) {
++        int from = formula.indexOf('{');
++        if (from < 0) {
++            from = formula.indexOf('}');
++        }
++        if (from < 0) {
++            return "?";
++        }
++        return formula.substring(from, Math.min(formula.length(), from + 40));
++    }
++
+     /**
+      * 计算周期换算（模板 default_calc_period varchar(16) 周期码 → 实例 calc_period int 秒，
+      * 0=到达驱动，PDF §1.6 p14 口径）：null/空白→0；纯数字串→按秒直取（实施侧写秒的自由度）；
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplTest.java
+index 7066dbf..cb7de64 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplTest.java
+@@ -456,6 +456,110 @@ class IotDataItemServiceImplTest {
+         assertTrue(e.getMessage().contains("并发冲突"), e.getMessage());
+     }
+ 
++    // ---------- 修订轮（评审 Critical 0 / Important 2 / Minor 5）必修四项红转绿 ----------
++
++    @Test
++    @DisplayName("修订轮 I-1 红转绿 - 畸形 token（{ self.X } 带空格 / 连字符编码）展开后残留花括号 → 整批拒，文案含原始编码与 token 示例")
++    void testGenerate_MalformedTokenResidualBrace_FailsWholeBatch() {
++        // 场景 1：{ self.X } 带空格——不匹配展开/剥壳任一正则，原样残留即坏公式
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, PARENT_ID, TEMPLATE_ID));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(TEMPLATE_ID, "AIR_COMPRESSOR"));
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(1L, "MALFORMED_A", "畸形公式项", 2, "{ self.X } + 1", null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID)).thenReturn(List.of());
++
++        BusinessException spaceCase = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++        assertTrue(spaceCase.getMessage().contains("残留花括号"), spaceCase.getMessage());
++        assertTrue(spaceCase.getMessage().contains("MALFORMED_A"), "文案含原始编码: " + spaceCase.getMessage());
++        assertTrue(spaceCase.getMessage().contains("{ self.X }"), "文案含 token 示例: " + spaceCase.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++
++        // 场景 2：{SELF.ELEC-METER} 连字符编码（字典编码字符集超纲，展开器不识别）
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(2L, "MALFORMED_B", "畸形公式项二", 2, "{SELF.ELEC-METER} * 2", null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID)).thenReturn(List.of());
++
++        BusinessException hyphenCase = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++        assertTrue(hyphenCase.getMessage().contains("残留花括号"), hyphenCase.getMessage());
++        assertTrue(hyphenCase.getMessage().contains("MALFORMED_B"), hyphenCase.getMessage());
++        assertTrue(hyphenCase.getMessage().contains("{SELF.ELEC-METER}"), hyphenCase.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++    }
++
++    @Test
++    @DisplayName("修订轮 I-2 红转绿 - SELF 引用已删占用码（模板在册但本批不生成）→ 整批拒且文案指向引用编码（修复前静默落悬空边为红）")
++    void testGenerate_SelfRefToDeletedOccupiedCode_FailsWholeBatch() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, PARENT_ID, TEMPLATE_ID));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(TEMPLATE_ID, "AIR_COMPRESSOR"));
++        // GONE 已删占用（本批不生成）、KEEP 活跃既有项、NEWER 为待补生成新项且公式引用 GONE
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(1L, "GONE", "已删项", 1, null, null, null, "kWh", null),
++                templateItem(2L, "KEEP", "既有项", 1, null, null, null, "kWh", null),
++                templateItem(3L, "NEWER", "新项", 2, "{SELF.GONE} * 2", null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID))
++                .thenReturn(List.of(occupancyRow("GONE", 1), occupancyRow("KEEP", 0)));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++
++        assertTrue(e.getMessage().contains("SELF.GONE"), "文案指向引用的编码: " + e.getMessage());
++        assertTrue(e.getMessage().contains("不存在"), e.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++    }
++
++    @Test
++    @DisplayName("修订轮 M-5 红转绿 - 剥壳绝对引用键超长（>180，ref_full_key varchar(180)）→ paramError 含键与长度，不触 SQL Data-too-long")
++    void testGenerate_AbsoluteRefKeyTooLong_Fails() {
++        String longKey = "F01." + "A".repeat(200);
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, PARENT_ID, TEMPLATE_ID));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(TEMPLATE_ID, "AIR_COMPRESSOR"));
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(1L, "LONGREF", "超长引用项", 2, "{" + longKey + "} + 1", null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID)).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++
++        assertTrue(e.getMessage().contains("超长"), e.getMessage());
++        assertTrue(e.getMessage().contains("180"), "文案含上限: " + e.getMessage());
++        assertTrue(e.getMessage().contains(String.valueOf(longKey.length())), "文案含实际长度: " + e.getMessage());
++        assertTrue(e.getMessage().contains("LONGREF"), "文案含原始编码: " + e.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++        verify(dataItemRefMapper, never()).insert(any(IotDataItemRef.class));
++    }
++
++    @Test
++    @DisplayName("修订轮 M-6 红转绿 - source_type=2 且公式空白 → 整批拒「公式项缺少公式」（null 与空白两形态）")
++    void testGenerate_FormulaItemMissingFormula_FailsWholeBatch() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, PARENT_ID, TEMPLATE_ID));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(TEMPLATE_ID, "AIR_COMPRESSOR"));
++        // 形态 1：default_formula=null
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(1L, "NOFORMULA", "缺公式项", 2, null, null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID)).thenReturn(List.of());
++
++        BusinessException nullCase = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++        assertTrue(nullCase.getMessage().contains("公式项缺少公式"), nullCase.getMessage());
++        assertTrue(nullCase.getMessage().contains("NOFORMULA"), nullCase.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++
++        // 形态 2：default_formula=空白串
++        when(dataItemTemplateMapper.selectList(any())).thenReturn(List.of(
++                templateItem(2L, "BLANKFORMULA", "空白公式项", 2, "   ", null, null, null, null)));
++        when(baseMapper.selectOccupancyByInstance(TENANT, INSTANCE_ID)).thenReturn(List.of());
++
++        BusinessException blankCase = assertThrows(BusinessException.class,
++                () -> dataItemService.generateForInstance(INSTANCE_ID));
++        assertTrue(blankCase.getMessage().contains("公式项缺少公式"), blankCase.getMessage());
++        assertTrue(blankCase.getMessage().contains("BLANKFORMULA"), blankCase.getMessage());
++        verify(baseMapper, never()).insert(any(IotDataItem.class));
++    }
++
+     // ---------- 重生成幂等（触发二） ----------
+ 
+     @Test

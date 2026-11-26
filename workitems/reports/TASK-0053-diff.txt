@@ -1,0 +1,1781 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java
+new file mode 100644
+index 0000000..a15410b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java
+@@ -0,0 +1,103 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
++import net.otlab.admin.module.openapi.OpenApiCodes;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.Deque;
++import java.util.Map;
++
++/**
++ * 订阅管理接口（TASK-0053，brief 决策 5）：开通/关闭订阅走 0051 appKey+HMAC 链 + scope 校验，
++ * 订阅动作挂 {@code @OperateLog} 审计（0079/0052 范式）；过滤器缺位 fail-closed。
++ *
++ * <p>路径在 /openapi/v1/subscribe/** 下——{@link net.otlab.admin.module.openapi.filter.OpenApiAuthFilter}
++ * 全覆盖验签 + 限流 + iot_api_call_log 全量审计（403 类全量，0051 既有不改）；类级 @Anonymous
++ * 不进 Sa-Token 登录态。@OperateLog 在机器请求无登录会话时由切面以身份列 NULL 落库
++ * （BUG-0003 既有行为），订阅动作仍留痕。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Anonymous
++@Tag(name = "对外数据服务推送订阅（/openapi/v1/subscribe）")
++@RestController
++@RequestMapping("/openapi/v1/subscribe")
++public class SubscriptionController {
++
++    private final SubscriptionService subscriptionService;
++
++    public SubscriptionController(SubscriptionService subscriptionService) {
++        this.subscriptionService = subscriptionService;
++    }
++
++    @OperateLog(title = "推送订阅", businessType = BusinessType.INSERT)
++    @Operation(summary = "开通数据项订阅（scope 校验；主题 iot/open/{tenant}/{instance}/item）")
++    @PostMapping("/item/{instanceCode}")
++    public Result<Map<String, String>> openItem(@PathVariable("instanceCode") String instanceCode,
++                                                HttpServletRequest request) {
++        String topic = subscriptionService.openItem(requireIdentity(request), instanceCode);
++        return Result.success(Map.of("topic", topic));
++    }
++
++    @OperateLog(title = "推送订阅", businessType = BusinessType.DELETE)
++    @Operation(summary = "关闭数据项订阅（幂等）")
++    @DeleteMapping("/item/{instanceCode}")
++    public Result<Boolean> closeItem(@PathVariable("instanceCode") String instanceCode,
++                                     HttpServletRequest request) {
++        return Result.success(subscriptionService.closeItem(requireIdentity(request), instanceCode));
++    }
++
++    @OperateLog(title = "推送订阅", businessType = BusinessType.INSERT)
++    @Operation(summary = "开通指标事件订阅（MQTT iot/{tenant}/metric/out + Kafka iot.metric.result.{tenant}）")
++    @PostMapping("/metric")
++    public Result<Map<String, String[]>> openMetric(HttpServletRequest request) {
++        String[] topics = subscriptionService.openMetric(requireIdentity(request));
++        return Result.success(Map.of("mqtt", new String[]{topics[0]}, "kafka", new String[]{topics[1]}));
++    }
++
++    @OperateLog(title = "推送订阅", businessType = BusinessType.DELETE)
++    @Operation(summary = "关闭指标事件订阅（幂等）")
++    @DeleteMapping("/metric")
++    public Result<Boolean> closeMetric(HttpServletRequest request) {
++        return Result.success(subscriptionService.closeMetric(requireIdentity(request)));
++    }
++
++    @Operation(summary = "指标事件读口（最近缓冲；以 st_metric_value 物化表为准，事件仅触发信号）")
++    @GetMapping("/metric/events")
++    public Result<Deque<MetricProducedEventVO>> metricEvents(HttpServletRequest request) {
++        requireIdentity(request);
++        return Result.success(subscriptionService.metricEvents());
++    }
++
++    @Operation(summary = "数据项事件读口（最近缓冲）")
++    @GetMapping("/item/events")
++    public Result<Deque<ItemChangeEventVO>> itemEvents(HttpServletRequest request) {
++        requireIdentity(request);
++        return Result.success(subscriptionService.itemEvents());
++    }
++
++    /** 验签产物读取（过滤器写入）；缺位 fail-closed——不给过滤器误配置时的匿名通道 */
++    private OpenApiClientIdentity requireIdentity(HttpServletRequest request) {
++        Object identity = request.getAttribute(OpenApiCodes.ATTR_CLIENT_IDENTITY);
++        if (identity instanceof OpenApiClientIdentity clientIdentity) {
++            return clientIdentity;
++        }
++        throw new BusinessException(401, "未认证（鉴权过滤器未生效或凭据缺失）");
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionObserveController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionObserveController.java
+new file mode 100644
+index 0000000..cb55984
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionObserveController.java
+@@ -0,0 +1,55 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.result.Result;
++import org.springframework.context.annotation.Profile;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.Map;
++
++/**
++ * 订阅消费内部观测驱动面（TASK-0053，dev 档）：仅用于 live 冒烟注入一条真协议路径之外的
++ * 消息到消费入口（主题 + 载荷），断言全键窗口幂等/租户隔离/缓冲读口。
++ *
++ * <p><b>仅 dev profile 装配</b>（{@code @Profile("dev")}），prod 档不存在此端点；class-level
++ * @Anonymous（内网冒烟面，与 0046 /calc/v1/metric/recalc 同族的观测缝，不进 Sa-Token 登录态，
++ * 非 /openapi/v1 前缀不经 HMAC 过滤器）；生产事件链由 PahoSubscriptionBridge 从真 broker
++ * 收消息直接调 {@link SubscriptionConsumer}，本端点仅测试驱动缝。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Profile("dev")
++@Anonymous
++@Tag(name = "订阅消费内部观测面（dev）")
++@RestController
++@RequestMapping("/internal/v1/subscribe")
++public class SubscriptionObserveController {
++
++    private final SubscriptionConsumer consumer;
++
++    public SubscriptionObserveController(SubscriptionConsumer consumer) {
++        this.consumer = consumer;
++    }
++
++    /** 注入一条数据项消息（topic + payload），返回投递计数 1=落缓冲 0=忽略 */
++    @Operation(summary = "dev 注入数据项事件（真协议路径之外，仅冒烟）")
++    @PostMapping("/item")
++    public Result<Map<String, Integer>> injectItem(@RequestBody Map<String, String> body) {
++        int delivered = consumer.onItemMessage(body.get("topic"), body.get("payload"));
++        return Result.success(Map.of("delivered", delivered));
++    }
++
++    /** 注入一条指标消息（topic + payload，MQTT/Kafka 同入口） */
++    @Operation(summary = "dev 注入指标事件（真协议路径之外，仅冒烟）")
++    @PostMapping("/metric")
++    public Result<Map<String, Integer>> injectMetric(@RequestBody Map<String, String> body) {
++        int delivered = consumer.onMetricMessage(body.get("topic"), body.get("payload"));
++        return Result.success(Map.of("delivered", delivered));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/ItemChangeEventVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/ItemChangeEventVO.java
+new file mode 100644
+index 0000000..8afc567
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/ItemChangeEventVO.java
+@@ -0,0 +1,43 @@
++package net.otlab.admin.module.openapi.dto;
++
++import lombok.Data;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 数据项变更订阅消息体（TASK-0053，冻结契约 v1.1.0 §3.5「订阅主题」行）。
++ *
++ * <p>主题 {@code iot/open/{tenant_code}/{instance_code}/item}；消息体即统一消息模型 4 字段，
++ * <b>字段名定版 camelCase、ts 毫秒时间戳</b>（闭合契约「与上游差异」第 7/8 条的待定版项——
++ * 通过本 VO + javadoc 定版，不改冻结契约文件本体；风格变更走 CONV-03 升版裁决）。
++ * 4 字段逐字：fullKey / ts / value / quality，不增不改（不变契约）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++public class ItemChangeEventVO {
++
++    /** 数据项全键（实例+数据项编码口径，契约新增键字段） */
++    private String fullKey;
++
++    /** 设备侧采样时间（毫秒时间戳，§3.2 ts 同义） */
++    private Long ts;
++
++    /** 数值 */
++    private Double value;
++
++    /** 质量码（CONV-02 枚举 0-10） */
++    private Integer quality;
++
++    /** 有序载荷（契约字段序逐字锁定，camelCase 定版） */
++    public Map<String, Object> toMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("fullKey", fullKey);
++        m.put("ts", ts);
++        m.put("value", value);
++        m.put("quality", quality);
++        return m;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/MetricProducedEventVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/MetricProducedEventVO.java
+new file mode 100644
+index 0000000..d0a0e07
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/MetricProducedEventVO.java
+@@ -0,0 +1,103 @@
++package net.otlab.admin.module.openapi.dto;
++
++import lombok.Data;
++
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 指标产出事件载荷（TASK-0053，冻结契约 v1.1.0 §3.5「推送」行）。
++ *
++ * <p>主题 MQTT {@code iot/{tenant}/metric/out} / Kafka {@code iot.metric.result.{tenant}}；
++ * 生产侧由 0046（calc）发出，本任务只做消费侧。<b>字段名定版 camelCase、窗口起止为毫秒
++ * 时间戳</b>（闭合契约「与上游差异」第 7/8 条待定版项——通过本 VO + javadoc 定版，
++ * 不改冻结契约文件本体；风格变更走 CONV-03 升版裁决）。
++ *
++ * <p>9 扩展字段逐字（契约原文 snake_case → 线上定版 camelCase）：metricCode、instanceKey
++ * （即 full_key）、period、windowStart、windowEnd、value、yoy、mom、quality。另含租户双隔离
++ * 字段 tenant/tenantId；yoy/mom 为 null 时如实保留（不返回 0 冒充）；hash 仅作传输校验，
++ * <b>幂等键 = 指标全键 + 窗口（非 hash）</b>——hash 含值随修正重算变化（ADR-0010 TD-0030 /
++ * 0046 修订轮 F-06）。无 isRecalc/calcTime 等随重算变化的时间/标记字段（ADR-0010）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++public class MetricProducedEventVO {
++
++    /** 事件类型（生产侧固定 metric.out） */
++    private String eventType;
++
++    /** 租户编码（与主题 tenant 双重校验，不一致丢弃） */
++    private String tenant;
++
++    /** 租户 id（生产侧携带，诊断用） */
++    private Long tenantId;
++
++    /** 扩展 1：指标编码 */
++    private String metricCode;
++
++    /** 扩展 2：实例键（即 full_key，冻结契约 instance_key） */
++    private String instanceKey;
++
++    /** 生产侧过渡双字段（instanceCode，0053 定版后收敛，消费以 instanceKey 为准） */
++    private String instanceCode;
++
++    /** 扩展 3：统计周期（DAY 等） */
++    private String period;
++
++    /** 扩展 4：窗口起（毫秒时间戳，本任务定版） */
++    private Long windowStart;
++
++    /** 扩展 5：窗口止（毫秒时间戳，本任务定版） */
++    private Long windowEnd;
++
++    /** 扩展 6：指标值 */
++    private Double value;
++
++    /** 扩展 7：同比小数比率（可为 null，不返回 0 冒充） */
++    private Double yoy;
++
++    /** 扩展 8：环比小数比率（可为 null） */
++    private Double mom;
++
++    /** 扩展 9：质量码（CONV-02，随载荷承载不扩 st_metric_value 列） */
++    private Integer quality;
++
++    /** 完整度（生产侧伴随值，诊断用） */
++    private Double completeness;
++
++    /** 不完整标志（quality 派生源） */
++    private Boolean incomplete;
++
++    /** 传输校验和（SHA-256 of 全键+窗口+结果+伴随值；非幂等键） */
++    private String hash;
++
++    /** 有序载荷：9 扩展字段 camelCase 逐字 + 租户双隔离 + 生产侧伴随/校验字段 */
++    public Map<String, Object> toMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("eventType", eventType);
++        m.put("tenant", tenant);
++        m.put("tenantId", tenantId);
++        m.put("metricCode", metricCode);
++        m.put("instanceKey", instanceKey);
++        m.put("instanceCode", instanceCode);
++        m.put("period", period);
++        m.put("windowStart", windowStart);
++        m.put("windowEnd", windowEnd);
++        m.put("value", value);
++        m.put("yoy", yoy);
++        m.put("mom", mom);
++        m.put("quality", quality);
++        m.put("completeness", completeness);
++        m.put("incomplete", incomplete);
++        m.put("hash", hash);
++        return m;
++    }
++
++    /** 幂等键 = 指标全键（tenant|metricCode|instanceKey|period）+ 窗口（start/end）——非 hash */
++    public String idempotencyKey() {
++        return tenant + "|" + metricCode + "|" + instanceKey + "|" + period
++                + "|" + windowStart + "|" + windowEnd;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/exception/ScopeDeniedException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/exception/ScopeDeniedException.java
+new file mode 100644
+index 0000000..b087566
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/exception/ScopeDeniedException.java
+@@ -0,0 +1,17 @@
++package net.otlab.admin.module.openapi.exception;
++
++import net.otlab.core.exception.BusinessException;
++
++/**
++ * 订阅 scope 拒绝（TASK-0053）：订阅时校验目标实例是否在调用方授权范围内，
++ * 越权按业务码 6003（与 0051 对外 scope 外同码，HTTP 200 + body 6003）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class ScopeDeniedException extends BusinessException {
++
++    public ScopeDeniedException(String message) {
++        super(net.otlab.admin.module.openapi.OpenApiCodes.SCOPE_DENIED, message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/KafkaSubscriptionBridge.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/KafkaSubscriptionBridge.java
+new file mode 100644
+index 0000000..5851828
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/KafkaSubscriptionBridge.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.context.annotation.Configuration;
++
++/**
++ * Kafka 指标事件消费桥（TASK-0053，brief 决策 2）：主题 iot.metric.result.{tenant}。
++ *
++ * <p>本环境无 Kafka broker，开关 {@code ot.openapi.subscribe.kafka-enabled} 默认 false
++ * ——本类零装配、零连接尝试；true 时当前为演进位占位（WARN 提示需接真 consumer），
++ * 消息入口与 MQTT 共用 {@link SubscriptionConsumer#onMetricMessage}（同载荷/同幂等口径），
++ * 真 consumer 接线时直接调该入口即可，无需改消费侧领域逻辑。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration
++@ConditionalOnProperty(name = "ot.openapi.subscribe.kafka-enabled", havingValue = "true")
++public class KafkaSubscriptionBridge {
++
++    private static final Logger log = LoggerFactory.getLogger(KafkaSubscriptionBridge.class);
++
++    private final SubscriptionConsumer consumer;
++
++    public KafkaSubscriptionBridge(SubscriptionConsumer consumer) {
++        this.consumer = consumer;
++        log.warn("[OPENAPI-SUB] Kafka 订阅开关已开，但真 consumer 为演进位（本环境无 broker）；"
++                + "接真 consumer 时统一调用 SubscriptionConsumer.onMetricMessage");
++    }
++
++    /** 消费入口供真 consumer 接线复用（topic = iot.metric.result.{tenant}） */
++    public int onMetric(String topic, String payload) {
++        return consumer.onMetricMessage(topic, payload);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/PahoSubscriptionBridge.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/PahoSubscriptionBridge.java
+new file mode 100644
+index 0000000..4a9d218
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/PahoSubscriptionBridge.java
+@@ -0,0 +1,102 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
++import org.eclipse.paho.client.mqttv3.MqttCallback;
++import org.eclipse.paho.client.mqttv3.MqttClient;
++import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
++import org.eclipse.paho.client.mqttv3.MqttMessage;
++import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.boot.context.event.ApplicationReadyEvent;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.context.event.EventListener;
++
++import java.nio.charset.StandardCharsets;
++import java.util.UUID;
++
++/**
++ * MQTT 订阅桥（TASK-0053，brief 决策 1/2）：真 Paho 客户端连 broker，订阅两路主题通配符，
++ * 收到消息转交 {@link SubscriptionConsumer}（主题/租户双校验 + 全键窗口幂等在消费侧）。
++ *
++ * <p>条件装配 {@code ot.openapi.subscribe.mqtt-enabled=true}（默认 false 时零连接尝试）；
++ * broker 地址 env 可切（1883 握手退化时用本地夹具 broker 验证，恢复后免改码）。
++ * QoS1（至少一次，与生产侧一致）；重连/退订幂等由 Paho 客户端与注册表共同保证；
++ * 连接失败 fail-soft WARN，不阻断 ot-admin 启动（订阅是尽力能力，重连由 Paho 自动进行）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration
++@ConditionalOnProperty(name = "ot.openapi.subscribe.mqtt-enabled", havingValue = "true")
++public class PahoSubscriptionBridge {
++
++    private static final Logger log = LoggerFactory.getLogger(PahoSubscriptionBridge.class);
++
++    /** 数据项订阅通配符（tenant/instance 段由消费侧按注册表精确匹配，主题先粗订阅） */
++    public static final String ITEM_TOPIC_WILDCARD = "iot/open/+/+/item";
++
++    /** 指标产出事件通配符（MQTT，与 0046 生产侧 iot/{tenant}/metric/out 同口径） */
++    public static final String METRIC_TOPIC_WILDCARD = "iot/+/metric/out";
++
++    private static final int QOS = 1;
++
++    private final SubscriptionProperties properties;
++    private final SubscriptionConsumer consumer;
++
++    private volatile MqttClient client;
++
++    public PahoSubscriptionBridge(SubscriptionProperties properties, SubscriptionConsumer consumer) {
++        this.properties = properties;
++        this.consumer = consumer;
++    }
++
++    @EventListener(ApplicationReadyEvent.class)
++    public void connectAndSubscribe() {
++        try {
++            String clientId = properties.getMqttClientPrefix() + "-" + UUID.randomUUID().toString().substring(0, 8);
++            MqttClient c = new MqttClient(properties.getMqttBroker(), clientId, new MemoryPersistence());
++            MqttConnectOptions options = new MqttConnectOptions();
++            options.setAutomaticReconnect(true);
++            options.setCleanSession(true);
++            options.setConnectionTimeout(30);
++            c.connect(options);
++            c.setCallback(new Callback());
++            c.subscribe(new String[]{ITEM_TOPIC_WILDCARD, METRIC_TOPIC_WILDCARD}, new int[]{QOS, QOS});
++            this.client = c;
++            log.info("[OPENAPI-SUB] MQTT 订阅已建立 broker={} clientId={} topics={},{}",
++                    properties.getMqttBroker(), clientId, ITEM_TOPIC_WILDCARD, METRIC_TOPIC_WILDCARD);
++        } catch (Exception e) {
++            // fail-soft：broker 退化不阻断启动；自动重连 + 管理面重新订阅兜底
++            log.warn("[OPENAPI-SUB] MQTT 订阅连接失败（fail-soft，broker={}）", properties.getMqttBroker(), e);
++        }
++    }
++
++    /** 已连接客户端（供 live 冒烟/管理面观测；未连接返回 null） */
++    public MqttClient client() {
++        return client;
++    }
++
++    private class Callback implements MqttCallback {
++        @Override
++        public void connectionLost(Throwable cause) {
++            log.warn("[OPENAPI-SUB] MQTT 连接丢失（自动重连中）", cause);
++        }
++
++        @Override
++        public void messageArrived(String topic, MqttMessage message) {
++            String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
++            if (topic != null && topic.contains("/item")) {
++                consumer.onItemMessage(topic, payload);
++            } else {
++                consumer.onMetricMessage(topic, payload);
++            }
++        }
++
++        @Override
++        public void deliveryComplete(IMqttDeliveryToken token) {
++            // 订阅侧无主动发布（纯消费），无需处理
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConfig.java
+new file mode 100644
+index 0000000..d9e49d2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConfig.java
+@@ -0,0 +1,48 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++
++/**
++ * 订阅消费侧装配（TASK-0053）：注册表 / 环形缓冲 / 消费入口 / 编解码器。
++ *
++ * <p>MQTT/Kafka 传输通道各自条件装配（见 PahoSubscriptionBridge / KafkaSubscriptionBridge）——
++ * 默认关闭时零连接尝试，仅领域对象存在，prod/dev 启动不受影响。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Configuration(proxyBeanMethods = false)
++public class SubscriptionConfig {
++
++    public SubscriptionConfig() {
++    }
++
++    @Bean
++    public OpenApiEventCodec openApiEventCodec() {
++        return new OpenApiEventCodec();
++    }
++
++    @Bean
++    public SubscriptionRegistry subscriptionRegistry(OpenApiTenantMapper tenantMapper,
++                                                      OpenApiInstanceMapper instanceMapper,
++                                                      DataPermService dataPermService) {
++        return new SubscriptionRegistry(tenantMapper, instanceMapper, dataPermService);
++    }
++
++    @Bean
++    public SubscriptionEventStore subscriptionEventStore(SubscriptionProperties properties) {
++        return new SubscriptionEventStore(properties.getRingCapacity());
++    }
++
++    @Bean
++    public SubscriptionConsumer subscriptionConsumer(SubscriptionRegistry registry,
++                                                      SubscriptionEventStore store,
++                                                      OpenApiEventCodec codec) {
++        return new SubscriptionConsumer(registry, store, codec);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java
+new file mode 100644
+index 0000000..04223a1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java
+@@ -0,0 +1,86 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 事件消费入口（TASK-0053，brief 决策 2/4）：MQTT/Kafka 共用的消息落地点。
++ *
++ * <p>每路消息做三重判定：① 主题解析（非法丢弃）；② 租户隔离——主题 tenant 必须有对应订阅，
++ * 且载荷 tenant 与主题 tenant 一致（不一致丢弃 + WARN，租户 B 收不到租户 A 事件）；
++ * ③ 载荷契约校验（缺字段由 codec fail-closed 拒绝）。通过后写入
++ * {@link SubscriptionEventStore}（幂等按全键+窗口，非 hash）。无订阅者=静默忽略不报错。
++ *
++ * <p>返回投递计数（1=落缓冲，0=未投递），供 live 冒烟与单测断言。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class SubscriptionConsumer {
++
++    private static final Logger log = LoggerFactory.getLogger(SubscriptionConsumer.class);
++
++    private final SubscriptionRegistry registry;
++    private final SubscriptionEventStore store;
++    private final OpenApiEventCodec codec;
++
++    public SubscriptionConsumer(SubscriptionRegistry registry, SubscriptionEventStore store, OpenApiEventCodec codec) {
++        this.registry = registry;
++        this.store = store;
++        this.codec = codec;
++    }
++
++    /** 数据项消息入口（MQTT broker 回调）；返回 1=已投递，0=忽略 */
++    public int onItemMessage(String topic, String payload) {
++        SubscriptionRegistry.TopicParts parts = SubscriptionRegistry.parseItemTopic(topic);
++        if (parts == null) {
++            return 0; // 非法主题：静默忽略
++        }
++        if (!registry.hasItemSubscription(parts.tenantCode(), parts.instanceCode())) {
++            return 0; // 无订阅者不报错
++        }
++        try {
++            ItemChangeEventVO event = codec.parseItem(payload);
++            // 数据项订阅主题不含载荷 tenant（契约 4 字段），隔离由主题 tenant + 订阅登记保证；
++            // fullKey 必须落在订阅实例的命名空间，防跨实例注入（fullKey 形如 {instance}.{code}）。
++            if (!event.getFullKey().startsWith(parts.instanceCode() + ".")) {
++                log.warn("[OPENAPI-SUB] 数据项事件 fullKey 越出订阅实例丢弃 topic={} fullKey={}",
++                        topic, event.getFullKey());
++                return 0;
++            }
++            store.acceptItem(event);
++            return 1;
++        } catch (IllegalArgumentException e) {
++            log.warn("[OPENAPI-SUB] 数据项事件载荷非法丢弃 topic={}: {}", topic, e.getMessage());
++            return 0;
++        }
++    }
++
++    /** 指标消息入口（MQTT + Kafka 共用）；返回 1=已投递，0=忽略 */
++    public int onMetricMessage(String topic, String payload) {
++        String topicTenant = SubscriptionRegistry.parseMetricTopic(topic);
++        if (topicTenant == null) {
++            return 0;
++        }
++        if (!registry.hasMetricSubscription(topicTenant)) {
++            return 0; // 无订阅者不报错
++        }
++        try {
++            MetricProducedEventVO event = codec.parseMetric(payload);
++            // 双重校验：载荷 tenant 必须与主题 tenant 一致；不一致丢弃 + WARN（租户 B 收不到 A）
++            if (topicTenant.equals(event.getTenant())) {
++                store.acceptMetric(event);
++                return 1;
++            }
++            log.warn("[OPENAPI-SUB] 指标事件租户不一致丢弃 topicTenant={} payloadTenant={} topic={}",
++                    topicTenant, event.getTenant(), topic);
++            return 0;
++        } catch (IllegalArgumentException e) {
++            log.warn("[OPENAPI-SUB] 指标事件载荷非法丢弃 topic={}: {}", topic, e.getMessage());
++            return 0;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java
+new file mode 100644
+index 0000000..0547a6e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java
+@@ -0,0 +1,100 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++
++import java.util.ArrayDeque;
++import java.util.Deque;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 订阅事件环形缓冲 + 幂等登记（TASK-0053，brief 决策 3）。
++ *
++ * <p>幂等口径严格按「指标全键 + 窗口」（{@link MetricProducedEventVO#idempotencyKey()}），
++ * <b>不用 hash</b>——hash 含结果值，0046 修正重算后变化，作幂等键会把重发当成新事件。
++ * 同键重发以最新载荷覆盖（值/伴随值反映修正结果），不重复占用缓冲位。
++ *
++ * <p>事件仅作触发信号：本缓冲不写任何业务表，指标结果以 0045 st_metric_value 物化表为准
++ * （ADR-0010，不重复写业务表）。有界 LinkedHashMap 维持最近容量条（按最近一次接受排序），
++ * 读口取最新/遍历全序列。无订阅者不报错（accept 恒真，调用方决定是否投递）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class SubscriptionEventStore {
++
++    private final int capacity;
++    private final Map<String, MetricProducedEventVO> metrics = new LinkedHashMap<>();
++    private final Map<String, ItemChangeEventVO> items = new LinkedHashMap<>();
++
++    public SubscriptionEventStore(int capacity) {
++        this.capacity = capacity <= 0 ? 1 : capacity;
++    }
++
++    /** 接受指标事件：同全键+窗口覆盖（重发不新增），恒返回 true（无订阅者亦不报错） */
++    public synchronized boolean acceptMetric(MetricProducedEventVO event) {
++        if (event == null) {
++            return false;
++        }
++        upsert(metrics, event.idempotencyKey(), event);
++        return true;
++    }
++
++    /** 接受数据项事件：同 fullKey+ts+quality 覆盖，恒返回 true */
++    public synchronized boolean acceptItem(ItemChangeEventVO event) {
++        if (event == null) {
++            return false;
++        }
++        String key = event.getFullKey() + "|" + event.getTs() + "|" + event.getQuality();
++        upsert(items, key, event);
++        return true;
++    }
++
++    private <T> void upsert(Map<String, T> map, String key, T value) {
++        map.remove(key);
++        map.put(key, value); // 最近接受排到末尾；同键重发只占一个位
++        while (map.size() > capacity) {
++            String oldest = map.keySet().iterator().next();
++            map.remove(oldest);
++        }
++    }
++
++    public synchronized int metricCount() {
++        return metrics.size();
++    }
++
++    public synchronized int itemCount() {
++        return items.size();
++    }
++
++    public synchronized MetricProducedEventVO latestMetric() {
++        return last(metrics);
++    }
++
++    public synchronized ItemChangeEventVO latestItem() {
++        return last(items);
++    }
++
++    private <T> T last(Map<String, T> map) {
++        if (map.isEmpty()) {
++            return null;
++        }
++        java.util.Iterator<T> it = map.values().iterator();
++        T result = null;
++        while (it.hasNext()) {
++            result = it.next();
++        }
++        return result;
++    }
++
++    /** 指标环形缓冲快照（最旧在前、最新在后，逐条只读） */
++    public synchronized Deque<MetricProducedEventVO> metricRing() {
++        return new ArrayDeque<>(metrics.values());
++    }
++
++    /** 数据项环形缓冲快照 */
++    public synchronized Deque<ItemChangeEventVO> itemRing() {
++        return new ArrayDeque<>(items.values());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionProperties.java
+new file mode 100644
+index 0000000..4a7e9ed
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionProperties.java
+@@ -0,0 +1,36 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * 订阅消费侧配置（TASK-0053，ot.openapi.subscribe.*）。
++ *
++ * <p>MQTT/Kafka 订阅开关均默认 false（Kafka 环境无 broker，按 brief 默认关）；broker 地址
++ * env 可切（EMQX 1883 握手退化时用本地夹具 broker 验证，恢复后免改码复验）；clientId 前缀
++ * 多实例隔离；环形缓冲容量限定单进程内存占用。字段名定版 camelCase/毫秒见事件 VO javadoc。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.openapi.subscribe")
++public class SubscriptionProperties {
++
++    /** MQTT 订阅总开关（默认 false；true 时建立 Paho 客户端连 broker 订阅两路主题） */
++    private boolean mqttEnabled = false;
++
++    /** MQTT broker 地址（env 可切：默认 tcp://192.168.31.145:1883，本地夹具用 tcp://127.0.0.1:<port>） */
++    private String mqttBroker = "tcp://192.168.31.145:1883";
++
++    /** MQTT clientId 前缀（随机后缀隔离多实例，避免同 id 互踢） */
++    private String mqttClientPrefix = "ot-admin-sub";
++
++    /** Kafka 订阅开关（默认 false——本环境无 broker；true 时启用消费端订阅） */
++    private boolean kafkaEnabled = false;
++
++    /** 环形缓冲容量（每类事件最近 N 条；<=0 归一为 1） */
++    private int ringCapacity = 256;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java
+new file mode 100644
+index 0000000..683174b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java
+@@ -0,0 +1,181 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.exception.ScopeDeniedException;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 订阅注册表（TASK-0053，brief 决策 1/4/5）。
++ *
++ * <p>订阅时以 0051 验签产物为准：租户取调用方行（DB 权威），scope 经
++ * {@link DataPermService#resolveClientScope(Long, Long, String)} 显式租户重载翻译——与对外
++ * scope 三态同口径（空/null=默认拒绝，subtree 展开由组件负责）；数据项订阅的 instance_code
++ * 必须解析到 scope 内实例才允许，否则 6003 拒绝（不订阅、不建立连接）。指标事件主题按租户
++ * 隔离（无 instance_code 段），订阅只需作用域非空（默认拒绝纪律同向）。
++ *
++ * <p>进程内注册表（多实例共享/持久化归演进位，同 0046 幂等/留痕口径）；退订幂等，重复退订
++ * 返回 false 不报错。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class SubscriptionRegistry {
++
++    private static final Logger log = LoggerFactory.getLogger(SubscriptionRegistry.class);
++
++    private final OpenApiTenantMapper tenantMapper;
++    private final OpenApiInstanceMapper instanceMapper;
++    private final DataPermService dataPermService;
++
++    private final Map<String, Subscription> itemSubscriptions = new LinkedHashMap<>();
++    private final Map<String, Subscription> metricSubscriptions = new LinkedHashMap<>();
++
++    public SubscriptionRegistry(OpenApiTenantMapper tenantMapper,
++                                OpenApiInstanceMapper instanceMapper,
++                                DataPermService dataPermService) {
++        this.tenantMapper = tenantMapper;
++        this.instanceMapper = instanceMapper;
++        this.dataPermService = dataPermService;
++    }
++
++    /** 一次订阅的授权快照（scope 校验通过后登记，供消息到达时匹配） */
++    public record Subscription(String appKey, Long tenantId, String tenantCode,
++                               String instanceCode, long subscribedAt) {
++    }
++
++    /** 主题拆解结果（数据项：tenant + instance；指标：tenant） */
++    public record TopicParts(String tenantCode, String instanceCode) {
++    }
++
++    /**
++     * 数据项订阅（scope 校验）：主题 iot/open/{tenant_code}/{instance_code}/item。
++     * instance_code 解析到本租户实例且落在可见实例集合才允许；否则 6003。
++     */
++    public synchronized Subscription subscribeItem(OpenApiClientIdentity identity, String instanceCode) {
++        if (identity == null || identity.getTenantId() == null || instanceCode == null || instanceCode.isBlank()) {
++            throw new ScopeDeniedException("订阅参数不完整（租户/实例缺失）");
++        }
++        VisibleScope scope = requireScope(identity);
++        List<OpenApiInstanceRow> rows = instanceMapper.selectByCodesForTenant(
++                identity.getTenantId(), Set.of(instanceCode));
++        boolean allowed = rows.stream().anyMatch(r -> scope.instanceIds().contains(r.getId()));
++        if (!allowed) {
++            log.warn("[OPENAPI-SUB] scope 拒绝订阅 instance={} appKey={}", instanceCode, identity.getAppKey());
++            throw new ScopeDeniedException("实例不在调用方授权范围内（scope 外 6003）");
++        }
++        String tenantCode = tenantMapper.selectTenantCodeById(identity.getTenantId());
++        if (tenantCode == null || tenantCode.isBlank()) {
++            throw new ScopeDeniedException("租户编码缺失，无法建立订阅");
++        }
++        Subscription sub = new Subscription(identity.getAppKey(), identity.getTenantId(), tenantCode,
++                instanceCode, System.currentTimeMillis());
++        itemSubscriptions.put(key(identity.getAppKey(), instanceCode), sub);
++        log.info("[OPENAPI-SUB] 订阅建立 appKey={} topic={}", identity.getAppKey(),
++                itemTopic(tenantCode, instanceCode));
++        return sub;
++    }
++
++    /** 指标事件订阅（主题 iot/{tenant}/metric/out + Kafka iot.metric.result.{tenant}） */
++    public synchronized Subscription subscribeMetric(OpenApiClientIdentity identity) {
++        if (identity == null || identity.getTenantId() == null) {
++            throw new ScopeDeniedException("订阅参数不完整（租户缺失）");
++        }
++        requireScope(identity);
++        String tenantCode = tenantMapper.selectTenantCodeById(identity.getTenantId());
++        if (tenantCode == null || tenantCode.isBlank()) {
++            throw new ScopeDeniedException("租户编码缺失，无法建立订阅");
++        }
++        Subscription sub = new Subscription(identity.getAppKey(), identity.getTenantId(), tenantCode,
++                null, System.currentTimeMillis());
++        metricSubscriptions.put(identity.getAppKey(), sub);
++        return sub;
++    }
++
++    /** 退订数据项（幂等：重复退订返回 false，不报错） */
++    public synchronized boolean unsubscribeItem(String appKey, String instanceCode) {
++        return itemSubscriptions.remove(key(appKey, instanceCode)) != null;
++    }
++
++    /** 退订指标（幂等） */
++    public synchronized boolean unsubscribeMetric(String appKey) {
++        return metricSubscriptions.remove(appKey) != null;
++    }
++
++    /** 数据项消息是否命中有效订阅（主题 tenant+instance 双匹配） */
++    public synchronized boolean hasItemSubscription(String tenantCode, String instanceCode) {
++        return itemSubscriptions.values().stream()
++                .anyMatch(s -> s.tenantCode().equals(tenantCode) && s.instanceCode().equals(instanceCode));
++    }
++
++    /** 指标消息是否命中有效订阅（主题 tenant 匹配；订阅清晰，载荷 tenant 另由消费侧校验） */
++    public synchronized boolean hasMetricSubscription(String tenantCode) {
++        return metricSubscriptions.values().stream().anyMatch(s -> s.tenantCode().equals(tenantCode));
++    }
++
++    private VisibleScope requireScope(OpenApiClientIdentity identity) {
++        VisibleScope scope = dataPermService.resolveClientScope(
++                identity.getClientId(), identity.getTenantId(), identity.getScopeJson());
++        if (scope == null || (scope.instanceIds().isEmpty() && !scope.allTenant())) {
++            throw new ScopeDeniedException("scope 为空默认拒绝（未授权任何实例）");
++        }
++        return scope;
++    }
++
++    private static String key(String appKey, String instanceCode) {
++        return appKey + "|" + instanceCode;
++    }
++
++    /** 构造数据项订阅主题（契约逐字 iot/open/{tenant}/{instance}/item） */
++    public static String itemTopic(String tenantCode, String instanceCode) {
++        return "iot/open/" + tenantCode + "/" + instanceCode + "/item";
++    }
++
++    /** 构造 MQTT 指标主题（与 0046 生产侧 MetricProducedEvent.mqttTopic 同口径） */
++    public static String metricMqttTopic(String tenantCode) {
++        return "iot/" + tenantCode + "/metric/out";
++    }
++
++    /** 构造 Kafka 指标主题（与 0046 kafkaTopic 同口径） */
++    public static String metricKafkaTopic(String tenantCode) {
++        return "iot.metric.result." + tenantCode;
++    }
++
++    /** 解析数据项主题；非法返回 null（不抛异常） */
++    public static TopicParts parseItemTopic(String topic) {
++        if (topic == null) {
++            return null;
++        }
++        String[] parts = topic.split("/");
++        if (parts.length == 5 && "iot".equals(parts[0]) && "open".equals(parts[1]) && "item".equals(parts[4])) {
++            return new TopicParts(parts[2], parts[3]);
++        }
++        return null;
++    }
++
++    /** 解析指标主题（MQTT iot/{tenant}/metric/out 与 Kafka iot.metric.result.{tenant}）；非法返回 null */
++    public static String parseMetricTopic(String topic) {
++        if (topic == null) {
++            return null;
++        }
++        String[] mqtt = topic.split("/");
++        if (mqtt.length == 4 && "iot".equals(mqtt[0]) && "metric".equals(mqtt[2]) && "out".equals(mqtt[3])) {
++            return mqtt[1];
++        }
++        String prefix = "iot.metric.result.";
++        if (topic.startsWith(prefix) && topic.length() > prefix.length()) {
++            return topic.substring(prefix.length());
++        }
++        return null;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java
+new file mode 100644
+index 0000000..78b0b09
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++
++import java.util.Deque;
++import java.util.List;
++
++/**
++ * 订阅管理 + 事件读口（TASK-0053）：对外开通/关闭订阅（鉴权链在过滤器），中台侧读缓冲。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface SubscriptionService {
++
++    /** 开通数据项订阅（scope 校验在注册表），返回实际订阅主题 */
++    String openItem(OpenApiClientIdentity identity, String instanceCode);
++
++    /** 关闭数据项订阅（幂等），返回是否确实移除 */
++    boolean closeItem(OpenApiClientIdentity identity, String instanceCode);
++
++    /** 开通指标事件订阅，返回 MQTT + Kafka 主题 */
++    String[] openMetric(OpenApiClientIdentity identity);
++
++    /** 关闭指标事件订阅（幂等） */
++    boolean closeMetric(OpenApiClientIdentity identity);
++
++    /** 事件读口：最近指标事件（以物化表为准，事件仅触发信号） */
++    MetricProducedEventVO latestMetric();
++
++    /** 事件读口：最近数据项事件 */
++    ItemChangeEventVO latestItem();
++
++    /** 事件读口：指标事件序列（最旧→最新） */
++    Deque<MetricProducedEventVO> metricEvents();
++
++    /** 事件读口：数据项事件序列 */
++    Deque<ItemChangeEventVO> itemEvents();
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java
+new file mode 100644
+index 0000000..41ef08a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java
+@@ -0,0 +1,72 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import org.springframework.stereotype.Service;
++
++import java.util.Deque;
++
++/**
++ * 订阅管理实现（TASK-0053）：注册表 + 缓冲的薄门面，鉴权/scope 不在此重复实现
++ * （验签由过滤器、scope 由注册表，分层同 0051）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class SubscriptionServiceImpl implements SubscriptionService {
++
++    private final SubscriptionRegistry registry;
++    private final SubscriptionEventStore store;
++
++    public SubscriptionServiceImpl(SubscriptionRegistry registry, SubscriptionEventStore store) {
++        this.registry = registry;
++        this.store = store;
++    }
++
++    @Override
++    public String openItem(OpenApiClientIdentity identity, String instanceCode) {
++        SubscriptionRegistry.Subscription sub = registry.subscribeItem(identity, instanceCode);
++        return SubscriptionRegistry.itemTopic(sub.tenantCode(), sub.instanceCode());
++    }
++
++    @Override
++    public boolean closeItem(OpenApiClientIdentity identity, String instanceCode) {
++        return registry.unsubscribeItem(identity.getAppKey(), instanceCode);
++    }
++
++    @Override
++    public String[] openMetric(OpenApiClientIdentity identity) {
++        SubscriptionRegistry.Subscription sub = registry.subscribeMetric(identity);
++        return new String[]{
++                SubscriptionRegistry.metricMqttTopic(sub.tenantCode()),
++                SubscriptionRegistry.metricKafkaTopic(sub.tenantCode())
++        };
++    }
++
++    @Override
++    public boolean closeMetric(OpenApiClientIdentity identity) {
++        return registry.unsubscribeMetric(identity.getAppKey());
++    }
++
++    @Override
++    public MetricProducedEventVO latestMetric() {
++        return store.latestMetric();
++    }
++
++    @Override
++    public ItemChangeEventVO latestItem() {
++        return store.latestItem();
++    }
++
++    @Override
++    public Deque<MetricProducedEventVO> metricEvents() {
++        return store.metricRing();
++    }
++
++    @Override
++    public Deque<ItemChangeEventVO> itemEvents() {
++        return store.itemRing();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiEventCodec.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiEventCodec.java
+new file mode 100644
+index 0000000..8a4b66d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/support/OpenApiEventCodec.java
+@@ -0,0 +1,111 @@
++package net.otlab.admin.module.openapi.support;
++
++import cn.hutool.json.JSONObject;
++import cn.hutool.json.JSONUtil;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++
++import java.util.Map;
++
++/**
++ * 推送事件编解码（TASK-0053）。
++ *
++ * <p>入站（生产侧 0046 / 0029 发出的 JSON）解析为定版 VO；出站序列化用于回环校验与读口转发。
++ * 字段名 camelCase、时间毫秒——定版口径见两个 VO 的 javadoc。缺契约必填字段即拒
++ * （fail-closed：载荷不齐不得静默消费），生产侧过渡/多余字段忽略（向前兼容）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class OpenApiEventCodec {
++
++    private static final ObjectMapper MAPPER = new ObjectMapper();
++
++    private static final String[] ITEM_REQUIRED = {"fullKey", "ts", "value", "quality"};
++    private static final String[] METRIC_REQUIRED = {"metricCode", "instanceKey", "period",
++            "windowStart", "windowEnd", "value", "yoy", "mom", "quality"};
++
++    /** 解析数据项订阅消息体（4 字段 camelCase 定版）；缺字段抛 IllegalArgumentException */
++    public ItemChangeEventVO parseItem(String json) {
++        JSONObject o = parse(json);
++        require(o, ITEM_REQUIRED, "数据项订阅消息体");
++        ItemChangeEventVO vo = new ItemChangeEventVO();
++        vo.setFullKey(o.getStr("fullKey"));
++        vo.setTs(o.getLong("ts"));
++        vo.setValue(o.getDouble("value"));
++        vo.setQuality(o.getInt("quality"));
++        return vo;
++    }
++
++    /** 解析指标产出事件（9 扩展字段 camelCase 定版）；缺字段抛 IllegalArgumentException */
++    public MetricProducedEventVO parseMetric(String json) {
++        JSONObject o = parse(json);
++        require(o, METRIC_REQUIRED, "指标产出事件载荷");
++        MetricProducedEventVO vo = new MetricProducedEventVO();
++        vo.setEventType(o.getStr("eventType"));
++        vo.setTenant(o.getStr("tenant"));
++        vo.setTenantId(o.getLong("tenantId"));
++        vo.setMetricCode(o.getStr("metricCode"));
++        vo.setInstanceKey(o.getStr("instanceKey"));
++        vo.setInstanceCode(o.getStr("instanceCode"));
++        vo.setPeriod(o.getStr("period"));
++        vo.setWindowStart(o.getLong("windowStart"));
++        vo.setWindowEnd(o.getLong("windowEnd"));
++        vo.setValue(o.getDouble("value"));
++        // yoy/mom 可为 null（上期无数据/分母 0），containsKey 已由 require 保证键存在
++        vo.setYoy(o.getDouble("yoy"));
++        vo.setMom(o.getDouble("mom"));
++        vo.setQuality(o.getInt("quality"));
++        vo.setCompleteness(o.getDouble("completeness"));
++        vo.setIncomplete(o.getBool("incomplete"));
++        vo.setHash(o.getStr("hash"));
++        return vo;
++    }
++
++    private JSONObject parse(String json) {
++        if (json == null || json.isBlank()) {
++            throw new IllegalArgumentException("载荷为空，无法解析");
++        }
++        try {
++            return JSONUtil.parseObj(json);
++        } catch (RuntimeException e) {
++            throw new IllegalArgumentException("载荷非合法 JSON", e);
++        }
++    }
++
++    private void require(JSONObject o, String[] fields, String label) {
++        for (String f : fields) {
++            if (!o.containsKey(f)) {
++                throw new IllegalArgumentException(label + "缺少契约字段 " + f);
++            }
++        }
++    }
++
++    /** 有序载荷映射（契约字段序逐字，camelCase 定版） */
++    public Map<String, Object> toMap(ItemChangeEventVO vo) {
++        return vo.toMap();
++    }
++
++    public Map<String, Object> toMap(MetricProducedEventVO vo) {
++        return vo.toMap();
++    }
++
++    /** 序列化（LinkedHashMap 保序、null 值如实输出） */
++    public String toJson(ItemChangeEventVO vo) {
++        return write(vo.toMap());
++    }
++
++    public String toJson(MetricProducedEventVO vo) {
++        return write(vo.toMap());
++    }
++
++    private String write(Map<String, Object> map) {
++        try {
++            return MAPPER.writeValueAsString(map);
++        } catch (JsonProcessingException e) {
++            throw new IllegalStateException("载荷序列化失败", e);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index bc4c937..fe65865 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -46,6 +46,12 @@ ot:
+     realtime-cache-key-prefix: ${OT_OPENAPI_REALTIME_CACHE_KEY_PREFIX:openapi:realtime:}   # Redis 实时值键前缀（0068 联调契约锚）：键 = 前缀 + tenantId + ":" + fullKey，值 JSON {"v","q","ts"}；ingest 写链未交付，本期读取恒未命中 → 空集如实
+     realtime-cache-ttl-seconds: ${OT_OPENAPI_REALTIME_CACHE_TTL_SECONDS:60}   # 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填的键必须短 TTL 过期——键过期即回源，杜绝 ingest 停写后旧值长期充当「实时值」与键无限累积（BUG-0053 同危害类）
+     rotation-window-days: ${OT_OPENAPI_ROTATION_WINDOW_DAYS:7}   # 轮换并行窗天数（TASK-0052，默认 7——「双密钥轮换并行一周」）：轮换后窗内新旧 secret 均可验签（业务连续性），过窗旧密钥失效并由验签路径惰性清理 prev 列
++    subscribe:   # 推送订阅与指标事件消费侧（TASK-0053；字段名 camelCase / 窗口毫秒定版见事件 VO javadoc）
++      mqtt-enabled: ${OT_OPENAPI_SUB_MQTT_ENABLED:false}    # MQTT 订阅总开关（默认 false；true 时用 Paho 连 broker 订阅 iot/open/{t}/{i}/item + iot/{t}/metric/out）
++      mqtt-broker: ${OT_OPENAPI_SUB_MQTT_BROKER:tcp://192.168.31.145:1883}   # broker 地址 env 可切（1883 握手退化时切本地夹具，恢复后免改码）
++      mqtt-client-prefix: ${OT_OPENAPI_SUB_MQTT_CLIENT_PREFIX:ot-admin-sub}   # clientId 前缀（随机后缀多实例隔离）
++      kafka-enabled: ${OT_OPENAPI_SUB_KAFKA_ENABLED:false}  # Kafka 订阅开关（默认 false——本环境无 broker）；订阅 iot.metric.result.{tenant}
++      ring-capacity: ${OT_OPENAPI_SUB_RING_CAPACITY:256}    # 每类事件环形缓冲容量（最近 N 条；<=0 归一 1）
+   publish:
+     storage-path: ${OT_PUBLISH_STORAGE_PATH:./data/snapshots}   # 配置版本快照本地存储根目录（TASK-0024 一期本地目录裁决；文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，snapshot_uri 存相对路径）；MinIO 对象存储二期登记
+     ack-scan-interval-seconds: ${OT_PUBLISH_ACK_SCAN_INTERVAL_SECONDS:60}   # ACK 超时扫描周期（秒，TASK-0025 fixedDelay——上次执行完毕后计时；扫描逾窗未回执行置 2，幂等）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+index 9dfd5a0..fded85d 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+@@ -67,6 +67,8 @@ class OpenApiYmlStructureTest {
+         assertFalse(openapi.containsKey("cache-enabled"), "ot.openapi 不得包含 dataperm 的 cache-enabled（I-1）");
+         assertFalse(openapi.containsKey("cache-ttl-seconds"), "ot.openapi 不得包含 dataperm 的 cache-ttl-seconds（I-1）");
+         assertFalse(openapi.containsKey("subtree-max"));
+-        assertEquals(5, openapi.size(), "openapi 块恰五键（防块结构漂移）");
++        assertEquals(6, openapi.size(), "openapi 块恰六键：原五键 + TASK-0053 新增 subscribe 子块"
++                + "（订阅消费侧配置，仍在 ot.openapi.* 命名空间内；防块结构漂移）");
++        assertTrue(openapi.get("subscribe") instanceof Map, "TASK-0053 ot.openapi.subscribe 子块存在");
+     }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/SubscriptionPropertiesTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/SubscriptionPropertiesTest.java
+new file mode 100644
+index 0000000..b44ce15
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/SubscriptionPropertiesTest.java
+@@ -0,0 +1,60 @@
++package net.otlab.admin.module.openapi.config;
++
++import net.otlab.admin.module.openapi.subscribe.SubscriptionProperties;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.yaml.snakeyaml.Yaml;
++
++import java.io.InputStream;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 订阅消费侧配置契约（TASK-0053）：application.yml ot.openapi.subscribe.* 键族 + 默认值
++ * （MQTT 订阅默认关/broker env 可切、Kafka 默认关、环形缓冲容量、读口窗口）。
++ *
++ * <p>字段名定版 camelCase/毫秒在 VO/codec 实现，冻结契约文件不改（CONV-03 升版走裁决）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class SubscriptionPropertiesTest {
++
++    private static Map<String, Object> loadOtOpenapi() throws Exception {
++        try (InputStream in = SubscriptionPropertiesTest.class.getClassLoader()
++                .getResourceAsStream("application.yml")) {
++            assertNotNull(in);
++            Map<String, Object> root = new Yaml().load(in);
++            return (Map<String, Object>) ((Map<String, Object>) root.get("ot")).get("openapi");
++        }
++    }
++
++    @Test
++    @DisplayName("默认值：MQTT/Kafka 订阅均默认关（Kafka 必须默认关），broker 可 env 切换，容量>0")
++    void defaultsEnvSwitchable() {
++        SubscriptionProperties p = new SubscriptionProperties();
++        assertFalse(p.isMqttEnabled());
++        assertFalse(p.isKafkaEnabled());
++        assertNotNull(p.getMqttBroker());
++        assertTrue(p.getRingCapacity() > 0);
++    }
++
++    @Test
++    @DisplayName("application.yml 顶层 ot.openapi.subscribe 块存在且键名逐字（原 5 键不漂移）")
++    @SuppressWarnings("unchecked")
++    void ymlSubscribeBlock() throws Exception {
++        Map<String, Object> openapi = loadOtOpenapi();
++        Map<String, Object> sub = (Map<String, Object>) openapi.get("subscribe");
++        assertNotNull(sub, "ot.openapi.subscribe 块必须存在");
++        for (String key : new String[]{"mqtt-enabled", "mqtt-broker", "mqtt-client-prefix",
++                "kafka-enabled", "ring-capacity"}) {
++            assertTrue(sub.containsKey(key), "ot.openapi.subscribe." + key + " 必须存在");
++        }
++        // 原 5 键不漂移（0051/0054 既有键族保持）
++        assertEquals(5L, openapi.keySet().stream().filter(k -> !"subscribe".equals(k)).count());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/EventRingBufferContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/EventRingBufferContractTest.java
+new file mode 100644
+index 0000000..897e6ef
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/EventRingBufferContractTest.java
+@@ -0,0 +1,108 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.Deque;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 事件落地/转发契约（TASK-0053，brief 决策 3）：内存环形缓冲 + 按「指标全键+窗口」幂等，
++ * 非 hash（hash 含值随修正重算变化）；以 st_metric_value 物化表为准，事件仅触发信号，
++ * 不重复写业务表（ADR-0010）；无订阅者不报错。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class EventRingBufferContractTest {
++
++    private OpenApiEventCodec codec;
++    private SubscriptionEventStore store;
++
++    @BeforeEach
++    void setUp() {
++        codec = new OpenApiEventCodec();
++        store = new SubscriptionEventStore(8);
++    }
++
++    private MetricProducedEventVO metric(String value, String hash) {
++        String json = "{\"eventType\":\"metric.out\",\"tenant\":\"tA\",\"tenantId\":1,"
++                + "\"metricCode\":\"M_LIVE\",\"instanceKey\":\"F01.ELEC_METER\","
++                + "\"period\":\"DAY\",\"windowStart\":1795305600000,\"windowEnd\":1795392000000,"
++                + "\"value\":" + value + ",\"yoy\":0.25,\"mom\":-0.2,\"quality\":0}";
++        MetricProducedEventVO e = codec.parseMetric(json);
++        if (hash != null) {
++            e.setHash(hash);
++        }
++        return e;
++    }
++
++    @Test
++    @DisplayName("全键+窗口为幂等键：修正重发同窗口（值/hash 变化）不重复入环，以最新为准")
++    void idempotentByFullKeyAndWindowNotHash() {
++        assertTrue(store.acceptMetric(metric("100.0", "hash-v1")));
++        assertTrue(store.acceptMetric(metric("150.0", "hash-v2"))); // 同键同窗，值与 hash 变了仍算重发
++        assertEquals(1, store.metricCount());
++        assertEquals(150.0, store.latestMetric().getValue(), 1e-9);
++        assertEquals("hash-v2", store.latestMetric().getHash());
++    }
++
++    @Test
++    @DisplayName("不同窗口 / 不同指标 / 不同实例各自独立入环")
++    void differentWindowsAndKeysAreDistinct() {
++        assertTrue(store.acceptMetric(metric("100.0", "h")));
++        MetricProducedEventVO another = metric("100.0", "h");
++        another.setWindowEnd(1795392000001L);
++        assertTrue(store.acceptMetric(another));
++        another.setWindowEnd(1795392000000L);
++        another.setMetricCode("M_OTHER");
++        assertTrue(store.acceptMetric(another));
++        another.setMetricCode("M_LIVE");
++        another.setInstanceKey("F02.ELEC_METER");
++        assertTrue(store.acceptMetric(another));
++        assertEquals(4, store.metricCount());
++    }
++
++    @Test
++    @DisplayName("数据项事件按 fullKey+ts+quality 幂等，最新覆盖；与指标缓冲分流")
++    void itemEventsIdempotentAndSeparate() {
++        ItemChangeEventVO v1 = codec.parseItem("{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":10,\"quality\":0}");
++        ItemChangeEventVO v2 = codec.parseItem("{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":11,\"quality\":0}");
++        assertTrue(store.acceptItem(v1));
++        assertTrue(store.acceptItem(v2));
++        assertEquals(1, store.itemCount());
++        assertEquals(11.0, store.latestItem().getValue(), 1e-9);
++        assertNull(store.latestMetric(), "数据项事件不进指标缓冲");
++    }
++
++    @Test
++    @DisplayName("环形缓冲有界：超过容量只保留最近 N 条")
++    void ringBufferIsBounded() {
++        SubscriptionEventStore small = new SubscriptionEventStore(3);
++        for (int i = 0; i < 5; i++) {
++            MetricProducedEventVO e = metric("1", "h");
++            e.setWindowEnd(1795392000000L + i);
++            assertTrue(small.acceptMetric(e));
++        }
++        assertEquals(3, small.metricCount());
++        Deque<MetricProducedEventVO> ring = small.metricRing();
++        assertEquals(1795392000002L, ring.getFirst().getWindowEnd());
++        assertEquals(1795392000004L, ring.getLast().getWindowEnd());
++    }
++
++    @Test
++    @DisplayName("无订阅者场景：accept 不抛异常（fire-and-forget 触发语义由消费侧保证）")
++    void noSubscriberNoError() {
++        SubscriptionEventStore noSubscriber = new SubscriptionEventStore(4);
++        assertEquals(true, noSubscriber.acceptMetric(metric("1", "h")));
++        assertNotNull(noSubscriber.latestMetric());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/ItemChangeEventContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/ItemChangeEventContractTest.java
+new file mode 100644
+index 0000000..ba53803
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/ItemChangeEventContractTest.java
+@@ -0,0 +1,58 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 数据项变更订阅载荷契约（TASK-0053，冻结契约 v1.1.0 §3.5「订阅主题」行）。
++ *
++ * <p>消息体即统一消息模型 4 字段 fullKey/ts/value/quality，逐字定版 camelCase + 毫秒；
++ * 字段名定版由本任务闭合（§与上游差异第 7/8 条），不改冻结契约文件。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class ItemChangeEventContractTest {
++
++    private final OpenApiEventCodec codec = new OpenApiEventCodec();
++
++    @Test
++    @DisplayName("数据项订阅消息体恰 4 字段 camelCase，ts 毫秒，序列化键序逐字")
++    void payloadIsExactlyFourContractFields() {
++        String json = "{\"fullKey\":\"F01.WS13.R2OKQ.ELEC_METER\",\"ts\":1795211995000,"
++                + "\"value\":123.4,\"quality\":0}";
++        ItemChangeEventVO vo = codec.parseItem(json);
++
++        assertEquals("F01.WS13.R2OKQ.ELEC_METER", vo.getFullKey());
++        assertEquals(1795211995000L, vo.getTs());
++        assertEquals(123.4, vo.getValue(), 1e-9);
++        assertEquals(0, vo.getQuality());
++
++        Map<String, Object> map = codec.toMap(vo);
++        assertEquals(List.of("fullKey", "ts", "value", "quality"), new ArrayList<>(map.keySet()));
++        String out = codec.toJson(vo);
++        assertTrue(out.contains("\"fullKey\""));
++        assertTrue(out.contains("\"ts\":1795211995000"));
++        assertTrue(out.contains("\"quality\":0"));
++    }
++
++    @Test
++    @DisplayName("生产侧多余字段被忽略，但契约 4 字段缺一即拒")
++    void extraFieldsIgnoredMissingFieldRejected() {
++        String withExtra = "{\"tenant\":\"tA\",\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":2,\"quality\":0,\"sentAt\":2}";
++        assertEquals("F01.M01", codec.parseItem(withExtra).getFullKey());
++
++        assertThrows(IllegalArgumentException.class,
++                () -> codec.parseItem("{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":2}"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/MetricProducedEventContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/MetricProducedEventContractTest.java
+new file mode 100644
+index 0000000..8030d5d
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/MetricProducedEventContractTest.java
+@@ -0,0 +1,95 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 指标产出事件载荷契约（TASK-0053，冻结契约 v1.1.0 §3.5「推送」行）。
++ *
++ * <p>9 扩展字段 camelCase 定版：metricCode/instanceKey/period/windowStart/windowEnd/value/
++ * yoy/mom/quality；windowStart/windowEnd 毫秒时间戳（§与上游差异第 8 条闭合）；
++ * quality 随载荷（CONV-02）；无 isRecalc/calcTime（ADR-0010）。字段名定版通过 VO +
++ * javadoc 实现，不改冻结契约文件。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricProducedEventContractTest {
++
++    private final OpenApiEventCodec codec = new OpenApiEventCodec();
++
++    private static String payload() {
++        return "{\"eventType\":\"metric.out\",\"tenant\":\"tA\",\"tenantId\":1,"
++                + "\"metricCode\":\"M_LIVE\",\"instanceKey\":\"F01.WS13.R2OKQ.ELEC_METER\","
++                + "\"instanceCode\":\"F01.WS13.R2OKQ.ELEC_METER\","
++                + "\"period\":\"DAY\",\"windowStart\":1795305600000,\"windowEnd\":1795392000000,"
++                + "\"value\":100.0,\"yoy\":0.25,\"mom\":-0.2,\"quality\":0,"
++                + "\"completeness\":1.0,\"incomplete\":false,"
++                + "\"hash\":\"abc123\"}";
++    }
++
++    @Test
++    @DisplayName("9 扩展字段逐字段 camelCase 解析；窗口为毫秒；hash 仅作传输校验非幂等键")
++    void nineExtensionFieldsCamelCaseAndMillis() {
++        MetricProducedEventVO e = codec.parseMetric(payload());
++        assertEquals("M_LIVE", e.getMetricCode());
++        assertEquals("F01.WS13.R2OKQ.ELEC_METER", e.getInstanceKey());
++        assertEquals("DAY", e.getPeriod());
++        assertEquals(1795305600000L, e.getWindowStart());
++        assertEquals(1795392000000L, e.getWindowEnd());
++        assertEquals(100.0, e.getValue(), 1e-9);
++        assertEquals(0.25, e.getYoy(), 1e-9);
++        assertEquals(-0.2, e.getMom(), 1e-9);
++        assertEquals(0, e.getQuality());
++        assertEquals("tA", e.getTenant());
++        assertEquals("abc123", e.getHash());
++    }
++
++    @Test
++    @DisplayName("camelCase 载荷序列化键序逐字锁定（9 扩展字段全在，snake_case 不出现）")
++    void serializerLocksCamelCaseKeys() {
++        MetricProducedEventVO e = codec.parseMetric(payload());
++        Map<String, Object> map = codec.toMap(e);
++        for (String key : new String[]{"metricCode", "instanceKey", "period", "windowStart", "windowEnd",
++                "value", "yoy", "mom", "quality"}) {
++            assertTrue(map.containsKey(key), "扩展字段 " + key + " 必须在载荷中");
++        }
++        String json = codec.toJson(e);
++        assertTrue(json.contains("\"windowStart\""));
++        assertTrue(json.contains("\"windowEnd\""));
++        assertTrue(!json.contains("window_start") && !json.contains("metric_code"),
++                "定版 camelCase，不得出现 snake_case");
++        assertTrue(new ArrayList<>(map.keySet()).contains("quality"));
++    }
++
++    @Test
++    @DisplayName("yoy/mom 为 null 时如实保留 null，不返回 0 冒充（compareNote 语义由消费方 null 承载）")
++    void nullCompanionValuesPreserved() {
++        String json = payload().replace("\"yoy\":0.25", "\"yoy\":null")
++                .replace("\"mom\":-0.2", "\"mom\":null");
++        MetricProducedEventVO e = codec.parseMetric(json);
++        assertNull(e.getYoy());
++        assertNull(e.getMom());
++        assertNull(codec.toMap(e).get("yoy"));
++    }
++
++    @Test
++    @DisplayName("缺任一 9 扩展字段即拒（契约载荷不齐不得静默消费）")
++    void missingExtensionFieldRejected() {
++        assertThrows(IllegalArgumentException.class,
++                () -> codec.parseMetric(payload().replace("\"quality\":0,", "")));
++        assertThrows(IllegalArgumentException.class,
++                () -> codec.parseMetric(payload().replace("\"instanceKey\":\"F01.WS13.R2OKQ.ELEC_METER\",", "")));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionIsolationContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionIsolationContractTest.java
+new file mode 100644
+index 0000000..455b793
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionIsolationContractTest.java
+@@ -0,0 +1,174 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.OpenApiCodes;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.admin.module.openapi.exception.ScopeDeniedException;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * 订阅 scope 校验 + 租户隔离契约（TASK-0053，brief 决策 1/4）。
++ *
++ * <p>主题含 tenant + 载荷含 tenant 双重校验：租户 B 收不到租户 A 事件，载荷 tenant 与主题
++ * tenant 不一致丢弃 + WARN；scope 三态与 0051 对外 scope 一致（空=默认拒绝）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class SubscriptionIsolationContractTest {
++
++    private OpenApiTenantMapper tenantMapper;
++    private OpenApiInstanceMapper instanceMapper;
++    private DataPermService dataPermService;
++    private SubscriptionRegistry registry;
++    private SubscriptionEventStore store;
++    private SubscriptionConsumer consumer;
++    private OpenApiEventCodec codec;
++
++    private OpenApiClientIdentity identity(long clientId, long tenantId, String appKey, String scopeJson) {
++        OpenApiClientIdentity id = new OpenApiClientIdentity();
++        id.setClientId(clientId);
++        id.setTenantId(tenantId);
++        id.setAppKey(appKey);
++        id.setScopeJson(scopeJson);
++        return id;
++    }
++
++    @BeforeEach
++    void setUp() {
++        tenantMapper = mock(OpenApiTenantMapper.class);
++        instanceMapper = mock(OpenApiInstanceMapper.class);
++        dataPermService = mock(DataPermService.class);
++        when(tenantMapper.selectTenantCodeById(1L)).thenReturn("tA");
++        when(tenantMapper.selectTenantCodeById(2L)).thenReturn("tB");
++        when(dataPermService.resolveClientScope(anyLong(), anyLong(), any()))
++                .thenReturn(new VisibleScope(false, Set.of(), Set.of(10L), false));
++        OpenApiInstanceRow row = new OpenApiInstanceRow();
++        row.setId(10L);
++        row.setInstanceCode("F01");
++        row.setTenantId(1L);
++        when(instanceMapper.selectByCodesForTenant(anyLong(), any())).thenAnswer(inv -> {
++            var codes = (java.util.Collection<String>) inv.getArgument(1);
++            return codes.contains("F01") ? List.of(row) : List.of();
++        });
++        registry = new SubscriptionRegistry(tenantMapper, instanceMapper, dataPermService);
++        store = new SubscriptionEventStore(16);
++        codec = new OpenApiEventCodec();
++        consumer = new SubscriptionConsumer(registry, store, codec);
++    }
++
++    @Test
++    @DisplayName("scope 内实例订阅成功；scope 外实例订阅被拒（与 0051 scope 三态一致）")
++    void subscribeScopeChecked() {
++        SubscriptionRegistry.Subscription s = registry.subscribeItem(identity(1, 1, "akA", "{\"instanceIds\":[10],\"subtree\":false}"), "F01");
++        assertEquals("tA", s.tenantCode());
++        assertEquals("F01", s.instanceCode());
++        assertEquals(OpenApiCodes.SCOPE_DENIED, assertThrows(ScopeDeniedException.class,
++                () -> registry.subscribeItem(identity(1, 1, "akA", "{\"instanceIds\":[10],\"subtree\":false}"), "F02")).getCode());
++    }
++
++    @Test
++    @DisplayName("scope 空（默认拒绝）订阅任何实例均被拒")
++    void emptyScopeDenied() {
++        when(dataPermService.resolveClientScope(anyLong(), anyLong(), any())).thenReturn(VisibleScope.denied());
++        assertThrows(ScopeDeniedException.class,
++                () -> registry.subscribeItem(identity(1, 1, "akA", null), "F01"));
++    }
++
++    @Test
++    @DisplayName("数据项：主题租户隔离——订阅 tA 后 tB 主题消息不被投递（租户 B 收不到 A 的反面成立）")
++    void itemTopicTenantIsolation() {
++        registry.subscribeItem(identity(1, 1, "akA", "{}"), "F01");
++        String payload = "{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":10,\"quality\":0}";
++        assertEquals(1, consumer.onItemMessage("iot/open/tA/F01/item", payload));
++        assertEquals(0, consumer.onItemMessage("iot/open/tB/F01/item", payload));
++        assertEquals(1, store.itemCount());
++        assertEquals("F01.M01", store.latestItem().getFullKey());
++    }
++
++    @Test
++    @DisplayName("数据项：无订阅者不报错（同租户其它实例主题静默忽略）")
++    void itemNoSubscriberNoError() {
++        registry.subscribeItem(identity(1, 1, "akA", "{}"), "F01");
++        assertEquals(0, consumer.onItemMessage("iot/open/tA/F02/item",
++                "{\"fullKey\":\"F02.M01\",\"ts\":1,\"value\":10,\"quality\":0}"));
++        assertEquals(0, store.itemCount());
++    }
++
++    @Test
++    @DisplayName("指标：MQTT 主题含 tenant + 载荷 tenant 双校验——载荷 tenant 不一致丢弃")
++    void metricTenantDoubleCheck() {
++        registry.subscribeMetric(identity(1, 1, "akA", "{}"));
++        String payloadForB = metricPayload("tB");
++        assertEquals(0, consumer.onMetricMessage("iot/tA/metric/out", payloadForB));
++        assertEquals(0, store.metricCount());
++    }
++
++    @Test
++    @DisplayName("指标：主题 tA + 订阅 tB（无 tA 订阅）不投递；订阅 tA 同 tenant 投递成功")
++    void metricTopicTenantIsolation() {
++        registry.subscribeMetric(identity(2, 2, "akB", "{}")); // tB 订阅
++        String payloadA = metricPayload("tA");
++        assertEquals(0, consumer.onMetricMessage("iot/tA/metric/out", payloadA));
++        assertEquals(0, store.metricCount());
++
++        registry.subscribeMetric(identity(1, 1, "akA", "{}"));
++        assertEquals(1, consumer.onMetricMessage("iot/tA/metric/out", payloadA));
++        assertEquals(1, store.metricCount());
++    }
++
++    @Test
++    @DisplayName("指标：Kafka 主题 iot.metric.result.{tenant} 解析同口径，投递成功")
++    void kafkaTopicParsed() {
++        registry.subscribeMetric(identity(1, 1, "akA", "{}"));
++        assertEquals(1, consumer.onMetricMessage("iot.metric.result.tA", metricPayload("tA")));
++        assertEquals(1, store.metricCount());
++    }
++
++    @Test
++    @DisplayName("退订幂等：重复退订不报错，退订后不再投递")
++    void unsubscribeIdempotent() {
++        registry.subscribeMetric(identity(1, 1, "akA", "{}"));
++        assertTrue(registry.unsubscribeMetric("akA"));
++        assertFalse(registry.unsubscribeMetric("akA"));
++        assertEquals(0, consumer.onMetricMessage("iot/tA/metric/out", metricPayload("tA")));
++    }
++
++    @Test
++    @DisplayName("主题解析：非法主题返回 null 不抛异常")
++    void malformedTopicTolerated() {
++        assertNull(SubscriptionRegistry.parseItemTopic("iot/open/tA/F01"));
++        assertNull(SubscriptionRegistry.parseMetricTopic("garbage/topic"));
++        assertEquals("tA", SubscriptionRegistry.parseMetricTopic("iot/tA/metric/out"));
++        assertEquals("tA", SubscriptionRegistry.parseMetricTopic("iot.metric.result.tA"));
++        assertTrue(SubscriptionRegistry.itemTopic("tA", "F01").equals("iot/open/tA/F01/item"));
++    }
++
++    private String metricPayload(String tenant) {
++        return "{\"eventType\":\"metric.out\",\"tenant\":\"" + tenant + "\",\"tenantId\":1,"
++                + "\"metricCode\":\"M_LIVE\",\"instanceKey\":\"F01.ELEC_METER\","
++                + "\"period\":\"DAY\",\"windowStart\":1795305600000,\"windowEnd\":1795392000000,"
++                + "\"value\":100.0,\"yoy\":0.25,\"mom\":-0.2,\"quality\":0}";
++    }
++}

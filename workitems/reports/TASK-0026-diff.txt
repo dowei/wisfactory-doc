@@ -1,0 +1,2490 @@
+diff --git a/backend/ot-admin/pom.xml b/backend/ot-admin/pom.xml
+index 229cfe0..bdea04d 100644
+--- a/backend/ot-admin/pom.xml
++++ b/backend/ot-admin/pom.xml
+@@ -62,6 +62,14 @@
+             <artifactId>minio</artifactId>
+         </dependency>
+ 
++        <!-- MQTT 客户端（TASK-0026 config.changed 下行通知，ot.publish.notify.enabled=true 时启用；
++             版本显式钉死——1.2.5 为 org.eclipse.paho.client.mqttv3 最新稳定版） -->
++        <dependency>
++            <groupId>org.eclipse.paho</groupId>
++            <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
++            <version>1.2.5</version>
++        </dependency>
++
+         <!-- 阿里云短信，ot.sms.type=aliyun 时启用 -->
+         <dependency>
+             <groupId>com.aliyun</groupId>
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+index 2a6daad..477344f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+@@ -15,6 +15,10 @@ import org.springframework.stereotype.Component;
+  * {@code ot.publish.target-*}）：下发回执超时扫描周期/超时窗、接入/计算下发目标标识
+  * （target_id 语义——网关行取 gateway_code，接入/计算行取本配置标识）。
+  *
++ * <p>TASK-0026 新增键（brief 允许的新增范围：{@code ot.publish.notify.*} 与
++ * {@code ot.publish.changes-*}）：config.changed MQTT 通知（enabled 默认 false——未启用
++ * 保持 NoOp 语义路径）与增量摘要最大跨度。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -59,4 +63,60 @@ public class PublishProperties {
+      * 版本，回执时按 (versionId, targetType=3, targetId=本值) 定位行）。
+      */
+     private String targetCalcId = "calc";
++
++    /**
++     * 增量摘要最大跨度（默认 10；{@code ot.publish.changes-max-span}）。
++     * GET /internal/v1/config/changes：latestVersion - sinceVersion <b>严格大于</b>本值时
++     * 返回 needFullSync=true（只给 latest 摘要，不给逐版 diff——下游全量重拉）；中间版本
++     * 快照文件缺失同样 needFullSync=true。
++     */
++    private Integer changesMaxSpan = 10;
++
++    /**
++     * config.changed 通知配置（TASK-0026；{@code ot.publish.notify.*}）。
++     *
++     * <p>装配语义：{@code enabled=true} 时 {@link net.otlab.admin.module.iot.publish.notify.MqttNotifySender}
++     * + {@link net.otlab.admin.module.iot.publish.notify.PahoMqttPublisher} 注册（条件装配），
++     * false/缺省时走 {@link net.otlab.admin.module.iot.publish.notify.NoOpNotifySender}
++     * （brief D1：默认 false——未启用时保持 NoOp 语义路径，未配置 broker 不产生连接尝试）。
++     */
++    private Notify notify = new Notify();
++
++    /**
++     * MQTT 通知子配置（broker 连接参数；键族 {@code ot.publish.notify.*}）。
++     */
++    @Data
++    public static class Notify {
++
++        /**
++         * 通知开关（{@code ot.publish.notify.enabled}，默认 false）——条件装配键，
++         * true 时真实现注册，false/缺省走 NoOp。
++         */
++        private Boolean enabled = false;
++
++        /**
++         * EMQX broker 地址（如 tcp://127.0.0.1:1883；{@code ot.publish.notify.broker-url}）。
++         * enabled=true 但本值为空时：每次发送抛 INVALID_CLIENT 由发送方 WARN fail-soft
++         * （发布不阻断，下游拉取对账兜底）。
++         */
++        private String brokerUrl;
++
++        /** broker 用户名（{@code ot.publish.notify.username}，空=匿名） */
++        private String username;
++
++        /** broker 口令（{@code ot.publish.notify.password}，空=匿名；凭据经环境变量注入，不入库不入快照——ADR-0006） */
++        private String password;
++
++        /**
++         * MQTT clientId（{@code ot.publish.notify.client-id}）。
++         * 空白=进程内随机生成（ot-admin-notify-&lt;random&gt;——多实例同 id 会互踢，随机后缀规避）。
++         */
++        private String clientId;
++
++        /** MQTT keep-alive（秒，默认 60；{@code ot.publish.notify.keep-alive-seconds}） */
++        private Integer keepAliveSeconds = 60;
++
++        /** MQTT 连接超时（秒，默认 30；{@code ot.publish.notify.timeout-seconds}） */
++        private Integer timeoutSeconds = 30;
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java
+index 2082681..05cbd97 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java
+@@ -6,17 +6,24 @@ import jakarta.servlet.http.HttpServletRequest;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
+ import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.dto.ChangesListVO;
++import net.otlab.admin.module.iot.publish.dto.InternalSnapshotVO;
+ import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.admin.module.iot.publish.service.IotPublishService;
+ import net.otlab.core.annotation.Anonymous;
+ import net.otlab.core.result.Result;
+ import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PostMapping;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+ 
+ /**
+- * 配置下发内部回执控制器（TASK-0025，POST /internal/v1/config/ack，详细设计 §3.3 p25）。
++ * 配置下发内部控制器（TASK-0025 建 POST /internal/v1/config/ack；TASK-0026 扩展
++ * GET /internal/v1/config/snapshot 快照拉取与 GET /internal/v1/config/changes 增量摘要
++ * ——详细设计 §3.3 p25）。
+  *
+  * <p><b>无 Sa-Token</b>：内部系统间接口（/internal/v1/**，详细设计 §3 p20 物理隔离）——
+  * {@code @Anonymous} 跳过管理面登录校验，认证由 InternalAuthChecker 承担：拦截器层
+@@ -25,17 +32,17 @@ import org.springframework.web.bind.annotation.RestController;
+  * 0017/0019 同范式）；静态令牌 X-Internal-Token + IP 白名单，失败 401/403。
+  *
+  * <p><b>无管理面数据权限</b>（brief D7：内部令牌已收口）：回执定位 (version_id,
+- * target_type, target_id) 为内部服务（接入/计算引擎）已知坐标；ackStatus=1 生效（任意
+- * 旧态可置 1）/ 2 失败（errorMsg 必填，仅可从 0/2 覆盖——已生效 1 为终态不被失败回执
+- * 倒退）/ 0 拒绝 400。返回 data=true=已应用；data=false=忽略（已生效行收到过期失败
+- * 回执——终态不倒退，非错误）。
++ * target_type, target_id) 为内部服务（接入/计算引擎）已知坐标；快照/增量按
++ * (scopeType, scopeId[, version]) 定位——跨租户歧义（计算 scope scopeId=0 跨租户同名）
++ * 由可选 tenant 参数（租户编码）消解，缺省歧义即 400 fail-closed（服务层裁决）。返回
++ * data=true=已应用；data=false=忽略（已生效行收到过期失败回执——终态不倒退，非错误）。
+  *
+  * <p>不挂 @OperateLog（内部运行链路，照 0017 心跳口径）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+  */
+-@Tag(name = "配置下发内部回执（服务间）")
++@Tag(name = "配置下发内部接口（服务间）")
+ @RestController
+ @RequestMapping("/internal/v1/config")
+ public class IotPublishInternalController {
+@@ -43,6 +50,9 @@ public class IotPublishInternalController {
+     @Autowired
+     private IotPublishLogService publishLogService;
+ 
++    @Autowired
++    private IotPublishService publishService;
++
+     @Autowired
+     private InternalAuthChecker internalAuthChecker;
+ 
+@@ -61,4 +71,41 @@ public class IotPublishInternalController {
+         internalAuthChecker.check(request);
+         return Result.success(publishLogService.ack(form));
+     }
++
++    /**
++     * 快照拉取（TASK-0026，§3.3 p25）：query scopeType/scopeId 必填、version 可选
++     * （缺省=最新已发布版）、tenant 可选（租户编码——跨租户歧义消解）。响应含
++     * version/snapshotHash/snapshotUri/schemaVersion 与快照体嵌套对象；取回哈希核对 +
++     * 出站凭据终检（防存储篡改外泄凭据）。
++     */
++    @Anonymous
++    @Operation(summary = "快照拉取（内部接口：静态令牌+IP 白名单；scopeType/scopeId 必填、"
++            + "version 缺省=最新版、tenant 可选消歧；响应含哈希与快照体，下游必须比对通知 hash）")
++    @GetMapping("/snapshot")
++    public Result<InternalSnapshotVO> snapshot(HttpServletRequest request,
++                                               @RequestParam Integer scopeType,
++                                               @RequestParam Long scopeId,
++                                               @RequestParam(required = false) Long version,
++                                               @RequestParam(required = false) String tenant) {
++        internalAuthChecker.check(request);
++        return Result.success(publishService.retrieveSnapshotInternal(scopeType, scopeId, version, tenant));
++    }
++
++    /**
++     * 增量摘要（TASK-0026，§3.3 p25）：query scopeType/scopeId/sinceVersion 必填、
++     * tenant 可选。逐版 diff 五段摘要；跨度超限（changes-max-span）/中间快照缺失 →
++     * needFullSync=true（只给 latest 摘要——下游全量重拉）；sinceVersion ≥ 最新 → 空数组。
++     */
++    @Anonymous
++    @Operation(summary = "增量查询（内部接口：静态令牌+IP 白名单；sinceVersion 必填；"
++            + "needFullSync=true 时下游全量重拉——中间快照清理/缺失兜底）")
++    @GetMapping("/changes")
++    public Result<ChangesListVO> changes(HttpServletRequest request,
++                                         @RequestParam Integer scopeType,
++                                         @RequestParam Long scopeId,
++                                         @RequestParam Long sinceVersion,
++                                         @RequestParam(required = false) String tenant) {
++        internalAuthChecker.check(request);
++        return Result.success(publishService.changesSince(scopeType, scopeId, sinceVersion, tenant));
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeEntryVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeEntryVO.java
+new file mode 100644
+index 0000000..a47b948
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeEntryVO.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.time.LocalDateTime;
++
++/**
++ * 单版本变更摘要条目（TASK-0026，ChangesListVO.changes 元素）——version 相邻两版快照体
++ * 的 diff（前版 → 本版），五段（点位/通道/数据项/公式/指标）计变更对象与类型。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "单版本变更摘要条目（TASK-0026）")
++public class ChangeEntryVO {
++
++    @Schema(description = "版本号")
++    private Long version;
++
++    @Schema(description = "该版本快照哈希（SHA-256；下游增量应用后可与拉取哈希互证）")
++    private String hash;
++
++    @Schema(description = "发布时间")
++    private LocalDateTime publishTime;
++
++    @Schema(description = "变更摘要（相对前一版本的 added/removed/changed）")
++    private ChangeSummaryVO summary;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeItemVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeItemVO.java
+new file mode 100644
+index 0000000..48b852a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeItemVO.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 变更对象定位（TASK-0026，ChangeSummaryVO 三段元素）——五段对齐键：
++ * <ul>
++ * <li>point（点位）→ pointCode；</li>
++ * <li>channel（通道）→ channelCode；</li>
++ * <li>dataItem（数据项）→ fullKey（租户内唯一；dataCode 跨实例可重名）；</li>
++ * <li>formula（公式引用边）→ id（边行无业务 code，以行 id 对齐）；</li>
++ * <li>metric（指标）→ metricCode。</li>
++ * </ul>
++ * code 缺失时回退行 id（String.valueOf）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "变更对象定位（TASK-0026）")
++public class ChangeItemVO {
++
++    @Schema(description = "对象类型 point/channel/dataItem/formula/metric")
++    private String type;
++
++    @Schema(description = "对齐键（code 或行 id 字符串）")
++    private String key;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeSummaryVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeSummaryVO.java
+new file mode 100644
+index 0000000..c211927
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangeSummaryVO.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.util.List;
++
++/**
++ * 变更摘要三段（TASK-0026，brief §3.3 载荷形态 {@code summary:{added:[], removed:[],
++ * changed:[]}}）——每段元素 {@link ChangeItemVO}（type+key），五段（点位/通道/数据项/
++ * 公式/指标）按对象 code/id 对齐后计入。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "变更摘要三段（TASK-0026）")
++public class ChangeSummaryVO {
++
++    @Schema(description = "新增对象（前一版本不存在的 code/id）")
++    private List<ChangeItemVO> added;
++
++    @Schema(description = "移除对象（本版本不再存在的 code/id）")
++    private List<ChangeItemVO> removed;
++
++    @Schema(description = "变更对象（两版均存在但内容不一致）")
++    private List<ChangeItemVO> changed;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangesListVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangesListVO.java
+new file mode 100644
+index 0000000..ed07289
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ChangesListVO.java
+@@ -0,0 +1,40 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.util.List;
++
++/**
++ * 增量查询响应（TASK-0026，GET /internal/v1/config/changes——详细设计 §3.3 p25：
++ * 「返回之后变更摘要（变更对象与类型），供下游判断增量应用还是全量重拉」）。
++ *
++ * <p>needFullSync=true 的触发：①latestVersion - sinceVersion 严格大于
++ * {@code ot.publish.changes-max-span}（默认 10）；②sinceVersion 版本行不存在（下游
++ * 基线不可信）；③逐版 diff 所需快照文件缺失。此时 {@code changes} 只含一条 latest
++ * 摘要（基线→latest 累计 diff，基线不可得时留空三段），不给逐版 diff——下游应全量
++ * 重拉（snapshot 端点不带 version 即最新版）。
++ *
++ * <p>sinceVersion ≥ latestVersion → changes 空数组、needFullSync=false（下游已领先/
++ * 持平，无增量）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "增量查询响应（TASK-0026）")
++public class ChangesListVO {
++
++    @Schema(description = "true=跨度超限/基线缺失/中间快照缺失——下游应全量重拉（changes 仅含 latest 摘要）")
++    private boolean needFullSync;
++
++    @Schema(description = "该 scope 当前最新已发布版本号")
++    private Long latestVersion;
++
++    @Schema(description = "变更摘要逐版条目（needFullSync=true 时仅含 latest 一条；无增量时空数组）")
++    private List<ChangeEntryVO> changes;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/InternalSnapshotVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/InternalSnapshotVO.java
+new file mode 100644
+index 0000000..bd1bbfb
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/InternalSnapshotVO.java
+@@ -0,0 +1,48 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import tools.jackson.databind.JsonNode;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 内部快照拉取响应（TASK-0026，GET /internal/v1/config/snapshot——详细设计 §3.3 p25：
++ * 「响应含 version、snapshotHash 与快照体」；scopeType/scopeId 必填、version 可选
++ * 缺省=最新已发布版）。
++ *
++ * <p>{@code snapshot} 为解析后的<b>快照体嵌套 JSON 对象</b>（非转义字符串——管理面
++ * {@code /iot/publish/snapshot} 的 SnapshotVO.snapshotBody 是原文 String 口径，本端点
++ * 供下游服务消费，嵌套对象免二次解析）。字段类型为 Jackson 3（tools.jackson，运行时
++ * HTTP 序列化栈同源）{@code JsonNode}——出站经 Spring Boot 4 JsonMapper 原样输出 JSON
++ * 树；Jackson 2（com.fasterxml）节点会被按 POJO 序列化成属性散列（冒烟实测），不得使用。{@code schemaVersion} 取快照体内实际值
++ * （Schema 版本号一并下发——§3.3 承诺）。
++ *
++ * <p>出站前两道防线：存储取回 + 哈希核对（不一致 500 告警——存储损坏探测）→
++ * 凭据终检（SnapshotCredentialGuard 对出站体同样生效——防存储被篡改后凭据外泄，
++ * ADR-0006；命中按服务端故障语义 500）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "内部快照拉取响应（TASK-0026）")
++public class InternalSnapshotVO {
++
++    @Schema(description = "版本号（缺省 version 参数时=该 scope 最新已发布版）")
++    private Long version;
++
++    @Schema(description = "快照哈希（SHA-256，64 位小写十六进制；下游拉取后比对通知 hash 的锚）")
++    private String snapshotHash;
++
++    @Schema(description = "快照文件地址（一期本地目录相对路径；MinIO 二期）")
++    private String snapshotUri;
++
++    @Schema(description = "快照 Schema 版本（取自快照体 schemaVersion，一并下发）")
++    private String schemaVersion;
++
++    @Schema(description = "快照体对象（Schema v1.0.1——嵌套 JSON 对象）")
++    private JsonNode snapshot;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySender.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySender.java
+new file mode 100644
+index 0000000..fb096d8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySender.java
+@@ -0,0 +1,205 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++import com.fasterxml.jackson.annotation.JsonPropertyOrder;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.stereotype.Component;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++/**
++ * config.changed MQTT 通知发送器（TASK-0026，{@link NotifySender} 真实现——详细设计
++ * §3.2 p24 下行配置主题 + §3.3 p25 通知载荷）。
++ *
++ * <p><b>topic 映射</b>（brief D1，按 publish_log 目标逐行发）：
++ * <ul>
++ * <li>target_type=1 网关 → 专属主题 {@code iot/{tenantCode}/{gatewayCode}/config}
++ *     （gatewayCode 即下发行 targetId——落行时取自 iot_gateway.gateway_code）；</li>
++ * <li>target_type=2 接入 / 3 计算 → 共享内部主题 {@code iot/config.changed}
++ *     （接入订阅后按 scopeType=1 过滤、计算按 scopeType=2 过滤——单一共享主题不按目标
++ *     拆分；未知 targetType 防御性走共享主题，载荷自带 scopeType 供下游过滤）。</li>
++ * </ul>
++ *
++ * <p><b>载荷（§3.3 逐字五键）</b>：{@code {"tenant","scopeType","scopeId","version","hash"}}
++ * ——tenant=租户编码（tenant_id 反查 sys_tenant）、hash=快照 SHA-256（下游拉取比对哈希
++ * 的锚）。通知只作触发信号，<b>不带快照体</b>（避免大消息压垮 Broker）；QoS 1、
++ * retain=false。
++ *
++ * <p><b>fail-soft 纪律（REQ-0033 验收 2）</b>：broker 未配置/连接失败/发布异常/租户编码
++ * 解析失败 → WARN 日志、<b>发布流程不阻断不回滚</b>——通知丢失靠下游拉取对账哈希兜底。
++ *
++ * <p><b>0025 评审 Minor ④ 取舍=a（brief 交接约束，{@link NotifySender} 接口登记）</b>：
++ * 发送动作移至 <b>afterCommit</b>——调用点位于发布/回滚事务提交前（recordDispatch 同事务），
++ * 若立即发送会产生「通知已发、行已回滚」的伪通知（下游拉到回滚前不存在的版本）；本类在
++ * 事务激活时先组装载荷（事务内可读）并注册 {@link TransactionSynchronization#afterCommit}
++ * 回调，提交后才做网络发送；无事务链路（重发 resend——行更新即时提交）立即发送。载荷
++ * 数据捕获于调用点，回调内不做任何 DB 读取。
++ *
++ * <p><b>paho 隔离</b>：本类不触 paho API——连接生命周期（懒建立/自动重连/句柄复用）在
++ * {@link PahoMqttPublisher}（{@link MqttPublisherPort} 唯一真实现）；单测 mock port
++ * 验 topic 映射/载荷/fail-soft（brief D5），真 broker 验证登记 TD-0056。
++ *
++ * <p><b>装配</b>：{@code ot.publish.notify.enabled=true} 时注册（替换
++ * {@link NoOpNotifySender}——同类型唯一 Bean 由条件装配保证；false/缺省保持 NoOp 语义
++ * 路径，brief D1 默认 false）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Component
++@ConditionalOnProperty(name = "ot.publish.notify.enabled", havingValue = "true")
++public class MqttNotifySender implements NotifySender {
++
++    private static final Logger log = LoggerFactory.getLogger(MqttNotifySender.class);
++
++    /** target_type=1 网关（附录 A p33 target_type，与落行派生同值域） */
++    private static final int TARGET_GATEWAY = 1;
++
++    /** 下行配置主题 QoS 1（§3.2 p24——配置变更通知至少一次可达） */
++    private static final int MQTT_QOS = 1;
++
++    /** 接入/计算共享内部主题（§3.2 p24——单一共享主题，下游按 scopeType 过滤） */
++    static final String SHARED_TOPIC = "iot/config.changed";
++
++    /** 载荷序列化：POJO 字段序由 @JsonPropertyOrder 钉死（§3.3 逐字五键顺序） */
++    private static final JsonMapper PAYLOAD_MAPPER = JsonMapper.builder().build();
++
++    private final MqttPublisherPort publisher;
++    private final SysTenantMapper tenantMapper;
++
++    public MqttNotifySender(MqttPublisherPort publisher, SysTenantMapper tenantMapper) {
++        this.publisher = publisher;
++        this.tenantMapper = tenantMapper;
++    }
++
++    @Override
++    public void notify(IotConfigVersion version, Integer targetType, String targetId) {
++        // 载荷在调用点（事务内）组装捕获；afterCommit 回调内零 DB 读取
++        NotifyPayload payload = buildPayload(version);
++        if (payload == null) {
++            return;
++        }
++        String topic = topicOf(targetType, targetId, payload.tenant);
++        if (topic == null) {
++            return;
++        }
++        String json = serialize(payload);
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            // Minor ④ 决策 a：发送延迟到事务提交后（杜绝伪通知——见类注释）
++            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
++                @Override
++                public void afterCommit() {
++                    sendQuietly(topic, json, version, targetType, targetId);
++                }
++            });
++            log.info("[PUBLISH-NOTIFY] config.changed deferred to afterCommit topic={} versionId={} "
++                            + "version={} target={}-{}", topic, version.getId(), version.getVersion(),
++                    targetType, targetId);
++        } else {
++            sendQuietly(topic, json, version, targetType, targetId);
++        }
++    }
++
++    /** 网关目标=专属主题 iot/{tenant}/{gatewayCode}/config；接入/计算（含未知类型防御）=共享主题 */
++    private String topicOf(Integer targetType, String targetId, String tenantCode) {
++        if (targetType != null && targetType == TARGET_GATEWAY) {
++            if (targetId == null || targetId.isBlank()) {
++                // 落行侧已 fail-closed 网关码；防御分支仍兜底 fail-soft（不发空目标）
++                log.warn("[PUBLISH-NOTIFY] gateway target missing code (notify skipped, fail-soft) tenant={}",
++                        tenantCode);
++                return null;
++            }
++            return "iot/" + tenantCode + "/" + targetId + "/config";
++        }
++        return SHARED_TOPIC;
++    }
++
++    /**
++     * 载荷组装（五键）：tenant 由 tenant_id 反查 sys_tenant（平台级表无租户注入——会话
++     * 内外一致）；解析失败 WARN 跳过（fail-soft——载荷缺 tenant 不得外发，下游按 topic/
++     * scope 定位会失配）。
++     */
++    private NotifyPayload buildPayload(IotConfigVersion version) {
++        if (version == null) {
++            log.warn("[PUBLISH-NOTIFY] null version row (notify skipped, fail-soft)");
++            return null;
++        }
++        String tenantCode = resolveTenantCode(version.getTenantId());
++        if (tenantCode == null || tenantCode.isBlank()) {
++            log.warn("[PUBLISH-NOTIFY] tenant_code resolve failed (notify skipped, fail-soft) "
++                    + "tenantId={} versionId={} version={}", version.getTenantId(),
++                    version.getId(), version.getVersion());
++            return null;
++        }
++        return new NotifyPayload(tenantCode, version.getScopeType(), version.getScopeId(),
++                version.getVersion(), version.getSnapshotHash());
++    }
++
++    private String resolveTenantCode(Long tenantId) {
++        if (tenantId == null) {
++            return null;
++        }
++        SysTenant tenant = tenantMapper.selectById(tenantId);
++        return tenant == null ? null : tenant.getTenantCode();
++    }
++
++    private String serialize(NotifyPayload payload) {
++        try {
++            return PAYLOAD_MAPPER.writeValueAsString(payload);
++        } catch (JsonProcessingException e) {
++            // 载荷全为标量——序列化不可达；仍按 fail-soft 兜底（不阻断发布事务）
++            log.warn("[PUBLISH-NOTIFY] payload serialize failed (notify skipped, fail-soft): {}", e.getMessage());
++            return null;
++        }
++    }
++
++    /** 实际网络发送：任何异常 WARN 不抛（发布流程不阻断——REQ-0033 验收 2 拉取对账兜底） */
++    private void sendQuietly(String topic, String json, IotConfigVersion version,
++                             Integer targetType, String targetId) {
++        if (json == null) {
++            return;
++        }
++        try {
++            publisher.publish(topic, json, MQTT_QOS, false);
++            log.info("[PUBLISH-NOTIFY] config.changed sent topic={} versionId={} version={} target={}-{} hash={}",
++                    topic, version.getId(), version.getVersion(), targetType, targetId,
++                    version.getSnapshotHash());
++        } catch (Exception e) {
++            log.warn("[PUBLISH-NOTIFY] config.changed publish failed (fail-soft, 发布不阻断——"
++                    + "下游拉取对账哈希兜底 REQ-0033) topic={} versionId={} version={} target={}-{} err={}",
++                    topic, version.getId(), version.getVersion(), targetType, targetId, e.getMessage());
++        }
++    }
++
++    /**
++     * 通知载荷（§3.3 逐字五键；JSON 键序由 @JsonPropertyOrder 钉死）。
++     */
++    @JsonPropertyOrder({"tenant", "scopeType", "scopeId", "version", "hash"})
++    static class NotifyPayload {
++
++        /** 租户编码（sys_tenant.tenant_code） */
++        public final String tenant;
++        /** 范围 1 网关 2 计算 */
++        public final Integer scopeType;
++        /** 范围对象 ID（1=网关 id；2=0 租户粒度） */
++        public final Long scopeId;
++        /** 版本号（同 (tenant, scope) 单调递增；注意非版本行 id） */
++        public final Long version;
++        /** 快照 SHA-256（下游拉取快照后比对的锚） */
++        public final String hash;
++
++        NotifyPayload(String tenant, Integer scopeType, Long scopeId, Long version, String hash) {
++            this.tenant = tenant;
++            this.scopeType = scopeType;
++            this.scopeId = scopeId;
++            this.version = version;
++            this.hash = hash;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttPublisherPort.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttPublisherPort.java
+new file mode 100644
+index 0000000..d925815
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/MqttPublisherPort.java
+@@ -0,0 +1,28 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++/**
++ * MQTT 发布薄接口（TASK-0026，brief D5 mock 口径）——隔离 paho 客户端 API，
++ * 使 {@link MqttNotifySender} 的 topic 映射/载荷/fail-soft 语义可单测（mock port），
++ * 真 broker 验证登记 TD-0056。
++ *
++ * <p>连接生命周期（懒建立 + 自动重连 + 句柄复用不逐发新建）由实现方
++ * {@link PahoMqttPublisher} 承担；本接口只暴露「发布一条消息」原语，失败以异常上报，
++ * 由发送方按 fail-soft 纪律处置（WARN 不阻断发布事务）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface MqttPublisherPort {
++
++    /**
++     * 发布一条 MQTT 消息（阻塞至客户端确认或抛异常）
++     *
++     * @param topic   主题（网关目标=iot/{tenantCode}/{gatewayCode}/config；接入/计算=共享
++     *                内部主题 iot/config.changed——由发送方映射，本接口不感知业务语义）
++     * @param payload 消息体（UTF-8 文本；config.changed 五键载荷）
++     * @param qos     服务质量等级（下行配置主题 QoS 1）
++     * @param retain  是否保留消息（config.changed 恒 false——旧信号不得投递给晚接入方）
++     * @throws Exception 连接失败/未连接/发布失败（实现方原样上报，发送方 fail-soft）
++     */
++    void publish(String topic, String payload, int qos, boolean retain) throws Exception;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java
+index 3a24daa..6930127 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java
+@@ -1,28 +1,34 @@
+ package net.otlab.admin.module.iot.publish.notify;
+ 
+ import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+- * 下发通知 NoOp 实现（TASK-0025 占位——恒空操作，<b>发布/重发不阻断</b>）。
++ * 下发通知 NoOp 实现（TASK-0025 占位，TASK-0026 起为「未启用」语义路径——恒空操作，
++ * <b>发布/重发不阻断</b>）。
+  *
+- * <p>config.changed 真实通知（MQTT/消息通道触发下游拉快照比对哈希）与
+- * /internal/v1/config/snapshot 快照拉取端点归 TASK-0026 交付——届时以真实现替换本 Bean
+- * （同类型唯一 Bean 覆盖或配置类显式装配），发布落行后 / 重发重置后的调用点不扩散
+- * （接口 {@link NotifySender} javadoc 载明接线义务）。
++ * <p><b>条件装配（TASK-0026）</b>：{@code ot.publish.notify.enabled=false 或缺省} 时注册
++ * 本 Bean（matchIfMissing=true——键缺省默认 NoOp 语义，brief D1「默认 false」）；
++ * enabled=true 时由 {@link MqttNotifySender}（MQTT 真实现）替换，同类型唯一 Bean。
++ * 与真实现同一契约：事务激活时的调用点由发送方决定时机（真实现 afterCommit——见
++ * {@link NotifySender} 接口 Minor ④ 取舍登记），本占位恒空操作、无外部副作用。
+  *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ @Slf4j
+ @Component
++@ConditionalOnProperty(name = "ot.publish.notify.enabled", havingValue = "false", matchIfMissing = true)
+ public class NoOpNotifySender implements NotifySender {
+ 
+     @Override
+-    public void notify(Long versionId, Integer targetType, String targetId) {
+-        // 占位空操作：TASK-0026 交付后替换为真实 config.changed 通知实现（REQ-0033——
+-        // 通知只作触发信号，下游拉快照比对哈希）。本期发布/重发不阻断（brief D5/D8）。
++    public void notify(IotConfigVersion version, Integer targetType, String targetId) {
++        // 未启用通知（ot.publish.notify.enabled=false/缺省）：占位空操作，发布/重发不阻断。
++        // 真实现见 MqttNotifySender（enabled=true 条件装配；REQ-0033——通知只作触发信号，
++        // 下游拉快照比对哈希，通知丢失靠拉取对账兜底）。
+         log.debug("[PUBLISH-NOTIFY] NoOp notify versionId={} targetType={} targetId={}",
+-                versionId, targetType, targetId);
++                version == null ? null : version.getId(), targetType, targetId);
+     }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java
+index ab8e503..4f4196f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java
+@@ -1,18 +1,28 @@
+ package net.otlab.admin.module.iot.publish.notify;
+ 
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++
+ /**
+- * 下发通知接缝（TASK-0025）——语义=触发 config.changed 下发（REQ-0033：通知只带版本号
+- * 与哈希、只作触发信号，下游必须拉快照比对哈希不得信任通知内容；真实通知归 TASK-0026）。
++ * 下发通知接缝（TASK-0025 建立，TASK-0026 接真实现）——语义=触发 config.changed 下发
++ * （REQ-0033：通知只带版本号与哈希、只作触发信号，下游必须拉快照比对哈希不得信任通知内容）。
+  *
+- * <p><b>调用点（本期两处，brief D5）</b>：
++ * <p><b>调用点（不扩散）</b>：
+  * <ol>
+- * <li>发布/回滚落行后——每个目标行调用一次（网关 scope 两行=两次调用）；</li>
+- * <li>重发重置后——该目标行调用一次。</li>
++ * <li>发布/回滚落行后——每个目标行调用一次（网关 scope 两行=两次调用，
++ *     {@code IotPublishLogServiceImpl.recordDispatch}）；</li>
++ * <li>重发重置后——该目标行调用一次（{@code IotPublishLogServiceImpl.resend}）。</li>
+  * </ol>
+  *
+- * <p><b>接线义务（TASK-0026 交付时）</b>：以真实实现替换 {@link NoOpNotifySender}
+- * （同类型唯一 Bean 覆盖或配置类显式装配），调用点不扩散（接口即接缝，照 TASK-0024
+- * PublishConfirmGate NoOp 范式）。本期 {@code NoOp} 占位恒空操作，<b>发布/重发不阻断</b>。
++ * <p><b>接线（TASK-0026 交付）</b>：真实现 {@link MqttNotifySender}（条件装配
++ * {@code ot.publish.notify.enabled=true}）替换 {@link NoOpNotifySender}（enabled=false
++ * 或缺省时的语义路径，条件装配保证同类型唯一 Bean），调用点数量与位置不变（接口即接缝，
++ * 照 TASK-0024 PublishConfirmGate NoOp 范式）。
++ *
++ * <p><b>0025 评审 Minor ④ 取舍登记（brief 交接约束，二选一裁决=a）</b>：落行调用点位于
++ * 发布事务提交前——真实现把<b>发送动作移至 afterCommit</b>（事务激活时注册提交后回调，
++ * 无事务链路〔重发〕立即发送），杜绝「通知已发、行已回滚」的伪通知；载荷数据在调用点
++ * （事务内）组装捕获，提交后仅做网络发送。裁决理由：伪通知会让下游拉到回滚前不存在的
++ * 版本（拉取 400/空转），虽拉取对账可兜底，但避免发送必然失败的信号是零成本正确性。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -20,11 +30,12 @@ package net.otlab.admin.module.iot.publish.notify;
+ public interface NotifySender {
+ 
+     /**
+-     * 触发一次 config.changed 下发信号（本期 NoOp 占位）
++     * 触发一次 config.changed 下发信号
+      *
+-     * @param versionId  配置版本 ID（iot_config_version.id，= 下发记录 version_id）
++     * @param version    已落库版本行（载荷五键来源：tenant_id 反查租户编码、scopeType/
++     *                   scopeId/version、snapshotHash）——事务内传引用，实现方自决何时外发
+      * @param targetType 目标 1 网关 2 接入 3 计算
+      * @param targetId   目标标识（网关=gateway_code；接入/计算=配置化服务标识）
+      */
+-    void notify(Long versionId, Integer targetType, String targetId);
++    void notify(IotConfigVersion version, Integer targetType, String targetId);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PahoMqttPublisher.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PahoMqttPublisher.java
+new file mode 100644
+index 0000000..3d1627c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PahoMqttPublisher.java
+@@ -0,0 +1,115 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import org.eclipse.paho.client.mqttv3.MqttClient;
++import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
++import org.eclipse.paho.client.mqttv3.MqttException;
++import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.stereotype.Component;
++
++import java.nio.charset.StandardCharsets;
++
++/**
++ * MQTT 发布器（paho 实现位，TASK-0026）——{@link MqttPublisherPort} 唯一真实现，
++ * 全类仅本类触 paho API（发送器与业务语义隔离在 {@link MqttNotifySender}）。
++ *
++ * <p>连接纪律（brief D1）：懒建立（首次发布才创建/连接，未启用时零 paho 对象零连接尝试）+
++ * 自动重连（{@link MqttConnectOptions#setAutomaticReconnect(boolean)}）+ 句柄复用
++ * （成员持有 {@link MqttClient}，不逐发新建）。断连期间的发布失败原样上报（发送方
++ * fail-soft WARN——下游拉取对账兜底，REQ-0033 验收 2），不做同步重试风暴。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Component
++@ConditionalOnProperty(name = "ot.publish.notify.enabled", havingValue = "true")
++public class PahoMqttPublisher implements MqttPublisherPort {
++
++    private static final Logger log = LoggerFactory.getLogger(PahoMqttPublisher.class);
++
++    private final PublishProperties properties;
++
++    /** 句柄复用：懒建立后全程持有（不逐发新建）；paho 客户端线程安全可并发 publish */
++    private MqttClient client;
++
++    public PahoMqttPublisher(PublishProperties properties) {
++        this.properties = properties;
++    }
++
++    @Override
++    public void publish(String topic, String payload, int qos, boolean retain) throws Exception {
++        MqttClient c = obtainClient();
++        c.publish(topic, payload.getBytes(StandardCharsets.UTF_8), qos, retain);
++    }
++
++    /**
++     * 取已连接客户端：懒建立（首次创建 + 连接）；已建立但断连时尝试重连（自动重连在后台
++     * 进行，此处同步补一次 connect——已在重连中则 connect 抛 32110 由发送方 fail-soft）。
++     */
++    private synchronized MqttClient obtainClient() throws MqttException {
++        if (client != null && client.isConnected()) {
++            return client;
++        }
++        if (client == null) {
++            PublishProperties.Notify cfg = properties.getNotify();
++            MqttConnectOptions options = new MqttConnectOptions();
++            if (cfg.getUsername() != null && !cfg.getUsername().isBlank()) {
++                options.setUserName(cfg.getUsername());
++            }
++            if (cfg.getPassword() != null) {
++                options.setPassword(cfg.getPassword().toCharArray());
++            }
++            options.setKeepAliveInterval(cfg.getKeepAliveSeconds() == null ? 60 : cfg.getKeepAliveSeconds());
++            options.setConnectionTimeout(cfg.getTimeoutSeconds() == null ? 30 : cfg.getTimeoutSeconds());
++            options.setAutomaticReconnect(true);
++            options.setCleanSession(true);
++
++            String brokerUrl = cfg.getBrokerUrl();
++            if (brokerUrl == null || brokerUrl.isBlank()) {
++                // 未配置 broker：构造失败即刻上报（发送方 WARN fail-soft），不空转重连
++                throw new MqttException(MqttException.REASON_CODE_CLIENT_EXCEPTION);
++            }
++            try {
++                client = new MqttClient(brokerUrl, resolveClientId(cfg), new MemoryPersistence());
++                client.connect(options);
++                log.info("[PUBLISH-NOTIFY] mqtt publisher connected broker={} clientId={}",
++                        brokerUrl, client.getClientId());
++            } catch (MqttException e) {
++                client = null;
++                throw e;
++            }
++            return client;
++        }
++        // 句柄已存在但断连：同步补一次 connect（失败原样上报——发送方 fail-soft WARN）
++        MqttConnectOptions options = connectOptions();
++        client.connect(options);
++        return client;
++    }
++
++    private MqttConnectOptions connectOptions() {
++        PublishProperties.Notify cfg = properties.getNotify();
++        MqttConnectOptions options = new MqttConnectOptions();
++        if (cfg.getUsername() != null && !cfg.getUsername().isBlank()) {
++            options.setUserName(cfg.getUsername());
++        }
++        if (cfg.getPassword() != null) {
++            options.setPassword(cfg.getPassword().toCharArray());
++        }
++        options.setKeepAliveInterval(cfg.getKeepAliveSeconds() == null ? 60 : cfg.getKeepAliveSeconds());
++        options.setConnectionTimeout(cfg.getTimeoutSeconds() == null ? 30 : cfg.getTimeoutSeconds());
++        options.setAutomaticReconnect(true);
++        options.setCleanSession(true);
++        return options;
++    }
++
++    /** client-id：配置值优先；空白=进程内随机生成（多实例同 id 会互踢，随机后缀避免） */
++    private String resolveClientId(PublishProperties.Notify cfg) {
++        if (cfg.getClientId() != null && !cfg.getClientId().isBlank()) {
++            return cfg.getClientId();
++        }
++        return "ot-admin-notify-" + java.util.UUID.randomUUID().toString().substring(0, 8);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java
+index 89fd2ef..9adb0d5 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishService.java
+@@ -1,6 +1,8 @@
+ package net.otlab.admin.module.iot.publish.service;
+ 
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.publish.dto.ChangesListVO;
++import net.otlab.admin.module.iot.publish.dto.InternalSnapshotVO;
+ import net.otlab.admin.module.iot.publish.dto.PublishForm;
+ import net.otlab.admin.module.iot.publish.dto.RollbackForm;
+ import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
+@@ -8,7 +10,8 @@ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
+ 
+ /**
+  * 配置发布服务（TASK-0024，FEAT-0008/REQ-0033——发布链第一环：快照生成 + 版本落库 +
+- * 回滚 + 取回；下发记录 ACK/通知归 TASK-0025/0026）。
++ * 回滚 + 取回；下发记录 ACK/通知归 TASK-0025/0026；TASK-0026 扩展内部快照拉取与
++ * 增量摘要——§3.3 p25 下游对账口径）。
+  *
+  * <p>发布流程（brief D4）：组装（Schema v1.0.1）→ 凭据终检（fail-closed）→ 哈希 →
+  * 存储 → 版本落库（publish_status=1, publish_time=NOW）→ config_version 回写。
+@@ -16,6 +19,10 @@ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
+  * 快照文件（哈希同），历史版本不改写。取回（brief D6）：存储取回 + 哈希核对，不一致
+  * 500 告警（存储损坏探测）。
+  *
++ * <p>内部查询（TASK-0026）：/internal/v1/config/snapshot 与 /changes——内部令牌收口
++ * （无管理面会话），跨租户歧义（计算 scope scopeId=0 跨租户同名）由显式 tenant 参数
++ * （租户编码）消解，缺省歧义即 400 fail-closed。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -60,4 +67,44 @@ public interface IotPublishService {
+      * @return 版本信封 + 快照体 JSON 原文
+      */
+     SnapshotVO retrieveSnapshot(Integer scopeType, Long scopeId, Long version);
++
++    /**
++     * 内部快照拉取（TASK-0026，GET /internal/v1/config/snapshot——§3.3 p25）：存储取回
++     * + 哈希核对（不一致 500 告警，复用 0024 路径）+ 凭据终检对出站快照体同样生效
++     * （防存储被篡改后凭据外泄，ADR-0006）；version 缺省=最新已发布版，指定版本不存在
++     * → 400。
++     *
++     * <p>内部链路无管理面会话（内部令牌收口，brief D6）——不做数据权限防线，跨租户
++     * 歧义（计算 scope scopeId=0 跨租户同名）由 {@code tenantCode} 消解：携带=精确过滤，
++     * 缺省且命中多租户行 → 400 fail-closed（不猜租户）。
++     *
++     * @param scopeType  范围 1 网关 2 计算（必填）
++     * @param scopeId    范围对象 ID（必填；2 归一 0）
++     * @param version    版本号（null=最新已发布版）
++     * @param tenantCode 租户编码（null=不按租户过滤——歧义时 400）
++     * @return 版本信封 + schemaVersion + 快照体嵌套对象
++     * @throws net.otlab.core.exception.BusinessException 400：参数非法/版本不存在/跨租户
++     *         歧义；500：快照文件缺失/哈希核对失败/出站凭据终检命中（告警日志）
++     */
++    InternalSnapshotVO retrieveSnapshotInternal(Integer scopeType, Long scopeId,
++                                                Long version, String tenantCode);
++
++    /**
++     * 增量摘要（TASK-0026，GET /internal/v1/config/changes——§3.3 p25）：相邻版本快照体
++     * diff 生成逐版变更摘要（五段：点位/通道/数据项/公式/指标，按对象 code/id 对齐），
++     * 供下游判断增量应用还是全量重拉。
++     *
++     * <p>needFullSync=true（changes 仅含 latest 一条摘要）：latestVersion-sinceVersion
++     * 严格大于 {@code ot.publish.changes-max-span}（默认 10）/ sinceVersion 版本行不存在
++     * / diff 所需快照文件缺失。sinceVersion ≥ latestVersion → changes 空数组。
++     *
++     * @param scopeType  范围 1 网关 2 计算（必填）
++     * @param scopeId    范围对象 ID（必填；2 归一 0）
++     * @param sinceVersion 下游当前持有版本号（必填）
++     * @param tenantCode 租户编码（null=不按租户过滤——歧义时 400）
++     * @return needFullSync + latestVersion + 逐版摘要
++     * @throws net.otlab.core.exception.BusinessException 400：参数非法/scope 无版本/跨租户
++     *         歧义
++     */
++    ChangesListVO changesSince(Integer scopeType, Long scopeId, Long sinceVersion, String tenantCode);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java
+index dbcfdd2..e2a67ba 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java
+@@ -94,7 +94,7 @@ public class IotPublishLogServiceImpl implements IotPublishLogService {
+         List<IotConfigPublishLog> targets = deriveTargets(version);
+         for (IotConfigPublishLog row : targets) {
+             publishLogMapper.insert(row);
+-            notifySender.notify(version.getId(), row.getTargetType(), row.getTargetId());
++            notifySender.notify(version, row.getTargetType(), row.getTargetId());
+         }
+         log.info("[PUBLISH-LOG] dispatch rows written versionId={} scope={}-{} version={} rows={}",
+                 version.getId(), version.getScopeType(), version.getScopeId(), version.getVersion(), targets.size());
+@@ -318,8 +318,9 @@ public class IotPublishLogServiceImpl implements IotPublishLogService {
+         if (affected <= 0) {
+             throw paramError("已生效无需重发");
+         }
+-        // 触发下发接缝（brief D5：重发重置后调用一次；NoOp 占位，TASK-0026 接真实通知）
+-        notifySender.notify(version.getId(), row.getTargetType(), row.getTargetId());
++        // 触发下发接缝（brief D5：重发重置后调用一次；TASK-0026 真实现按 enabled 条件装配——
++        // enabled=true 时 MQTT 通知〔事务外链路立即发送〕，false 时 NoOp）
++        notifySender.notify(version, row.getTargetType(), row.getTargetId());
+         log.info("[PUBLISH-LOG] resend reset row id={} versionId={} targetType={} targetId={}",
+                 row.getId(), version.getId(), row.getTargetType(), row.getTargetId());
+         return publishLogMapper.selectById(row.getId());
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index fa7a8b6..6f72616 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -4,11 +4,20 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.json.JsonMapper;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.ChangeEntryVO;
++import net.otlab.admin.module.iot.publish.dto.ChangeItemVO;
++import net.otlab.admin.module.iot.publish.dto.ChangeSummaryVO;
++import net.otlab.admin.module.iot.publish.dto.ChangesListVO;
++import net.otlab.admin.module.iot.publish.dto.InternalSnapshotVO;
+ import net.otlab.admin.module.iot.publish.dto.PublishForm;
+ import net.otlab.admin.module.iot.publish.dto.RollbackForm;
+ import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
+@@ -36,7 +45,10 @@ import org.springframework.transaction.annotation.Transactional;
+ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.time.LocalDateTime;
++import java.util.ArrayList;
+ import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
+ 
+ /**
+  * 配置发布服务实现（TASK-0024，发布链第一环——快照生成 + 版本落库 + 回滚 + 取回；
+@@ -106,6 +118,17 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     /** 回滚复用快照体解析用（id 提取——与组装侧确定性序列化独立，只读不产哈希） */
+     private static final JsonMapper BODY_MAPPER = JsonMapper.builder().build();
+ 
++    /** 内部拉取/增量摘要快照体解析用（TASK-0026——相邻版本 diff；com.fasterxml 与 0024 组装/终检同源） */
++    private static final JsonMapper DIFF_MAPPER = JsonMapper.builder().build();
++
++    /**
++     * 出站快照体对象化用（TASK-0026）——Jackson 3（tools.jackson，运行时 HTTP 序列化栈
++     * 同源）：{@link InternalSnapshotVO#getSnapshot()} 须为 tools JsonNode 才会被 HTTP
++     * JsonMapper 原样输出 JSON 树；com.fasterxml 节点会被按 POJO 序列化成属性散列（冒烟实测）。
++     */
++    private static final tools.jackson.databind.json.JsonMapper OUT_MAPPER =
++            tools.jackson.databind.json.JsonMapper.builder().build();
++
+     @Autowired
+     private IotPointMapper pointMapper;
+ 
+@@ -132,6 +155,14 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     @Autowired
+     private IotPublishLogService publishLogService;
+ 
++    /** 发布域属性（TASK-0026：changes-max-span 增量摘要跨度） */
++    @Autowired
++    private PublishProperties properties;
++
++    /** 租户主数据（TASK-0026：内部链路 tenant 参数 → 租户 id 反查；sys_tenant 平台级表无租户注入） */
++    @Autowired
++    private SysTenantMapper tenantMapper;
++
+     // ---------- 发布 ----------
+ 
+     @Override
+@@ -341,18 +372,185 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+             throw new BusinessException(ResultCode.NOT_FOUND.getCode(),
+                     version == null ? "该范围尚无已发布版本" : "指定版本不存在: " + version);
+         }
++        // 存储取回 + 哈希核对（TASK-0026 起提取共享私有方法——管理面取回与内部拉取同实现防漂移；
++        // 缺失/不一致 → ERROR 500 告警语义不变）
++        byte[] bytes = readAndVerifySnapshot(row);
++        return new SnapshotVO(normalizedType, normalizedId, row.getVersion(),
++                row.getSnapshotHash(), new String(bytes, StandardCharsets.UTF_8));
++    }
++
++    // ---------- 内部快照拉取与增量摘要（TASK-0026，GET /internal/v1/config/snapshot 与 /changes） ----------
++
++    @Override
++    public InternalSnapshotVO retrieveSnapshotInternal(Integer scopeType, Long scopeId,
++                                                       Long version, String tenantCode) {
++        // 内部链路无管理面会话（内部令牌收口，brief D6）——不做数据权限防线，仅参数归一；
++        // 跨租户歧义由显式 tenant（租户编码）消解，缺省歧义即 400 fail-closed（不猜租户）
++        Integer normalizedType = scopeGuard.normalizeScopeType(scopeType);
++        Long normalizedId = scopeGuard.normalizeScopeId(normalizedType, scopeId);
++        Long tenantId = resolveInternalTenantId(tenantCode);
++        IotConfigVersion row = resolveInternalVersionRow(normalizedType, normalizedId, version, tenantId);
++        byte[] bytes = readAndVerifySnapshot(row);
++        String json = new String(bytes, StandardCharsets.UTF_8);
++        checkOutboundCredential(json, row);
++        tools.jackson.databind.JsonNode body = parseSnapshotBody(bytes, row);
++        String schemaVersion = body.hasNonNull("schemaVersion")
++                ? body.get("schemaVersion").asText()
++                : ConfigSnapshot.SCHEMA_VERSION;
++        return new InternalSnapshotVO(row.getVersion(), row.getSnapshotHash(), row.getSnapshotUri(),
++                schemaVersion, body);
++    }
++
++    @Override
++    public ChangesListVO changesSince(Integer scopeType, Long scopeId, Long sinceVersion, String tenantCode) {
++        Integer normalizedType = scopeGuard.normalizeScopeType(scopeType);
++        Long normalizedId = scopeGuard.normalizeScopeId(normalizedType, scopeId);
++        if (sinceVersion == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "sinceVersion 必填");
++        }
++        Long tenantId = resolveInternalTenantId(tenantCode);
++        List<IotConfigVersion> rows = baseMapper.selectList(new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, normalizedType)
++                .eq(IotConfigVersion::getScopeId, normalizedId)
++                .eq(tenantId != null, IotConfigVersion::getTenantId, tenantId)
++                .orderByAsc(IotConfigVersion::getVersion)
++                .orderByAsc(IotConfigVersion::getId));
++        if (rows.isEmpty()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "该范围尚无已发布版本");
++        }
++        if (tenantId == null) {
++            long distinctTenants = rows.stream().map(IotConfigVersion::getTenantId).distinct().count();
++            if (distinctTenants > 1) {
++                // 计算 scope（scopeId=0）跨租户同名常态——无 tenant 参数不猜租户（fail-closed）
++                throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "跨租户同名命中多个版本（scopeType+scopeId 不含租户），请携带 tenant 参数");
++            }
++        }
++        IotConfigVersion latestRow = rows.get(rows.size() - 1);
++        long latest = latestRow.getVersion();
++        Map<Long, IotConfigVersion> byVersion = rows.stream()
++                .collect(Collectors.toMap(IotConfigVersion::getVersion, r -> r, (a, b) -> a));
++        if (sinceVersion >= latest) {
++            // 下游已持平/领先——无增量（needFullSync=false 空数组）
++            return new ChangesListVO(false, latest, List.of());
++        }
++        IotConfigVersion baseline = byVersion.get(sinceVersion);
++        boolean needFullSync = baseline == null;
++        int maxSpan = properties.getChangesMaxSpan() == null ? 10 : properties.getChangesMaxSpan();
++        if (latest - sinceVersion > maxSpan) {
++            needFullSync = true;
++        }
++        if (needFullSync) {
++            // 跨度超限/基线缺失：只给 latest 摘要（基线→latest 累计 diff；基线不可得留空），
++            // 不给逐版 diff——下游全量重拉（snapshot 端点不带 version 即最新版）
++            log.info("[SNAPSHOT] changes needFullSync tenantId={} scope={}-{} since={} latest={} baselineKnown={} "
++                    + "maxSpan={}", latestRow.getTenantId(), normalizedType, normalizedId, sinceVersion,
++                    latest, baseline != null, maxSpan);
++            return new ChangesListVO(true, latest, List.of(latestEntry(latestRow,
++                    cumulativeSummaryQuietly(baseline, latestRow))));
++        }
++        List<ChangeEntryVO> entries = new ArrayList<>(rows.size());
++        for (long v = sinceVersion + 1; v <= latest; v++) {
++            IotConfigVersion prev = byVersion.get(v - 1);
++            IotConfigVersion cur = byVersion.get(v);
++            if (prev == null || cur == null) {
++                // 版本序列空洞（异常——单调递增无空洞）按缺失口径兜底 needFullSync
++                log.error("[SNAPSHOT] changes version gap tenantId={} scope={}-{} at={} → needFullSync",
++                        latestRow.getTenantId(), normalizedType, normalizedId, v);
++                return new ChangesListVO(true, latest, List.of(latestEntry(latestRow,
++                        cumulativeSummaryQuietly(baseline, latestRow))));
++            }
++            byte[] prevBytes = readQuietly(prev);
++            byte[] curBytes = readQuietly(cur);
++            JsonNode prevBody = parseQuietly(prevBytes);
++            JsonNode curBody = parseQuietly(curBytes);
++            if (prevBytes == null || curBytes == null || prevBody == null || curBody == null) {
++                // 中间快照文件缺失/损坏 → needFullSync=true（只给 latest 摘要，不给逐版 diff）
++                log.error("[SNAPSHOT] changes snapshot file missing/corrupt tenantId={} scope={}-{} "
++                        + "version={} → needFullSync", latestRow.getTenantId(), normalizedType,
++                        normalizedId, v);
++                return new ChangesListVO(true, latest, List.of(latestEntry(latestRow,
++                        cumulativeSummaryQuietly(baseline, latestRow))));
++            }
++            entries.add(new ChangeEntryVO(cur.getVersion(), cur.getSnapshotHash(),
++                    cur.getPublishTime(), diffSnapshotBodies(prevBody, curBody)));
++        }
++        return new ChangesListVO(false, latest, entries);
++    }
++
++    /** tenant 参数（租户编码）→ 租户 id；空白=不过滤；不存在 400（sys_tenant 平台级表无租户注入） */
++    private Long resolveInternalTenantId(String tenantCode) {
++        if (tenantCode == null || tenantCode.isBlank()) {
++            return null;
++        }
++        SysTenant tenant = tenantMapper.selectOne(new LambdaQueryWrapper<SysTenant>()
++                .eq(SysTenant::getTenantCode, tenantCode));
++        if (tenant == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户不存在: " + tenantCode);
++        }
++        return tenant.getId();
++    }
++
++    /**
++     * 内部链路版本行定位（scopeType+scopeId[+version][+tenant]）：version 给定=单行（多行
++     * =跨租户同名歧义 400）；缺省=各租户最大版本（跨租户并列即歧义 400——网关 id 全局唯一
++     * 理论不撞，计算 scope scopeId=0 恒可撞，统一 fail-closed）。
++     */
++    private IotConfigVersion resolveInternalVersionRow(Integer scopeType, Long scopeId,
++                                                       Long version, Long tenantId) {
++        LambdaQueryWrapper<IotConfigVersion> wrapper = new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, scopeType)
++                .eq(IotConfigVersion::getScopeId, scopeId)
++                .eq(tenantId != null, IotConfigVersion::getTenantId, tenantId);
++        if (version != null) {
++            List<IotConfigVersion> rows = baseMapper.selectList(wrapper.eq(IotConfigVersion::getVersion, version));
++            if (rows.isEmpty()) {
++                throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "指定版本不存在: " + version);
++            }
++            if (rows.size() > 1) {
++                throw ambiguousScopeError();
++            }
++            return rows.get(0);
++        }
++        List<IotConfigVersion> rows = baseMapper.selectList(wrapper);
++        if (rows.isEmpty()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "该范围尚无已发布版本");
++        }
++        Map<Long, IotConfigVersion> latestByTenant = new java.util.LinkedHashMap<>();
++        for (IotConfigVersion row : rows) {
++            latestByTenant.merge(row.getTenantId(), row,
++                    (a, b) -> a.getVersion() >= b.getVersion() ? a : b);
++        }
++        if (latestByTenant.size() > 1) {
++            throw ambiguousScopeError();
++        }
++        return latestByTenant.values().iterator().next();
++    }
+ 
++    private BusinessException ambiguousScopeError() {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                "跨租户同名命中多个版本（scopeType+scopeId 不含租户），请携带 tenant 参数");
++    }
++
++    /**
++     * 存储取回 + SHA-256 哈希核对（复用 0024 路径——管理面取回/内部拉取同实现防漂移；
++     * 缺失/不一致 → ERROR 500 + 告警日志，存储损坏探测语义不变）。
++     */
++    private byte[] readAndVerifySnapshot(IotConfigVersion row) {
+         byte[] bytes;
+         try {
+             bytes = snapshotStorage.readBytes(row.getSnapshotUri());
+         } catch (IOException e) {
+             log.error("[SNAPSHOT] read failed tenant={} scope={}-{} version={} uri={}",
+-                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(), row.getSnapshotUri(), e);
++                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(),
++                    row.getSnapshotUri(), e);
+             throw new BusinessException(ResultCode.ERROR.getCode(), "快照读取失败: " + e.getMessage());
+         }
+         if (bytes == null) {
+             log.error("[SNAPSHOT] snapshot file missing tenant={} scope={}-{} version={} uri={}",
+-                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(), row.getSnapshotUri());
++                    row.getTenantId(), row.getScopeType(), row.getScopeId(), row.getVersion(),
++                    row.getSnapshotUri());
+             throw new BusinessException(ResultCode.ERROR.getCode(),
+                     "快照文件缺失（存储损坏探测，见服务端告警日志）");
+         }
+@@ -364,10 +562,163 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+             throw new BusinessException(ResultCode.ERROR.getCode(),
+                     "快照哈希核对失败（存储损坏探测，见服务端告警日志）");
+         }
+-        return new SnapshotVO(normalizedType, normalizedId, row.getVersion(),
+-                row.getSnapshotHash(), new String(bytes, StandardCharsets.UTF_8));
++        return bytes;
++    }
++
++    /**
++     * 出站凭据终检（brief D2：复用 0024 组装终检 SnapshotCredentialGuard 对出站快照体同样
++     * 生效——防存储被篡改后凭据外泄，ADR-0006）。命中=存储篡改（服务端故障语义）→ ERROR
++     * 500 + 告警日志（终检文案保留——直指 ADR-0006 防线语义）。
++     */
++    private void checkOutboundCredential(String json, IotConfigVersion row) {
++        try {
++            credentialGuard.check(json);
++        } catch (BusinessException e) {
++            log.error("[SNAPSHOT] outbound credential guard tripped (storage tamper probe) tenant={} "
++                    + "scope={}-{} version={} hit={}", row.getTenantId(), row.getScopeType(),
++                    row.getScopeId(), row.getVersion(), e.getMessage());
++            throw new BusinessException(ResultCode.ERROR.getCode(), e.getMessage());
++        }
++    }
++
++    /** 快照体解析（出站对象化，Jackson 3 节点——见 OUT_MAPPER 注记）；失败=存储损坏（500 告警） */
++    private tools.jackson.databind.JsonNode parseSnapshotBody(byte[] bytes, IotConfigVersion row) {
++        try {
++            return OUT_MAPPER.readTree(new String(bytes, StandardCharsets.UTF_8));
++        } catch (tools.jackson.core.JacksonException e) {
++            log.error("[SNAPSHOT] snapshot body parse failed (storage corruption probe) tenant={} "
++                    + "scope={}-{} version={}", row.getTenantId(), row.getScopeType(), row.getScopeId(),
++                    row.getVersion(), e);
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "快照体解析失败（存储损坏探测，见服务端告警日志）");
++        }
++    }
++
++    /** latest 摘要条目（needFullSync=true 路径——不给逐版 diff） */
++    private ChangeEntryVO latestEntry(IotConfigVersion latestRow, ChangeSummaryVO summary) {
++        return new ChangeEntryVO(latestRow.getVersion(), latestRow.getSnapshotHash(),
++                latestRow.getPublishTime(), summary);
++    }
++
++    /** 基线→latest 累计 diff（needFullSync 路径的 latest 摘要；任一端不可读留空三段） */
++    private ChangeSummaryVO cumulativeSummaryQuietly(IotConfigVersion baseline, IotConfigVersion latestRow) {
++        if (baseline == null) {
++            return emptySummary();
++        }
++        try {
++            byte[] prevBytes = snapshotStorage.readBytes(baseline.getSnapshotUri());
++            byte[] curBytes = snapshotStorage.readBytes(latestRow.getSnapshotUri());
++            if (prevBytes == null || curBytes == null) {
++                return emptySummary();
++            }
++            return diffSnapshotBodies(DIFF_MAPPER.readTree(new String(prevBytes, StandardCharsets.UTF_8)),
++                    DIFF_MAPPER.readTree(new String(curBytes, StandardCharsets.UTF_8)));
++        } catch (IOException e) {
++            log.warn("[SNAPSHOT] changes latest summary degraded (baseline/latest unreadable) "
++                    + "tenantId={} scope={}-{} baseline={} latest={}", latestRow.getTenantId(),
++                    latestRow.getScopeType(), latestRow.getScopeId(), baseline.getVersion(),
++                    latestRow.getVersion());
++            return emptySummary();
++        }
++    }
++
++    private ChangeSummaryVO emptySummary() {
++        return new ChangeSummaryVO(List.of(), List.of(), List.of());
++    }
++
++    /**
++     * 相邻版本快照体 diff（五段：点位/通道/数据项/公式/指标；按对象 code/id 对齐——
++     * pointCode/channelCode/fullKey/metricCode，公式引用边无业务 code 以行 id 对齐，
++     * code 缺失回退行 id）。内容一致性=JsonNode 结构化相等（ObjectNode 为无序 Map equals
++     * ——键序无关、数组有序【行序 canonical】）；变更对象输出按 (type, key) 排序确定性。
++     */
++    private ChangeSummaryVO diffSnapshotBodies(JsonNode prev, JsonNode cur) {
++        ChangeSummaryVO summary = new ChangeSummaryVO(new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
++        diffSegment(prev, cur, "points", "pointCode", "point", summary);
++        diffSegment(prev, cur, "channels", "channelCode", "channel", summary);
++        diffSegment(prev, cur, "dataItems", "fullKey", "dataItem", summary);
++        diffSegment(prev, cur, "formulas", null, "formula", summary);
++        diffSegment(prev, cur, "metrics", "metricCode", "metric", summary);
++        java.util.Comparator<ChangeItemVO> byTypeKey = java.util.Comparator
++                .comparing(ChangeItemVO::getType).thenComparing(ChangeItemVO::getKey);
++        summary.getAdded().sort(byTypeKey);
++        summary.getRemoved().sort(byTypeKey);
++        summary.getChanged().sort(byTypeKey);
++        return summary;
+     }
+ 
++    /** 单段 diff：added（cur 独有）/changed（两版均有但内容不一致）/removed（prev 独有） */
++    private void diffSegment(JsonNode prev, JsonNode cur, String arrayKey, String codeKey,
++                             String type, ChangeSummaryVO summary) {
++        Map<String, JsonNode> prevMap = indexByIdentity(prev, arrayKey, codeKey);
++        Map<String, JsonNode> curMap = indexByIdentity(cur, arrayKey, codeKey);
++        for (Map.Entry<String, JsonNode> entry : curMap.entrySet()) {
++            if (!prevMap.containsKey(entry.getKey())) {
++                summary.getAdded().add(new ChangeItemVO(type, entry.getKey()));
++            } else if (!prevMap.get(entry.getKey()).equals(entry.getValue())) {
++                summary.getChanged().add(new ChangeItemVO(type, entry.getKey()));
++            }
++        }
++        for (Map.Entry<String, JsonNode> entry : prevMap.entrySet()) {
++            if (!curMap.containsKey(entry.getKey())) {
++                summary.getRemoved().add(new ChangeItemVO(type, entry.getKey()));
++            }
++        }
++    }
++
++    /** 五对象数组按对齐键索引（code 优先、缺失回退行 id；非对象元素跳过） */
++    private Map<String, JsonNode> indexByIdentity(JsonNode root, String arrayKey, String codeKey) {
++        Map<String, JsonNode> map = new java.util.LinkedHashMap<>();
++        if (root == null) {
++            return map;
++        }
++        JsonNode array = root.get(arrayKey);
++        if (array == null || !array.isArray()) {
++            return map;
++        }
++        for (JsonNode element : array) {
++            if (!element.isObject()) {
++                continue;
++            }
++            String key = null;
++            if (codeKey != null && element.hasNonNull(codeKey)
++                    && !element.get(codeKey).asText().isBlank()) {
++                key = element.get(codeKey).asText();
++            } else if (element.hasNonNull("id")) {
++                key = String.valueOf(element.get("id").asLong());
++            }
++            if (key != null) {
++                map.put(key, element);
++            }
++        }
++        return map;
++    }
++
++    /** 逐版 diff 读文件（缺失返回 null——调用方按缺失口径 needFullSync 兜底） */
++    private byte[] readQuietly(IotConfigVersion row) {
++        try {
++            return snapshotStorage.readBytes(row.getSnapshotUri());
++        } catch (IOException e) {
++            log.warn("[SNAPSHOT] changes diff read failed tenant={} version={} uri={} err={}",
++                    row.getTenantId(), row.getVersion(), row.getSnapshotUri(), e.getMessage());
++            return null;
++        }
++    }
++
++    /** 逐版 diff 解析（损坏返回 null——同缺失口径 needFullSync 兜底） */
++    private JsonNode parseQuietly(byte[] bytes) {
++        if (bytes == null) {
++            return null;
++        }
++        try {
++            return DIFF_MAPPER.readTree(new String(bytes, StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            return null;
++        }
++    }
++
++    // ---------- scope 归一与防线（TASK-0025 上提共享组件 PublishScopeGuard——发布/回滚/
++
+     // ---------- scope 归一与防线（TASK-0025 上提共享组件 PublishScopeGuard——发布/回滚/
+     // 列表/取回与下发状态查询/重发同防线，单一实现防两份漂移；行为逐字平移） ----------
+ 
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index 87ff357..b7d466b 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -51,6 +51,15 @@ ot:
+     ack-timeout-seconds: ${OT_PUBLISH_ACK_TIMEOUT_SECONDS:300}   # ACK 超时窗（秒，TASK-0025）：ack_status=0 且 create_time 早于 now-本值 的行视为超时（扫描置 2 + error_msg 记超时原因）；下发状态查询派生 timedOut 同用本值（覆盖扫描间隔间隙）
+     target-ingest-id: ${OT_PUBLISH_TARGET_INGEST_ID:ingest}   # 接入服务下发目标标识（TASK-0025）：网关 scope 发布落行的 target_type=2 行 target_id；接入服务按 (versionId, targetType=2, 本值) 回执
+     target-calc-id: ${OT_PUBLISH_TARGET_CALC_ID:calc}   # 计算引擎下发目标标识（TASK-0025）：计算 scope 发布落行的 target_type=3 行 target_id；计算引擎按 (versionId, targetType=3, 本值) 回执
++    changes-max-span: ${OT_PUBLISH_CHANGES_MAX_SPAN:10}   # 增量摘要最大跨度（TASK-0026）：/internal/v1/config/changes 的 latestVersion-sinceVersion 严格大于本值 → needFullSync=true（只给 latest 摘要——下游全量重拉）；中间版本快照文件缺失同样 needFullSync=true
++    notify:
++      enabled: ${OT_PUBLISH_NOTIFY_ENABLED:false}   # config.changed MQTT 通知开关（TASK-0026 默认 false——未启用走 NoOp 语义路径，发布/重发不阻断；通知丢失靠下游拉取对账哈希兜底，REQ-0033 验收 2）
++      broker-url: ${OT_PUBLISH_NOTIFY_BROKER_URL:}   # EMQX broker 地址（如 tcp://127.0.0.1:1883）；enabled=true 但本值空 → 每次发送 WARN fail-soft（不阻断发布）
++      username: ${OT_PUBLISH_NOTIFY_USERNAME:}   # broker 用户名（空=匿名）
++      password: ${OT_PUBLISH_NOTIFY_PASSWORD:}   # broker 口令（空=匿名；经环境变量注入——凭据不进快照/通知载荷，ADR-0006）
++      client-id: ${OT_PUBLISH_NOTIFY_CLIENT_ID:}   # MQTT clientId（空=进程内随机 ot-admin-notify-<random>，规避多实例同 id 互踢）
++      keep-alive-seconds: ${OT_PUBLISH_NOTIFY_KEEP_ALIVE_SECONDS:60}   # MQTT keep-alive（秒）
++      timeout-seconds: ${OT_PUBLISH_NOTIFY_TIMEOUT_SECONDS:30}   # MQTT 连接超时（秒）；连接懒建立+自动重连+句柄复用（不逐发新建）
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java
+index f733f0c..347f5cc 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java
+@@ -4,6 +4,7 @@ import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
+ import net.otlab.admin.module.iot.gateway.auth.InternalAuthInterceptor;
+ import net.otlab.admin.module.iot.publish.dto.AckForm;
+ import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.admin.module.iot.publish.service.IotPublishService;
+ import net.otlab.core.annotation.Anonymous;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.exception.GlobalExceptionHandler;
+@@ -24,10 +25,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.times;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+@@ -46,10 +49,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
+ class IotPublishInternalControllerTest {
+ 
+     private static final String ACK_URL = "/internal/v1/config/ack";
++    private static final String SNAPSHOT_URL = "/internal/v1/config/snapshot";
++    private static final String CHANGES_URL = "/internal/v1/config/changes";
+ 
+     @Mock
+     private IotPublishLogService publishLogService;
+ 
++    @Mock
++    private IotPublishService publishService;
++
+     @Mock
+     private InternalAuthChecker internalAuthChecker;
+ 
+@@ -62,6 +70,7 @@ class IotPublishInternalControllerTest {
+         MockitoAnnotations.openMocks(this);
+         internalController = new IotPublishInternalController();
+         ReflectionTestUtils.setField(internalController, "publishLogService", publishLogService);
++        ReflectionTestUtils.setField(internalController, "publishService", publishService);
+         ReflectionTestUtils.setField(internalController, "internalAuthChecker", internalAuthChecker);
+         // 拦截器层接线（与 GatewayInternalAuthConfig 同构）：checker 先于控制器执行
+         mockMvc = MockMvcBuilders.standaloneSetup(internalController)
+@@ -171,4 +180,144 @@ class IotPublishInternalControllerTest {
+                 .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
+                 .andExpect(jsonPath("$.message").value("下发记录不存在"));
+     }
++
++    // ---------- TASK-0026：GET /snapshot 与 GET /changes ----------
++
++    @Test
++    @DisplayName("注解契约 - snapshot/changes 均 @Anonymous + GET 路由；无 @SaCheckPermission；无 @OperateLog")
++    void testSnapshotChangesAnnotationContract() throws Exception {
++        Method snapshot = IotPublishInternalController.class.getMethod("snapshot",
++                jakarta.servlet.http.HttpServletRequest.class, Integer.class, Long.class, Long.class, String.class);
++        assertNotNull(snapshot.getAnnotation(Anonymous.class), "内部拉取须 @Anonymous 跳过管理面登录");
++        assertEquals(null, snapshot.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "内部接口不得挂管理面权限注解");
++        assertNull(snapshot.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "内部拉取不写操作日志");
++        assertEquals("/snapshot", snapshot.getAnnotation(
++                org.springframework.web.bind.annotation.GetMapping.class).value()[0]);
++
++        Method changes = IotPublishInternalController.class.getMethod("changes",
++                jakarta.servlet.http.HttpServletRequest.class, Integer.class, Long.class, Long.class, String.class);
++        assertNotNull(changes.getAnnotation(Anonymous.class), "增量查询须 @Anonymous");
++        assertEquals("/changes", changes.getAnnotation(
++                org.springframework.web.bind.annotation.GetMapping.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("snapshot - 认证双调用 + 参数透传（version/tenant 可选）+ 结果透传")
++    void testSnapshotAuthAndPassthrough() throws Exception {
++        when(publishService.retrieveSnapshotInternal(eq(1), eq(88L), eq(null), eq(null)))
++                .thenReturn(new net.otlab.admin.module.iot.publish.dto.InternalSnapshotVO(
++                        17L, "hash-abc", "1/1-88-17.json", "1.0.1",
++                        tools.jackson.databind.node.JsonNodeFactory.instance.objectNode()));
++
++        mockMvc.perform(get(SNAPSHOT_URL)
++                        .param("scopeType", "1").param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.version").value(17))
++                .andExpect(jsonPath("$.data.snapshotHash").value("hash-abc"))
++                .andExpect(jsonPath("$.data.schemaVersion").value("1.0.1"))
++                .andExpect(jsonPath("$.data.snapshot").isMap());
++
++        verify(internalAuthChecker, times(2)).check(any());
++        verify(publishService).retrieveSnapshotInternal(1, 88L, null, null);
++    }
++
++    @Test
++    @DisplayName("snapshot - 带指定 version/tenant 透传服务层")
++    void testSnapshotVersionAndTenantPassthrough() throws Exception {
++        mockMvc.perform(get(SNAPSHOT_URL)
++                        .param("scopeType", "2").param("scopeId", "0")
++                        .param("version", "17").param("tenant", "group_a"))
++                .andExpect(status().isOk());
++
++        verify(publishService).retrieveSnapshotInternal(2, 0L, 17L, "group_a");
++    }
++
++    @Test
++    @DisplayName("snapshot - 必填缺失（scopeType/scopeId）→ 业务 400，服务层不被触达")
++    void testSnapshotRequiredParams() throws Exception {
++        mockMvc.perform(get(SNAPSHOT_URL).param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("缺少必填参数: scopeType"));
++        mockMvc.perform(get(SNAPSHOT_URL).param("scopeType", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(publishService, never()).retrieveSnapshotInternal(any(), any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("snapshot - 令牌无效（401）时服务层不被触达（fail-closed）")
++    void testSnapshotTokenRejectedBeforeService() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效"))
++                .when(internalAuthChecker).check(any());
++
++        mockMvc.perform(get(SNAPSHOT_URL)
++                        .param("scopeType", "1").param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.UNAUTHORIZED.getCode()));
++
++        verify(publishService, never()).retrieveSnapshotInternal(any(), any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("snapshot - 服务层 400（版本不存在/跨租户歧义）原样返回")
++    void testSnapshotBusinessErrorPassthrough() throws Exception {
++        when(publishService.retrieveSnapshotInternal(any(), any(), any(), any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "跨租户同名命中多个版本，请携带 tenant 参数"));
++
++        mockMvc.perform(get(SNAPSHOT_URL)
++                        .param("scopeType", "2").param("scopeId", "0"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("跨租户同名命中多个版本，请携带 tenant 参数"));
++    }
++
++    @Test
++    @DisplayName("changes - 认证双调用 + sinceVersion 必填透传 + 结果透传（needFullSync/changes）")
++    void testChangesAuthAndPassthrough() throws Exception {
++        when(publishService.changesSince(eq(1), eq(88L), eq(3L), eq(null)))
++                .thenReturn(new net.otlab.admin.module.iot.publish.dto.ChangesListVO(
++                        true, 17L, java.util.List.of()));
++
++        mockMvc.perform(get(CHANGES_URL)
++                        .param("scopeType", "1").param("scopeId", "88").param("sinceVersion", "3"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.needFullSync").value(true))
++                .andExpect(jsonPath("$.data.latestVersion").value(17))
++                .andExpect(jsonPath("$.data.changes").isArray());
++
++        verify(internalAuthChecker, times(2)).check(any());
++    }
++
++    @Test
++    @DisplayName("changes - sinceVersion 缺失 → 业务 400，服务层不被触达")
++    void testChangesRequiredParams() throws Exception {
++        mockMvc.perform(get(CHANGES_URL)
++                        .param("scopeType", "1").param("scopeId", "88"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("缺少必填参数: sinceVersion"));
++
++        verify(publishService, never()).changesSince(any(), any(), any(), any());
++    }
++
++    @Test
++    @DisplayName("changes - 令牌无效（401）时服务层不被触达（fail-closed）")
++    void testChangesTokenRejectedBeforeService() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效"))
++                .when(internalAuthChecker).check(any());
++
++        mockMvc.perform(get(CHANGES_URL)
++                        .param("scopeType", "1").param("scopeId", "88").param("sinceVersion", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.UNAUTHORIZED.getCode()));
++
++        verify(publishService, never()).changesSince(any(), any(), any(), any());
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySenderTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySenderTest.java
+new file mode 100644
+index 0000000..6f43bc1
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/notify/MqttNotifySenderTest.java
+@@ -0,0 +1,280 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.json.JsonMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyBoolean;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * config.changed 通知发送器单元测试（TASK-0026，brief 测试口径：topic 映射 / 载荷五键
++ * 逐字+哈希值正确 / fail-soft（port 抛异常→WARN 不阻断） / enabled=false 走 NoOp / 
++ * afterCommit 事务提交后才真正发送（0025 评审 Minor ④ 决策 a））。
++ *
++ * <p>mock 口径（brief D5）：NotifySender 依赖薄接口 {@link MqttPublisherPort} 隔离 paho，
++ * 单测 mock port 验 topic 映射/载荷/fail-soft；真 broker 验证登记 TD-0056。
++ * afterCommit 断言用 TransactionSynchronizationManager 手工 init/clear 同步器域。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class MqttNotifySenderTest {
++
++    private static final String SHARED_TOPIC = "iot/config.changed";
++    private static final long TENANT_ID = 1L;
++    private static final String TENANT_CODE = "group_a";
++    private static final String HASH = "ad5c5fb0e18e49b8a51b0e6a9e5f1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f80";
++
++    @Mock
++    private MqttPublisherPort publisher;
++
++    @Mock
++    private SysTenantMapper tenantMapper;
++
++    private MqttNotifySender sender;
++
++    private AutoCloseable mocks;
++
++    private boolean synchronizationActive;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        sender = new MqttNotifySender(publisher, tenantMapper);
++        when(tenantMapper.selectById(TENANT_ID)).thenReturn(tenant(TENANT_CODE));
++        // 重发等无事务路径：默认无同步器域（每个用例自行声明）
++        synchronizationActive = TransactionSynchronizationManager.isSynchronizationActive();
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        if (TransactionSynchronizationManager.isSynchronizationActive()) {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++        mocks.close();
++    }
++
++    // ---------- topic 映射 ----------
++
++    @Test
++    @DisplayName("topic 映射 - target_type=1 网关 → 专属主题 iot/{tenantCode}/{gatewayCode}/config")
++    void gatewayTargetUsesDedicatedTopic() throws Exception {
++        sender.notify(versionRow(), 1, "GW01");
++
++        ArgumentCaptor<String> topic = ArgumentCaptor.forClass(String.class);
++        verify(publisher).publish(topic.capture(), anyString(), anyInt(), anyBoolean());
++        assertEquals("iot/group_a/GW01/config", topic.getValue());
++    }
++
++    @Test
++    @DisplayName("topic 映射 - target_type=2 接入 → 共享内部主题 iot/config.changed")
++    void ingestTargetUsesSharedTopic() throws Exception {
++        sender.notify(versionRow(), 2, "ingest");
++
++        ArgumentCaptor<String> topic = ArgumentCaptor.forClass(String.class);
++        verify(publisher).publish(topic.capture(), anyString(), anyInt(), anyBoolean());
++        assertEquals(SHARED_TOPIC, topic.getValue());
++    }
++
++    @Test
++    @DisplayName("topic 映射 - target_type=3 计算 → 共享内部主题 iot/config.changed")
++    void calcTargetUsesSharedTopic() throws Exception {
++        sender.notify(versionRow(), 3, "calc");
++
++        ArgumentCaptor<String> topic = ArgumentCaptor.forClass(String.class);
++        verify(publisher).publish(topic.capture(), anyString(), anyInt(), anyBoolean());
++        assertEquals(SHARED_TOPIC, topic.getValue());
++    }
++
++    // ---------- 载荷（§3.3 逐字五键） ----------
++
++    @Test
++    @DisplayName("载荷 - 五键逐字 {tenant,scopeType,scopeId,version,hash}，tenant=租户编码、hash=快照 SHA-256")
++    void payloadCarriesFiveVerbatimKeys() throws Exception {
++        sender.notify(versionRow(), 1, "GW01");
++
++        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
++        verify(publisher).publish(anyString(), payload.capture(), anyInt(), anyBoolean());
++        JsonNode body = new JsonMapper().readTree(payload.getValue());
++        assertEquals(5, body.size(), "载荷恰五键（通知只带版本号与哈希，不带快照体）");
++        assertEquals("group_a", body.get("tenant").asText(), "tenant=租户编码");
++        assertEquals(1, body.get("scopeType").asInt(), "scopeType=版本行范围");
++        assertEquals(88L, body.get("scopeId").asLong(), "scopeId=版本行范围对象");
++        assertEquals(17L, body.get("version").asLong(), "version=版本号（非 versionId）");
++        assertEquals(HASH, body.get("hash").asText(), "hash=快照 SHA-256（下游拉取比对哈希的锚）");
++    }
++
++    @Test
++    @DisplayName("载荷 - QoS 1、retain=false（下行配置主题 QoS 1 口径）")
++    void payloadUsesQos1AndNoRetain() throws Exception {
++        sender.notify(versionRow(), 2, "ingest");
++
++        verify(publisher).publish(anyString(), anyString(), eq(1), eq(false));
++    }
++
++    @Test
++    @DisplayName("载荷 - 计算 scope scopeId=0（归一后值随版本行）")
++    void payloadCarriesNormalizedComputeScopeId() throws Exception {
++        IotConfigVersion compute = versionRow();
++        compute.setScopeType(2);
++        compute.setScopeId(0L);
++
++        sender.notify(compute, 3, "calc");
++
++        ArgumentCaptor<String> payload = ArgumentCaptor.forClass(String.class);
++        verify(publisher).publish(anyString(), payload.capture(), anyInt(), anyBoolean());
++        JsonNode body = assertParses(payload.getValue());
++        assertEquals(2, body.get("scopeType").asInt());
++        assertEquals(0L, body.get("scopeId").asLong());
++    }
++
++    // ---------- fail-soft 纪律 ----------
++
++    @Test
++    @DisplayName("fail-soft - port 发布异常 → WARN 不抛（发布流程不阻断不回滚，REQ-0033 验收 2）")
++    void portFailureDoesNotPropagate() throws Exception {
++        doThrow(new RuntimeException("broker down")).when(publisher)
++                .publish(anyString(), anyString(), anyInt(), anyBoolean());
++
++        assertDoesNotThrow(() -> sender.notify(versionRow(), 1, "GW01"),
++                "通知失败不得阻断发布事务（下游拉取对账哈希兜底）");
++    }
++
++    @Test
++    @DisplayName("fail-soft - 租户编码解析失败 → 跳过发送不抛（载荷缺 tenant 不得外发）")
++    void tenantResolveFailureSkipsQuietly() throws Exception {
++        when(tenantMapper.selectById(TENANT_ID)).thenReturn(null);
++
++        assertDoesNotThrow(() -> sender.notify(versionRow(), 1, "GW01"));
++        verify(publisher, never()).publish(anyString(), anyString(), anyInt(), anyBoolean());
++    }
++
++    @Test
++    @DisplayName("fail-soft - 网关目标缺 gatewayCode（targetId 空白）→ 跳过发送不抛")
++    void blankGatewayTargetSkipsQuietly() throws Exception {
++        assertDoesNotThrow(() -> sender.notify(versionRow(), 1, " "));
++        verify(publisher, never()).publish(anyString(), anyString(), anyInt(), anyBoolean());
++    }
++
++    // ---------- enabled=false 走 NoOp（装配条件契约） ----------
++
++    @Test
++    @DisplayName("enabled=false 走 NoOp - MqttNotifySender 条件 havingValue=true；NoOp 条件 havingValue=false+matchIfMissing")
++    void enabledSwitchIsWiringContract() {
++        org.springframework.boot.autoconfigure.condition.ConditionalOnProperty mqtt =
++                MqttNotifySender.class.getAnnotation(
++                        org.springframework.boot.autoconfigure.condition.ConditionalOnProperty.class);
++        assertNotNull(mqtt, "真实现必须挂条件装配（ot.publish.notify.enabled=true 才注册）");
++        assertEquals("ot.publish.notify.enabled", mqtt.name()[0]);
++        assertEquals("true", mqtt.havingValue());
++
++        org.springframework.boot.autoconfigure.condition.ConditionalOnProperty noop =
++                NoOpNotifySender.class.getAnnotation(
++                        org.springframework.boot.autoconfigure.condition.ConditionalOnProperty.class);
++        assertNotNull(noop, "NoOp 必须挂条件装配（未启用时的语义路径）");
++        assertEquals("ot.publish.notify.enabled", noop.name()[0]);
++        assertEquals("false", noop.havingValue(), "enabled=false 走 NoOp");
++        assertTrue(noop.matchIfMissing(), "键缺省（未配置）默认走 NoOp——brief D1 默认 false");
++    }
++
++    // ---------- afterCommit（0025 评审 Minor ④ 决策 a） ----------
++
++    @Test
++    @DisplayName("afterCommit - 事务激活时发送延迟到提交后（杜绝「通知已发、行已回滚」伪通知）")
++    void sendDeferredToAfterCommitWhenTransactionActive() throws Exception {
++        TransactionSynchronizationManager.initSynchronization();
++        try {
++            sender.notify(versionRow(), 1, "GW01");
++
++            verify(publisher, never()).publish(anyString(), anyString(), anyInt(), anyBoolean());
++
++            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
++            assertEquals(1, syncs.size(), "恰好注册一个提交后回调");
++            syncs.forEach(TransactionSynchronization::afterCommit);
++
++            ArgumentCaptor<String> topic = ArgumentCaptor.forClass(String.class);
++            verify(publisher).publish(topic.capture(), anyString(), anyInt(), anyBoolean());
++            assertEquals("iot/group_a/GW01/config", topic.getValue());
++        } finally {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++    }
++
++    @Test
++    @DisplayName("afterCommit - 无事务（重发链路）立即发送")
++    void sendsImmediatelyWithoutTransaction() throws Exception {
++        sender.notify(versionRow(), 2, "ingest");
++
++        verify(publisher).publish(eq(SHARED_TOPIC), anyString(), anyInt(), anyBoolean());
++    }
++
++    @Test
++    @DisplayName("afterCommit - 提交后回调里发布异常仍 fail-soft（不污染提交链路）")
++    void afterCommitFailureDoesNotPropagate() throws Exception {
++        doThrow(new BusinessException(500, "commit path boom")).when(publisher)
++                .publish(anyString(), anyString(), anyInt(), anyBoolean());
++
++        TransactionSynchronizationManager.initSynchronization();
++        try {
++            sender.notify(versionRow(), 1, "GW01");
++            List<TransactionSynchronization> syncs = TransactionSynchronizationManager.getSynchronizations();
++            assertDoesNotThrow(() -> syncs.forEach(TransactionSynchronization::afterCommit));
++        } finally {
++            TransactionSynchronizationManager.clearSynchronization();
++        }
++    }
++
++    // ---------- fixtures ----------
++
++    private IotConfigVersion versionRow() {
++        IotConfigVersion row = new IotConfigVersion();
++        row.setId(101L);
++        row.setTenantId(TENANT_ID);
++        row.setScopeType(1);
++        row.setScopeId(88L);
++        row.setVersion(17L);
++        row.setSnapshotHash(HASH);
++        return row;
++    }
++
++    private SysTenant tenant(String code) {
++        SysTenant t = new SysTenant();
++        t.setId(TENANT_ID);
++        t.setTenantCode(code);
++        return t;
++    }
++
++    private JsonNode assertParses(String json) {
++        try {
++            return new JsonMapper().readTree(json);
++        } catch (Exception e) {
++            throw new IllegalStateException("载荷不是合法 JSON: " + json, e);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java
+index 0221a56..afdd740 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java
+@@ -48,6 +48,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.times;
+@@ -155,9 +156,9 @@ class IotPublishLogServiceImplTest {
+             assertNull(row.getAckTime());
+             assertNull(row.getErrorMsg());
+         }
+-        verify(notifySender, times(2)).notify(anyLong(), any(), any());
+-        verify(notifySender).notify(VERSION_ROW_ID, 1, "GW01");
+-        verify(notifySender).notify(VERSION_ROW_ID, 2, "ingest");
++        verify(notifySender, times(2)).notify(any(IotConfigVersion.class), any(), any());
++        verify(notifySender).notify(any(IotConfigVersion.class), eq(1), eq("GW01"));
++        verify(notifySender).notify(any(IotConfigVersion.class), eq(2), eq("ingest"));
+     }
+ 
+     @Test
+@@ -174,7 +175,7 @@ class IotPublishLogServiceImplTest {
+         assertEquals("calc", row.getTargetId(), "计算行 targetId=ot.publish.target-calc-id");
+         assertEquals(VERSION_ROW_ID, row.getVersionId());
+         assertEquals(0, row.getAckStatus());
+-        verify(notifySender, times(1)).notify(VERSION_ROW_ID, 3, "calc");
++        verify(notifySender, times(1)).notify(any(IotConfigVersion.class), eq(3), eq("calc"));
+     }
+ 
+     @Test
+@@ -414,7 +415,7 @@ class IotPublishLogServiceImplTest {
+         Map<String, Object> params = captor.getValue().getParamNameValuePairs();
+         assertTrue(params.containsValue(0), "重置 0: " + params);
+         assertTrue(params.containsValue(31L), "按行定位: " + params);
+-        verify(notifySender, times(1)).notify(VERSION_ROW_ID, 1, "GW01");
++        verify(notifySender, times(1)).notify(any(IotConfigVersion.class), eq(1), eq("GW01"));
+     }
+ 
+     @Test
+@@ -429,7 +430,7 @@ class IotPublishLogServiceImplTest {
+         IotConfigPublishLog result = logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "ingest"));
+ 
+         assertEquals(0, result.getAckStatus());
+-        verify(notifySender).notify(VERSION_ROW_ID, 2, "ingest");
++        verify(notifySender).notify(any(IotConfigVersion.class), eq(2), eq("ingest"));
+     }
+ 
+     @Test
+@@ -443,7 +444,7 @@ class IotPublishLogServiceImplTest {
+         assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
+         assertTrue(ex.getMessage().contains("已生效"), "文案指认终态: " + ex.getMessage());
+         verify(publishLogMapper, never()).update(any(), any());
+-        verify(notifySender, never()).notify(anyLong(), any(), any());
++        verify(notifySender, never()).notify(any(IotConfigVersion.class), any(), any());
+     }
+ 
+     @Test
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplInternalQueryTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplInternalQueryTest.java
+new file mode 100644
+index 0000000..6e24fd4
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplInternalQueryTest.java
+@@ -0,0 +1,508 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.ChangeEntryVO;
++import net.otlab.admin.module.iot.publish.dto.ChangesListVO;
++import net.otlab.admin.module.iot.publish.dto.InternalSnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
++import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.core.exception.BusinessException;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.time.LocalDateTime;
++import java.util.List;
++import java.util.Set;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.when;
++
++/**
++ * 内部快照拉取与增量摘要服务单元测试（TASK-0026，brief 测试口径：snapshot 端点
++ * （最新/指定/不存在 400/哈希核对/凭据终检出站生效）/ changes 端点（diff 五段摘要正确 /
++ * 跨度超限 needFullSync / 中间缺失 needFullSync / 空数组））。
++ *
++ * <p>standalone Mockito 范式：version/tenant Mapper 全 mock，存储真实实现指向 @TempDir
++ * （文件布局/哈希核对端到端）。内部链路无会话（无 TenantContext/SecurityUtils static mock）
++ * ——租户消歧走显式 tenant 参数（tenant_code → sys_tenant 反查 id）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotPublishServiceImplInternalQueryTest {
++
++    private static final long TENANT = 1L;
++    private static final long TENANT_B = 2L;
++    private static final String TENANT_CODE_A = "group_a";
++    private static final long GATEWAY_ID = 88L;
++
++    @TempDir
++    Path tempDir;
++
++    @Mock
++    private IotConfigVersionMapper versionMapper;
++
++    @Mock
++    private IotGatewayMapper gatewayMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private SysTenantMapper tenantMapper;
++
++    private IotPublishServiceImpl publishService;
++
++    private SnapshotStorage storage;
++
++    private PublishProperties properties;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotConfigVersion.class);
++        TableInfoHelper.initTableInfo(assistant, SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        properties = new PublishProperties();
++        properties.setStoragePath(tempDir.toString());
++        storage = new SnapshotStorage(properties);
++        PublishScopeGuard scopeGuard = new PublishScopeGuard(gatewayMapper, dataPermService);
++
++        publishService = new IotPublishServiceImpl();
++        ReflectionTestUtils.setField(publishService, "baseMapper", versionMapper);
++        ReflectionTestUtils.setField(publishService, "scopeGuard", scopeGuard);
++        ReflectionTestUtils.setField(publishService, "snapshotStorage", storage);
++        ReflectionTestUtils.setField(publishService, "credentialGuard", new SnapshotCredentialGuard());
++        ReflectionTestUtils.setField(publishService, "properties", properties);
++        ReflectionTestUtils.setField(publishService, "tenantMapper", tenantMapper);
++
++        when(tenantMapper.selectOne(any())).thenAnswer(inv -> tenant(TENANT, TENANT_CODE_A));
++    }
++
++    // ---------- 内部快照拉取（GET /internal/v1/config/snapshot） ----------
++
++    @Test
++    @DisplayName("snapshot - 不带 version 返回最新已发布版（信封含 version/hash/uri/schemaVersion+快照体对象）")
++    void internalSnapshotLatestVersion() throws Exception {
++        IotConfigVersion v1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion v2 = storedRow(TENANT, 1, GATEWAY_ID, 2, body(TENANT, 2, 5));
++        when(versionMapper.selectList(any())).thenReturn(List.of(v2));
++
++        InternalSnapshotVO vo = publishService.retrieveSnapshotInternal(1, GATEWAY_ID, null, null);
++
++        assertEquals(2L, vo.getVersion(), "缺省=最新版");
++        assertEquals(v2.getSnapshotHash(), vo.getSnapshotHash());
++        assertEquals(v2.getSnapshotUri(), vo.getSnapshotUri());
++        assertEquals("1.0.1", vo.getSchemaVersion(), "Schema 版本号一并下发");
++        assertNotNull(vo.getSnapshot(), "快照体为嵌套对象（非转义字符串）");
++        assertEquals(5, vo.getSnapshot().get("points").get(0).get("minValue").asInt(),
++                "快照体取自存储并哈希核对后原样出站");
++    }
++
++    @Test
++    @DisplayName("snapshot - 带 version 返回指定版")
++    void internalSnapshotSpecificVersion() throws Exception {
++        IotConfigVersion v1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        when(versionMapper.selectList(any())).thenReturn(List.of(v1));
++
++        InternalSnapshotVO vo = publishService.retrieveSnapshotInternal(1, GATEWAY_ID, 1L, null);
++
++        assertEquals(1L, vo.getVersion());
++        assertEquals(0, vo.getSnapshot().get("points").get(0).get("minValue").asInt());
++    }
++
++    @Test
++    @DisplayName("snapshot - 指定版本不存在 → 400")
++    void internalSnapshotVersionMissing400() {
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(1, GATEWAY_ID, 99L, null));
++        assertEquals(400, e.getCode());
++    }
++
++    @Test
++    @DisplayName("snapshot - scope 无任何已发布版本 → 400")
++    void internalSnapshotScopeEmpty400() {
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(1, GATEWAY_ID, null, null));
++        assertEquals(400, e.getCode());
++    }
++
++    @Test
++    @DisplayName("snapshot - 存储文件被篡改 → 哈希核对失败 500 告警（复用 0024 路径）")
++    void internalSnapshotHashMismatch500() throws Exception {
++        IotConfigVersion row = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        when(versionMapper.selectList(any())).thenReturn(List.of(row));
++        // 篡改：文件内容改写（哈希与落库不一致）
++        Path file = tempDir.resolve(row.getSnapshotUri());
++        Files.write(file, "{\"schemaVersion\":\"1.0.1\",\"tampered\":true}".getBytes(StandardCharsets.UTF_8));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(1, GATEWAY_ID, 1L, null));
++        assertEquals(500, e.getCode(), "存储损坏探测转 500");
++        assertTrue(e.getMessage().contains("哈希核对失败"));
++    }
++
++    @Test
++    @DisplayName("snapshot - 凭据终检对出站快照体生效（存储被篡改塞凭据且哈希被同步改写 → 拒绝出站）")
++    void internalSnapshotCredentialGuardAppliesToOutboundBody() throws Exception {
++        String poison = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[],"
++                + "\"channels\":[{\"id\":1,\"channelCode\":\"C1\",\"status\":1,\"hasCredential\":false,"
++                + "\"connConfig\":{\"broker\":\"tcp://127.0.0.1:1883\",\"mqttPassword\":\"hunter2\"}}],"
++                + "\"dataItems\":[],\"formulas\":[],\"metrics\":[]}";
++        // 直接写毒文件并把行哈希同步改写为毒文件哈希（绕过哈希核对，专测出站终检）
++        IotConfigVersion row = rowWithUri(TENANT, 1, GATEWAY_ID, 1, "1/1-88-1.json");
++        Files.createDirectories(tempDir.resolve("1"));
++        Files.write(tempDir.resolve(row.getSnapshotUri()), poison.getBytes(StandardCharsets.UTF_8));
++        row.setSnapshotHash(SnapshotStorage.sha256Hex(poison.getBytes(StandardCharsets.UTF_8)));
++        when(versionMapper.selectList(any())).thenReturn(List.of(row));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(1, GATEWAY_ID, 1L, null));
++        assertEquals(500, e.getCode(), "出站终检命中=存储篡改（服务端故障语义 500）");
++        assertTrue(e.getMessage().contains("凭据关键词"), "ADR-0006 防线文案保留: " + e.getMessage());
++    }
++
++    @Test
++    @DisplayName("snapshot - 无 tenant 参数且 (scopeType+scopeId) 跨租户同名 → 400 要求携带 tenant")
++    void internalSnapshotAmbiguousWithoutTenant400() throws Exception {
++        IotConfigVersion a = storedRow(TENANT, 2, 0L, 1, body(TENANT, 1, 0));
++        IotConfigVersion b = storedRow(TENANT_B, 2, 0L, 1, body(TENANT, 1, 0));
++        when(versionMapper.selectList(any())).thenReturn(List.of(a, b));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(2, 0L, 1L, null));
++        assertEquals(400, e.getCode(), "跨租户歧义拒绝（fail-closed，不猜租户）");
++        assertTrue(e.getMessage().contains("tenant"));
++    }
++
++    @Test
++    @DisplayName("snapshot - 携带 tenant 参数（租户编码）→ 反查 id 过滤后精确命中")
++    void internalSnapshotTenantParamDisambiguates() throws Exception {
++        when(tenantMapper.selectOne(any())).thenReturn(tenant(TENANT_B, "group_b"));
++        IotConfigVersion b = storedRow(TENANT_B, 2, 0L, 1, body(TENANT_B, 1, 0));
++        when(versionMapper.selectList(any())).thenReturn(List.of(b));
++
++        InternalSnapshotVO vo = publishService.retrieveSnapshotInternal(2, 0L, 1L, "group_b");
++
++        assertEquals(1L, vo.getVersion());
++        assertEquals(TENANT_B, vo.getSnapshot().get("tenantId").asLong(), "返回 B 租户快照体");
++    }
++
++    @Test
++    @DisplayName("snapshot - tenant 参数指向不存在租户 → 400")
++    void internalSnapshotUnknownTenant400() {
++        when(tenantMapper.selectOne(any())).thenReturn(null);
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.retrieveSnapshotInternal(1, GATEWAY_ID, 1L, "ghost"));
++        assertEquals(400, e.getCode());
++    }
++
++    // ---------- 增量摘要（GET /internal/v1/config/changes） ----------
++
++    @Test
++    @DisplayName("changes - 相邻版本 diff 五段摘要正确（added/removed/changed 按 code/id 对齐）")
++    void changesDiffCoversFiveSegments() throws Exception {
++        // 计算 scope 五段全量差异：v1 基线 → v2 变更
++        String v1 = computeBody("P1:0", "C1", "D1", "200", "M1");
++        // v2：P1 变更 + P2 新增；C1 移除；D1 不变；公式 F2(201) 新增；指标 M1 移除
++        String v2 = computeBody("P1:5,P2:0", null, "D1", "200,201", null);
++        IotConfigVersion r1 = storedRow(TENANT, 2, 0L, 1, v1);
++        IotConfigVersion r2 = storedRow(TENANT, 2, 0L, 2, v2);
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2));
++
++        ChangesListVO vo = publishService.changesSince(2, 0L, 1L, null);
++
++        assertFalse(vo.isNeedFullSync());
++        assertEquals(2L, vo.getLatestVersion());
++        assertEquals(1, vo.getChanges().size(), "逐版 diff：一条（v2）");
++        ChangeEntryVO entry = vo.getChanges().get(0);
++        assertEquals(2L, entry.getVersion());
++        assertEquals(r2.getSnapshotHash(), entry.getHash());
++        assertNotNull(entry.getPublishTime());
++        Set<String> added = keysOf(entry, "added");
++        Set<String> removed = keysOf(entry, "removed");
++        Set<String> changed = keysOf(entry, "changed");
++        assertEquals(Set.of("point:P2", "formula:201"), added, "新增=点位 P2 + 公式边 201");
++        assertEquals(Set.of("channel:C1", "metric:M1"), removed, "移除=通道 C1 + 指标 M1");
++        assertEquals(Set.of("point:P1"), changed, "变更=点位 P1（minValue 0→5）");
++    }
++
++    @Test
++    @DisplayName("changes - sinceVersion ≥ 最新 → changes 空数组、needFullSync=false")
++    void changesSinceLatestReturnsEmpty() throws Exception {
++        IotConfigVersion r1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion r2 = storedRow(TENANT, 1, GATEWAY_ID, 2, body(TENANT, 2, 5));
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2));
++
++        ChangesListVO at = publishService.changesSince(1, GATEWAY_ID, 2L, null);
++        assertFalse(at.isNeedFullSync());
++        assertEquals(2L, at.getLatestVersion());
++        assertTrue(at.getChanges().isEmpty(), "since=latest → 空");
++
++        ChangesListVO beyond = publishService.changesSince(1, GATEWAY_ID, 3L, null);
++        assertFalse(beyond.isNeedFullSync());
++        assertTrue(beyond.getChanges().isEmpty(), "since>latest → 空（下游已领先）");
++    }
++
++    @Test
++    @DisplayName("changes - 跨度超限（latest-since > changes-max-span）→ needFullSync=true 只给 latest 摘要")
++    void changesSpanExceededNeedsFullSync() throws Exception {
++        properties.setChangesMaxSpan(2);
++        IotConfigVersion r1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion r2 = storedRow(TENANT, 1, GATEWAY_ID, 2, body(TENANT, 2, 5));
++        IotConfigVersion r3 = storedRow(TENANT, 1, GATEWAY_ID, 3, body(TENANT, 3, 5));
++        IotConfigVersion r4 = storedRow(TENANT, 1, GATEWAY_ID, 4, body(TENANT, 4, 9));
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2, r3, r4));
++
++        ChangesListVO vo = publishService.changesSince(1, GATEWAY_ID, 1L, null);
++
++        assertTrue(vo.isNeedFullSync(), "跨度 3 > maxSpan 2 → needFullSync");
++        assertEquals(1, vo.getChanges().size(), "只给 latest 摘要，不给逐版 diff");
++        ChangeEntryVO latest = vo.getChanges().get(0);
++        assertEquals(4L, latest.getVersion());
++        assertEquals(Set.of("point:P1"), keysOf(latest, "changed"),
++                "latest 摘要=基线(since)→latest 累计 diff");
++    }
++
++    @Test
++    @DisplayName("changes - 跨度恰好等于 maxSpan 不触发 needFullSync（边界语义：仅严格大于）")
++    void changesSpanAtLimitStaysIncremental() throws Exception {
++        properties.setChangesMaxSpan(2);
++        IotConfigVersion r1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion r2 = storedRow(TENANT, 1, GATEWAY_ID, 2, body(TENANT, 2, 5));
++        IotConfigVersion r3 = storedRow(TENANT, 1, GATEWAY_ID, 3, body(TENANT, 3, 9));
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2, r3));
++
++        ChangesListVO vo = publishService.changesSince(1, GATEWAY_ID, 1L, null);
++
++        assertFalse(vo.isNeedFullSync(), "跨度 2 = maxSpan 2 → 逐版 diff");
++        assertEquals(2, vo.getChanges().size());
++        assertEquals(3L, vo.getChanges().get(1).getVersion());
++    }
++
++    @Test
++    @DisplayName("changes - 中间快照文件缺失 → needFullSync=true 只给 latest 摘要")
++    void changesMiddleFileMissingNeedsFullSync() throws Exception {
++        IotConfigVersion r1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion r2 = rowWithUri(TENANT, 1, GATEWAY_ID, 2, "1/1-88-2.json"); // 文件未落盘
++        IotConfigVersion r3 = storedRow(TENANT, 1, GATEWAY_ID, 3, body(TENANT, 3, 9));
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2, r3));
++
++        ChangesListVO vo = publishService.changesSince(1, GATEWAY_ID, 1L, null);
++
++        assertTrue(vo.isNeedFullSync(), "中间快照缺失 → needFullSync 兜底");
++        assertEquals(1, vo.getChanges().size());
++        assertEquals(3L, vo.getChanges().get(0).getVersion());
++        assertEquals(Set.of("point:P1"), keysOf(vo.getChanges().get(0), "changed"),
++                "latest 摘要仍可由基线(since)→latest 端点快照计算");
++    }
++
++    @Test
++    @DisplayName("changes - 基线版本行不存在（下游状态不可信）→ needFullSync=true 摘要留空")
++    void changesUnknownBaselineNeedsFullSync() throws Exception {
++        IotConfigVersion r1 = storedRow(TENANT, 1, GATEWAY_ID, 1, body(TENANT, 1, 0));
++        IotConfigVersion r2 = storedRow(TENANT, 1, GATEWAY_ID, 2, body(TENANT, 2, 5));
++        when(versionMapper.selectList(any())).thenReturn(List.of(r1, r2));
++
++        ChangesListVO vo = publishService.changesSince(1, GATEWAY_ID, 0L, null);
++
++        assertTrue(vo.isNeedFullSync(), "sinceVersion=0 无版本行——下游基线不可信");
++        assertEquals(1, vo.getChanges().size());
++        assertTrue(vo.getChanges().get(0).getSummary().getAdded().isEmpty());
++        assertTrue(vo.getChanges().get(0).getSummary().getRemoved().isEmpty());
++        assertTrue(vo.getChanges().get(0).getSummary().getChanged().isEmpty(), "无基线无法 diff → 摘要留空");
++    }
++
++    @Test
++    @DisplayName("changes - scope 无已发布版本 → 400；sinceVersion 缺失 → 400")
++    void changesParamValidation() {
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++
++        BusinessException empty = assertThrows(BusinessException.class,
++                () -> publishService.changesSince(1, GATEWAY_ID, 1L, null));
++        assertEquals(400, empty.getCode());
++
++        BusinessException noSince = assertThrows(BusinessException.class,
++                () -> publishService.changesSince(1, GATEWAY_ID, null, null));
++        assertEquals(400, noSince.getCode(), "sinceVersion 必填");
++    }
++
++    @Test
++    @DisplayName("changes - 无 tenant 参数且 scope 跨租户同名 → 400 要求携带 tenant")
++    void changesAmbiguousWithoutTenant400() throws Exception {
++        IotConfigVersion a = storedRow(TENANT, 2, 0L, 1, computeBody("P1:0", "C1", "D1", "200", "M1"));
++        IotConfigVersion b = storedRow(TENANT_B, 2, 0L, 1, computeBody("P1:0", "C1", "D1", "200", "M1"));
++        when(versionMapper.selectList(any())).thenReturn(List.of(a, b));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> publishService.changesSince(2, 0L, 1L, null));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("tenant"));
++    }
++
++    // ---------- fixtures ----------
++
++    /** 网关 scope 最小快照体（points 单段；值嵌入 minValue 便于断言 diff） */
++    private String body(long tenantId, long version, double minValue) {
++        return "{\"schemaVersion\":\"1.0.1\",\"tenantId\":" + tenantId + ",\"scopeType\":1,"
++                + "\"scopeId\":" + GATEWAY_ID + ",\"version\":" + version + ","
++                + "\"points\":[{\"id\":12020,\"pointCode\":\"P1\",\"minValue\":" + minValue + "}],"
++                + "\"channels\":[]}";
++    }
++
++    /**
++     * 计算 scope 最小快照体（五段齐备便于 diff 断言）：
++     * points 以 code:minValue 对（空段传 null）、channels/dataItems 传 code 清单、
++     * formulas 传 id 清单、metrics 传 metricCode 清单。
++     */
++    private String computeBody(String pointsSpec, String channels, String dataItems,
++                               String formulas, String metrics) {
++        StringBuilder sb = new StringBuilder();
++        sb.append("{\"schemaVersion\":\"1.0.1\",\"tenantId\":").append(TENANT)
++                .append(",\"scopeType\":2,\"scopeId\":0,\"version\":0,");
++        sb.append("\"points\":[");
++        if (pointsSpec != null) {
++            long id = 1;
++            for (String seg : pointsSpec.split(",")) {
++                String[] kv = seg.split(":");
++                if (id > 1) {
++                    sb.append(',');
++                }
++                sb.append("{\"id\":").append(id).append(",\"pointCode\":\"").append(kv[0])
++                        .append("\",\"minValue\":").append(kv[1]).append("}");
++                id++;
++            }
++        }
++        sb.append("],\"channels\":[");
++        if (channels != null) {
++            long id = 10;
++            for (String code : channels.split(",")) {
++                if (id > 10) {
++                    sb.append(',');
++                }
++                sb.append("{\"id\":").append(id).append(",\"channelCode\":\"").append(code).append("\"}");
++                id++;
++            }
++        }
++        sb.append("],\"dataItems\":[");
++        if (dataItems != null) {
++            long id = 100;
++            for (String code : dataItems.split(",")) {
++                if (id > 100) {
++                    sb.append(',');
++                }
++                sb.append("{\"id\":").append(id).append(",\"dataCode\":\"").append(code)
++                        .append("\",\"fullKey\":\"F01.WS1.EQ1.").append(code).append("\"}");
++                id++;
++            }
++        }
++        sb.append("],\"formulas\":[");
++        if (formulas != null) {
++            boolean first = true;
++            for (String idText : formulas.split(",")) {
++                if (!first) {
++                    sb.append(',');
++                }
++                sb.append("{\"id\":").append(idText).append(",\"itemId\":100}");
++                first = false;
++            }
++        }
++        sb.append("],\"metrics\":[");
++        if (metrics != null) {
++            long id = 300;
++            for (String code : metrics.split(",")) {
++                if (id > 300) {
++                    sb.append(',');
++                }
++                sb.append("{\"id\":").append(id).append(",\"metricCode\":\"").append(code).append("\"}");
++                id++;
++            }
++        }
++        sb.append("]}");
++        return sb.toString();
++    }
++
++    /** 落库行 + 快照文件真实落盘（哈希=文件内容 SHA-256，自洽） */
++    private IotConfigVersion storedRow(long tenantId, int scopeType, long scopeId,
++                                       long version, String json) throws Exception {
++        IotConfigVersion row = rowWithUri(tenantId, scopeType, scopeId, version,
++                tenantId + "/" + scopeType + "-" + scopeId + "-" + version + ".json");
++        Path file = tempDir.resolve(row.getSnapshotUri());
++        Files.createDirectories(file.getParent());
++        Files.write(file, json.getBytes(StandardCharsets.UTF_8));
++        row.setSnapshotHash(SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8)));
++        return row;
++    }
++
++    private IotConfigVersion rowWithUri(long tenantId, int scopeType, long scopeId,
++                                        long version, String uri) {
++        IotConfigVersion row = new IotConfigVersion();
++        row.setId(version * 10);
++        row.setTenantId(tenantId);
++        row.setScopeType(scopeType);
++        row.setScopeId(scopeId);
++        row.setVersion(version);
++        row.setSnapshotUri(uri);
++        row.setPublishStatus(1);
++        row.setPublishTime(LocalDateTime.of(2026, 11, 23, 10, 0));
++        return row;
++    }
++
++    private SysTenant tenant(long id, String code) {
++        SysTenant t = new SysTenant();
++        t.setId(id);
++        t.setTenantCode(code);
++        return t;
++    }
++
++    /** 摘要三段转 "type:key" 集合（断言用） */
++    private Set<String> keysOf(ChangeEntryVO entry, String action) {
++        if ("added".equals(action)) {
++            return entry.getSummary().getAdded().stream()
++                    .map(i -> i.getType() + ":" + i.getKey()).collect(Collectors.toSet());
++        }
++        if ("removed".equals(action)) {
++            return entry.getSummary().getRemoved().stream()
++                    .map(i -> i.getType() + ":" + i.getKey()).collect(Collectors.toSet());
++        }
++        return entry.getSummary().getChanged().stream()
++                .map(i -> i.getType() + ":" + i.getKey()).collect(Collectors.toSet());
++    }
++}

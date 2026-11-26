@@ -1,0 +1,744 @@
+diff --git a/frontend/src/api/display/display-api.ts b/frontend/src/api/display/display-api.ts
+index 043f88c..a28d9c2 100644
+--- a/frontend/src/api/display/display-api.ts
++++ b/frontend/src/api/display/display-api.ts
+@@ -260,6 +260,37 @@ export interface MetricCompletenessRow {
+   incomplete: boolean;
+ }
+ 
++// ---------------- TASK-0089：管理面登录态四读口（0087 交付，展示端只封装、不直连 HMAC） ----------------
++//
++// 四个 GET 由 TASK-0087 交付，全部走 SaToken 登录态 + iot:instance:query 权限码，
++// 数据权限由服务端会话口径裁剪。前端只调这四口，不持有 appKey/secret、不直连 /openapi/v1/**、
++// 不自造代理（安全红线同 0059/0060）。契约逐字对齐 0087 controller：
++//   /iot/instance/{id}/items/realtime → Map<fullKey,{v:number|null,q:int,ts:long|null}>；
++//   /iot/item/history → [{ts,v:number|null,q:int}]（OpenApiHistoryPointVO）；
++//   /iot/metric/values → MetricValueRow[]（value/yoy/mom 同源不现算，null 不冒充 0）；
++//   /iot/metric/completeness → {available,reason?,rows}（当前 available=false 诚实空集）。
++
++/** 实时值读口单行（对齐 0087 OpenApiRealtimeItemVO：v 可为 null=无值，q 质量码，ts epoch 毫秒或 null） */
++export interface RealtimeItemVO {
++  v: number | null;
++  q: number;
++  ts: number | null;
++}
++
++/** 历史曲线读口单点（对齐 0087 OpenApiHistoryPointVO：ts 毫秒 / v 可为 null / q 质量码） */
++export interface IotHistoryPoint {
++  ts: number;
++  v: number | null;
++  q: number;
++}
++
++/** 完整度读口响应（对齐 0087 MetricCompletenessVO；无源时 available=false + reason + 空 rows） */
++export interface MetricCompletenessVO {
++  available: boolean;
++  reason?: string;
++  rows: MetricCompletenessRow[];
++}
++
+ /** 后端 Result<T> 包络（code!==200 已被 axios 拦截器 reject，这里只取 data） */
+ interface ResultEnvelope<T> {
+   code: number;
+@@ -349,4 +380,58 @@ export const displayApi = {
+     });
+     return asArray(res?.data?.records);
+   },
++
++  // -------- TASK-0089：管理面登录态四读口（0087；展示端接真值，只增不改既有签名） --------
++
++  /**
++   * 实例数据项实时值（一次批量取 fullKeys；0087 端点 scope 外实例 403、外键静默裁剪）。
++   * data 非对象/null → 空对象（空态不造假；缺失项由视图显示「数据接入中」）。
++   */
++  async itemsRealtime(instanceId: number, fullKeys: string[]): Promise<Record<string, RealtimeItemVO>> {
++    const res: ResultEnvelope<Record<string, RealtimeItemVO>> = await getRequest(`/iot/instance/${instanceId}/items/realtime`, {
++      fullKeys: fullKeys.join(','),
++    });
++    const data = res?.data;
++    return data != null && typeof data === 'object' && !Array.isArray(data) ? data : {};
++  },
++
++  /** 数据项历史曲线（fullKey + 时间窗 + 可选降采样/聚合；超行上限由响应头 X-Truncated 告知） */
++  async itemHistory(fullKey: string, start: number, end: number, interval?: string, agg?: string): Promise<IotHistoryPoint[]> {
++    const res: ResultEnvelope<IotHistoryPoint[]> = await getRequest('/iot/item/history', {
++      fullKey,
++      start,
++      end,
++      interval,
++      agg,
++    });
++    return asArray(res?.data);
++  },
++
++  /**
++   * 指标值（metricCodes + period + 时间窗；复用 MetricValueRow，value/yoy/mom 同源展示不现算，
++   * null 伴随值不冒充 0）。
++   */
++  async metricValues(metricCodes: string[], period: string, start: number, end: number): Promise<MetricValueRow[]> {
++    const res: ResultEnvelope<MetricValueRow[]> = await getRequest('/iot/metric/values', {
++      metricCodes: metricCodes.join(','),
++      period,
++      start,
++      end,
++    });
++    return asArray(res?.data);
++  },
++
++  /**
++   * 指标完整度（当前 0087 诚实空集 available=false；有源时 rows 填 completeness）。
++   * data=null/缺失 → available=false + 空 rows（fail-closed，不静默判完整）。
++   */
++  async metricCompleteness(metricCodes: string[], period: string): Promise<MetricCompletenessVO> {
++    const res: ResultEnvelope<MetricCompletenessVO> = await getRequest('/iot/metric/completeness', {
++      metricCodes: metricCodes.join(','),
++      period,
++    });
++    const data = res?.data;
++    if (data == null || typeof data !== 'object') return { available: false, rows: [] };
++    return { available: data.available === true, reason: data.reason, rows: asArray(data.rows) };
++  },
+ };
+diff --git a/frontend/src/views/display/device/device-realtime-zone.vue b/frontend/src/views/display/device/device-realtime-zone.vue
+index ad3ad7b..041527a 100644
+--- a/frontend/src/views/display/device/device-realtime-zone.vue
++++ b/frontend/src/views/display/device/device-realtime-zone.vue
+@@ -1,14 +1,13 @@
+ <!--
+-  * 设备详情页 · 实时数据区（TASK-0059）
++  * 设备详情页 · 实时数据区（TASK-0059 / TASK-0089 接真值）
+   *
+-  * 数据源：管理面 GET /iot/item/list（数据项清单）+ GET /iot/point/list（绑定点位）+
+-  * GET /iot/point/{id}/curve（0023 近 24h 曲线，最后一条=当前采集值）。全部登录态端点，
+-  * 不持有 appKey/secret、不直连 openapi/v1/items/realtime（HMAC，浏览器不可直连）。
++  * 数据源（0089）：管理面 GET /iot/item/list（数据项清单）+ 登录态
++  * GET /iot/instance/{id}/items/realtime（0087 交付，一次批量取 v/q/ts 真值）。
++  * 绑定类、公式类、汇总类统一走 realtime 读口——服务端对所有 sourceType 返回 v/q/ts，
++  * 前端同源展示，不用点位曲线末点派生、不现算、不持有 appKey/secret、不直连 openapi/v1 HMAC。
+   *
+-  * 注意（报告登记）：管理面无「按设备批量取数据项实时值」等价端点，当前值由绑定点位的
+-  * 近 24h 曲线末点派生（仅绑定类数据项有当前值；公式/汇总类需计算引擎实时值接口，
+-  * 缺口等裁决，本组件不造假）。无数据源/无点位/曲线空集=「数据接入中」。
+-  * 质量标记/超限标红/离线灰显按质量码 + alarm 阈值（ADR-0011 TD-0022）展示。
++  * 空态纪律：realtime 无该项 / v=null / 读口失败 → 「数据接入中」，不展示假数据；
++  * 来源如实标注「实时值读口」。质量标记/超限标红/离线灰显按读口 q + alarm 阈值（ADR-0011 TD-0022）。
+ -->
+ <template>
+   <a-card size="small" title="实时数据" class="device-realtime-zone">
+@@ -41,7 +40,7 @@
+ </template>
+ <script setup lang="ts">
+   import { computed, ref, watch } from 'vue';
+-  import { displayApi, type DisplayDataItem, type PointCurvePointVO } from '/@/api/display/display-api';
++  import { displayApi, type DisplayDataItem } from '/@/api/display/display-api';
+   import { formatTs, qualityMeta, realtimeDisplayState } from './device-utils';
+ 
+   const props = defineProps<{ instanceId: number; items: DisplayDataItem[] }>();
+@@ -95,40 +94,29 @@
+     }
+     loading.value = true;
+     try {
+-      // 绑定类项（sourceType=1）有 pointId → 走点位曲线末点取当前采集值；
+-      // 公式/汇总类项无管理面实时值端点 → 源文本标明，值走空态（不造假）。
+-      const bound = props.items.filter((it) => it.sourceType === 1 && it.pointId != null);
+-      const pointIds = [...new Set(bound.map((it) => it.pointId as number))];
+-      const pointCurves = await Promise.all(pointIds.map((pid) => displayApi.pointCurve(pid).catch(() => null)));
+-      const latestByPoint = new Map<number, PointCurvePointVO | null>();
+-      pointIds.forEach((pid, i) => {
+-        const pts = pointCurves[i]?.dataPoints ?? [];
+-        latestByPoint.set(pid, pts.length ? pts[pts.length - 1] : null);
+-      });
++      // TASK-0089：绑定/公式/汇总统一走 0087 realtime 真值读口（服务端对所有 sourceType
++      // 返回 v/q/ts），一次批量取回，前端按 fullKey 对应，同源展示不现算。
++      const fullKeys = [...new Set(props.items.map((it) => it.fullKey).filter(Boolean))];
++      const realtime = await displayApi.itemsRealtime(props.instanceId, fullKeys);
+ 
+       rows.value = props.items.map((item) => {
+-        const isBound = item.sourceType === 1 && item.pointId != null;
+-        const latest = isBound ? latestByPoint.get(item.pointId as number) ?? null : null;
+-        const rawValue = latest?.value ?? null;
+-        const quality = latest?.quality ?? null;
++        const live = realtime[item.fullKey] ?? null;
++        const rawValue = live?.v ?? null;
++        const quality = live?.q ?? null;
+         const state = realtimeDisplayState(quality, rawValue, item);
+-        const valueText = isBound ? (rawValue == null ? '数据接入中' : `${rawValue}${item.unit ?? ''}`) : '需实时计算（数据接入中）';
+         return {
+           itemId: item.id,
+           dataCode: item.dataCode,
+           dataName: item.dataName,
+           unit: item.unit ?? '',
+-          valueText,
+-          qualityLabel: isBound ? state.qualityLabel : '—',
++          // 无该项 / v=null → 「数据接入中」空态；null 不冒充 0
++          valueText: rawValue == null ? '数据接入中' : `${rawValue}${item.unit ?? ''}`,
++          qualityLabel: live ? state.qualityLabel : '—',
+           tone: state.tone,
+           red: state.red,
+           grey: state.grey,
+-          updateTime: isBound && latest?.ts ? formatTs(latest.ts) : '—',
+-          sourceText: isBound
+-            ? `点位 #${item.pointId}（近 24h 曲线末点）`
+-            : item.sourceType === 2
+-            ? '公式计算（实时值端点待接入）'
+-            : '子级汇总（实时值端点待接入）',
++          updateTime: live?.ts != null ? formatTs(live.ts) : '—',
++          sourceText: '实时值读口（登录态 /iot/instance/{id}/items/realtime）',
+         };
+       });
+     } catch (e) {
+diff --git a/frontend/src/views/display/metrics/index.vue b/frontend/src/views/display/metrics/index.vue
+index 825dc16..b82ab57 100644
+--- a/frontend/src/views/display/metrics/index.vue
++++ b/frontend/src/views/display/metrics/index.vue
+@@ -1,21 +1,19 @@
+ <!--
+-  * 展示端 · 指标看板（TASK-0060）
++  * 展示端 · 指标看板（TASK-0060 / TASK-0089 接真值）
+   *
+   * 路由：/display/metrics（展示端独立视图区，静态注册、hideInMenu、需登录，范式同 0058/0059）。
+   *
+   * 数据纪律（硬约束，逐条落地）：
+   * 1) 指标卡片网格：指标定义取管理面 /iot/metric/list（真数据、数据权限裁剪），按工厂维度过滤、
+-  *    按周期分组；本期值/同比(yoy)/环比(mom)取 st_metric_value 结果表真实列（TASK-0045 冻结契约），
+-  *    卡片与结果表同数——前端不现算（ADR-0011）。
+-  * 2) 完整度标记：低于 80% 阈值明显标记（与 0045 completenessMin 同口径）；完整度无物理列
+-  *    （由 /calc/v1/status.metric 内存视图承载）。
++  *    按周期分组；本期值/同比(yoy)/环比(mom)取 0087 登录态读口 /iot/metric/values 的真实列
++  *    （st_metric_value 冻结契约 value/yoy/mom），卡片与结果表同数——前端不现算（ADR-0011）。
++  * 2) 完整度标记：取自 0087 /iot/metric/completeness；低于 80% 阈值明显标记。
+   * 3) 趋势图：多周期叠加 + 去年同期对比（同 ts 去年同期真实行；yoy 是比率不可反推历史值），
+-  *    降采样明示标注（ADR-0010）。
+-  * 4) 安全红线 + 缺口：管理面 /iot/metric/** 只有指标「定义」读口，**无指标值/完整度登录态读口**；
+-  *    值只在 /openapi/v1/metrics/query（appKey+HMAC，浏览器不可直连），完整度只在 calc 内网观测面。
+-  *    前端零 appKey/secret、零 HMAC 直连、不自造代理——值与完整度当前一律空态 + 页面缺口登记，
+-  *    不静默、不造假；读口交付后仅替换「取数处」，卡片/趋势/纯函数不动。
+-  * 5) 空态：无指标定义/无值/取数失败均显示空态（「指标数据接入中」），不造假数字。
++  *    降采样明示标注（ADR-0010）。组件/纯函数不动。
++  * 4) 安全红线：只调管理面登录态 API（0087 四读口）；前端零 appKey/secret、零 HMAC 直连、
++  *    不自造代理。当前完整度读口 available=false（calc 内网观测面未对管理面开放）——
++  *    前端接了也走空态 + 告警，不静默判完整、不造假。
++  * 5) 空态：无指标定义/无值/完整度无源/取数失败均显示空态（「指标数据接入中」），不造假数字。
+   *
+   * 演进位（ADR-0011）：涨跌颜色租户可配、上看板标记真值——接口交付后接入，渲染逻辑不动。
+ -->
+@@ -32,14 +30,14 @@
+       </a-button>
+     </div>
+ 
+-    <!-- 管理面指标值读口缺口登记（安全红线：不直连 HMAC openapi、不自造代理） -->
++    <!-- 完整度读口无源告警（0087 available=false；空态登记，不造假） -->
+     <a-alert
+       v-if="readGap"
+       type="warning"
+       show-icon
+       class="display-page__alert"
+-      message="管理面指标值读口缺口（空态登记，不造假）"
+-      description="管理面 /iot/metric/** 仅提供指标定义，无指标值/完整度登录态读口；指标值仅存于 /openapi/v1/metrics/query（appKey+HMAC，浏览器不可直连），完整度仅存于 calc /calc/v1/status.metric（内网观测面）。前端不持有凭据、不直连 HMAC、不自造代理，故本期值/同比/环比/完整度/趋势均为空态，待管理面登录态读口交付后接入。"
++      message="完整度接入中（读口待接入，空态登记不造假）"
++      description="管理面 /iot/metric/completeness 当前 available=false（calc 内网观测面未对管理面开放，暂无可用完整度数据源）。指标值/趋势已接 0087 登录态读口同源展示；完整度保持空态，不静默判完整、不伪造 0/1。前端零 appKey/secret、零 HMAC 直连、不自造代理。"
+     />
+ 
+     <a-alert v-if="treeError" type="error" :message="treeError" show-icon class="display-page__alert" />
+@@ -80,7 +78,10 @@
+ 
+   const { tree, error: treeError, loaded, loadTree } = useDisplayTree();
+ 
+-  /** 管理面指标值读口缺口恒为 true（/iot/metric/** 无值读口；当前无登录态指标值端点） */
++  /**
++   * 完整度读口无源告警位（0087 当前 available=false；有源后自动消除，不静默判完整）。
++   * 初始 true——读口未返回/失败时保持告警空态（fail-closed）。
++   */
+   const readGap = ref(true);
+   const loading = ref(false);
+   const selectedFactoryId = ref<number | 'all'>('all');
+@@ -101,9 +102,9 @@
+   const metrics = ref<MetricEntry[]>([]);
+ 
+   /**
+-   * 指标值行（st_metric_value 同源）与完整度——当前恒空：管理面无登录态读口。
+-   * 演进位：读口交付后，在 loadAll 内把读口响应映射填入 valueRows/completenessMap，
+-   * 组件与纯函数（metric-utils/trendDisplay/completenessDisplay/buildMetricTrend）均无需改动。
++   * 指标值行（0087 /iot/metric/values 同源）与完整度（/iot/metric/completeness）。
++   * 只换取数处——组件与纯函数（metric-utils/trendDisplay/completenessDisplay/buildMetricTrend）
++   * 均不改：值行原样喂给 valueOf/metric-card/metric-trend，完整度 available=true 时填 map。
+    */
+   const valueRows = ref<MetricValueRow[]>([]);
+   const completenessMap = ref<Map<string, number>>(new Map());
+@@ -143,13 +144,47 @@
+         }
+       });
+       metrics.value = collected;
+-      // 值/完整度保持空态：管理面读口缺口（见 readGap / 页面告警），不自造数据。
+-      valueRows.value = [];
+-      completenessMap.value = new Map();
++
++      // TASK-0089：接 0087 登录态读口（value/yoy/mom 同源不现算；完整度 available=false 保持空态）。
++      // 按定义里出现的 period 分组各查一次时间窗（windowStart 落在近 1 年，覆盖去年同 ts 对比行）。
++      // 两个读口独立 fail-soft：任一失败只让对应数据走空态，不影响指标定义与另一读口。
++      const end = Date.now();
++      const start = end - 366 * 24 * 60 * 60 * 1000;
++      const periodPairs = new Map<string, string[]>();
++      for (const entry of collected) {
++        const period = entry.metric.period ?? 'DAY';
++        const codes = periodPairs.get(period) ?? [];
++        if (!codes.includes(entry.metric.metricCode)) codes.push(entry.metric.metricCode);
++        periodPairs.set(period, codes);
++      }
++      const valueResults = await Promise.all(
++        [...periodPairs.entries()].map(([period, codes]) => displayApi.metricValues(codes, period, start, end).catch(() => []))
++      );
++      valueRows.value = valueResults.flat();
++
++      const allCodes = [...new Set(collected.map((e) => e.metric.metricCode))];
++      const periods = [...periodPairs.keys()];
++      const completenessResults = await Promise.all(
++        periods.map((period) => displayApi.metricCompleteness(allCodes, period).catch(() => ({ available: false, rows: [] })))
++      );
++      // available=false（当前 0087 诚实空集）→ 保持 completenessMap 空 + readGap 告警，不静默判完整；
++      // available=true 且有源时填 completeness（null 完整度不伪造 0/1，不写进 map）。
++      const completeness = new Map<string, number>();
++      let anyAvailable = false;
++      for (const result of completenessResults) {
++        if (!result.available) continue;
++        anyAvailable = true;
++        for (const row of result.rows) {
++          if (row.completeness != null) completeness.set(row.metricCode, row.completeness);
++        }
++      }
++      completenessMap.value = completeness;
++      readGap.value = !anyAvailable;
+     } catch (e) {
+       metrics.value = [];
+       valueRows.value = [];
+       completenessMap.value = new Map();
++      readGap.value = true;
+       console.error('[display] metrics board load failed:', e);
+     } finally {
+       loading.value = false;
+diff --git a/frontend/tests/unit/display/device-realtime-zone.spec.ts b/frontend/tests/unit/display/device-realtime-zone.spec.ts
+new file mode 100644
+index 0000000..1b318bf
+--- /dev/null
++++ b/frontend/tests/unit/display/device-realtime-zone.spec.ts
+@@ -0,0 +1,124 @@
++/*
++ * TASK-0089 · 设备实时区接 items/realtime 真值单测（D2 / D4）
++ *
++ * 覆盖：
++ * - 绑定类 + 公式/汇总类统一走 realtime 真值（v/q/ts 同源），来源标注「实时值读口」；
++ * - realtime 无该项 / v=null → 「数据接入中」空态，不展示假数据；
++ * - 读口整体失败（catch）走空态 + console.error，不炸页面；
++ * - 组件只调用 displayApi.itemsRealtime，不再走 pointCurve 末点派生。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const itemsRealtime = vi.hoisted(() => vi.fn());
++const pointCurve = vi.hoisted(() => vi.fn());
++const consoleError = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/api/display/display-api', () => ({
++  displayApi: { itemsRealtime, pointCurve },
++}));
++
++import DeviceRealtimeZone from '/@/views/display/device/device-realtime-zone.vue';
++import type { DisplayDataItem } from '/@/api/display/display-api';
++
++const mountOptions = { global: { plugins: [Antd] } };
++
++function item(over: Partial<DisplayDataItem> = {}): DisplayDataItem {
++  return {
++    id: 1,
++    instanceId: 42,
++    dataCode: 'TEMP',
++    dataName: '温度',
++    fullKey: 'F01.EQ.TEMP',
++    category: null,
++    unit: '℃',
++    sourceType: 1,
++    pointId: 7,
++    formula: null,
++    rollupMethod: null,
++    calcPeriod: null,
++    validMin: null,
++    validMax: null,
++    alarmLow: null,
++    alarmHigh: 80,
++    status: 1,
++    ...over,
++  };
++}
++
++describe('设备实时区接 realtime 真值（TASK-0089 D2）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    vi.spyOn(console, 'error').mockImplementation(consoleError);
++  });
++
++  it('绑定类 + 公式类统一取 realtime 真值（v/q/ts 同源），来源标注「实时值读口」', async () => {
++    itemsRealtime.mockResolvedValue({
++      'F01.EQ.TEMP': { v: 23.5, q: 0, ts: 1_700_000_000_000 },
++      'F01.EQ.FORMULA': { v: 100, q: 1, ts: 1_700_000_000_000 },
++    });
++    const wrapper = mount(DeviceRealtimeZone, {
++      props: {
++        instanceId: 42,
++        items: [item(), item({ id: 2, dataCode: 'FORMULA', dataName: '公式值', fullKey: 'F01.EQ.FORMULA', sourceType: 2, pointId: null })],
++      },
++      ...mountOptions,
++    });
++    await wrapper.vm.load();
++    await flushPromises();
++
++    expect(itemsRealtime).toHaveBeenCalledTimes(1);
++    expect(itemsRealtime).toHaveBeenCalledWith(42, ['F01.EQ.TEMP', 'F01.EQ.FORMULA']);
++    expect(pointCurve).not.toHaveBeenCalled();
++
++    const text = wrapper.text();
++    expect(text).toContain('23.5℃');
++    expect(text).toContain('100℃');
++    expect(text).toContain('实时值读口');
++    expect(text).not.toContain('曲线末点');
++    // 质量码 1（超上限）标红
++    const redCells = wrapper.findAll('.device-realtime-zone__value--red');
++    expect(redCells.length).toBeGreaterThanOrEqual(1);
++    wrapper.unmount();
++  });
++
++  it('v=null（无实时值）→ 该行显示「数据接入中」，不冒充 0', async () => {
++    itemsRealtime.mockResolvedValue({ 'F01.EQ.TEMP': { v: null, q: 3, ts: 1_700_000_000_000 } });
++    const wrapper = mount(DeviceRealtimeZone, { props: { instanceId: 42, items: [item()] }, ...mountOptions });
++    await wrapper.vm.load();
++    await flushPromises();
++    const text = wrapper.text();
++    expect(text).toContain('数据接入中');
++    expect(text).not.toContain('0℃');
++    expect(text).not.toContain('null');
++    wrapper.unmount();
++  });
++
++  it('realtime 无该项 → 显示「数据接入中」空态，不造假', async () => {
++    itemsRealtime.mockResolvedValue({});
++    const wrapper = mount(DeviceRealtimeZone, { props: { instanceId: 42, items: [item()] }, ...mountOptions });
++    await wrapper.vm.load();
++    await flushPromises();
++    expect(wrapper.text()).toContain('数据接入中');
++    wrapper.unmount();
++  });
++
++  it('读口整体失败 → 空态 + console.error，不炸页面', async () => {
++    itemsRealtime.mockRejectedValue(new Error('read port down'));
++    const wrapper = mount(DeviceRealtimeZone, { props: { instanceId: 42, items: [item()] }, ...mountOptions });
++    await wrapper.vm.load();
++    await flushPromises();
++    expect(consoleError).toHaveBeenCalled();
++    expect(wrapper.text()).toContain('数据接入中');
++    wrapper.unmount();
++  });
++
++  it('items 为空时不调用读口，显示空态', async () => {
++    const wrapper = mount(DeviceRealtimeZone, { props: { instanceId: 42, items: [] }, ...mountOptions });
++    await flushPromises();
++    expect(itemsRealtime).not.toHaveBeenCalled();
++    expect(wrapper.text()).toContain('数据接入中');
++    wrapper.unmount();
++  });
++});
+diff --git a/frontend/tests/unit/display/display-read-ports.spec.ts b/frontend/tests/unit/display/display-read-ports.spec.ts
+new file mode 100644
+index 0000000..26d214d
+--- /dev/null
++++ b/frontend/tests/unit/display/display-read-ports.spec.ts
+@@ -0,0 +1,144 @@
++/*
++ * TASK-0089 · 展示端管理面四读口封装单测 + 安全红线
++ *
++ * 覆盖（D1 / D4）：
++ * - itemsRealtime / itemHistory / metricValues / metricCompleteness 的 URL 与参数逐字对齐 0087；
++ * - 响应容错：null/undefined/非数组 → 空对象/空数组；完整度无源 fail-closed（available=false）；
++ * - 安全红线：display-api.ts 代码区（剔除注释）零 appKey/secret/HMAC、零 /openapi/v1 直连、零自造代理。
++ */
++import { readFileSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++const getRequest = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/lib/axios', () => ({ getRequest }));
++
++import { displayApi } from '/@/api/display/display-api';
++
++const getMock = vi.mocked(getRequest);
++
++describe('display read ports (TASK-0089 D1)', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('itemsRealtime: URL/参数逐字对齐 0087，返回 fullKey→{v,q,ts} 原样', async () => {
++    const data = { 'F01.EQ.TEMP': { v: 23.5, q: 0, ts: 1_700_000_000_000 }, 'F01.EQ.SUM': { v: null, q: 3, ts: null } };
++    getMock.mockResolvedValue({ code: 200, data });
++    const out = await displayApi.itemsRealtime(42, ['F01.EQ.TEMP', 'F01.EQ.SUM']);
++    expect(getMock).toHaveBeenCalledWith('/iot/instance/42/items/realtime', { fullKeys: 'F01.EQ.TEMP,F01.EQ.SUM' });
++    expect(out).toEqual(data);
++  });
++
++  it('itemsRealtime: data=null/undefined → 空对象（空态不造假）', async () => {
++    getMock.mockResolvedValueOnce({ code: 200, data: null });
++    expect(await displayApi.itemsRealtime(42, ['k'])).toEqual({});
++    getMock.mockResolvedValueOnce(undefined);
++    expect(await displayApi.itemsRealtime(42, ['k'])).toEqual({});
++  });
++
++  it('itemHistory: URL/参数含可选 interval/agg，响应 asArray', async () => {
++    const rows = [
++      { ts: 1_700_000_000_000, v: 23.5, q: 0 },
++      { ts: 1_700_000_006_000, v: 24.1, q: 1 },
++    ];
++    getMock.mockResolvedValue({ code: 200, data: rows });
++    const out = await displayApi.itemHistory('F01.EQ.TEMP', 1_700_000_000_000, 1_700_000_006_000, '60s', 'last');
++    expect(getMock).toHaveBeenCalledWith('/iot/item/history', {
++      fullKey: 'F01.EQ.TEMP',
++      start: 1_700_000_000_000,
++      end: 1_700_000_006_000,
++      interval: '60s',
++      agg: 'last',
++    });
++    expect(out).toEqual(rows);
++  });
++
++  it('itemHistory: data=null/非数组 → 空数组', async () => {
++    getMock.mockResolvedValueOnce({ code: 200, data: null });
++    expect(await displayApi.itemHistory('k', 1, 2)).toEqual([]);
++    getMock.mockResolvedValueOnce({ code: 200, data: { not: 'array' } });
++    expect(await displayApi.itemHistory('k', 1, 2)).toEqual([]);
++  });
++
++  it('metricValues: URL/参数含 metricCodes/period/时间窗，value/yoy/mom 同源原样返回', async () => {
++    const rows = [
++      {
++        metricCode: 'M_ENERGY',
++        instanceCode: 'F01',
++        period: 'DAY',
++        ts: 1_700_000_000_000,
++        value: 412.6,
++        yoy: 0.083,
++        mom: -0.021,
++        unit: 'kWh',
++      },
++      { metricCode: 'M_WATER', instanceCode: 'F01', period: 'DAY', ts: 1_700_000_000_000, value: null, yoy: null, mom: null },
++    ];
++    getMock.mockResolvedValue({ code: 200, data: rows });
++    const out = await displayApi.metricValues(['M_ENERGY', 'M_WATER'], 'DAY', 1_699_000_000_000, 1_700_000_000_000);
++    expect(getMock).toHaveBeenCalledWith('/iot/metric/values', {
++      metricCodes: 'M_ENERGY,M_WATER',
++      period: 'DAY',
++      start: 1_699_000_000_000,
++      end: 1_700_000_000_000,
++    });
++    expect(out).toEqual(rows);
++    // 同源不现算：null 伴随值保持 null，不冒充 0
++    expect(out[1].value).toBeNull();
++    expect(out[1].yoy).toBeNull();
++    expect(out[1].mom).toBeNull();
++  });
++
++  it('metricValues: data=null/undefined → 空数组', async () => {
++    getMock.mockResolvedValueOnce({ code: 200, data: null });
++    expect(await displayApi.metricValues(['M'], 'DAY', 1, 2)).toEqual([]);
++    getMock.mockResolvedValueOnce(undefined);
++    expect(await displayApi.metricValues(['M'], 'DAY', 1, 2)).toEqual([]);
++  });
++
++  it('metricCompleteness: available=true 原样返回 rows（含 null 完整度不伪造 0/1）', async () => {
++    const data = {
++      available: true,
++      rows: [
++        { metricCode: 'M_ENERGY', completeness: 0.92, incomplete: false },
++        { metricCode: 'M_WATER', completeness: null, incomplete: null },
++      ],
++    };
++    getMock.mockResolvedValue({ code: 200, data });
++    const out = await displayApi.metricCompleteness(['M_ENERGY', 'M_WATER'], 'DAY');
++    expect(getMock).toHaveBeenCalledWith('/iot/metric/completeness', { metricCodes: 'M_ENERGY,M_WATER', period: 'DAY' });
++    expect(out.available).toBe(true);
++    expect(out.rows).toEqual(data.rows);
++  });
++
++  it('metricCompleteness: available=false（当前无源）保留 reason + 空 rows，不静默判完整', async () => {
++    getMock.mockResolvedValue({ code: 200, data: { available: false, reason: '完整度读口接入中', rows: [] } });
++    const out = await displayApi.metricCompleteness(['M'], 'DAY');
++    expect(out.available).toBe(false);
++    expect(out.reason).toBe('完整度读口接入中');
++    expect(out.rows).toEqual([]);
++  });
++
++  it('metricCompleteness: data=null/undefined → available=false + 空 rows（fail-closed）', async () => {
++    getMock.mockResolvedValueOnce({ code: 200, data: null });
++    expect(await displayApi.metricCompleteness(['M'], 'DAY')).toEqual({ available: false, reason: undefined, rows: [] });
++    getMock.mockResolvedValueOnce(undefined);
++    expect(await displayApi.metricCompleteness(['M'], 'DAY')).toEqual({ available: false, reason: undefined, rows: [] });
++  });
++});
++
++describe('安全红线（TASK-0089 / 0059 / 0060 同款）', () => {
++  it('display-api.ts 代码区零 appKey/secret/HMAC 直连、零 /openapi/v1、零自造代理', () => {
++    const path = resolve(process.cwd(), 'src/api/display/display-api.ts');
++    const source = readFileSync(path, 'utf8');
++    // 剔除块注释与行注释——红线针对「可执行代码」，注释中的纪律说明不算命中
++    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
++    expect(code).not.toMatch(/appKey|appSecret|createHmac|HMAC|secret/i);
++    expect(code).not.toMatch(/\/openapi\/v1/);
++    expect(code).not.toMatch(/\bfetch\s*\(/);
++    // 唯一取数通道是管理面登录态 getRequest（/iot/** 与 /api/v1/iot/status/**）
++    expect(code).toContain('getRequest(');
++  });
++});
+diff --git a/frontend/tests/unit/display/metrics-board-read-ports.spec.ts b/frontend/tests/unit/display/metrics-board-read-ports.spec.ts
+new file mode 100644
+index 0000000..d805882
+--- /dev/null
++++ b/frontend/tests/unit/display/metrics-board-read-ports.spec.ts
+@@ -0,0 +1,140 @@
++/*
++ * TASK-0089 · 指标看板接 metric/values + metric/completeness 单测（D3 / D4）
++ *
++ * 覆盖：
++ * - metricValues → valueRows 映射正确（value/yoy/mom/单位同源，不现算、不造假）；
++ * - completeness available=true 填 completenessMap（低于阈值标记可见）；
++ * - completeness available=false（当前无源）保持 completenessMap 空 + readGap 告警，不静默判完整；
++ * - null 伴随值保持空态，不冒充 0；读口失败不炸页面；
++ * - 组件/纯函数零改动证据：组件只用既有 buildMetricTrend/completenessDisplay 口径（通过渲染断言）。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const queryInstanceTree = vi.hoisted(() => vi.fn());
++const queryMetricList = vi.hoisted(() => vi.fn());
++const metricValues = vi.hoisted(() => vi.fn());
++const metricCompleteness = vi.hoisted(() => vi.fn());
++const consoleError = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/api/display/display-api', () => ({
++  displayApi: { queryInstanceTree, queryMetricList, metricValues, metricCompleteness },
++  childrenOf: (nodes: unknown[], parentId: unknown) =>
++    parentId === null ? (nodes as Array<{ nodeType: number }>).filter((n) => n.nodeType === 1) : [],
++  DISPLAY_NODE_TYPE: { FACTORY: 1, WORKSHOP: 2, LINE: 3, DEVICE: 4, COMPONENT: 5 },
++}));
++
++vi.mock('/@/components/framework/ot-loading', () => ({ OtLoading: { show: vi.fn(), hide: vi.fn() } }));
++
++// 图表组件在 happy-dom 无 canvas 2d 上下文——mock 为纯文本桩，只验证看板传值/渲染逻辑
++vi.mock('/@/views/display/metrics/metric-trend.vue', () => ({
++  default: {
++    name: 'MetricTrend',
++    props: ['rows', 'loading'],
++    template: '<div class="metric-trend-stub">指标趋势（多周期叠加 · 去年同期对比）</div>',
++  },
++}));
++
++import MetricsBoard from '/@/views/display/metrics/index.vue';
++
++const mountOptions = { global: { plugins: [Antd] } };
++const TS = Date.UTC(2026, 10, 20);
++
++const tree = [{ id: 1, parentId: 0, instanceCode: 'F01', instanceName: '工厂A', nodeType: 1 }];
++const defs = [
++  { id: 10, metricCode: 'M_ENERGY', metricName: '用电', instanceId: 1, sourceItemId: null, period: 'DAY', status: 1 },
++  { id: 11, metricCode: 'M_WATER', metricName: '用水', instanceId: 1, sourceItemId: null, period: 'DAY', status: 1 },
++];
++
++describe('指标看板接真值读口（TASK-0089 D3）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    vi.spyOn(console, 'error').mockImplementation(consoleError);
++    queryInstanceTree.mockResolvedValue(tree);
++    queryMetricList.mockResolvedValue(defs);
++  });
++
++  it('metricValues→卡片同源展示：value/yoy/mom/unit 原样，不现算', async () => {
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: 0.083, mom: -0.021, unit: 'kWh' },
++    ]);
++    metricCompleteness.mockResolvedValue({ available: false, reason: '无源', rows: [] });
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++
++    expect(metricValues).toHaveBeenCalledWith(['M_ENERGY', 'M_WATER'], 'DAY', expect.any(Number), expect.any(Number));
++    expect(metricCompleteness).toHaveBeenCalledWith(['M_ENERGY', 'M_WATER'], 'DAY');
++    const text = wrapper.text();
++    expect(text).toContain('412.6');
++    expect(text).toContain('kWh');
++    expect(text).toContain('+8.3%');
++    expect(text).toContain('-2.1%');
++    // 有值指标出真值（M_ENERGY 412.6）；另一无值指标仍走空态，不因此掩盖真值
++    expect(text).toContain('M_ENERGY');
++    wrapper.unmount();
++  });
++
++  it('null 伴随值保持空态，不冒充 0', async () => {
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: 0.083, mom: -0.021, unit: 'kWh' },
++      { metricCode: 'M_WATER', instanceCode: 'F01', period: 'DAY', ts: TS, value: null, yoy: null, mom: null },
++    ]);
++    metricCompleteness.mockResolvedValue({ available: false, reason: '无源', rows: [] });
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++    // M_WATER 无值 → 空态；M_ENERGY 真值不受影响
++    expect(wrapper.text()).toContain('指标数据接入中');
++    expect(wrapper.text()).toContain('412.6');
++    wrapper.unmount();
++  });
++
++  it('completeness available=true 填 map，低于阈值标记可见', async () => {
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: null, mom: null, unit: 'kWh' },
++    ]);
++    metricCompleteness.mockResolvedValue({
++      available: true,
++      rows: [{ metricCode: 'M_ENERGY', completeness: 0.6, incomplete: true }],
++    });
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++    const text = wrapper.text();
++    expect(text).toContain('完整度 60%');
++    expect(text).toContain('低于 80% 阈值');
++    // 有源后缺口告警消除（读口已交付）
++    expect(text).not.toContain('完整度接入中（读口待接入');
++    wrapper.unmount();
++  });
++
++  it('completeness available=false（当前诚实空集）→ 保持空态 + readGap 告警，不静默判完整', async () => {
++    metricValues.mockResolvedValue([
++      { metricCode: 'M_ENERGY', instanceCode: 'F01', period: 'DAY', ts: TS, value: 412.6, yoy: null, mom: null, unit: 'kWh' },
++    ]);
++    metricCompleteness.mockResolvedValue({
++      available: false,
++      reason: '完整度读口接入中：calc 内网观测面未对管理面开放，暂无可用数据源',
++      rows: [],
++    });
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++    const text = wrapper.text();
++    expect(text).toContain('完整度接入中（读口待接入');
++    expect(text).toContain('读口待接入');
++    expect(text).not.toContain('完整度 100%');
++    wrapper.unmount();
++  });
++
++  it('读口失败：metrics 定义仍在、值/完整度空态，不炸页面（局部 catch 降级）', async () => {
++    metricValues.mockRejectedValue(new Error('values down'));
++    metricCompleteness.mockRejectedValue(new Error('completeness down'));
++    const wrapper = mount(MetricsBoard, mountOptions);
++    await flushPromises();
++    const text = wrapper.text();
++    expect(text).toContain('指标看板');
++    expect(text).toContain('指标数据接入中');
++    expect(text).toContain('读口待接入');
++    // 每个读口局部 catch → 对应数据走空态，不冒泡到页面级 catch、不炸页面
++    wrapper.unmount();
++  });
++});

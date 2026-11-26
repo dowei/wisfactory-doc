@@ -1,0 +1,1147 @@
+diff --git a/frontend/src/api/iot/point-api.ts b/frontend/src/api/iot/point-api.ts
+index 2be9847c..c5efdf91 100644
+--- a/frontend/src/api/iot/point-api.ts
++++ b/frontend/src/api/iot/point-api.ts
+@@ -1,25 +1,76 @@
+ /*
+- * 采集点位——批量导入（智慧工厂）
++ * 采集点位 API（智慧工厂）
+  *
+- * 对接后端 IotPointController 导入三接口（TASK-0022，共用 iot:point:add 权限位）：
+- * GET /iot/point/import/template（模板下载，表头+示例行+说明行——说明行导入时自动跳过）、
+- * POST /iot/point/import（multipart Excel，单批≤10000 行整批原子：任一行校验失败整批拒绝
+- * body code=400 且 data 携带逐行回执 PointImportReceipt）、POST /iot/point/import/error-report
+- * （错误行清单下载，无状态回传渲染 xlsx——回执失败行→xlsx，无失败行仅表头）。
+- * 点位列表/详情/反查/曲线/批量启停等其余接口随点位管理页（4011）升级批补建，本文件只含
+- * 导入向导（菜单 4016）所需三接口及数据项绑定弹窗所需的分页列表接口（TASK-0092）。
++ * 对接后端 IotPointController（/iot/point，管理面 /api 登录态，权限位 iot:point:*）：
++ * - 分页列表 GET /iot/point/list（iot:point:list）
++ * - 详情 GET /iot/point/{id}（iot:point:query）
++ * - 反查 GET /iot/point/{id}/references（iot:point:query）
++ * - 曲线 GET /iot/point/{id}/curve（iot:point:query，本期 fail-soft 空集占位）
++ * - 新增 POST /iot/point（iot:point:add）、修改 PUT /iot/point（iot:point:edit）
++ * - 启停 PUT /iot/point/changeStatus（iot:point:edit）
++ * - 删除 DELETE /iot/point/{ids}（iot:point:remove，路径参数逗号拼接）
++ * - 导出 GET /iot/point/export（iot:point:list，xlsx 下载）
++ * - 导入三接口（TASK-0022，菜单 4016 导入向导独立，本模块保留供其复用）
++ *
++ * 不碰 appKey/secret/HMAC，不走 /openapi/v1/**。
+  */
+-import { getDownload, getRequest, postDownload, postRequest } from '/@/lib/axios';
++import { deleteRequest, getDownload, getRequest, postDownload, postRequest, putRequest } from '/@/lib/axios';
+ 
+ export const pointApi = {
+   /**
+-   * 点位分页列表（GET /iot/point/list，iot:point:list；支持 pageNum/pageSize/boundInstanceId/status
+-   * 等过滤，后端按数据权限裁剪；返回 ResultEnvelope 由调用方取 data.records）
++   * 点位分页列表（GET /iot/point/list，iot:point:list；支持 pointCode/pointName/dataType/
++   * valueType/status/channelId/deptId/boundInstanceId 等过滤，后端按数据权限裁剪）
+    */
+   queryList: (params) => {
+     return getRequest('/iot/point/list', params);
+   },
+ 
++  /** 点位详情聚合（GET /iot/point/{id}，iot:point:query；含 referenceCount/curve24h） */
++  getById: (id) => {
++    return getRequest(`/iot/point/${id}`, undefined);
++  },
++
++  /** 点位详情聚合别名（与 getById 同端点，语义化命名） */
++  detail: (id) => {
++    return getRequest(`/iot/point/${id}`, undefined);
++  },
++
++  /** 反向引用数据项清单（GET /iot/point/{id}/references，iot:point:query） */
++  references: (id) => {
++    return getRequest(`/iot/point/${id}/references`, undefined);
++  },
++
++  /** 近 24h 曲线（GET /iot/point/{id}/curve，iot:point:query；fail-soft 空集占位） */
++  curve: (id) => {
++    return getRequest(`/iot/point/${id}/curve`, undefined);
++  },
++
++  /** 新增点位（POST /iot/point，iot:point:add；pointCode 创建后不可改） */
++  add: (form) => {
++    return postRequest('/iot/point', form);
++  },
++
++  /** 修改点位（PUT /iot/point，iot:point:edit；status 不进编辑集，启停走 changeStatus） */
++  update: (form) => {
++    return putRequest('/iot/point', form);
++  },
++
++  /** 批量启停（PUT /iot/point/changeStatus，iot:point:edit；{ ids, status }） */
++  changeStatus: (form) => {
++    return putRequest('/iot/point/changeStatus', form);
++  },
++
++  /** 批量删除（DELETE /iot/point/{ids}，iot:point:remove；ids 逗号拼接路径参数） */
++  remove: (ids) => {
++    const idsParam = Array.isArray(ids) ? ids.join(',') : ids;
++    return deleteRequest(`/iot/point/${idsParam}`);
++  },
++
++  /** 按查询条件导出 xlsx（GET /iot/point/export，iot:point:list；getDownload 签名支持 GET 下载） */
++  export: (params) => {
++    return getDownload('/iot/point/export', params);
++  },
++
+   /**
+    * 下载点位导入模板（十三列表头+示例行+说明行；示例行导入前请删除或替换）
+    */
+diff --git a/frontend/src/components/iot/iot-consts.ts b/frontend/src/components/iot/iot-consts.ts
+index 583ec503..ad27d8b9 100644
+--- a/frontend/src/components/iot/iot-consts.ts
++++ b/frontend/src/components/iot/iot-consts.ts
+@@ -82,5 +82,20 @@ export const IOT_STATUS_DISABLE = '禁用';
+ /** 分页上限（后端 MybatisPlusConfig maxLimit=500） */
+ export const IOT_PAGE_MAX = 500;
+ 
++/** 点位数据种类：1 瞬时 2 累计 3 状态 4 开关（IotPoint.dataType @Min(1) @Max(4)） */
++export const IOT_POINT_DATA_TYPE_OPTIONS = [
++  { value: 1, label: '瞬时 (1)' },
++  { value: 2, label: '累计 (2)' },
++  { value: 3, label: '状态 (3)' },
++  { value: 4, label: '开关 (4)' },
++];
++
++export function iotPointDataTypeLabel(dataType?: number): string {
++  return IOT_POINT_DATA_TYPE_OPTIONS.find((o) => o.value === dataType)?.label || '-';
++}
++
++/** 点位值类型：DOUBLE/INT/BOOL/ENUM（IotPoint.valueType @Pattern，与 IOT_DATA_TYPE_OPTIONS 同值域） */
++export const IOT_POINT_VALUE_TYPE_OPTIONS = IOT_DATA_TYPE_OPTIONS;
++
+ /** 模板数据项单批上限（IotDataItemTemplateService.ITEM_BATCH_MAX） */
+ export const IOT_TEMPLATE_ITEM_BATCH_MAX = 500;
+diff --git a/frontend/src/views/iot/point/components/point-detail-modal.vue b/frontend/src/views/iot/point/components/point-detail-modal.vue
+new file mode 100644
+index 00000000..2827d9a6
+--- /dev/null
++++ b/frontend/src/views/iot/point/components/point-detail-modal.vue
+@@ -0,0 +1,127 @@
++<!--
++  * 点位详情弹窗（TASK-0097）
++  *
++  * 对接 GET /iot/point/{id}（IotPointDetailVO：档案字段 + referenceCount + curve24h）、
++  * GET /iot/point/{id}/references（反查数据项清单）、GET /iot/point/{id}/curve（近 24h 曲线）；
++  * 曲线/反查本期后端 fail-soft 空集占位——空数据展示诚实空态，不伪造曲线点/引用记录。
++-->
++<template>
++  <a-modal :open="visible" title="点位详情" :width="760" :footer="null" @cancel="onClose">
++    <a-descriptions bordered size="small" :column="2" :loading="detailLoading">
++      <a-descriptions-item label="ID">{{ detail.id }}</a-descriptions-item>
++      <a-descriptions-item label="点位编码">{{ detail.pointCode }}</a-descriptions-item>
++      <a-descriptions-item label="点位名称">{{ detail.pointName }}</a-descriptions-item>
++      <a-descriptions-item label="数据种类">{{ iotPointDataTypeLabel(detail.dataType as number) }}</a-descriptions-item>
++      <a-descriptions-item label="值类型">{{ detail.valueType }}</a-descriptions-item>
++      <a-descriptions-item label="单位">{{ detail.unit || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="有效范围">{{ rangeText }}</a-descriptions-item>
++      <a-descriptions-item label="采样周期">{{ detail.samplePeriod != null ? `${detail.samplePeriod} 秒` : '-' }}</a-descriptions-item>
++      <a-descriptions-item label="来源通道ID">{{ detail.channelId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="绑定实例ID">{{ detail.boundInstanceId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="绑定部门ID">{{ detail.deptId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="状态">
++        <a-tag v-if="detail.status === 1" color="green">启用</a-tag>
++        <a-tag v-else color="red">禁用</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="配置版本">{{ detail.configVersion ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="反向引用数">
++        <span v-if="detail.referenceCount != null">{{ detail.referenceCount }}</span>
++        <span v-else>-</span>
++      </a-descriptions-item>
++      <a-descriptions-item label="创建时间">{{ detail.createTime || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="更新时间">{{ detail.updateTime || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="备注" :span="2">{{ detail.remark || '-' }}</a-descriptions-item>
++    </a-descriptions>
++
++    <a-divider orientation="left">反向引用数据项（{{ referenceCountText }}）</a-divider>
++    <a-table size="small" :dataSource="references" :columns="referenceColumns" rowKey="itemId" :pagination="false" bordered>
++      <template #emptyText>暂无引用数据项</template>
++    </a-table>
++
++    <a-divider orientation="left">近 24h 曲线</a-divider>
++    <a-table size="small" :dataSource="curvePoints" :columns="curveColumns" rowKey="ts" :pagination="false" bordered>
++      <template #emptyText>近 24h 暂无曲线数据（后端 fail-soft 空集，真实数据待采集入库）</template>
++    </a-table>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref } from 'vue';
++  import { pointApi } from '/@/api/iot/point-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { iotPointDataTypeLabel } from '/@/components/iot/iot-consts';
++
++  const referenceColumns = [
++    { title: '数据项ID', dataIndex: 'itemId', width: 100 },
++    { title: '全键', dataIndex: 'fullKey' },
++    { title: '实例编码', dataIndex: 'instanceCode' },
++    { title: '数据项名称', dataIndex: 'dataName' },
++  ];
++  const curveColumns = [
++    { title: '时间', dataIndex: 'ts', width: 180 },
++    { title: '数值', dataIndex: 'value', width: 140 },
++    { title: '质量', dataIndex: 'quality' },
++  ];
++
++  const visible = ref(false);
++  const detailLoading = ref(false);
++  const detail = reactive<Record<string, unknown>>({});
++  const references = ref<Record<string, unknown>[]>([]);
++  const curvePoints = ref<Record<string, unknown>[]>([]);
++
++  const rangeText = computed(() => {
++    const min = detail.minValue;
++    const max = detail.maxValue;
++    if (min == null && max == null) return '-';
++    return `${min ?? '不限'} ~ ${max ?? '不限'}`;
++  });
++
++  const referenceCountText = computed(() => {
++    const count = detail.referenceCount;
++    return count != null ? String(count) : '未知';
++  });
++
++  async function showModal(id) {
++    visible.value = true;
++    detailLoading.value = true;
++    try {
++      // 三读并行；任一失败独立捕获，避免一处失败让整个详情空白
++      const [detailResp, refResp, curveResp] = await Promise.allSettled([
++        pointApi.detail(id),
++        pointApi.references(id),
++        pointApi.curve(id),
++      ]);
++      if (detailResp.status === 'fulfilled') {
++        Object.assign(detail, detailResp.value.data || {});
++        // 聚合详情自带 curve24h 时优先采用，否则用独立 curve 端点
++        const aggregateCurve = detailResp.value.data?.curve24h;
++        curvePoints.value = Array.isArray(aggregateCurve) && aggregateCurve.length > 0 ? aggregateCurve : [];
++      } else {
++        otSentry.captureError(detailResp.reason);
++      }
++      if (refResp.status === 'fulfilled') {
++        references.value = Array.isArray(refResp.value.data) ? refResp.value.data : [];
++      } else {
++        otSentry.captureError(refResp.reason);
++      }
++      if (curveResp.status === 'fulfilled') {
++        if (curvePoints.value.length === 0) {
++          const dataPoints = curveResp.value.data?.dataPoints;
++          curvePoints.value = Array.isArray(dataPoints) ? dataPoints : [];
++        }
++      } else {
++        otSentry.captureError(curveResp.reason);
++      }
++    } finally {
++      detailLoading.value = false;
++    }
++  }
++
++  function onClose() {
++    visible.value = false;
++    Object.keys(detail).forEach((key) => delete detail[key]);
++    references.value = [];
++    curvePoints.value = [];
++  }
++
++  defineExpose({ showModal });
++</script>
+diff --git a/frontend/src/views/iot/point/components/point-form-modal.vue b/frontend/src/views/iot/point/components/point-form-modal.vue
+new file mode 100644
+index 00000000..0c415a4d
+--- /dev/null
++++ b/frontend/src/views/iot/point/components/point-form-modal.vue
+@@ -0,0 +1,197 @@
++<!--
++  * 点位表单弹窗（TASK-0097）
++  *
++  * 表单校验与 IotPointCreateForm / IotPointUpdateForm 校验注解逐条对齐：
++  * - pointCode 必填 ≤96，仅字母/数字/下划线/点（租户内唯一，创建后不可改——编辑禁输并携带原值）
++  * - pointName 必填 ≤100；dataType 必选 1 瞬时/2 累计/3 状态/4 开关；valueType 必选 DOUBLE/INT/BOOL/ENUM
++  * - unit ≤32（后端强制单位字典 iot_unit 校验，禁手填——此处仅前置长度提示，后端为准）
++  * - minValue/maxValue 双给时须 min<=max；samplePeriod 1-86400；deadband 可空
++  * - protocolAddr ≤8192；boundInstanceId/channelId/deptId 可空原生输入（无字典数据源时诚实留空）
++  * - status 不进表单（启停走 changeStatus 独立接口）；新增 status 后端默认 1
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑点位' : '新增点位'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-alert v-if="form.id" type="info" show-icon class="ot-margin-bottom10" message="点位编码创建后不可修改；启停请通过列表行操作「启用/停用」执行" />
++    <br v-if="form.id" />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 6 }" :wrapper-col="{ span: 18 }">
++      <a-form-item label="点位编码" name="pointCode">
++        <a-input v-model:value="form.pointCode" :disabled="!!form.id" :maxlength="96" placeholder="字母/数字/下划线/点，租户内唯一，创建后不可改" />
++      </a-form-item>
++      <a-form-item label="点位名称" name="pointName">
++        <a-input v-model:value="form.pointName" :maxlength="100" placeholder="请输入点位名称" />
++      </a-form-item>
++      <a-form-item label="数据种类" name="dataType">
++        <a-select v-model:value="form.dataType" placeholder="请选择数据种类">
++          <a-select-option v-for="opt in IOT_POINT_DATA_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="值类型" name="valueType">
++        <a-select v-model:value="form.valueType" placeholder="请选择值类型">
++          <a-select-option v-for="t in IOT_POINT_VALUE_TYPE_OPTIONS" :key="t" :value="t">{{ t }}</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="单位" name="unit">
++        <a-input v-model:value="form.unit" :maxlength="32" placeholder="单位须取自单位字典（后端校验，禁手填）" />
++      </a-form-item>
++      <a-form-item label="下限" name="minValue">
++        <a-input-number style="width: 100%" v-model:value="form.minValue" placeholder="有效范围下限（可空）" />
++      </a-form-item>
++      <a-form-item label="上限" name="maxValue">
++        <a-input-number style="width: 100%" v-model:value="form.maxValue" placeholder="有效范围上限（可空）" />
++      </a-form-item>
++      <a-form-item label="采样周期" name="samplePeriod">
++        <a-input-number style="width: 100%" v-model:value="form.samplePeriod" :min="1" :max="86400" placeholder="秒，1-86400（可空）" />
++      </a-form-item>
++      <a-form-item label="死区" name="deadband">
++        <a-input-number style="width: 100%" v-model:value="form.deadband" placeholder="一期不启用，字段保留（可空）" />
++      </a-form-item>
++      <a-form-item label="来源通道ID" name="channelId">
++        <a-input-number style="width: 100%" v-model:value="form.channelId" :min="1" placeholder="iot_channel.id（可空）" />
++      </a-form-item>
++      <a-form-item label="绑定实例ID" name="boundInstanceId">
++        <a-input-number style="width: 100%" v-model:value="form.boundInstanceId" :min="1" placeholder="iot_model_instance.id（可空）" />
++      </a-form-item>
++      <a-form-item label="绑定部门ID" name="deptId">
++        <a-input-number style="width: 100%" v-model:value="form.deptId" :min="1" placeholder="sys_dept.id（可空）" />
++      </a-form-item>
++      <a-form-item label="协议地址" name="protocolAddr">
++        <a-input v-model:value="form.protocolAddr" :maxlength="8192" placeholder="协议地址 JSON 原文（可空，一期预留）" />
++      </a-form-item>
++      <a-form-item label="备注" name="remark">
++        <a-textarea v-model:value="form.remark" :maxlength="500" placeholder="备注（可空）" />
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { pointApi } from '/@/api/iot/point-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_POINT_DATA_TYPE_OPTIONS, IOT_POINT_VALUE_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++
++  const emit = defineEmits(['reloadList']);
++  const formRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    pointCode: '',
++    pointName: '',
++    dataType: undefined,
++    valueType: undefined,
++    unit: '',
++    minValue: undefined,
++    maxValue: undefined,
++    samplePeriod: undefined,
++    deadband: undefined,
++    channelId: undefined,
++    boundInstanceId: undefined,
++    deptId: undefined,
++    protocolAddr: '',
++    remark: '',
++  };
++  const form = reactive({ ...formDefault });
++
++  // 与 IotPointCreateForm / IotPointUpdateForm 注解对齐的前置校验（后端校验为准）
++  const rules = {
++    pointCode: [
++      { required: true, message: '请输入点位编码' },
++      { max: 96, message: '点位编码长度不能超过 96' },
++      { pattern: /^[A-Za-z0-9_.]+$/, message: '点位编码仅允许字母/数字/下划线/点' },
++    ],
++    pointName: [
++      { required: true, message: '请输入点位名称' },
++      { max: 100, message: '点位名称长度不能超过 100' },
++    ],
++    dataType: [
++      { required: true, message: '请选择数据种类' },
++      { type: 'number', min: 1, max: 4, message: '数据种类仅允许 1 瞬时/2 累计/3 状态/4 开关' },
++    ],
++    valueType: [
++      { required: true, message: '请选择值类型' },
++      { pattern: /^(DOUBLE|INT|BOOL|ENUM)$/, message: '值类型仅允许 DOUBLE/INT/BOOL/ENUM' },
++    ],
++    unit: [{ max: 32, message: '单位长度不能超过 32' }],
++    samplePeriod: [{ type: 'number', min: 1, max: 86400, message: '采样周期仅允许 1-86400 秒' }],
++    protocolAddr: [{ max: 8192, message: '协议地址 JSON 长度不能超过 8192' }],
++    remark: [{ max: 500, message: '备注长度不能超过 500' }],
++    maxValue: [
++      {
++        validator: (_rule, value) => {
++          if (value != null && form.minValue != null && Number(value) < Number(form.minValue)) {
++            return Promise.reject(new Error('上限不能小于下限'));
++          }
++          return Promise.resolve();
++        },
++        trigger: 'change',
++      },
++    ],
++  };
++
++  const visible = ref(false);
++
++  function showModal(rowData?) {
++    Object.assign(form, formDefault);
++    if (rowData) {
++      // 编辑：仅携带白名单可变字段 + id + pointCode（同值 no-op，后端拒绝不一致）
++      Object.assign(form, {
++        id: rowData.id,
++        pointCode: rowData.pointCode,
++        pointName: rowData.pointName,
++        dataType: rowData.dataType,
++        valueType: rowData.valueType,
++        unit: rowData.unit,
++        minValue: rowData.minValue,
++        maxValue: rowData.maxValue,
++        samplePeriod: rowData.samplePeriod,
++        deadband: rowData.deadband,
++        channelId: rowData.channelId,
++        boundInstanceId: rowData.boundInstanceId,
++        deptId: rowData.deptId,
++        protocolAddr: rowData.protocolAddr,
++        remark: rowData.remark,
++      });
++    }
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        try {
++          const payload = { ...form };
++          if (!payload.id) {
++            delete payload.id;
++          }
++          if (payload.id) {
++            await pointApi.update(payload);
++          } else {
++            await pointApi.add(payload);
++          }
++          message.success(`${payload.id ? '修改' : '新增'}成功`);
++          emit('reloadList');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  defineExpose({ showModal, onSubmit });
++</script>
+diff --git a/frontend/src/views/iot/point/index.vue b/frontend/src/views/iot/point/index.vue
+index 9f6260ce..641cb641 100644
+--- a/frontend/src/views/iot/point/index.vue
++++ b/frontend/src/views/iot/point/index.vue
+@@ -1,11 +1,301 @@
+ <!--
+-  * 点位管理（占位骨架，TASK-0055）
++  * 点位管理（TASK-0097：占位骨架 → 可用 CRUD 管理页）
+   *
+-  * 菜单挂载点：sys_menu 4011（/iot/point）。采集点位建档与配额展示归 TASK-0056/0070。
++  * 对接 IotPointController（/iot/point，权限位 iot:point:*：sys_menu 4053-4057/4079/4080）：
++  * 列表/导出 iot:point:list，查询/详情/反查/曲线 iot:point:query，新增 iot:point:add，
++  * 编辑/启停 iot:point:edit，删除 iot:point:remove；无权限按钮 v-privilege 隐藏。
++  * 导入向导独立菜单 4016（/iot/import），本页仅放跳转链接不重复实现。
++  * 「保存≠生效，重新发布后对接入生效」纪律沿用后端 effectNote 明示。
+ -->
+ <template>
+-  <IotPlaceholder title="点位管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="点位编码" class="ot-query-form-item">
++        <a-input style="width: 180px" v-model:value="queryForm.pointCode" placeholder="点位编码" />
++      </a-form-item>
++      <a-form-item label="点位名称" class="ot-query-form-item">
++        <a-input style="width: 180px" v-model:value="queryForm.pointName" placeholder="点位名称" />
++      </a-form-item>
++      <a-form-item label="数据种类" class="ot-query-form-item">
++        <a-select style="width: 130px" v-model:value="queryForm.dataType" :allowClear="true" placeholder="请选择">
++          <a-select-option v-for="opt in IOT_POINT_DATA_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="值类型" class="ot-query-form-item">
++        <a-select style="width: 130px" v-model:value="queryForm.valueType" :allowClear="true" placeholder="请选择">
++          <a-select-option v-for="t in IOT_POINT_VALUE_TYPE_OPTIONS" :key="t" :value="t">{{ t }}</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 110px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="通道ID" class="ot-query-form-item">
++        <a-input-number style="width: 120px" v-model:value="queryForm.channelId" :min="1" placeholder="通道ID" />
++      </a-form-item>
++      <a-form-item label="部门ID" class="ot-query-form-item">
++        <a-input-number style="width: 120px" v-model:value="queryForm.deptId" :min="1" placeholder="部门ID" />
++      </a-form-item>
++      <a-form-item label="实例ID" class="ot-query-form-item">
++        <a-input-number style="width: 120px" v-model:value="queryForm.boundInstanceId" :min="1" placeholder="实例ID" />
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:point:list'" type="primary" @click="onSearch">
++            <template #icon><SearchOutlined /></template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:point:list'" @click="resetQuery">
++            <template #icon><ReloadOutlined /></template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:point:add'" type="primary" @click="addOrUpdatePoint()">
++          <template #icon><PlusOutlined /></template>
++          新建
++        </a-button>
++        <a-button v-privilege="'iot:point:edit'" :disabled="!selectedRowKeys.length" @click="changeStatusBatch(1)">批量启用</a-button>
++        <a-button v-privilege="'iot:point:edit'" :disabled="!selectedRowKeys.length" @click="changeStatusBatch(0)">批量停用</a-button>
++        <a-button v-privilege="'iot:point:remove'" :disabled="!selectedRowKeys.length" danger @click="confirmDeleteBatch()">批量删除</a-button>
++        <a-button v-privilege="'iot:point:list'" @click="onExport">
++          <template #icon><DownloadOutlined /></template>
++          导出
++        </a-button>
++        <router-link v-privilege="'iot:point:add'" to="/iot/import" class="point-import-link">批量导入向导（菜单 4016）</router-link>
++      </div>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      :row-selection="{ selectedRowKeys, onChange: onSelectChange }"
++      rowKey="id"
++      :pagination="false"
++      bordered
++    >
++      <template #emptyText>暂无点位数据</template>
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'dataType'">
++          {{ iotPointDataTypeLabel(record.dataType) }}
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:point:query'" type="link" @click="showDetail(record)">详情</a-button>
++            <a-button v-privilege="'iot:point:edit'" type="link" @click="addOrUpdatePoint(record)">编辑</a-button>
++            <a-button v-if="record.status !== 1" v-privilege="'iot:point:edit'" type="link" @click="confirmChangeStatus(record, 1)">启用</a-button>
++            <a-button v-if="record.status === 1" v-privilege="'iot:point:edit'" type="link" @click="confirmChangeStatus(record, 0)">停用</a-button>
++            <a-button v-privilege="'iot:point:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <PointFormModal ref="pointFormModalRef" @reloadList="ajaxQuery" />
++    <PointDetailModal ref="pointDetailModalRef" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import PointFormModal from './components/point-form-modal.vue';
++  import PointDetailModal from './components/point-detail-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { DownloadOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { pointApi } from '/@/api/iot/point-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_POINT_DATA_TYPE_OPTIONS, IOT_POINT_VALUE_TYPE_OPTIONS, iotPointDataTypeLabel } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    { title: 'ID', width: 70, dataIndex: 'id' },
++    { title: '点位编码', dataIndex: 'pointCode' },
++    { title: '点位名称', dataIndex: 'pointName' },
++    { title: '数据种类', width: 110, dataIndex: 'dataType' },
++    { title: '值类型', width: 90, dataIndex: 'valueType' },
++    { title: '单位', width: 70, dataIndex: 'unit' },
++    { title: '采样周期', width: 100, dataIndex: 'samplePeriod' },
++    { title: '通道ID', width: 90, dataIndex: 'channelId' },
++    { title: '实例ID', width: 90, dataIndex: 'boundInstanceId' },
++    { title: '部门ID', width: 90, dataIndex: 'deptId' },
++    { title: '状态', width: 70, dataIndex: 'status' },
++    { title: '更新时间', width: 160, dataIndex: 'updateTime' },
++    { title: '操作', dataIndex: 'action', fixed: 'right', width: 230 },
++  ]);
++
++  const queryFormState = {
++    pointCode: '',
++    pointName: '',
++    dataType: undefined,
++    valueType: undefined,
++    status: undefined,
++    channelId: undefined,
++    deptId: undefined,
++    boundInstanceId: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const selectedRowKeys = ref<number[]>([]);
++  const pointFormModalRef = ref();
++  const pointDetailModalRef = ref();
++
++  function onSelectChange(keys: number[]) {
++    selectedRowKeys.value = keys;
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    onSearch();
++  }
++
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await pointApi.queryList({ ...queryForm });
++      tableData.value = responseData.data?.records || [];
++      total.value = responseData.data?.total || 0;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  function addOrUpdatePoint(rowData?) {
++    pointFormModalRef.value.showModal(rowData);
++  }
++
++  function showDetail(rowData) {
++    pointDetailModalRef.value.showModal(rowData.id);
++  }
++
++  async function doChangeStatus(ids: number[], status: number) {
++    try {
++      const resp = await pointApi.changeStatus({ ids, status });
++      const affected = resp.data?.affectedDataItemCount;
++      const note = resp.data?.effectNote;
++      message.success(
++        status === 0
++          ? `停用已保存，受影响数据项 ${affected ?? 0} 个${note ? `；${note}` : ''}`
++          : `启用已保存${note ? `；${note}` : ''}`
++      );
++      selectedRowKeys.value = [];
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    }
++  }
++
++  function confirmChangeStatus(rowData, status: number) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要${status === 1 ? '启用' : '停用'}点位【${rowData.pointCode} ${rowData.pointName}】吗？${status === 0 ? '停用后将影响绑定数据项，需重新发布后对接入生效。' : ''}`,
++      okText: status === 1 ? '启用' : '停用',
++      okType: status === 1 ? 'primary' : 'danger',
++      onOk() {
++        return doChangeStatus([rowData.id], status);
++      },
++    });
++  }
++
++  function changeStatusBatch(status: number) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要批量${status === 1 ? '启用' : '停用'}选中的 ${selectedRowKeys.value.length} 个点位吗？${status === 0 ? '停用后需重新发布才对接入生效。' : ''}`,
++      okText: status === 1 ? '启用' : '停用',
++      okType: status === 1 ? 'primary' : 'danger',
++      onOk() {
++        return doChangeStatus([...selectedRowKeys.value], status);
++      },
++    });
++  }
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除点位【${rowData.pointCode} ${rowData.pointName}】吗？（被数据项绑定时将被拒绝，编码删除后不复用）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        return doDelete([rowData.id]);
++      },
++    });
++  }
++
++  function confirmDeleteBatch() {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要批量删除选中的 ${selectedRowKeys.value.length} 个点位吗？（被数据项绑定时整批拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        return doDelete([...selectedRowKeys.value]);
++      },
++    });
++  }
++
++  async function doDelete(ids: number[]) {
++    try {
++      await pointApi.remove(ids);
++      message.success('删除成功');
++      selectedRowKeys.value = [];
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    }
++  }
++
++  function onExport() {
++    // getDownload 内部完成浏览器保存与错误提示，fire-and-forget 语义（返回 Promise 收敛）
++    pointApi.export({ ...queryForm });
++  }
++
++  onMounted(ajaxQuery);
+ </script>
++<style scoped lang="less">
++  .point-import-link {
++    margin-left: 12px;
++    font-size: 14px;
++    line-height: 32px;
++  }
++</style>
+diff --git a/frontend/tests/unit/api/iot/point-api.spec.ts b/frontend/tests/unit/api/iot/point-api.spec.ts
+new file mode 100644
+index 00000000..7801deaa
+--- /dev/null
++++ b/frontend/tests/unit/api/iot/point-api.spec.ts
+@@ -0,0 +1,105 @@
++/*
++ * point-api CRUD/详情/反查/曲线/启停/删除/导出请求参数单测（TASK-0097）
++ *
++ * 覆盖每条封装与后端 IotPointController 端点/方法的逐项对齐：
++ * - queryList GET /iot/point/list（原已覆盖，保留）
++ * - getById/detail GET /iot/point/{id}
++ * - references GET /iot/point/{id}/references
++ * - curve GET /iot/point/{id}/curve
++ * - add POST /iot/point；update PUT /iot/point
++ * - changeStatus PUT /iot/point/changeStatus
++ * - remove DELETE /iot/point/{ids}（逗号拼接）
++ * - export GET /iot/point/export（getDownload）
++ * - 导入三方法保留。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++
++vi.mock('/@/lib/axios', () => ({
++  getRequest: vi.fn(() => Promise.resolve({ code: 200, data: {} })),
++  postRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++  putRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++  deleteRequest: vi.fn(() => Promise.resolve({ code: 200, data: null })),
++  getDownload: vi.fn(() => Promise.resolve()),
++  postDownload: vi.fn(() => Promise.resolve()),
++}));
++
++import { deleteRequest, getDownload, getRequest, postDownload, postRequest, putRequest } from '/@/lib/axios';
++import { pointApi } from '/@/api/iot/point-api';
++
++describe('point-api 对齐 IotPointController（TASK-0097）', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('queryList 仍调 GET /iot/point/list 并透传分页与过滤参数', async () => {
++    const params = { pageNum: 1, pageSize: 10, pointCode: 'P', status: 1, channelId: 3, deptId: 4, boundInstanceId: 5 };
++    await pointApi.queryList(params);
++    expect(getRequest).toHaveBeenCalledWith('/iot/point/list', params);
++  });
++
++  it('getById / detail 均调 GET /iot/point/{id}', async () => {
++    await pointApi.getById(301);
++    await pointApi.detail(302);
++    expect(getRequest).toHaveBeenNthCalledWith(1, '/iot/point/301', undefined);
++    expect(getRequest).toHaveBeenNthCalledWith(2, '/iot/point/302', undefined);
++  });
++
++  it('references 调 GET /iot/point/{id}/references', async () => {
++    await pointApi.references(301);
++    expect(getRequest).toHaveBeenCalledWith('/iot/point/301/references', undefined);
++  });
++
++  it('curve 调 GET /iot/point/{id}/curve', async () => {
++    await pointApi.curve(301);
++    expect(getRequest).toHaveBeenCalledWith('/iot/point/301/curve', undefined);
++  });
++
++  it('add 调 POST /iot/point 并透传创建表单', async () => {
++    const form = { pointCode: 'P-001', pointName: '温度', dataType: 1, valueType: 'DOUBLE' };
++    await pointApi.add(form);
++    expect(postRequest).toHaveBeenCalledWith('/iot/point', form);
++  });
++
++  it('update 调 PUT /iot/point 并透传更新表单（不含 status）', async () => {
++    const form = { id: 301, pointCode: 'P-001', pointName: '温度2', dataType: 2 };
++    await pointApi.update(form);
++    expect(putRequest).toHaveBeenCalledWith('/iot/point', form);
++  });
++
++  it('changeStatus 调 PUT /iot/point/changeStatus 并透传 ids/status', async () => {
++    const form = { ids: [301, 302], status: 0 };
++    await pointApi.changeStatus(form);
++    expect(putRequest).toHaveBeenCalledWith('/iot/point/changeStatus', form);
++  });
++
++  it('remove 调 DELETE /iot/point/{ids}（数组逗号拼接路径参数）', async () => {
++    await pointApi.remove([301, 302, 303]);
++    expect(deleteRequest).toHaveBeenCalledWith('/iot/point/301,302,303');
++  });
++
++  it('remove 接受已拼接的字符串 ids', async () => {
++    await pointApi.remove('301,302');
++    expect(deleteRequest).toHaveBeenCalledWith('/iot/point/301,302');
++  });
++
++  it('export 调 GET /iot/point/export 并透传过滤参数（getDownload）', async () => {
++    const params = { pointCode: 'P', status: 1 };
++    await pointApi.export(params);
++    expect(getDownload).toHaveBeenCalledWith('/iot/point/export', params);
++  });
++
++  it('导入三方法保留：模板下载/批量导入/错误行清单下载', async () => {
++    await pointApi.downloadImportTemplate();
++    expect(getDownload).toHaveBeenCalledWith('/iot/point/import/template');
++    const formData = {} as FormData;
++    await pointApi.importPoints(formData);
++    expect(postRequest).toHaveBeenCalledWith('/iot/point/import', formData, {
++      headers: { 'Content-Type': 'multipart/form-data' },
++      timeout: 120000,
++      silentError: true,
++    });
++    const receipt = { rows: [] };
++    await pointApi.downloadImportErrorReport(receipt);
++    expect(postDownload).toHaveBeenCalledWith('/iot/point/import/error-report', receipt);
++  });
++});
+diff --git a/frontend/tests/unit/views/iot/point.spec.ts b/frontend/tests/unit/views/iot/point.spec.ts
+new file mode 100644
+index 00000000..270aba45
+--- /dev/null
++++ b/frontend/tests/unit/views/iot/point.spec.ts
+@@ -0,0 +1,267 @@
++/*
++ * 点位管理页单测（TASK-0097）
++ *
++ * 覆盖：
++ * ① 页面不再出现 IotPlaceholder / 「完整功能由 TASK-0056 / TASK-0070 交付」；
++ * ② 挂载拉列表（分页参数对齐）、查询/重置、空态诚实；
++ * ③ 新建/编辑通过父 ref 调 defineExpose.showModal（BUG-0008 回归）；
++ * ④ 详情弹窗通过父 ref 调 showModal(id) 且拉 detail/references/curve；
++ * ⑤ 启停（changeStatus）/删除（remove 逗号拼接）/导出（export）调用；
++ * ⑥ 表单弹窗字段对齐：编辑禁 pointCode、不提交 status、add/update 路由正确；
++ * ⑦ 详情空集诚实空态。
++ */
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { defineComponent, h, nextTick, ref } from 'vue';
++import { flushPromises, mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++
++const queryList = vi.hoisted(() =>
++  vi.fn(() =>
++    Promise.resolve({
++      code: 200,
++      data: {
++        records: [
++          { id: 301, pointCode: 'P-001', pointName: '1号温度', dataType: 1, valueType: 'DOUBLE', status: 1, updateTime: '2026-11-25 10:00:00' },
++          { id: 302, pointCode: 'P-002', pointName: '2号压力', dataType: 2, valueType: 'INT', status: 0, updateTime: '2026-11-25 09:00:00' },
++        ],
++        total: 2,
++      },
++    })
++  )
++);
++const changeStatus = vi.hoisted(() =>
++  vi.fn(() =>
++    Promise.resolve({
++      code: 200,
++      data: { targetStatus: 0, changedCount: 1, affectedDataItemCount: 3, effectNote: '变更已保存，重新发布后对接入生效' },
++    })
++  )
++);
++const remove = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: null })));
++const exportApi = vi.hoisted(() => vi.fn(() => Promise.resolve()));
++const detailApi = vi.hoisted(() =>
++  vi.fn(() =>
++    Promise.resolve({
++      code: 200,
++      data: { id: 301, pointCode: 'P-001', pointName: '1号温度', dataType: 1, valueType: 'DOUBLE', status: 1, referenceCount: 2, curve24h: [] },
++    })
++  )
++);
++const referencesApi = vi.hoisted(() =>
++  vi.fn(() => Promise.resolve({ code: 200, data: [{ itemId: 9001, fullKey: 'INST01.TEMP', instanceCode: 'INST01', dataName: '温度数据项' }] }))
++);
++const curveApi = vi.hoisted(() => vi.fn(() => Promise.resolve({ code: 200, data: { pointId: 301, windowHours: 24, dataPoints: [] } })));
++const addApi = vi.hoisted(() => vi.fn((_form: Record<string, unknown>) => Promise.resolve({ code: 200, data: null })));
++const updateApi = vi.hoisted(() => vi.fn((_form: Record<string, unknown>) => Promise.resolve({ code: 200, data: null })));
++
++const messageSuccess = vi.hoisted(() => vi.fn());
++const messageError = vi.hoisted(() => vi.fn());
++const captureError = vi.hoisted(() => vi.fn());
++const confirmCalls = vi.hoisted(() => vi.fn());
++
++vi.mock('/@/api/iot/point-api', () => ({
++  pointApi: {
++    queryList,
++    detail: detailApi,
++    getById: detailApi,
++    references: referencesApi,
++    curve: curveApi,
++    add: addApi,
++    update: updateApi,
++    changeStatus,
++    remove,
++    export: exportApi,
++  },
++}));
++vi.mock('/@/lib/ot-sentry', () => ({ otSentry: { captureError } }));
++vi.mock('/@/components/framework/ot-loading', () => ({ OtLoading: { show: vi.fn(), hide: vi.fn() } }));
++vi.mock('/@/components/iot/iot-optimistic-lock', () => ({ handleIotConflictError: (e: unknown) => e }));
++vi.mock('ant-design-vue', async () => {
++  const actual = await vi.importActual<typeof import('ant-design-vue')>('ant-design-vue');
++  return {
++    ...actual,
++    default: actual.default,
++    message: { success: messageSuccess, error: messageError, warn: vi.fn() },
++    Modal: {
++      ...actual.Modal,
++      confirm: (opts) => {
++        confirmCalls(opts);
++        return opts.onOk?.();
++      },
++    },
++  };
++});
++
++import PointIndex from '/@/views/iot/point/index.vue';
++import PointFormModal from '/@/views/iot/point/components/point-form-modal.vue';
++import PointDetailModal from '/@/views/iot/point/components/point-detail-modal.vue';
++
++function mountPage() {
++  return mount(PointIndex, {
++    global: {
++      plugins: [Antd],
++      directives: { privilege: {} },
++      stubs: { RouterLink: { template: '<a class="import-link"><slot /></a>' } },
++    },
++  });
++}
++
++describe('点位管理页（TASK-0097）', () => {
++  beforeEach(() => {
++    document.body.innerHTML = '';
++    vi.clearAllMocks();
++  });
++
++  it('挂载拉列表（默认分页）且无占位骨架文案', async () => {
++    const wrapper = mountPage();
++    await flushPromises();
++    expect(queryList).toHaveBeenCalledWith(expect.objectContaining({ pageNum: 1, pageSize: 10 }));
++    const html = wrapper.html();
++    expect(html).not.toContain('IotPlaceholder');
++    expect(html).not.toContain('完整功能由 TASK-0056 / TASK-0070 交付');
++    expect(wrapper.text()).toContain('P-001');
++    wrapper.unmount();
++  });
++
++  it('空数据时展示诚实空态，不造假数据', async () => {
++    queryList.mockResolvedValueOnce({ code: 200, data: { records: [], total: 0 } });
++    const wrapper = mountPage();
++    await flushPromises();
++    expect(wrapper.text()).toContain('暂无点位数据');
++    wrapper.unmount();
++  });
++
++  it('新建/详情通过父 ref 调 defineExpose.showModal（BUG-0008 回归）', async () => {
++    const wrapper = mountPage();
++    await flushPromises();
++    const formModal = wrapper.findComponent(PointFormModal);
++    const detailModal = wrapper.findComponent(PointDetailModal);
++    expect(typeof (formModal.vm as unknown as { showModal: unknown }).showModal).toBe('function');
++    expect(typeof (detailModal.vm as unknown as { showModal: unknown }).showModal).toBe('function');
++    wrapper.unmount();
++  });
++
++  it('启停调 changeStatus({ids,status})，停用含发布生效提示', async () => {
++    const wrapper = mountPage();
++    await flushPromises();
++    // wrapper 未挂载到 document.body，表格按钮在 wrapper 内查询
++    const buttons = wrapper.findAll('button').filter((b) => b.text().trim() === '停用');
++    expect(buttons.length).toBeGreaterThan(0);
++    buttons[0].trigger('click');
++    await flushPromises();
++    expect(changeStatus).toHaveBeenCalledWith({ ids: [301], status: 0 });
++    expect(messageSuccess).toHaveBeenCalledWith(expect.stringContaining('变更已保存，重新发布后对接入生效'));
++    wrapper.unmount();
++  });
++
++  it('删除调 remove([id])（API 层拼路径参数），导出调 export 带过滤参数', async () => {
++    const wrapper = mountPage();
++    await flushPromises();
++    const delButtons = wrapper.findAll('button').filter((b) => b.text().trim() === '删除');
++    expect(delButtons.length).toBeGreaterThan(0);
++    delButtons[0].trigger('click');
++    await flushPromises();
++    expect(remove).toHaveBeenCalledWith([301]);
++    const exportBtn = wrapper.findAll('button').find((b) => b.text().includes('导出'));
++    expect(exportBtn).toBeDefined();
++    exportBtn!.trigger('click');
++    await flushPromises();
++    expect(exportApi).toHaveBeenCalledWith(expect.objectContaining({ pageNum: 1, pageSize: 10 }));
++    wrapper.unmount();
++  });
++});
++
++// ---- 表单弹窗：校验白名单、点Code 锁定、status 不入提交 ----
++type FormModalRef = { showModal: (row?: Record<string, unknown>) => void; onSubmit: () => void };
++
++describe('点位表单弹窗（TASK-0097）', () => {
++  beforeEach(() => {
++    document.body.innerHTML = '';
++    vi.clearAllMocks();
++  });
++
++  function mountWithParent() {
++    const Parent = defineComponent({
++      setup(_props, { expose }) {
++        const modalRef = ref<FormModalRef | null>(null);
++        expose({ modalRef });
++        return () => h(PointFormModal, { ref: modalRef, onReloadList: () => undefined });
++      },
++    });
++    const wrapper = mount(Parent, {
++      global: {
++        plugins: [Antd],
++        directives: { privilege: {} },
++        // 跳过异步校验器，聚焦 payload 白名单与 API 路由（校验规则本身由 DTO 单测/接口覆盖）
++        stubs: { AForm: { template: '<form><slot /></form>', methods: { validate: () => Promise.resolve() } } },
++      },
++    });
++    return { wrapper, modalRef: (wrapper.vm as unknown as { modalRef: FormModalRef }).modalRef };
++  }
++
++  it('新增提交调 add，payload 不含 status/id', async () => {
++    const { wrapper, modalRef } = mountWithParent();
++    await modalRef.showModal({ pointCode: 'P-NEW', pointName: '新点位', dataType: 1, valueType: 'DOUBLE' });
++    modalRef.onSubmit();
++    await flushPromises();
++    expect(addApi).toHaveBeenCalledTimes(1);
++    const payload = addApi.mock.calls[0][0];
++    expect(payload).not.toHaveProperty('id');
++    expect(payload).not.toHaveProperty('status');
++    expect(payload.pointCode).toBe('P-NEW');
++    wrapper.unmount();
++  });
++
++  it('编辑提交调 update，携带 id 与 pointCode 同值，且不含 status', async () => {
++    const { wrapper, modalRef } = mountWithParent();
++    await modalRef.showModal({ id: 301, pointCode: 'P-001', pointName: '1号温度', dataType: 1, valueType: 'DOUBLE', status: 1 });
++    modalRef.onSubmit();
++    await flushPromises();
++    expect(updateApi).toHaveBeenCalledTimes(1);
++    const payload = updateApi.mock.calls[0][0];
++    expect(payload.id).toBe(301);
++    expect(payload.pointCode).toBe('P-001');
++    expect(payload).not.toHaveProperty('status');
++    wrapper.unmount();
++  });
++
++  it('编辑 showModal 后 pointCode 禁用（创建后不可改）', async () => {
++    const { wrapper, modalRef } = mountWithParent();
++    await modalRef.showModal({ id: 301, pointCode: 'P-001', pointName: '1号温度', dataType: 1, valueType: 'DOUBLE', status: 1 });
++    await flushPromises();
++    const codeInput = document.querySelector('input[placeholder*="租户内唯一"]') as HTMLInputElement;
++    expect(codeInput).not.toBeNull();
++    expect(codeInput.disabled).toBe(true);
++    wrapper.unmount();
++  });
++});
++
++// ---- 详情弹窗：三读调用与空集诚实 ----
++type DetailModalRef = { showModal: (id: number) => Promise<void> };
++
++describe('点位详情弹窗（TASK-0097）', () => {
++  beforeEach(() => {
++    document.body.innerHTML = '';
++    vi.clearAllMocks();
++  });
++
++  it('父 ref 调 showModal(id) → detail/references/curve 三读，曲线空集展示诚实提示', async () => {
++    const Parent = defineComponent({
++      setup(_props, { expose }) {
++        const modalRef = ref<DetailModalRef | null>(null);
++        expose({ modalRef });
++        return () => h(PointDetailModal, { ref: modalRef });
++      },
++    });
++    const wrapper = mount(Parent, { global: { plugins: [Antd], directives: { privilege: {} } } });
++    const modalRef = (wrapper.vm as unknown as { modalRef: DetailModalRef }).modalRef;
++    expect(typeof modalRef.showModal).toBe('function');
++    await modalRef.showModal(301);
++    await flushPromises();
++    expect(detailApi).toHaveBeenCalledWith(301);
++    expect(referencesApi).toHaveBeenCalledWith(301);
++    expect(curveApi).toHaveBeenCalledWith(301);
++    expect(document.body.textContent ?? '').toContain('近 24h 暂无曲线数据');
++    wrapper.unmount();
++  });
++});

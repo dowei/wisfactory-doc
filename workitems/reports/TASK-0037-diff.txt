@@ -1,0 +1,1483 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+index 93bdf99..978ed50 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+@@ -10,9 +10,14 @@ import net.otlab.admin.module.iot.dataitem.dto.IotItemHistoryVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemFormulaForm;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemImpactVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO;
+ import net.otlab.admin.module.iot.dataitem.dto.IotItemRollupForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemValidateForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
++import net.otlab.admin.module.iot.dataitem.service.IotTrialService;
+ import net.otlab.core.annotation.OperateLog;
+ import net.otlab.core.constant.BusinessType;
+ import net.otlab.core.exception.BusinessException;
+@@ -60,6 +65,9 @@ public class IotDataItemController {
+     @Autowired
+     private IotDataItemService dataItemService;
+ 
++    @Autowired
++    private IotTrialService trialService;
++
+     @Operation(summary = "按实例查数据项清单（数据权限裁剪：不可见实例返回空清单）")
+     @GetMapping("/iot/item/list")
+     @SaCheckPermission("iot:item:list")
+@@ -147,6 +155,24 @@ public class IotDataItemController {
+         return Result.success(dataItemService.getItemImpact(itemId));
+     }
+ 
++    // ---------- TASK-0037：validate/preview 单点试算读端点（POST 语义但不落库，不挂 @OperateLog） ----------
++
++    @Operation(summary = "公式校验（TASK-0037：语法/白名单/相对引用展开/引用存在性/循环依赖，错误码 4001 段；"
++            + "不落库，读语义不挂 @OperateLog）")
++    @PostMapping("/iot/item/validate")
++    @SaCheckPermission("iot:item:query")
++    public Result<IotItemValidateVO> validate(@Valid @RequestBody IotItemValidateForm form) {
++        return Result.success(trialService.validate(form.getInstanceId(), form.getItemId(), form.getFormula()));
++    }
++
++    @Operation(summary = "单点试算（TASK-0037：转发 calc trial 同引擎同口径，缺数明示不用 0；"
++            + "value/quality/missing/engineVersion 原样回传；不落库，读语义不挂 @OperateLog）")
++    @PostMapping("/iot/item/preview")
++    @SaCheckPermission("iot:item:query")
++    public Result<IotItemPreviewVO> preview(@Valid @RequestBody IotItemPreviewForm form) {
++        return Result.success(trialService.preview(form));
++    }
++
+     @Operation(summary = "数据项变更时间线（TASK-0039：change_time DESC 倒序分页；itemId 或 fullKey 二选一，"
+             + "full_key 冗余支持项删除后仍可查；tenant 会话强制注入跨租户空集；只读不审）")
+     @GetMapping("/api/v1/iot/dataitem/history")
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialProperties.java
+new file mode 100644
+index 0000000..642b193
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialProperties.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import lombok.Data;
++import org.springframework.boot.context.properties.ConfigurationProperties;
++import org.springframework.stereotype.Component;
++
++/**
++ * TASK-0037 · backend→calc 试算客户端配置（{@code ot.calc.*}）
++ *
++ * <p>默认 127.0.0.1:8095（calc 内部端点），prod 经 {@code OT_CALC_BASE_URL} 注入实际地址
++ * （与 TDengine {@code OT_TDENGINE_BASE_URL} 同范式），不硬编码凭据/文档库路径。
++ */
++@Data
++@Component
++@ConfigurationProperties(prefix = "ot.calc")
++public class CalcTrialProperties {
++
++    /** calc 内部试算端点基址 */
++    private String baseUrl = "http://127.0.0.1:8095";
++
++    /** 连接超时（毫秒） */
++    private long connectTimeoutMs = 3000;
++
++    /** 读超时（毫秒） */
++    private long readTimeoutMs = 5000;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialRequest.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialRequest.java
+new file mode 100644
+index 0000000..b7cc153
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialRequest.java
+@@ -0,0 +1,42 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0037 · calc trial 请求 DTO（逐字对齐 calc 侧 TrialRequest，camelCase / 毫秒）。
++ *
++ * <p>权威契约见 calc/.../trial/TrialRequest.java（0086 交付）：{@code POST /internal/v1/calc/trial}
++ * 请求体字段集 = formula / variables / history / atTime / window 五字段，不多不少（Jackson 缺省
++ * 序列化 null 字段，与 calc record 规范构造一致）。variables 值允许 number 或
++ * {@code {value,quality,ts}} 样本 Map；缺数的标识符不填入（绝不填 0）。
++ */
++public record CalcTrialRequest(
++        String formula,
++        Map<String, Object> variables,
++        Map<String, List<VariableSample>> history,
++        Long atTime,
++        TrialWindow window) {
++
++    /** 窗口曲线参数（start/end 闭区间，stepMs 步长；0038 用，0037 不构造但字段保留对齐契约） */
++    public record TrialWindow(long start, long end, long stepMs) {}
++
++    /** 统一样本形态（value/quality/ts 三键，与统一消息模型同义） */
++    public record VariableSample(double value, int quality, long ts) {}
++
++    public CalcTrialRequest {
++        variables = variables == null ? new LinkedHashMap<>() : variables;
++        history = history == null ? Map.of() : history;
++    }
++
++    /** 单点试算：formula + variables + atTime（可选） */
++    public static CalcTrialRequest of(String formula, Map<String, Object> variables, Long atTime) {
++        return new CalcTrialRequest(formula, variables, Map.of(), atTime, null);
++    }
++
++    /** 单点试算（无 atTime） */
++    public static CalcTrialRequest of(String formula, Map<String, Object> variables) {
++        return of(formula, variables, null);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialResponse.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialResponse.java
+new file mode 100644
+index 0000000..d217a0a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/CalcTrialResponse.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++
++import java.util.List;
++
++/**
++ * TASK-0037 · calc trial 响应 DTO（逐字对齐 calc 侧 TrialResponse，camelCase / 毫秒）。
++ *
++ * <p>权威契约见 calc/.../trial/TrialResponse.java（0086 交付）：value / quality / missing /
++ * reason / curve / engineVersion / rejected 七字段。缺数=HTTP 200 + value=null + quality=6 +
++ * missing 明示（绝不以 0 冒充）；语法/白名单拒绝=HTTP 400 + rejected=true，由客户端抛
++ * {@link net.otlab.admin.module.iot.dataitem.service.support.CalcTrialRejectedException} 区分。
++ * calc toMap 不输出 rejected，反序列化缺省 false。
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public record CalcTrialResponse(
++        Double value,
++        int quality,
++        List<String> missing,
++        String reason,
++        List<CurvePoint> curve,
++        String engineVersion,
++        boolean rejected) {
++
++    /** 窗口曲线单点（逐点 ts/value/quality/missing/reason） */
++    @JsonIgnoreProperties(ignoreUnknown = true)
++    public record CurvePoint(long ts, Double value, int quality, List<String> missing, String reason) {}
++
++    public CalcTrialResponse {
++        missing = missing == null ? List.of() : List.copyOf(missing);
++        reason = reason == null ? "" : reason;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewForm.java
+new file mode 100644
+index 0000000..021d070
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewForm.java
+@@ -0,0 +1,31 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++import java.util.Map;
++
++/** TASK-0037 · 单点试算请求（POST /iot/item/preview，不落库，转发 calc trial 同口径） */
++@Data
++@Schema(description = "单点试算请求（TASK-0037：转发 calc trial，缺数明示不用 0）")
++public class IotItemPreviewForm {
++
++    @NotNull(message = "实例ID不能为空")
++    private Long instanceId;
++
++    /** 可选：提供时核对该项归属（仅用于引用存在性，不影响试算公式） */
++    private Long itemId;
++
++    @NotBlank(message = "公式不能为空")
++    @Size(max = 2000, message = "公式长度不能超过 2000")
++    private String formula;
++
++    /** 指定时刻（epoch 毫秒；null=当前） */
++    private Long atTime;
++
++    /** 显式变量（优先；number 或 {value,quality,ts}；未提供则从实时值读口取，取不到不填入） */
++    private Map<String, Object> variables;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewVO.java
+new file mode 100644
+index 0000000..5ad9dc8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemPreviewVO.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import java.util.List;
++
++/**
++ * TASK-0037 · 单点试算结果（POST /iot/item/preview）。
++ *
++ * <p>字段直接来自 calc trial 响应（value/quality/missing/reason/engineVersion/curve 原样回传），
++ * backend 不另算。缺数时 value=null、missing 非空、quality=6，绝不伪造 0。
++ */
++@Schema(description = "单点试算结果（TASK-0037：trial 响应原样回传）")
++public record IotItemPreviewVO(
++        Double value,
++        int quality,
++        List<String> missing,
++        String reason,
++        String engineVersion,
++        List<CalcTrialResponse.CurvePoint> curve) {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateForm.java
+new file mode 100644
+index 0000000..062590b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateForm.java
+@@ -0,0 +1,23 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/** TASK-0037 · 公式校验请求（POST /iot/item/validate，不落库） */
++@Data
++@Schema(description = "公式校验请求（TASK-0037：不落库，语法/白名单/引用/循环）")
++public class IotItemValidateForm {
++
++    @NotNull(message = "实例ID不能为空")
++    private Long instanceId;
++
++    /** 可选：提供时核对该项归属；循环依赖以本项为起点检测 */
++    private Long itemId;
++
++    @NotBlank(message = "公式不能为空")
++    @Size(max = 2000, message = "公式长度不能超过 2000")
++    private String formula;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateVO.java
+new file mode 100644
+index 0000000..d0e5065
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemValidateVO.java
+@@ -0,0 +1,22 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import java.util.List;
++
++/**
++ * TASK-0037 · 公式校验结果（POST /iot/item/validate）。
++ *
++ * <p>{@code valid=true} 表示管理面粗校验通过（可继续试算/保存）；错误码 4001 段
++ * （与保存拒存同口径），errors 逐条携带 code/message。expandedFormula 为相对引用展开后的
++ * 裸键公式（便于前端定位与后续 preview 对齐）。
++ */
++@Schema(description = "公式校验结果（TASK-0037：valid/errors/展开后公式）")
++public record IotItemValidateVO(
++        boolean valid,
++        List<Error> errors,
++        String expandedFormula) {
++
++    /** 校验错误项（code=4001 段） */
++    @Schema(description = "校验错误项（code=4001 段）")
++    public record Error(int code, String message) {}
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotTrialService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotTrialService.java
+new file mode 100644
+index 0000000..62c964f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotTrialService.java
+@@ -0,0 +1,21 @@
++package net.otlab.admin.module.iot.dataitem.service;
++
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO;
++
++/**
++ * TASK-0037 · 数据项公式试算服务（validate/preview 读语义，不落库）。
++ *
++ * <p>validate 做管理面粗校验（函数白名单 + 相对引用展开 + 引用存在性 + 循环依赖，4001 段），
++ * preview 转发 calc trial 同引擎同口径（backend 不另算，缺数原样透传不用 0）。两者按
++ * instanceId 走 requireDataPerm（无权 403），不挂 @OperateLog。
++ */
++public interface IotTrialService {
++
++    /** 公式校验（POST /iot/item/validate，不落库） */
++    IotItemValidateVO validate(Long instanceId, Long itemId, String formula);
++
++    /** 单点试算（POST /iot/item/preview，不落库，转发 calc trial） */
++    IotItemPreviewVO preview(IotItemPreviewForm form);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImpl.java
+new file mode 100644
+index 0000000..dfb8f31
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImpl.java
+@@ -0,0 +1,349 @@
++package net.otlab.admin.module.iot.dataitem.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialRequest;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialResponse;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotTrialService;
++import net.otlab.admin.module.iot.dataitem.service.support.CalcTrialClient;
++import net.otlab.admin.module.iot.dataitem.service.support.CalcTrialRejectedException;
++import net.otlab.admin.module.iot.dataitem.service.support.FormulaCycleDetector;
++import net.otlab.admin.module.iot.dataitem.service.support.FormulaFunctionWhitelist;
++import net.otlab.admin.module.iot.dataitem.service.support.RelativeRefExpander;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.SecurityUtils;
++import org.springframework.stereotype.Service;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * TASK-0037 · 数据项公式试算服务实现（validate/preview 读语义，不落库）。
++ *
++ * <p><b>validate</b>：复用 0036 的 {@link RelativeRefExpander} / {@link FormulaFunctionWhitelist} /
++ * {@link FormulaCycleDetector} 做管理面粗校验，错误统一收进 4001 段 errors（不抛异常）；
++ * 相对引用 {SELF.X} 展开为该实例唯一键裸键形态，与保存链/试算同口径。
++ *
++ * <p><b>preview</b>：展开公式后转发 calc trial（{@link CalcTrialClient}）——value/quality/
++ * missing/reason/engineVersion/curve 原样回传，backend 不另算（ADR 同引擎定版）。变量优先
++ * 用请求体显式 variables；未提供时按展开后引用全键从 0050 管理面实时值读口
++ * （{@link IotDisplayReadService#itemsRealtime}）取当前值，取不到的标识符<b>不填入</b>
++ * variables（让 trial 报缺数，绝不填 0）。
++ */
++@Service
++public class IotTrialServiceImpl implements IotTrialService {
++
++    /** 与保存拒存同口径（详细设计 §3.4 4001 参数与校验段；ot-core 未设枚举，本域常量直用） */
++    public static final int CODE_VALIDATION_REJECTED = 4001;
++
++    private static final int MAX_LEN_FORMULA = 2000;
++    private static final int MAX_LEN_REF_FULL_KEY = 180;
++    private static final int REF_TYPE_DATA_ITEM = 1;
++
++    /** 已展开裸键形态的点分全键引用 */
++    private static final Pattern BARE_FULL_KEY = Pattern.compile(
++            "(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+)(?![A-Za-z0-9_.])");
++
++    private final IotDataItemMapper itemMapper;
++    private final IotDataItemRefMapper refMapper;
++    private final IotModelInstanceMapper instanceMapper;
++    private final DataPermService dataPermService;
++    private final IotDisplayReadService displayReadService;
++    private final CalcTrialClient calcTrialClient;
++
++    public IotTrialServiceImpl(IotDataItemMapper itemMapper,
++                               IotDataItemRefMapper refMapper,
++                               IotModelInstanceMapper instanceMapper,
++                               DataPermService dataPermService,
++                               IotDisplayReadService displayReadService,
++                               CalcTrialClient calcTrialClient) {
++        this.itemMapper = itemMapper;
++        this.refMapper = refMapper;
++        this.instanceMapper = instanceMapper;
++        this.dataPermService = dataPermService;
++        this.displayReadService = displayReadService;
++        this.calcTrialClient = calcTrialClient;
++    }
++
++    @Override
++    public IotItemValidateVO validate(Long instanceId, Long itemId, String formula) {
++        IotModelInstance instance = requireInstance(instanceId);
++        requireDataPerm(instanceId, "无权访问该实例（数据权限不命中）");
++        IotDataItem item = itemId == null ? null : requireItemOfInstance(instanceId, itemId);
++        List<IotItemValidateVO.Error> errors = new ArrayList<>();
++        String expanded = formula == null ? "" : formula.trim();
++        if (expanded.isBlank()) {
++            errors.add(error("公式不能为空"));
++            return new IotItemValidateVO(false, errors, expanded);
++        }
++        if (formula.length() > MAX_LEN_FORMULA) {
++            errors.add(error("公式长度不能超过 " + MAX_LEN_FORMULA));
++            return new IotItemValidateVO(false, errors, expanded);
++        }
++
++        // 父实例 lazy 解析（顶级实例 PARENT 引用 → 专门错误）
++        IotModelInstance parent = null;
++        if (RelativeRefExpander.containsParentRef(expanded)) {
++            parent = resolveParent(instance);
++        }
++        String parentCode = parent == null ? null : parent.getInstanceCode();
++        RelativeRefExpander.Outcome outcome;
++        try {
++            outcome = RelativeRefExpander.expand(expanded, instance.getInstanceCode(), parentCode);
++        } catch (BusinessException e) {
++            errors.add(error(e.getMessage()));
++            return new IotItemValidateVO(false, errors, expanded);
++        }
++        expanded = outcome.expandedFormula();
++
++        // 展开终检：畸形/超纲 token（残留花括号）
++        if (expanded.indexOf('{') >= 0 || expanded.indexOf('}') >= 0) {
++            errors.add(error("公式包含无法识别的引用 token（展开后残留花括号）: "
++                    + firstResidualToken(expanded)));
++        }
++        if (expanded.length() > MAX_LEN_FORMULA) {
++            errors.add(error("展开后公式超长（上限 " + MAX_LEN_FORMULA + "）"));
++        }
++
++        // 函数白名单
++        String violation = FormulaFunctionWhitelist.findViolation(expanded);
++        if (violation != null) {
++            errors.add(error(violation));
++        }
++
++        // 引用集（相对展开 + 裸键）
++        LinkedHashSet<String> refs = new LinkedHashSet<>(outcome.resolvedRefs());
++        collectBareFullKeyRefs(expanded, refs);
++        for (String ref : refs) {
++            if (ref.length() > MAX_LEN_REF_FULL_KEY) {
++                errors.add(error("公式引用的全键超长（上限 " + MAX_LEN_REF_FULL_KEY + "，实际 "
++                        + ref.length() + "）: " + ref));
++            }
++        }
++
++        // 引用存在性（SELF / PARENT / 指回本实例或父实例的绝对键）
++        List<IotDataItem> tenantItems = loadTenantItems();
++        Map<String, Long> idByFullKey = new LinkedHashMap<>();
++        tenantItems.forEach(i -> idByFullKey.put(i.getFullKey(), i.getId()));
++        Set<String> selfCodes = new LinkedHashSet<>();
++        for (IotDataItem i : tenantItems) {
++            if (instanceId.equals(i.getInstanceId())) {
++                selfCodes.add(i.getDataCode());
++            }
++        }
++        for (String code : outcome.selfCodes()) {
++            if (!selfCodes.contains(code)) {
++                errors.add(error("公式引用的数据项不存在: SELF." + code));
++            }
++        }
++        if (parent != null && !outcome.parentCodes().isEmpty()) {
++            Set<String> parentCodes = new LinkedHashSet<>();
++            for (IotDataItem i : tenantItems) {
++                if (parent.getId().equals(i.getInstanceId())) {
++                    parentCodes.add(i.getDataCode());
++                }
++            }
++            for (String code : outcome.parentCodes()) {
++                if (!parentCodes.contains(code)) {
++                    errors.add(error("公式引用的父实例数据项不存在: PARENT." + code));
++                }
++            }
++        }
++        for (String ref : refs) {
++            boolean local = ref.startsWith(instance.getInstanceCode() + ".")
++                    || (parentCode != null && ref.startsWith(parentCode + "."));
++            if (local && !idByFullKey.containsKey(ref)) {
++                errors.add(error("公式引用的数据项不存在: " + ref));
++            }
++        }
++
++        // 循环依赖（候选项替换旧边后 DFS；仅 itemId 给定时可判）
++        if (item != null) {
++            Set<Long> newTargets = new LinkedHashSet<>();
++            for (String ref : refs) {
++                Long target = idByFullKey.get(ref);
++                if (target != null) {
++                    newTargets.add(target);
++                }
++            }
++            Map<Long, Set<Long>> edges = new HashMap<>();
++            for (IotDataItemRef edge : loadDataItemRefs()) {
++                if (itemId.equals(edge.getItemId())) {
++                    continue;
++                }
++                Long target = edge.getRefItemId() != null
++                        ? edge.getRefItemId() : idByFullKey.get(edge.getRefFullKey());
++                if (target != null) {
++                    edges.computeIfAbsent(edge.getItemId(), k -> new LinkedHashSet<>()).add(target);
++                }
++            }
++            edges.put(itemId, newTargets);
++            List<Long> cycle = FormulaCycleDetector.findCycle(edges, itemId);
++            if (cycle != null) {
++                errors.add(error("循环依赖: 公式引用形成闭环（环上数据项 id: " + cycle + "）"));
++            }
++        }
++
++        return new IotItemValidateVO(errors.isEmpty(), errors, expanded);
++    }
++
++    @Override
++    public IotItemPreviewVO preview(IotItemPreviewForm form) {
++        IotModelInstance instance = requireInstance(form.getInstanceId());
++        requireDataPerm(form.getInstanceId(), "无权访问该实例（数据权限不命中）");
++        if (form.getItemId() != null) {
++            requireItemOfInstance(form.getInstanceId(), form.getItemId());
++        }
++        String formula = form.getFormula() == null ? "" : form.getFormula().trim();
++
++        // 相对引用展开（与保存链同口径）；preview 不落库、展开失败即 400
++        IotModelInstance parent = null;
++        if (RelativeRefExpander.containsParentRef(formula)) {
++            parent = resolveParent(instance);
++        }
++        RelativeRefExpander.Outcome outcome = RelativeRefExpander.expand(
++                formula, instance.getInstanceCode(), parent == null ? null : parent.getInstanceCode());
++        String expanded = outcome.expandedFormula();
++        if (expanded.indexOf('{') >= 0 || expanded.indexOf('}') >= 0) {
++            throw paramError("公式包含无法识别的引用 token（展开后残留花括号）");
++        }
++
++        // 变量：请求体显式优先；未提供时按 fullKey 从 0050 实时值读口取当前值（取不到不填入，不填 0）
++        Map<String, Object> variables = resolveVariables(form, instance.getId(), expanded);
++
++        CalcTrialRequest request = CalcTrialRequest.of(expanded, variables, form.getAtTime());
++        CalcTrialResponse response;
++        try {
++            response = calcTrialClient.trial(request);
++        } catch (CalcTrialRejectedException e) {
++            throw new BusinessException(CODE_VALIDATION_REJECTED, e.getReason());
++        }
++        // 同口径：trial 响应字段原样回传，backend 不另算
++        return new IotItemPreviewVO(response.value(), response.quality(), response.missing(),
++                response.reason(), response.engineVersion(), response.curve());
++    }
++
++    /** 显式 variables 优先；否则按展开公式中的全键从 0050 读当前值，取不到的键不放入（缺数由 trial 明示） */
++    private Map<String, Object> resolveVariables(IotItemPreviewForm form, Long instanceId, String expanded) {
++        if (form.getVariables() != null) {
++            return new LinkedHashMap<>(form.getVariables());
++        }
++        LinkedHashSet<String> keys = new LinkedHashSet<>();
++        collectBareFullKeyRefs(expanded, keys);
++        Map<String, Object> variables = new LinkedHashMap<>();
++        if (keys.isEmpty()) {
++            return variables;
++        }
++        Map<String, OpenApiRealtimeItemVO> latest = displayReadService.itemsRealtime(instanceId, List.copyOf(keys));
++        if (latest == null) {
++            return variables;
++        }
++        for (Map.Entry<String, OpenApiRealtimeItemVO> e : latest.entrySet()) {
++            OpenApiRealtimeItemVO sample = e.getValue();
++            if (sample == null || sample.getV() == null) {
++                continue; // 无值按缺数处理，不填入、不填 0
++            }
++            Map<String, Object> value = new LinkedHashMap<>();
++            value.put("value", sample.getV());
++            value.put("quality", sample.getQ() == null ? 0 : sample.getQ());
++            value.put("ts", sample.getTs() == null ? 0L : sample.getTs());
++            variables.put(e.getKey(), value);
++        }
++        return variables;
++    }
++
++    private List<IotDataItem> loadTenantItems() {
++        return itemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
++                .select(IotDataItem::getId, IotDataItem::getInstanceId,
++                        IotDataItem::getDataCode, IotDataItem::getFullKey));
++    }
++
++    private List<IotDataItemRef> loadDataItemRefs() {
++        return refMapper.selectList(new LambdaQueryWrapper<IotDataItemRef>()
++                .eq(IotDataItemRef::getRefType, REF_TYPE_DATA_ITEM));
++    }
++
++    private IotModelInstance requireInstance(Long instanceId) {
++        IotModelInstance instance = instanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + instanceId);
++        }
++        return instance;
++    }
++
++    private IotDataItem requireItemOfInstance(Long instanceId, Long itemId) {
++        IotDataItem item = itemMapper.selectById(itemId);
++        if (item == null || !instanceId.equals(item.getInstanceId())) {
++            throw paramError("数据项不存在或不属于该实例: " + itemId);
++        }
++        return item;
++    }
++
++    private IotModelInstance resolveParent(IotModelInstance instance) {
++        if (instance.getParentId() == null || instance.getParentId() == 0L) {
++            throw paramError("顶级实例不支持 PARENT 相对引用（无父实例可解析）");
++        }
++        IotModelInstance parent = instanceMapper.selectById(instance.getParentId());
++        if (parent == null) {
++            throw paramError("父实例不存在或已删除: " + instance.getParentId());
++        }
++        return parent;
++    }
++
++    /** 写/读统一数据权限口径：目标实例 ∈ 可见集，否则 403（文案不泄露实例标识） */
++    private void requireDataPerm(Long targetId, String message) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (scope == null || (!scope.allTenant() && !scope.instanceIds().contains(targetId))) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), message);
++        }
++    }
++
++    private static void collectBareFullKeyRefs(String formula, LinkedHashSet<String> refs) {
++        if (formula == null || formula.isBlank()) {
++            return;
++        }
++        Matcher matcher = BARE_FULL_KEY.matcher(formula);
++        while (matcher.find()) {
++            refs.add(matcher.group(1));
++        }
++    }
++
++    private static String firstResidualToken(String formula) {
++        int from = formula.indexOf('{');
++        if (from < 0) {
++            from = formula.indexOf('}');
++        }
++        if (from < 0) {
++            return "?";
++        }
++        return formula.substring(from, Math.min(formula.length(), from + 40));
++    }
++
++    private static IotItemValidateVO.Error error(String message) {
++        return new IotItemValidateVO.Error(CODE_VALIDATION_REJECTED, message);
++    }
++
++    private static BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClient.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClient.java
+new file mode 100644
+index 0000000..34d6311
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClient.java
+@@ -0,0 +1,128 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialProperties;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialRequest;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialResponse;
++import net.otlab.core.exception.BusinessException;
++import org.springframework.stereotype.Component;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++
++/**
++ * TASK-0037 · backend→calc trial HTTP 客户端（可配 + fail-soft）。
++ *
++ * <p>调用 {@code POST {ot.calc.base-url}/internal/v1/calc/trial}，请求/响应 DTO 与 calc 的
++ * TrialRequest/TrialResponse 逐字对齐（camelCase / 毫秒）。结果由 calc 同引擎算出，backend
++ * 不另算；缺数由 trial 以 value=null + missing 明示，本客户端原样透传不伪造 0。
++ *
++ * <p><b>fail-soft</b>（brief D2）：连接失败/超时/非 2xx/响应不可解析 → 抛
++ * {@code BusinessException}「试算服务不可用：…」（500，不返回假结果、不静默空值）；
++ * HTTP 400 是 trial 的语法/白名单拒绝（业务校验结果），单独抛
++ * {@link CalcTrialRejectedException}，由服务层映射为 4001，二者严格区分。
++ */
++@Slf4j
++@Component
++public class CalcTrialClient {
++
++    static final String TRIAL_PATH = "/internal/v1/calc/trial";
++
++    private final CalcTrialProperties props;
++    private final ObjectMapper objectMapper = new ObjectMapper();
++    private final HttpClient httpClient;
++
++    public CalcTrialClient(CalcTrialProperties props) {
++        this.props = props;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
++                .build();
++    }
++
++    /** 试算单点：成功原样返回 trial 响应；400 拒绝 / 不可用按上文语义抛异常。 */
++    public CalcTrialResponse trial(CalcTrialRequest request) {
++        final String url = trimBase(props.getBaseUrl()) + TRIAL_PATH;
++        final String body;
++        try {
++            body = objectMapper.writeValueAsString(request);
++        } catch (Exception e) {
++            throw unavailable("请求序列化失败", e);
++        }
++        HttpRequest httpRequest;
++        try {
++            httpRequest = HttpRequest.newBuilder()
++                    .uri(URI.create(url))
++                    .timeout(Duration.ofMillis(props.getReadTimeoutMs()))
++                    .header("Content-Type", "application/json")
++                    .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                    .build();
++        } catch (Exception e) {
++            throw unavailable("地址非法 " + url, e);
++        }
++        HttpResponse<String> response;
++        try {
++            response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw unavailable("调用被中断", e);
++        } catch (Exception e) {
++            throw unavailable("不可达 " + url, e);
++        }
++        int status = response.statusCode();
++        if (status == 400) {
++            throw new CalcTrialRejectedException(reasonOf(response.body()));
++        }
++        if (status < 200 || status >= 300) {
++            throw unavailable("HTTP " + status + "（" + summarize(response.body()) + "）", null);
++        }
++        try {
++            return objectMapper.readValue(response.body(), CalcTrialResponse.class);
++        } catch (Exception e) {
++            throw unavailable("应答不可解析（" + summarize(response.body()) + "）", e);
++        }
++    }
++
++    private BusinessException unavailable(String detail, Throwable cause) {
++        String message = "试算服务不可用：" + detail
++                + (cause == null ? "" : "（" + summarize(cause.getMessage() == null
++                        ? cause.toString() : cause.getMessage()) + "）");
++        log.warn("[CALC-TRIAL] fail-soft：{}", message);
++        return new BusinessException(500, message);
++    }
++
++    private static String reasonOf(String body) {
++        if (body == null || body.isBlank()) {
++            return "试算服务拒绝（trial HTTP 400）";
++        }
++        try {
++            JsonNode root = new ObjectMapper().readTree(body);
++            if (root.path("reason").isTextual() && !root.path("reason").asText().isBlank()) {
++                return root.path("reason").asText();
++            }
++        } catch (Exception ignored) {
++            // 应答非 JSON 时回退到响应体摘要
++        }
++        return summarize(body);
++    }
++
++    private static String trimBase(String baseUrl) {
++        if (baseUrl == null || baseUrl.isBlank()) {
++            return "http://127.0.0.1:8095";
++        }
++        return baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++    }
++
++    private static String summarize(String message) {
++        if (message == null) {
++            return "";
++        }
++        String firstLine = message.split("\\R", 2)[0];
++        return firstLine.length() > 200 ? firstLine.substring(0, 200) : firstLine;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialRejectedException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialRejectedException.java
+new file mode 100644
+index 0000000..ae893e9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialRejectedException.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++/**
++ * TASK-0037 · calc trial 语法/白名单拒绝（HTTP 400）信号，区别于「试算服务不可用」fail-soft。
++ *
++ * <p>管理面 preview 映射为 4001（与 validate/保存拒存同口径），reason 来自 trial 响应。
++ */
++public class CalcTrialRejectedException extends RuntimeException {
++
++    private final String reason;
++
++    public CalcTrialRejectedException(String reason) {
++        super(reason);
++        this.reason = reason;
++    }
++
++    public String getReason() {
++        return reason;
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index fe65865..0078088 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -35,6 +35,12 @@ ot:
+     password: ${OT_TDENGINE_PASSWORD:taosdata}                 # taosAdapter Basic 认证口令（默认安装值，现场部署经环境变量覆盖）
+     connect-timeout-ms: ${OT_TDENGINE_CONNECT_TIMEOUT_MS:3000} # REST 连接超时
+     read-timeout-ms: ${OT_TDENGINE_READ_TIMEOUT_MS:5000}       # REST 读超时
++  calc:
++    # TASK-0037：管理面试算转发 calc 内部端点 /internal/v1/calc/trial（同引擎同口径）。
++    # 默认本机 8095；prod 经 OT_CALC_BASE_URL 注入实际内网地址（与 TDengine 同范式）。
++    base-url: ${OT_CALC_BASE_URL:http://127.0.0.1:8095}
++    connect-timeout-ms: ${OT_CALC_CONNECT_TIMEOUT_MS:3000}    # 连接超时（毫秒）
++    read-timeout-ms: ${OT_CALC_READ_TIMEOUT_MS:5000}          # 读超时（毫秒）
+   dataperm:
+     subtree-max: ${OT_DATAPERM_SUBTREE_MAX:5000}   # 子树展开上限（TASK-0005 / ADR-0016 裁决 1）：步骤 4 ancestors 子树展开的实例数上限；超限截断并 WARN（[DATAPERM] subtree truncated user=<id> kept=<n> cap=<n>），不报错不降级；<=0 视为关闭上限
+     cache-enabled: ${OT_DATAPERM_CACHE_ENABLED:true}        # 可见集合 Redis 缓存开关（TASK-0006，默认 true）：false 走 NoOpVisibleScopeCache 直查（测试与故障兜底）；缓存键 iot:dataperm:scope:{userId}:{roleVer}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java
+index 1bdc3f4..d555b07 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/config/OperateLogCoverageGuardTest.java
+@@ -61,6 +61,14 @@ class OperateLogCoverageGuardTest {
+     /** 排除前缀：内部令牌端点 / 对外数据端点（brief 决策 4，各有独立审计链） */
+     private static final List<String> EXCLUDED_PATH_PREFIXES = Arrays.asList("/internal/v1/", "/openapi/v1/");
+ 
++    /**
++     * TASK-0037 精确豁免：validate/preview 为试算读端点（POST 语义但不落库、无业务副作用），
++     * brief D1 裁决「不挂 @OperateLog」避免试算刷审计（与 0061/0062 读不审一致）；
++     * 按完整路径精确豁免两条，不扩大其它 POST 的覆盖口径。
++     */
++    private static final java.util.Set<String> EXCLUDED_EXACT_PATHS = new java.util.HashSet<>(Arrays.asList(
++            "/iot/item/validate", "/iot/item/preview"));
++
+     @Test
+     @DisplayName("全局机械差集 - 管理面写端点全部挂 @OperateLog（内部/对外端点除外）——零缺失")
+     void allManagementWriteEndpointsAudited() throws Exception {
+@@ -180,6 +188,9 @@ class OperateLogCoverageGuardTest {
+     }
+ 
+     private static boolean isExcluded(String path) {
++        if (EXCLUDED_EXACT_PATHS.contains(path)) {
++            return true;
++        }
+         for (String prefix : EXCLUDED_PATH_PREFIXES) {
+             if (path.startsWith(prefix)) {
+                 return true;
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+index fc31ee0..dc9d539 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+@@ -61,6 +61,9 @@ class IotDataItemControllerTest {
+     @Mock
+     private IotDataItemService dataItemService;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.dataitem.service.IotTrialService trialService;
++
+     private IotDataItemController dataItemController;
+ 
+     @BeforeEach
+@@ -68,6 +71,7 @@ class IotDataItemControllerTest {
+         MockitoAnnotations.openMocks(this);
+         dataItemController = new IotDataItemController();
+         ReflectionTestUtils.setField(dataItemController, "dataItemService", dataItemService);
++        ReflectionTestUtils.setField(dataItemController, "trialService", trialService);
+         mockMvc = MockMvcBuilders.standaloneSetup(dataItemController)
+                 .setControllerAdvice(new GlobalExceptionHandler())
+                 .build();
+@@ -440,4 +444,95 @@ class IotDataItemControllerTest {
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.code").value(403));
+     }
++
++    // ---------- TASK-0037：validate/preview 单点试算读端点 ----------
++
++    @Test
++    @DisplayName("权限与审计（TASK-0037）- validate/preview=iot:item:query 且不挂 @OperateLog（读语义不刷审计）")
++    void testTrialEndpointsPermissionAndNoAudit() throws Exception {
++        Method validate = IotDataItemController.class.getMethod("validate",
++                net.otlab.admin.module.iot.dataitem.dto.IotItemValidateForm.class);
++        Method preview = IotDataItemController.class.getMethod("preview",
++                net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm.class);
++        assertEquals("iot:item:query", validate.getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:query", preview.getAnnotation(SaCheckPermission.class).value()[0]);
++        assertNull(validate.getAnnotation(OperateLog.class), "validate 为试算读语义，不挂 @OperateLog");
++        assertNull(preview.getAnnotation(OperateLog.class), "preview 为试算读语义，不挂 @OperateLog");
++    }
++
++    @Test
++    @DisplayName("校验 - POST /iot/item/validate 委派试算服务，valid/errors 透传")
++    void testValidate_SuccessAndInvalid() throws Exception {
++        net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO vo =
++                new net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO(
++                        false,
++                        List.of(new net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO.Error(
++                                4001, "公式函数 INTEGRAL 一期不开放")),
++                        "INTEGRAL(X)");
++        when(trialService.validate(eq(100L), eq(200L), eq("INTEGRAL(X)"))).thenReturn(vo);
++
++        mockMvc.perform(post("/iot/item/validate")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"itemId\":200,\"formula\":\"INTEGRAL(X)\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.valid").value(false))
++                .andExpect(jsonPath("$.data.errors[0].code").value(4001))
++                .andExpect(jsonPath("$.data.expandedFormula").value("INTEGRAL(X)"));
++
++        verify(trialService).validate(100L, 200L, "INTEGRAL(X)");
++    }
++
++    @Test
++    @DisplayName("校验 - 服务层 403（数据权限不命中）透传")
++    void testValidate_403Passthrough() throws Exception {
++        when(trialService.validate(eq(999L), any(), any()))
++                .thenThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例"));
++        mockMvc.perform(post("/iot/item/validate")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":999,\"formula\":\"X+1\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
++
++    @Test
++    @DisplayName("试算 - POST /iot/item/preview 委派试算服务，value/quality/missing/engineVersion 原样透传")
++    void testPreview_Success() throws Exception {
++        net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO vo =
++                new net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO(
++                        null, 6, List.of("B"), "缺数: B", "calc-engine/1.0.0/trial-v1", null);
++        when(trialService.preview(any())).thenReturn(vo);
++
++        mockMvc.perform(post("/iot/item/preview")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"formula\":\"A+B\","
++                                + "\"variables\":{\"A\":1},\"atTime\":1700000000000}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.value").doesNotExist())
++                .andExpect(jsonPath("$.data.quality").value(6))
++                .andExpect(jsonPath("$.data.missing[0]").value("B"))
++                .andExpect(jsonPath("$.data.engineVersion").value("calc-engine/1.0.0/trial-v1"));
++
++        ArgumentCaptor<net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm> captor =
++                ArgumentCaptor.forClass(net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm.class);
++        verify(trialService).preview(captor.capture());
++        assertEquals(100L, captor.getValue().getInstanceId());
++        assertEquals("A+B", captor.getValue().getFormula());
++        assertEquals(1700000000000L, captor.getValue().getAtTime());
++    }
++
++    @Test
++    @DisplayName("试算 - calc 不可达 500 明确错误透传（不返回假结果）")
++    void testPreview_FailSoftPassthrough() throws Exception {
++        when(trialService.preview(any())).thenThrow(
++                new BusinessException(500, "试算服务不可用：calc trial 不可达"));
++        mockMvc.perform(post("/iot/item/preview")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"instanceId\":100,\"formula\":\"A\",\"variables\":{\"A\":1}}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(500))
++                .andExpect(jsonPath("$.message").value(
++                        org.hamcrest.Matchers.containsString("试算服务不可用")));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImplTest.java
+new file mode 100644
+index 0000000..20a14ef
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotTrialServiceImplTest.java
+@@ -0,0 +1,313 @@
++package net.otlab.admin.module.iot.dataitem.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialRequest;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialResponse;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemPreviewVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemValidateVO;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.support.CalcTrialClient;
++import net.otlab.admin.module.iot.dataitem.service.support.CalcTrialRejectedException;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mockStatic;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0037 · 试算服务契约测试（TDD 红转绿）：validate 五类校验 + preview 转发同口径 + 缺数 + fail-soft。
++ */
++class IotTrialServiceImplTest {
++
++    private static final Long TENANT = 1L;
++    private static final Long INSTANCE_ID = 100L;
++    private static final String INSTANCE_CODE = "F01.WS01.EQ001";
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemRef.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++    }
++
++    private AutoCloseable mocks;
++    private MockedStatic<TenantContext> tenantContext;
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    private IotDataItemMapper itemMapper;
++    private IotDataItemRefMapper refMapper;
++    private IotModelInstanceMapper instanceMapper;
++    private DataPermService dataPermService;
++    private IotDisplayReadService displayReadService;
++    private CalcTrialClient calcTrialClient;
++    private IotTrialServiceImpl service;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        itemMapper = Mockito.mock(IotDataItemMapper.class);
++        refMapper = Mockito.mock(IotDataItemRefMapper.class);
++        instanceMapper = Mockito.mock(IotModelInstanceMapper.class);
++        dataPermService = Mockito.mock(DataPermService.class);
++        displayReadService = Mockito.mock(IotDisplayReadService.class);
++        calcTrialClient = Mockito.mock(CalcTrialClient.class);
++        tenantContext = mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(1L);
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(instanceMapper.selectById(INSTANCE_ID)).thenReturn(instance());
++        service = new IotTrialServiceImpl(itemMapper, refMapper, instanceMapper,
++                dataPermService, displayReadService, calcTrialClient);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    private IotModelInstance instance() {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(INSTANCE_ID);
++        inst.setTenantId(TENANT);
++        inst.setInstanceCode(INSTANCE_CODE);
++        inst.setInstanceName("试验实例");
++        inst.setParentId(0L);
++        inst.setStatus(1);
++        return inst;
++    }
++
++    private IotDataItem item(long id, String code) {
++        IotDataItem item = new IotDataItem();
++        item.setId(id);
++        item.setTenantId(TENANT);
++        item.setInstanceId(INSTANCE_ID);
++        item.setDataCode(code);
++        item.setFullKey(INSTANCE_CODE + "." + code);
++        item.setEnabled(1);
++        item.setStatus(1);
++        return item;
++    }
++
++    private void stubTenantItems(IotDataItem... items) {
++        when(itemMapper.selectList(any())).thenReturn(List.of(items));
++        when(refMapper.selectList(any())).thenReturn(List.of());
++        for (IotDataItem item : items) {
++            when(itemMapper.selectById(item.getId())).thenReturn(item);
++        }
++    }
++
++    // ---------- validate ----------
++
++    @Test
++    @DisplayName("validate - 合法公式（白名单函数 + SELF 引用展开）valid=true，errors 空")
++    void validateLegalFormula() {
++        stubTenantItems(item(201L, "X"), item(202L, "Y"));
++        IotItemValidateVO vo = service.validate(INSTANCE_ID, 202L, "ABS({SELF.X}) + 1");
++        assertTrue(vo.valid());
++        assertEquals(List.of(), vo.errors());
++    }
++
++    @Test
++    @DisplayName("validate - 函数白名单外（INTEGRAL）valid=false + 4001 错误码")
++    void validateRejectsWhitelistViolation() {
++        stubTenantItems(item(201L, "X"));
++        IotItemValidateVO vo = service.validate(INSTANCE_ID, 201L, "INTEGRAL(X)+1");
++        assertFalse(vo.valid());
++        assertEquals(4001, vo.errors().get(0).code());
++        assertTrue(vo.errors().get(0).message().contains("INTEGRAL"));
++    }
++
++    @Test
++    @DisplayName("validate - 相对引用 {SELF.X} 展开为实例唯一键（转发 trial 的 formula 为裸键）")
++    void validateExpandsRelativeRef() {
++        stubTenantItems(item(201L, "X"), item(202L, "Y"));
++        IotItemValidateVO vo = service.validate(INSTANCE_ID, 202L, "{SELF.X}+1");
++        assertTrue(vo.valid());
++        assertEquals(INSTANCE_CODE + ".X+1", vo.expandedFormula());
++    }
++
++    @Test
++    @DisplayName("validate - 循环依赖（本项引用自身）valid=false + 4001")
++    void validateRejectsCycle() {
++        stubTenantItems(item(201L, "X"));
++        IotItemValidateVO vo = service.validate(INSTANCE_ID, 201L, "{SELF.X}+1");
++        assertFalse(vo.valid());
++        assertEquals(4001, vo.errors().get(0).code());
++        assertTrue(vo.errors().get(0).message().contains("循环依赖"));
++    }
++
++    @Test
++    @DisplayName("validate - 畸形 token（展开后残留花括号）valid=false + 4001")
++    void validateRejectsMalformedToken() {
++        stubTenantItems(item(201L, "X"));
++        IotItemValidateVO vo = service.validate(INSTANCE_ID, 201L, "{ SELF.X }+1");
++        assertFalse(vo.valid());
++        assertEquals(4001, vo.errors().get(0).code());
++        assertTrue(vo.errors().get(0).message().contains("无法识别"));
++    }
++
++    @Test
++    @DisplayName("validate - 无权实例 403（requireDataPerm，不泄露）")
++    void validateForbidden() {
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.denied());
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.validate(INSTANCE_ID, 201L, "X+1"));
++        assertEquals(403, ex.getCode());
++        verify(calcTrialClient, never()).trial(any());
++    }
++
++    // ---------- preview ----------
++
++    @Test
++    @DisplayName("preview - 转发 trial 成功 → value/quality/missing/reason/engineVersion 原样回传（backend 不另算）")
++    void previewPassesThroughTrial() {
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("A+1");
++        form.setVariables(Map.of("A", 2));
++        when(calcTrialClient.trial(any())).thenReturn(new CalcTrialResponse(
++                3.0, 0, List.of(), "", null, "calc-engine/1.0.0/trial-v1", false));
++
++        IotItemPreviewVO vo = service.preview(form);
++
++        assertEquals(3.0, vo.value());
++        assertEquals(0, vo.quality());
++        assertEquals(List.of(), vo.missing());
++        assertEquals("calc-engine/1.0.0/trial-v1", vo.engineVersion());
++        ArgumentCaptor<CalcTrialRequest> captor = ArgumentCaptor.forClass(CalcTrialRequest.class);
++        verify(calcTrialClient).trial(captor.capture());
++        assertEquals("A+1", captor.getValue().formula());
++        assertEquals(2, ((Number) captor.getValue().variables().get("A")).intValue());
++        assertNull(captor.getValue().atTime());
++    }
++
++    @Test
++    @DisplayName("preview - 缺数（trial 返回 missing）原样透传，不冒充 0")
++    void previewMissingNeverZero() {
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("A+B");
++        form.setVariables(Map.of("A", 1));
++        when(calcTrialClient.trial(any())).thenReturn(new CalcTrialResponse(
++                null, 6, List.of("B"), "缺数: B（不以 0 代入）", null, "calc-engine/1.0.0/trial-v1", false));
++
++        IotItemPreviewVO vo = service.preview(form);
++
++        assertNull(vo.value());
++        assertEquals(6, vo.quality());
++        assertEquals(List.of("B"), vo.missing());
++        assertTrue(vo.reason().contains("不以 0 代入"));
++    }
++
++    @Test
++    @DisplayName("preview - 未提供 variables 时按 fullKey 从 0050 实时值读口取数；取不到不填入（trial 报缺数）")
++    void previewFetchesVariablesFromRealtimeRead() {
++        stubTenantItems(item(201L, "X"), item(202L, "Y"));
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("{SELF.X}+{SELF.Y}");
++        when(displayReadService.itemsRealtime(eq(INSTANCE_ID), any())).thenReturn(Map.of(
++                INSTANCE_CODE + ".X", new OpenApiRealtimeItemVO(5.0, 0, 1700000000000L)));
++        when(calcTrialClient.trial(any())).thenReturn(new CalcTrialResponse(
++                5.0, 0, List.of(), "", null, "calc-engine/1.0.0/trial-v1", false));
++
++        service.preview(form);
++
++        ArgumentCaptor<List<String>> keys = ArgumentCaptor.forClass(List.class);
++        verify(displayReadService).itemsRealtime(eq(INSTANCE_ID), keys.capture());
++        assertTrue(keys.getValue().contains(INSTANCE_CODE + ".X"));
++        assertTrue(keys.getValue().contains(INSTANCE_CODE + ".Y"));
++        ArgumentCaptor<CalcTrialRequest> captor = ArgumentCaptor.forClass(CalcTrialRequest.class);
++        verify(calcTrialClient).trial(captor.capture());
++        // X 取到实时值（sample 形态），Y 取不到绝不填 0
++        assertEquals(1, captor.getValue().variables().size());
++        assertTrue(captor.getValue().variables().containsKey(INSTANCE_CODE + ".X"));
++        assertEquals(INSTANCE_CODE + ".X+" + INSTANCE_CODE + ".Y", captor.getValue().formula());
++    }
++
++    @Test
++    @DisplayName("preview - calc 不可达 fail-soft 明确错误，不返回假结果")
++    void previewCalcUnavailable() {
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("A+1");
++        form.setVariables(Map.of("A", 1));
++        when(calcTrialClient.trial(any())).thenThrow(
++                new BusinessException(500, "试算服务不可用：calc trial 不可达"));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.preview(form));
++        assertTrue(ex.getMessage().contains("试算服务不可用"));
++    }
++
++    @Test
++    @DisplayName("preview - trial 400 语法/白名单拒绝映射为 4001（与 validate 同口径）")
++    void previewTrial400MapsTo4001() {
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("INTEGRAL(A)");
++        form.setVariables(Map.of("A", 1));
++        when(calcTrialClient.trial(any())).thenThrow(
++                new CalcTrialRejectedException("公式函数 INTEGRAL 一期不开放"));
++
++        BusinessException ex = assertThrows(BusinessException.class, () -> service.preview(form));
++        assertEquals(4001, ex.getCode());
++        assertTrue(ex.getMessage().contains("INTEGRAL"));
++    }
++
++    @Test
++    @DisplayName("preview - atTime 指定时刻透传 trial（毫秒）")
++    void previewPassesAtTime() {
++        IotItemPreviewForm form = new IotItemPreviewForm();
++        form.setInstanceId(INSTANCE_ID);
++        form.setFormula("A");
++        form.setVariables(Map.of("A", 1));
++        form.setAtTime(1700000000123L);
++        when(calcTrialClient.trial(any())).thenReturn(new CalcTrialResponse(
++                1.0, 0, List.of(), "", null, "v", false));
++
++        service.preview(form);
++        ArgumentCaptor<CalcTrialRequest> captor = ArgumentCaptor.forClass(CalcTrialRequest.class);
++        verify(calcTrialClient).trial(captor.capture());
++        assertEquals(1700000000123L, captor.getValue().atTime());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClientTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClientTest.java
+new file mode 100644
+index 0000000..f43fe00
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/support/CalcTrialClientTest.java
+@@ -0,0 +1,158 @@
++package net.otlab.admin.module.iot.dataitem.service.support;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialProperties;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialRequest;
++import net.otlab.admin.module.iot.dataitem.dto.CalcTrialResponse;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0037 · backend→calc trial HTTP 客户端契约测试（TDD 红转绿）。
++ *
++ * <p>用 JDK 内置 HttpServer 起本地假 calc，逐字断言请求体（camelCase、毫秒），
++ * 响应 value/quality/missing/reason/engineVersion 原样透传；覆盖 fail-soft 四类失败
++ * （不可达/非 2xx/不可解析/400 拒绝），不伪造结果、不静默 0。
++ */
++class CalcTrialClientTest {
++
++    private static final ObjectMapper MAPPER = new ObjectMapper();
++
++    private HttpServer server;
++    private final AtomicReference<String> capturedPath = new AtomicReference<>();
++    private final AtomicReference<String> capturedBody = new AtomicReference<>();
++    private final AtomicReference<String> capturedContentType = new AtomicReference<>();
++    private volatile int responseStatus = 200;
++    private volatile String responseBody = "{}";
++
++    @BeforeEach
++    void startServer() throws IOException {
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/internal/v1/calc/trial", this::handle);
++        server.start();
++    }
++
++    @AfterEach
++    void stopServer() {
++        server.stop(0);
++    }
++
++    private void handle(HttpExchange exchange) throws IOException {
++        capturedPath.set(exchange.getRequestURI().getPath());
++        capturedBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
++        capturedContentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
++        byte[] bytes = responseBody.getBytes(StandardCharsets.UTF_8);
++        exchange.getResponseHeaders().add("Content-Type", "application/json;charset=UTF-8");
++        exchange.sendResponseHeaders(responseStatus, bytes.length);
++        exchange.getResponseBody().write(bytes);
++        exchange.close();
++    }
++
++    private CalcTrialClient client() {
++        CalcTrialProperties props = new CalcTrialProperties();
++        props.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
++        return new CalcTrialClient(props);
++    }
++
++    @Test
++    @DisplayName("契约 - POST /internal/v1/calc/trial 请求体逐字对齐 TrialRequest（camelCase / 毫秒）")
++    void forwardsExactTrialRequest() {
++        responseBody = "{\"value\":7.5,\"quality\":0,\"missing\":[],\"reason\":\"\","
++                + "\"engineVersion\":\"calc-engine/1.0.0/trial-v1\"}";
++        CalcTrialRequest req = CalcTrialRequest.of("A*2+B", Map.of(
++                "A", 2.5,
++                "B", Map.of("value", 2.5, "quality", 1, "ts", 1700000000000L)), 1700000000000L);
++
++        CalcTrialResponse result = client().trial(req);
++
++        assertEquals("/internal/v1/calc/trial", capturedPath.get());
++        assertTrue(capturedContentType.get() != null && capturedContentType.get().contains("application/json"),
++                "Content-Type 必须为 application/json，实际 " + capturedContentType.get());
++        try {
++            com.fasterxml.jackson.databind.JsonNode actual = MAPPER.readTree(capturedBody.get());
++            assertEquals("A*2+B", actual.path("formula").asText());
++            assertEquals(2.5, actual.path("variables").path("A").asDouble());
++            assertEquals(2.5, actual.path("variables").path("B").path("value").asDouble());
++            assertEquals(1, actual.path("variables").path("B").path("quality").asInt());
++            assertEquals(1700000000000L, actual.path("variables").path("B").path("ts").asLong());
++            assertEquals(1700000000000L, actual.path("atTime").asLong());
++            assertEquals(5, actual.size(), "请求体字段集合须恰为 TrialRequest 五字段（history/window 为 null 也带上）");
++        } catch (IOException e) {
++            throw new AssertionError(e);
++        }
++        assertEquals(7.5, result.value());
++        assertEquals(0, result.quality());
++        assertEquals(List.of(), result.missing());
++        assertEquals("calc-engine/1.0.0/trial-v1", result.engineVersion());
++    }
++
++    @Test
++    @DisplayName("透传 - 缺数响应 value=null + missing + quality=6 原样回传，不冒充 0")
++    void passesThroughMissingVerbatim() {
++        responseBody = "{\"value\":null,\"quality\":6,\"missing\":[\"B\"],"
++                + "\"reason\":\"缺数: B（不以 0 代入）\",\"engineVersion\":\"calc-engine/1.0.0/trial-v1\"}";
++        CalcTrialResponse result = client().trial(CalcTrialRequest.of("A+B", Map.of("A", 1)));
++        assertNull(result.value());
++        assertEquals(6, result.quality());
++        assertEquals(List.of("B"), result.missing());
++        assertTrue(result.reason().contains("不以 0 代入"));
++        assertEquals("calc-engine/1.0.0/trial-v1", result.engineVersion());
++    }
++
++    @Test
++    @DisplayName("fail-soft - calc 不可达抛明确「试算服务不可用」错误，不返回假结果")
++    void unreachableCalcFailsSoft() {
++        server.stop(0); // 端口释放即不可达
++        CalcTrialProperties props = new CalcTrialProperties();
++        props.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
++        CalcTrialClient offline = new CalcTrialClient(props);
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> offline.trial(CalcTrialRequest.of("A", Map.of("A", 1))));
++        assertTrue(ex.getMessage().contains("试算服务不可用"), ex.getMessage());
++    }
++
++    @Test
++    @DisplayName("fail-soft - 非 2xx（500）与不可解析应答均抛明确错误，不伪造空结果")
++    void non2xxAndUnparseableFailSoft() {
++        responseStatus = 500;
++        responseBody = "calc boom";
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> client().trial(CalcTrialRequest.of("A", Map.of("A", 1))));
++        assertTrue(ex.getMessage().contains("试算服务不可用"), ex.getMessage());
++        assertTrue(ex.getMessage().contains("500"), ex.getMessage());
++
++        responseStatus = 200;
++        responseBody = "not-json";
++        BusinessException ex2 = assertThrows(BusinessException.class,
++                () -> client().trial(CalcTrialRequest.of("A", Map.of("A", 1))));
++        assertTrue(ex2.getMessage().contains("试算服务不可用"), ex2.getMessage());
++    }
++
++    @Test
++    @DisplayName("拒绝 - trial HTTP 400（语法/白名单拒绝）抛 CalcTrialRejectedException 带 reason")
++    void rejection400IsDistinctFromUnavailable() {
++        responseStatus = 400;
++        responseBody = "{\"value\":null,\"quality\":6,\"missing\":[],"
++                + "\"reason\":\"公式函数 INTEGRAL 一期不开放\",\"engineVersion\":\"calc-engine/1.0.0/trial-v1\"}";
++        CalcTrialRejectedException ex = assertThrows(CalcTrialRejectedException.class,
++                () -> client().trial(CalcTrialRequest.of("INTEGRAL(A)", Map.of("A", 1))));
++        assertTrue(ex.getReason().contains("INTEGRAL"), ex.getReason());
++    }
++}

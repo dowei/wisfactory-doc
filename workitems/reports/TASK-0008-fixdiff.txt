@@ -1,0 +1,209 @@
+commit d971c10bdd07b9555541687e693761ce01524854
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 00:31:10 2026 +0800
+
+    fix(iot): 字典新增/编辑全量字段白名单构建，堵 mass assignment（TASK-0008 修订轮 / 评审 I-1）
+    
+    - insertDict 白名单构建：请求仅可携带 dataCode/dataName/category/dataType/defaultUnit；
+      status 强制 1、deleted 强制 0（deleted=1 幽灵行会不可见地永久占用 uk_tenant_data_code）、
+      id/审计字段不复制（框架自增与 MetaObjectHandler 回填），tenant_id 仍会话覆盖
+    - updateDict 收紧：dataCode/dataType 不再以库内值回写（不可变字段不进 UPDATE SET），
+      仅 dataName/category/defaultUnit 可变，status/deleted/tenant_id/审计字段维持排除
+    - 测试 +3 例（红→绿）：POST 携带 status=0/deleted=1 落库仍 status=1/deleted=0 且同码重建
+      走预检闸 4002（非幽灵占用）；PUT 携带 status=1 复活禁用条目不生效；白名单断言同步收紧
+    - 全量复跑 1135 例 0 失败（基线 1105 + 首轮 27 + 修订轮 3）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+index 4f67c79..6425ff3 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+@@ -57,20 +57,35 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public boolean insertDict(IotDataDict dict) {
+-        // tenant_id 服务层从会话覆盖，不信任请求体（REQ-0001 核心规则）；
+-        // 插件对 iot_ 前缀表 INSERT 自动补列与会话租户同值（双保险，口径一致）
+-        dict.setTenantId(TenantContext.getTenantId());
++        // 字段白名单构建新增实体（TASK-0008 修订轮 / 评审 I-1，照 SysTenantServiceImpl.updateTenant 范式）：
++        // 请求仅可携带五个业务字段，其余一律不取请求值——
++        // 1) status 强制 1：写侧仅 DELETE 禁用语义可置 0（实体不变量，否则 POST 可直带任意值落库）；
++        // 2) deleted 强制 0：@TableLogic 直带 1 会落库成全 API 不可见的幽灵行，且永久占用
++        //    uk_tenant_data_code（编码永不复用 + 无删路径 = 该编码不可见地报废且无法经 API 排查）；
++        // 3) id / createBy / createTime / updateBy / updateTime 不复制（id 框架自增，审计字段由
++        //    MetaObjectHandler 按当前登录者回填——strictInsertFill 仅填空值，直落请求实体即被注入）；
++        // 4) tenant_id 服务层从会话覆盖（REQ-0001 核心规则）；插件对 iot_ 前缀表 INSERT 自动补列
++        //    与会话租户同值（双保险，口径一致）。
++        IotDataDict entity = new IotDataDict();
++        entity.setDataCode(dict.getDataCode());
++        entity.setDataName(dict.getDataName());
++        entity.setCategory(dict.getCategory());
++        entity.setDataType(dict.getDataType());
++        entity.setDefaultUnit(dict.getDefaultUnit());
++        entity.setStatus(1);
++        entity.setDeleted(0);
++        entity.setTenantId(TenantContext.getTenantId());
+         // 预检活跃行：@TableLogic 过滤已删行；租户条件由插件追加（会话态下即租户内唯一）
+         LambdaQueryWrapper<IotDataDict> wrapper = new LambdaQueryWrapper<>();
+-        wrapper.eq(IotDataDict::getDataCode, dict.getDataCode());
++        wrapper.eq(IotDataDict::getDataCode, entity.getDataCode());
+         if (this.count(wrapper) > 0) {
+-            throw duplicateDataCode(dict.getDataCode());
++            throw duplicateDataCode(entity.getDataCode());
+         }
+         try {
+-            return this.save(dict);
++            return this.save(entity);
+         } catch (DuplicateKeyException e) {
+             // 兜底：并发插入或已禁用/已删除行仍占用编码（物理唯一索引不被逻辑删除释放）
+-            throw duplicateDataCode(dict.getDataCode());
++            throw duplicateDataCode(entity.getDataCode());
+         }
+     }
+ 
+@@ -89,16 +104,16 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+         if (dict.getDataType() == null || !dict.getDataType().equals(existing.getDataType())) {
+             throw paramError("数据类型不允许修改");
+         }
+-        // 字段白名单构建更新（不直接 updateById 请求实体）：
+-        // 1) status 不进更新集——编辑接口不承载启停语义，status 只能由 DELETE 禁用接口置 0；
+-        // 2) tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写）；
+-        // 3) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
+-        //    杜绝客户端 mass assignment（updateBy/updateTime 由 MetaObjectHandler 按当前登录者回填）；
+-        // 4) dataCode/dataType 经上方不可改校验后与库内同值，回写为 no-op。
++        // 字段白名单构建更新（不直接 updateById 请求实体；修订轮 I-1：不可变字段不回写、连 no-op 都不进 SET）：
++        // 1) 仅 dataName/category/defaultUnit 可变——dataCode/dataType 经上方不可改校验后
++        //    不进更新集（库内值本就不变，SET 不含不可变字段，语义更干净）；
++        // 2) status 不进更新集——编辑接口不承载启停语义，status 只能由 DELETE 禁用接口置 0，
++        //    携带 status=1 亦不得复活已禁用条目；
++        // 3) tenant_id 不进更新集（插件 WHERE 条件已隔离租户，SET 也不得改写）；
++        // 4) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
++        //    杜绝客户端 mass assignment（updateBy/updateTime 由 MetaObjectHandler 按当前登录者回填）。
+         IotDataDict upd = new IotDataDict();
+         upd.setId(existing.getId());
+-        upd.setDataCode(existing.getDataCode());
+-        upd.setDataType(existing.getDataType());
+         upd.setDataName(dict.getDataName());
+         upd.setCategory(dict.getCategory());
+         upd.setDefaultUnit(dict.getDefaultUnit());
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplTest.java
+index e599139..c9ce47e 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplTest.java
+@@ -125,6 +125,67 @@ class IotDataDictServiceImplTest {
+         assertEquals(4002, e.getCode());
+     }
+ 
++    @Test
++    @DisplayName("新增字典 - 请求携带 status=0/deleted=1/id/审计字段不落库（修订轮 I-1：白名单构建，status 强制 1、deleted 强制 0）")
++    void testInsertDict_RequestFieldsNotTrusted() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++
++        IotDataDict request = newDict();
++        request.setId(888L);
++        request.setStatus(0);
++        request.setDeleted(1);
++        request.setCreateBy(999L);
++        request.setCreateTime(LocalDateTime.of(2020, 1, 1, 0, 0));
++        request.setUpdateBy(999L);
++        request.setUpdateTime(LocalDateTime.of(2020, 1, 1, 0, 0));
++
++        assertTrue(dictService.insertDict(request));
++
++        ArgumentCaptor<IotDataDict> captor = ArgumentCaptor.captor();
++        verify(baseMapper).insert(captor.capture());
++        IotDataDict saved = captor.getValue();
++        // 五个业务字段照请求落库
++        assertEquals("ELEC_CONS", saved.getDataCode());
++        assertEquals("用电量", saved.getDataName());
++        assertEquals("ELEC", saved.getCategory());
++        assertEquals("DOUBLE", saved.getDataType());
++        assertEquals("kWh", saved.getDefaultUnit());
++        // mass assignment 防护：其余字段一律不取请求值
++        assertEquals(1, saved.getStatus(), "status 请求携带 0 不得落库：新增恒启用（status 只能经 DELETE 禁用语义置 0）");
++        assertEquals(0, saved.getDeleted(), "deleted 请求携带 1 不得落库：deleted=1 幽灵行会不可见地永久占用 uk_tenant_data_code");
++        assertNull(saved.getId(), "id 由框架自增填充，请求携带值不得复制");
++        assertNull(saved.getCreateBy(), "createBy 由 MetaObjectHandler 回填，不得采用请求值");
++        assertNull(saved.getCreateTime(), "createTime 由 MetaObjectHandler 回填，不得采用请求值");
++        assertNull(saved.getUpdateBy(), "updateBy 不得采用请求值");
++        assertNull(saved.getUpdateTime(), "updateTime 不得采用请求值");
++        assertNull(saved.getTenantId(), "tenantId 由会话覆盖（standalone 无会话为 null），不得采用请求值 999");
++    }
++
++    @Test
++    @DisplayName("新增字典 - 幽灵请求落库为正常行后，同码重建走预检闸报 4002（非幽灵行占用）")
++    void testInsertDict_GhostRequestThenDuplicateHitsPrecheckGate() {
++        // 第一笔：请求携带 deleted=1/status=0，落库应为 deleted=0/status=1 的正常启用行
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(IotDataDict.class))).thenReturn(1);
++        IotDataDict ghostRequest = newDict();
++        ghostRequest.setStatus(0);
++        ghostRequest.setDeleted(1);
++        assertTrue(dictService.insertDict(ghostRequest));
++        ArgumentCaptor<IotDataDict> first = ArgumentCaptor.captor();
++        verify(baseMapper).insert(first.capture());
++        assertEquals(0, first.getValue().getDeleted(), "落库非幽灵行（deleted=0，API 可见可管理）");
++        assertEquals(1, first.getValue().getStatus(), "落库为启用行（status=1）");
++
++        // 第二笔同码：预检计数 1（可见活跃行）→ 4002 走第一道闸，无需 DuplicateKeyException 兜底
++        when(baseMapper.selectCount(any())).thenReturn(1L);
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.insertDict(newDict()));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals(4002, e.getCode());
++        // 全程仅第一笔触达 insert：第二笔被预检拦截（行可见 = 占码可经 API 排查，非幽灵）
++        verify(baseMapper, times(1)).insert(any(IotDataDict.class));
++    }
++
+     // ---------- 编辑 ----------
+ 
+     @Test
+@@ -212,7 +273,7 @@ class IotDataDictServiceImplTest {
+     }
+ 
+     @Test
+-    @DisplayName("编辑字典 - 同码同型携带时放行：data_name/category/default_unit 可改，其余字段不进更新集")
++    @DisplayName("编辑字典 - 同码同型携带时放行：仅 data_name/category/default_unit 进更新集（修订轮 I-1：dataCode/dataType/status/deleted/审计字段一律排除）")
+     void testUpdateDict_WhitelistFieldsSaved() {
+         IotDataDict existing = newDict();
+         existing.setId(1L);
+@@ -239,8 +300,8 @@ class IotDataDictServiceImplTest {
+         verify(baseMapper).updateById(captor.capture());
+         IotDataDict upd = captor.getValue();
+         assertEquals(1L, upd.getId());
+-        assertEquals("ELEC_CONS", upd.getDataCode(), "编码以库内值回写（no-op，不可经编辑改写）");
+-        assertEquals("DOUBLE", upd.getDataType(), "数据类型以库内值回写（no-op，创建后锁定）");
++        assertNull(upd.getDataCode(), "data_code 已锁死为库内值，不进更新集（UPDATE SET 不含不可变字段）");
++        assertNull(upd.getDataType(), "data_type 已锁死为库内值，不进更新集（UPDATE SET 不含不可变字段）");
+         assertEquals("总用电量", upd.getDataName());
+         assertEquals("OTHER", upd.getCategory());
+         assertEquals("MWh", upd.getDefaultUnit());
+@@ -253,6 +314,29 @@ class IotDataDictServiceImplTest {
+         assertNull(upd.getDeleted(), "deleted 为 @TableLogic 字段，不得经编辑请求改写");
+     }
+ 
++    @Test
++    @DisplayName("编辑字典 - PUT 携带 status=1 尝试复活已禁用条目不生效（修订轮 I-1：status 变更只走 DELETE 禁用端点）")
++    void testUpdateDict_ReviveDisabledViaStatusNotEffective() {
++        IotDataDict existing = newDict();
++        existing.setId(1L);
++        existing.setStatus(0); // 库内已禁用
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(IotDataDict.class))).thenReturn(1);
++
++        IotDataDict request = newDict();
++        request.setId(1L);
++        request.setStatus(1);   // 复活尝试
++        request.setDeleted(1);  // 幽灵化尝试
++
++        assertTrue(dictService.updateDict(request));
++
++        ArgumentCaptor<IotDataDict> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        IotDataDict upd = captor.getValue();
++        assertNull(upd.getStatus(), "请求 status=1 不得进入更新集——禁用条目不因编辑复活");
++        assertNull(upd.getDeleted(), "请求 deleted=1 不得进入更新集——幽灵行会不可见地永久占用 uk_tenant_data_code");
++    }
++
+     // ---------- 禁用（DELETE 语义） ----------
+ 
+     @Test

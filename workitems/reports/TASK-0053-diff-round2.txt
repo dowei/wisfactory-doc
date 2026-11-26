@@ -1,0 +1,402 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java
+index a15410b..8b624fa 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/SubscriptionController.java
+@@ -78,18 +78,18 @@ public class SubscriptionController {
+         return Result.success(subscriptionService.closeMetric(requireIdentity(request)));
+     }
+ 
+-    @Operation(summary = "指标事件读口（最近缓冲；以 st_metric_value 物化表为准，事件仅触发信号）")
++    @Operation(summary = "指标事件读口（按身份订阅授权隔离；以 st_metric_value 物化表为准，事件仅触发信号）")
+     @GetMapping("/metric/events")
+     public Result<Deque<MetricProducedEventVO>> metricEvents(HttpServletRequest request) {
+-        requireIdentity(request);
+-        return Result.success(subscriptionService.metricEvents());
++        // 修订轮 I-1：身份不再丢弃——读口按该 appKey 的有效订阅 tenant 过滤，租户 B 读不到 A
++        return Result.success(subscriptionService.metricEvents(requireIdentity(request)));
+     }
+ 
+-    @Operation(summary = "数据项事件读口（最近缓冲）")
++    @Operation(summary = "数据项事件读口（按身份订阅授权隔离：租户+实例）")
+     @GetMapping("/item/events")
+     public Result<Deque<ItemChangeEventVO>> itemEvents(HttpServletRequest request) {
+-        requireIdentity(request);
+-        return Result.success(subscriptionService.itemEvents());
++        // 修订轮 I-1：按该 appKey 的有效订阅 (tenant,instance) 过滤
++        return Result.success(subscriptionService.itemEvents(requireIdentity(request)));
+     }
+ 
+     /** 验签产物读取（过滤器写入）；缺位 fail-closed——不给过滤器误配置时的匿名通道 */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java
+index 04223a1..3bff3ea 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionConsumer.java
+@@ -51,7 +51,9 @@ public class SubscriptionConsumer {
+                         topic, event.getFullKey());
+                 return 0;
+             }
+-            store.acceptItem(event);
++            // 摄入侧双校验（主题 tenant + 订阅实例 + fullKey 命名空间）保持不变；此处仅把
++            // 事件到达的主题归属传给缓冲记录，供读口按 appKey 授权过滤（修订轮 I-1）。
++            store.acceptItem(event, parts.tenantCode(), parts.instanceCode());
+             return 1;
+         } catch (IllegalArgumentException e) {
+             log.warn("[OPENAPI-SUB] 数据项事件载荷非法丢弃 topic={}: {}", topic, e.getMessage());
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java
+index 0547a6e..e04243b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionEventStore.java
+@@ -7,6 +7,8 @@ import java.util.ArrayDeque;
+ import java.util.Deque;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
++import java.util.Set;
++import java.util.stream.Collectors;
+ 
+ /**
+  * 订阅事件环形缓冲 + 幂等登记（TASK-0053，brief 决策 3）。
+@@ -27,6 +29,8 @@ public class SubscriptionEventStore {
+     private final int capacity;
+     private final Map<String, MetricProducedEventVO> metrics = new LinkedHashMap<>();
+     private final Map<String, ItemChangeEventVO> items = new LinkedHashMap<>();
++    /** 数据项事件的租户/实例归属（与 items 同键）：读口按订阅授权过滤，摄入侧不参与幂等键 */
++    private final Map<String, String> itemProvenance = new LinkedHashMap<>();
+ 
+     public SubscriptionEventStore(int capacity) {
+         this.capacity = capacity <= 0 ? 1 : capacity;
+@@ -41,16 +45,33 @@ public class SubscriptionEventStore {
+         return true;
+     }
+ 
+-    /** 接受数据项事件：同 fullKey+ts+quality 覆盖，恒返回 true */
++    /** 接受数据项事件：同 fullKey+ts+quality 覆盖，恒返回 true（归属未知，读口按未知处理） */
+     public synchronized boolean acceptItem(ItemChangeEventVO event) {
++        return acceptItem(event, null, null);
++    }
++
++    /**
++     * 接受数据项事件并记录归属（修订轮 I-1）：tenantCode/instanceCode 取自事件到达的主题
++     * （摄入侧已做主题+实例双重校验，此处仅记录归属供读口隔离，不改变幂等口径）。
++     */
++    public synchronized boolean acceptItem(ItemChangeEventVO event, String tenantCode, String instanceCode) {
+         if (event == null) {
+             return false;
+         }
+-        String key = event.getFullKey() + "|" + event.getTs() + "|" + event.getQuality();
++        String key = itemKey(event);
+         upsert(items, key, event);
++        itemProvenance.put(key, provenance(tenantCode, instanceCode));
+         return true;
+     }
+ 
++    private static String itemKey(ItemChangeEventVO event) {
++        return event.getFullKey() + "|" + event.getTs() + "|" + event.getQuality();
++    }
++
++    private static String provenance(String tenantCode, String instanceCode) {
++        return (tenantCode == null ? "" : tenantCode) + "|" + (instanceCode == null ? "" : instanceCode);
++    }
++
+     private <T> void upsert(Map<String, T> map, String key, T value) {
+         map.remove(key);
+         map.put(key, value); // 最近接受排到末尾；同键重发只占一个位
+@@ -97,4 +118,40 @@ public class SubscriptionEventStore {
+     public synchronized Deque<ItemChangeEventVO> itemRing() {
+         return new ArrayDeque<>(items.values());
+     }
++
++    /**
++     * 指标事件读口（修订轮 I-1）：仅返回 tenant 落在授权集合内的事件。
++     * 租户 B 的 appKey 只带 tB 的 tenantCode，读不到 tA 已落缓冲的指标载荷。
++     */
++    public synchronized Deque<MetricProducedEventVO> metricEventsFor(Set<String> allowedTenantCodes) {
++        if (allowedTenantCodes == null || allowedTenantCodes.isEmpty()) {
++            return new ArrayDeque<>();
++        }
++        return metrics.values().stream()
++                .filter(e -> allowedTenantCodes.contains(e.getTenant()))
++                .collect(Collectors.toCollection(ArrayDeque::new));
++    }
++
++    /**
++     * 数据项事件读口（修订轮 I-1）：仅返回归属 (tenantCode, instanceCode) 落在授权集合内的事件。
++     * 授权集合由注册表按 appKey 的有效订阅生成（仅该身份有权订阅的主题/租户），同租户下
++     * 只订 F01 的 appKey 读不到 F02；无订阅的 appKey 授权集为空，返回空。
++     */
++    public synchronized Deque<ItemChangeEventVO> itemEventsFor(Set<String> allowedProvenance) {
++        if (allowedProvenance == null || allowedProvenance.isEmpty()) {
++            return new ArrayDeque<>();
++        }
++        Deque<ItemChangeEventVO> out = new ArrayDeque<>();
++        for (Map.Entry<String, ItemChangeEventVO> e : items.entrySet()) {
++            if (allowedProvenance.contains(itemProvenance.get(e.getKey()))) {
++                out.add(e.getValue());
++            }
++        }
++        return out;
++    }
++
++    /** 归属键（供注册表授权集与事件归属同口径比对） */
++    public static String provenanceKey(String tenantCode, String instanceCode) {
++        return provenance(tenantCode, instanceCode);
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java
+index 683174b..dc2c045 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionRegistry.java
+@@ -123,6 +123,35 @@ public class SubscriptionRegistry {
+         return metricSubscriptions.values().stream().anyMatch(s -> s.tenantCode().equals(tenantCode));
+     }
+ 
++    /**
++     * 读口授权 tenant 集合（修订轮 I-1）：该 appKey 当前有效指标订阅的租户编码集合。
++     * 读口以此过滤环形缓冲——只有本身份订阅过的租户事件才可见；无订阅=空集=读不到任何事件。
++     */
++    public synchronized java.util.Set<String> authorizedMetricTenants(String appKey) {
++        if (appKey == null) {
++            return java.util.Set.of();
++        }
++        return metricSubscriptions.values().stream()
++                .filter(s -> s.appKey().equals(appKey))
++                .map(Subscription::tenantCode)
++                .collect(java.util.stream.Collectors.toSet());
++    }
++
++    /**
++     * 读口授权数据项归属集合（修订轮 I-1）：该 appKey 当前有效数据项订阅的 (tenantCode,instanceCode)
++     * 归属键集合（与 {@link SubscriptionEventStore#provenanceKey} 同口径）。同租户只订 F01 的 appKey
++     * 不含 F02 归属——读口按实例裁剪；无订阅=空集。
++     */
++    public synchronized java.util.Set<String> authorizedItemProvenance(String appKey) {
++        if (appKey == null) {
++            return java.util.Set.of();
++        }
++        return itemSubscriptions.values().stream()
++                .filter(s -> s.appKey().equals(appKey))
++                .map(s -> SubscriptionEventStore.provenanceKey(s.tenantCode(), s.instanceCode()))
++                .collect(java.util.stream.Collectors.toSet());
++    }
++
+     private VisibleScope requireScope(OpenApiClientIdentity identity) {
+         VisibleScope scope = dataPermService.resolveClientScope(
+                 identity.getClientId(), identity.getTenantId(), identity.getScopeJson());
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java
+index 78b0b09..6720a71 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionService.java
+@@ -33,9 +33,9 @@ public interface SubscriptionService {
+     /** 事件读口：最近数据项事件 */
+     ItemChangeEventVO latestItem();
+ 
+-    /** 事件读口：指标事件序列（最旧→最新） */
+-    Deque<MetricProducedEventVO> metricEvents();
++    /** 事件读口：指标事件序列（最旧→最新），按身份订阅授权过滤（修订轮 I-1） */
++    Deque<MetricProducedEventVO> metricEvents(OpenApiClientIdentity identity);
+ 
+-    /** 事件读口：数据项事件序列 */
+-    Deque<ItemChangeEventVO> itemEvents();
++    /** 事件读口：数据项事件序列，按身份订阅授权过滤（修订轮 I-1） */
++    Deque<ItemChangeEventVO> itemEvents(OpenApiClientIdentity identity);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java
+index 41ef08a..03feb2d 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/subscribe/SubscriptionServiceImpl.java
+@@ -61,12 +61,14 @@ public class SubscriptionServiceImpl implements SubscriptionService {
+     }
+ 
+     @Override
+-    public Deque<MetricProducedEventVO> metricEvents() {
+-        return store.metricRing();
++    public Deque<MetricProducedEventVO> metricEvents(OpenApiClientIdentity identity) {
++        // 修订轮 I-1：按身份的有效订阅 tenant 集合过滤——无订阅/租户不匹配读不到任何事件
++        return store.metricEventsFor(registry.authorizedMetricTenants(identity == null ? null : identity.getAppKey()));
+     }
+ 
+     @Override
+-    public Deque<ItemChangeEventVO> itemEvents() {
+-        return store.itemRing();
++    public Deque<ItemChangeEventVO> itemEvents(OpenApiClientIdentity identity) {
++        // 修订轮 I-1：按身份的有效订阅 (tenant,instance) 归属集合过滤——同租户跨实例亦隔离
++        return store.itemEventsFor(registry.authorizedItemProvenance(identity == null ? null : identity.getAppKey()));
+     }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionReadIsolationContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionReadIsolationContractTest.java
+new file mode 100644
+index 0000000..d94fde6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/subscribe/SubscriptionReadIsolationContractTest.java
+@@ -0,0 +1,172 @@
++package net.otlab.admin.module.openapi.subscribe;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.ItemChangeEventVO;
++import net.otlab.admin.module.openapi.dto.MetricProducedEventVO;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiEventCodec;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.Deque;
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * 事件读口越权红线回归（TASK-0053 修订轮 I-1，评审 F-01）。
++ *
++ * <p>旧实现读口只 requireIdentity 却丢弃身份，直接返回全局环形缓冲——租户 B 的合法 appKey
++ * 可读到租户 A 已落缓冲的事件载荷。本套件对旧实现必红：
++ * <ul>
++ * <li>租户 B 读不到租户 A 的指标/数据项事件；</li>
++ * <li>无订阅权限的 appKey 读不到任何事件；</li>
++ * <li>同租户但只订阅了实例 F01 的 appKey 读不到实例 F02 的数据项事件（scope 裁剪）。</li>
++ * </ul>
++ * 摄入侧双校验不动——本套件只验证读口侧过滤。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class SubscriptionReadIsolationContractTest {
++
++    private OpenApiTenantMapper tenantMapper;
++    private OpenApiInstanceMapper instanceMapper;
++    private DataPermService dataPermService;
++    private SubscriptionRegistry registry;
++    private SubscriptionEventStore store;
++    private SubscriptionConsumer consumer;
++    private OpenApiEventCodec codec;
++    private SubscriptionService service;
++
++    private OpenApiClientIdentity identity(long clientId, long tenantId, String appKey, String scopeJson) {
++        OpenApiClientIdentity id = new OpenApiClientIdentity();
++        id.setClientId(clientId);
++        id.setTenantId(tenantId);
++        id.setAppKey(appKey);
++        id.setScopeJson(scopeJson);
++        return id;
++    }
++
++    @BeforeEach
++    void setUp() {
++        tenantMapper = mock(OpenApiTenantMapper.class);
++        instanceMapper = mock(OpenApiInstanceMapper.class);
++        dataPermService = mock(DataPermService.class);
++        when(tenantMapper.selectTenantCodeById(1L)).thenReturn("tA");
++        when(tenantMapper.selectTenantCodeById(2L)).thenReturn("tB");
++        when(tenantMapper.selectTenantCodeById(3L)).thenReturn("tC");
++        // 每个调用方 scope 都含其可见实例；按 appKey 区分由 mock 返回（见各测试断言）
++        when(dataPermService.resolveClientScope(anyLong(), anyLong(), any()))
++                .thenReturn(new VisibleScope(false, Set.of(), Set.of(10L, 11L), false));
++        OpenApiInstanceRow f01 = row(10L, "F01", 1L);
++        OpenApiInstanceRow f02 = row(11L, "F02", 1L);
++        when(instanceMapper.selectByCodesForTenant(anyLong(), any())).thenAnswer(inv -> {
++            var codes = (java.util.Collection<String>) inv.getArgument(1);
++            return java.util.stream.Stream.of(f01, f02)
++                    .filter(r -> codes.contains(r.getInstanceCode())).toList();
++        });
++        registry = new SubscriptionRegistry(tenantMapper, instanceMapper, dataPermService);
++        store = new SubscriptionEventStore(32);
++        codec = new OpenApiEventCodec();
++        consumer = new SubscriptionConsumer(registry, store, codec);
++        service = new SubscriptionServiceImpl(registry, store);
++    }
++
++    private static OpenApiInstanceRow row(long id, String code, long tenantId) {
++        OpenApiInstanceRow r = new OpenApiInstanceRow();
++        r.setId(id);
++        r.setInstanceCode(code);
++        r.setTenantId(tenantId);
++        return r;
++    }
++
++    private OpenApiClientIdentity appA() {
++        return identity(1, 1, "akA", "{\"instanceIds\":[10,11],\"subtree\":false}");
++    }
++
++    private OpenApiClientIdentity appB() {
++        return identity(2, 2, "akB", "{\"instanceIds\":[10,11],\"subtree\":false}");
++    }
++
++    private void feedTenantA() {
++        registry.subscribeMetric(appA());
++        registry.subscribeItem(appA(), "F01");
++        consumer.onMetricMessage("iot/tA/metric/out", metric("tA", 100.0));
++        consumer.onItemMessage("iot/open/tA/F01/item",
++                "{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":12.5,\"quality\":0}");
++    }
++
++    private String metric(String tenant, double value) {
++        return "{\"eventType\":\"metric.out\",\"tenant\":\"" + tenant + "\",\"tenantId\":1,"
++                + "\"metricCode\":\"M_LIVE\",\"instanceKey\":\"F01.ELEC_METER\","
++                + "\"period\":\"DAY\",\"windowStart\":1795305600000,\"windowEnd\":1795392000000,"
++                + "\"value\":" + value + ",\"yoy\":0.25,\"mom\":-0.2,\"quality\":0}";
++    }
++
++    @Test
++    @DisplayName("I-1 红线：租户 B 合法 appKey 订阅后，读口读不到租户 A 的指标事件")
++    void tenantBCannotReadTenantAMetricEvents() {
++        feedTenantA();                       // tA 的指标 + 数据项事件落全局缓冲
++        registry.subscribeMetric(appB());    // tB 合法订阅自己的租户
++
++        Deque<MetricProducedEventVO> aEvents = service.metricEvents(appA());
++        Deque<MetricProducedEventVO> bEvents = service.metricEvents(appB());
++        assertEquals(1, aEvents.size());
++        assertEquals("tA", aEvents.getFirst().getTenant());
++        assertTrue(bEvents.isEmpty(), "租户 B 读口不得返回租户 A 的指标事件（I-1）");
++    }
++
++    @Test
++    @DisplayName("I-1 红线：租户 B 合法 appKey 订阅后，读口读不到租户 A 的数据项事件")
++    void tenantBCannotReadTenantAItemEvents() {
++        feedTenantA();
++        registry.subscribeItem(appB(), "F01");
++
++        Deque<ItemChangeEventVO> aEvents = service.itemEvents(appA());
++        Deque<ItemChangeEventVO> bEvents = service.itemEvents(appB());
++        assertEquals(1, aEvents.size());
++        assertEquals("F01.M01", aEvents.getFirst().getFullKey());
++        assertTrue(bEvents.isEmpty(), "租户 B 读口不得返回租户 A 的数据项事件（I-1）");
++    }
++
++    @Test
++    @DisplayName("I-1 红线：无订阅权限的 appKey 读口返回空（不暴露任何缓冲事件）")
++    void noSubscriptionCannotRead() {
++        feedTenantA();
++        OpenApiClientIdentity stranger = identity(3, 3, "akC", "{}"); // tC，无任何订阅
++        assertTrue(service.metricEvents(stranger).isEmpty(), "无指标订阅的 appKey 不得读到任何事件");
++        assertTrue(service.itemEvents(stranger).isEmpty(), "无数据项订阅的 appKey 不得读到任何事件");
++    }
++
++    @Test
++    @DisplayName("I-1 红线：同租户不同实例订阅——只订 F01 的 appKey 读不到 F02 的数据项事件")
++    void scopeInstanceNarrowing() {
++        // appA 只订阅 F01；以 B 的身份但 tA 租户无法构造，改用同一 appKey 在 tA 下只订 F01，
++        // 另注入一条 tA/F02 事件（全局缓冲），断言该 appKey 读口不含 F02。
++        OpenApiClientIdentity onlyF01 = identity(1, 1, "akOnlyF01", "{\"instanceIds\":[10],\"subtree\":false}");
++        registry.subscribeItem(onlyF01, "F01");
++        // 通过另一 appKey 订阅 F02 并注入 F02 事件（同意图：全局缓冲同时含 F01/F02）
++        OpenApiClientIdentity other = identity(2, 1, "akOther", "{\"instanceIds\":[11],\"subtree\":false}");
++        registry.subscribeItem(other, "F02");
++        consumer.onItemMessage("iot/open/tA/F01/item",
++                "{\"fullKey\":\"F01.M01\",\"ts\":1,\"value\":12.5,\"quality\":0}");
++        consumer.onItemMessage("iot/open/tA/F02/item",
++                "{\"fullKey\":\"F02.M02\",\"ts\":2,\"value\":99,\"quality\":0}");
++
++        Deque<ItemChangeEventVO> events = service.itemEvents(onlyF01);
++        assertEquals(1, events.size(), "只订 F01 的 appKey 只能读到 F01 事件");
++        assertEquals("F01.M01", events.getFirst().getFullKey());
++    }
++}

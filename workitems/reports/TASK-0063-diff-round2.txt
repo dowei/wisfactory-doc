@@ -1,0 +1,266 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java
+index 692696e..294db63 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/calcread/impl/CalcReadServiceImpl.java
+@@ -33,8 +33,10 @@ import java.util.List;
+  * 不报错、不阻塞管理系统；真机列条件在报告中登记（DDL 由用户应用后探针复验）。
+  *
+  * <p><b>数据权限</b>：fullKey 形如 {@code tenant|metricCode|instanceCode|period}（0046 指标全键），
+- * 取实例段解析 instanceId，按会话可见实例集裁剪（越权 403 不泄露存在性）；无法解析出实例的
+- * fullKey（如旧形态单段 metricCode）按「仅同租户、无实例维度」处理——只对会话租户行可见。
++ * 取实例段解析 instanceId，按会话可见实例集裁剪（越权不返回、不泄露存在性）。
++ * <b>单段 fullKey（如 state 侧 metricCode，无实例段）</b>无法定位实例：仅 {@code allTenant}
++ * 角色可见；部门/实例受限角色一律裁掉（返回空集，fail-closed 不泄露）——这是安全方向正确的
++ * 保守口径；受限角色若要按实例看状态，需 fullKey 携带实例段（log 侧四段全键即此形态）。
+  *
+  * @author dowei
+  * @date 2026-11-24
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadDataPermContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadDataPermContractTest.java
+new file mode 100644
+index 0000000..cf9b815
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/CalcReadDataPermContractTest.java
+@@ -0,0 +1,109 @@
++package net.otlab.admin.module.iot.calcread.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.calcread.CalcStateVO;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceRow;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.jdbc.datasource.DriverManagerDataSource;
++
++import java.util.List;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0063 修订轮 m-1：数据权限裁剪端到端（走真实 visible() 路径，非 deps=null 捷径）。
++ *
++ * <p>锁定评审 F-2 的实际行为：单段 fullKey（metricCode，state 侧真实形态）无法定位实例 →
++ * {@code allTenant} 角色可见、受限角色 fail-closed 裁掉；四段 fullKey 携带实例段时按可见实例集
++ * 裁剪。**方向 fail-closed 不泄露**——本测试只锁行为、不改裁剪逻辑。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcReadDataPermContractTest {
++
++    private static final long TENANT = 1L;
++    private JdbcTemplate jdbc;
++    private DataPermService dataPermService;
++    private OpenApiInstanceMapper instanceMapper;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login("7"); // 数值 login id（SecurityUtils.getUserId() 需 getLoginIdAsLong）
++        StpUtil.getSession().set("tenant_id", TENANT);
++        DriverManagerDataSource ds = new DriverManagerDataSource();
++        ds.setDriverClassName("org.h2.Driver");
++        ds.setUrl("jdbc:h2:mem:calc_read_perm_" + System.nanoTime() + ";MODE=MySQL;DB_CLOSE_DELAY=-1");
++        ds.setUsername("sa");
++        ds.setPassword("");
++        jdbc = new JdbcTemplate(ds);
++        jdbc.execute("CREATE TABLE iot_calc_state ("
++                + "id BIGINT AUTO_INCREMENT PRIMARY KEY, tenant_id BIGINT, full_key VARCHAR(180), "
++                + "last_calc_time TIMESTAMP, watermark TIMESTAMP, calc_status INT, "
++                + "error_count INT, last_error VARCHAR(1000), update_time TIMESTAMP)");
++        // 三行：单段 metricCode / 四段携带可见实例 I01 / 四段携带越权实例 I99
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id, full_key, calc_status) VALUES (?,?,1)",
++                TENANT, "M.A");
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id, full_key, calc_status) VALUES (?,?,1)",
++                TENANT, "T|M.B|I01|day");
++        jdbc.update("INSERT INTO iot_calc_state (tenant_id, full_key, calc_status) VALUES (?,?,1)",
++                TENANT, "T|M.C|I99|day");
++        dataPermService = mock(DataPermService.class);
++        instanceMapper = mock(OpenApiInstanceMapper.class);
++        // I01 → instanceId=101（可见集内）；I99 → 102（不在可见集）
++        OpenApiInstanceRow rowI01 = new OpenApiInstanceRow();
++        rowI01.setId(101L);
++        OpenApiInstanceRow rowI99 = new OpenApiInstanceRow();
++        rowI99.setId(102L);
++        when(instanceMapper.selectByCodesForTenant(anyLong(), any())).thenAnswer(inv -> {
++            @SuppressWarnings("unchecked")
++            java.util.Collection<String> codes = inv.getArgument(1);
++            return codes.contains("I01") ? List.of(rowI01) : List.of(rowI99);
++        });
++        when(dataPermService.resolve(any())).thenReturn(
++                new VisibleScope(false, Set.of(), Set.of(101L), false)); // 受限角色：仅 I01 可见
++    }
++
++    @AfterEach
++    void tearDown() {
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    private CalcReadServiceImpl serviceWithDataPerm() {
++        return new CalcReadServiceImpl(jdbc, instanceMapper, dataPermService);
++    }
++
++    @Test
++    @DisplayName("受限角色：单段 fullKey 裁掉（fail-closed），四段按实例可见集裁剪")
++    void restrictedRoleClipsSingleSegmentAndOutOfScopeInstance() {
++        List<CalcStateVO> rows = serviceWithDataPerm().state(null);
++        // 只剩四段 I01 一行；单段 M.A（无实例段）与 I99（越权）均被裁
++        assertEquals(1, rows.size(), "仅 I01 可见行通过数据权限");
++        assertEquals("T|M.B|I01|day", rows.get(0).getFullKey());
++    }
++
++    @Test
++    @DisplayName("allTenant 角色：单段 fullKey 与全部实例行可见（不裁剪）")
++    void allTenantRoleSeesSingleSegmentFullKey() {
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        List<CalcStateVO> rows = serviceWithDataPerm().state(null);
++        assertEquals(3, rows.size(), "allTenant 不裁剪——单段 metricCode 状态页可见");
++        assertTrue(rows.stream().anyMatch(v -> "M.A".equals(v.getFullKey())));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/IotCalcDdlSplitContractTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/IotCalcDdlSplitContractTest.java
+new file mode 100644
+index 0000000..fbb822a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/calcread/impl/IotCalcDdlSplitContractTest.java
+@@ -0,0 +1,92 @@
++package net.otlab.admin.module.iot.calcread.impl;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0063 修订轮 I-1：iot_calc DDL 脚本「每条语句独占一行」守卫（对旧脚本必红）。
++ *
++ * <p>根因：{@code backend/scripts/sql-exec.sh} 以 {@code ;\s*\n}（分号 + 换行）切分语句——
++ * 同行中出现多个 {@code ;}（如 {@code PREPARE ...; EXECUTE ...; DEALLOCATE ...;} 写在一行）
++ * 会被当作一条语句交给 JDBC 执行，MySQL 报 {@code SQLERROR near 'PREPARE ...'}，建号段落中止、
++ * 留下无账号半套 schema（评审 F-1，只读探针实测）。本测试机械锁定「按 sql-exec.sh 切分后，
++ * 每段至多一条可执行语句」——覆盖脚本内所有多行语句，不只建号处。只文本分析，不连库。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotCalcDdlSplitContractTest {
++
++    private static final String REL = "resources/sql/upgrade/20261124_iot_calc_schema.sql";
++
++    private static Path repoRoot() {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位仓库根（resources/sql/01_base.sql）");
++        return dir;
++    }
++
++    private static List<String> executableSegments(String ddl) {
++        // 复刻 sql-exec.sh 的切分：split(";\\s*\\n")，逐行剥 -- 注释与空行
++        List<String> segments = new ArrayList<>();
++        for (String seg : ddl.split(";\\s*\\n")) {
++            StringBuilder sb = new StringBuilder();
++            for (String line : seg.split("\n")) {
++                String t = line.strip();
++                if (!t.isEmpty() && !t.startsWith("--")) {
++                    sb.append(line).append("\n");
++                }
++            }
++            String s = sb.toString().strip();
++            if (!s.isEmpty()) {
++                segments.add(s);
++            }
++        }
++        return segments;
++    }
++
++    @Test
++    @DisplayName("DDL 每条语句独占一行：按 sql-exec.sh 的 ;\\n 切分后，任一段不含行内第二处分号")
++    void everyStatementIsOnItsOwnLine() throws Exception {
++        Path p = repoRoot().resolve(REL);
++        assertTrue(Files.exists(p), "缺 DDL 脚本: " + REL);
++        String ddl = Files.readString(p, StandardCharsets.UTF_8);
++        List<String> segments = executableSegments(ddl);
++        assertTrue(segments.size() >= 8, "切分段数异常偏少（" + segments.size() + "），解析口径不可信");
++
++        List<String> bad = new ArrayList<>();
++        for (String seg : segments) {
++            // 段内若仍含分号（; 已被切分符消费，残余分号只能是同行多语句），即为 F-1 形态。
++            // 注意：字符串字面量里的分号（如 GRANTEE 常量）不会出现在本脚本——脚本内所有语句均无。
++            if (seg.contains(";")) {
++                bad.add(seg.replace("\n", " ⏎ ").strip());
++            }
++        }
++        assertEquals(List.of(), bad,
++                "以下切分段仍含同行分号（sql-exec.sh 会作为一条语句交给 JDBC，导致 SQLERROR）: " + bad);
++    }
++
++    @Test
++    @DisplayName("DDL 建号段落形态：PREPARE / EXECUTE / DEALLOCATE 各自独占一行（F-1 锚点）")
++    void accountStatementsEachOnOwnLine() throws Exception {
++        String ddl = Files.readString(repoRoot().resolve(REL), StandardCharsets.UTF_8);
++        for (String kw : new String[]{"PREPARE rw_stmt FROM", "EXECUTE rw_stmt", "DEALLOCATE PREPARE rw_stmt",
++                "PREPARE ro_stmt FROM", "EXECUTE ro_stmt", "DEALLOCATE PREPARE ro_stmt"}) {
++            long hit = java.util.Arrays.stream(ddl.split("\\R"))
++                    .filter(line -> line.strip().startsWith(kw)).count();
++            assertEquals(1, hit, "建号语句须独占一行（且仅一行）: " + kw);
++        }
++    }
++}
+diff --git a/resources/sql/upgrade/20261124_iot_calc_schema.sql b/resources/sql/upgrade/20261124_iot_calc_schema.sql
+index d34c3a4..c1b62a5 100644
+--- a/resources/sql/upgrade/20261124_iot_calc_schema.sql
++++ b/resources/sql/upgrade/20261124_iot_calc_schema.sql
+@@ -11,7 +11,8 @@
+ --   3) 账号口令使用占位符（${IOT_CALC_RW_PASSWORD} / ${IOT_CALC_RO_PASSWORD}），由部署注入，
+ --      不在脚本中硬编码任何真实口令；GRANT 仅授权所需最小权限。
+ --   4) 幂等：schema/表/账号均 IF NOT EXISTS 或 information_schema 判存，可重复执行无副作用。
+---   5) 执行纪律：backend/scripts/sql-exec.sh 每条语句单独一次调用。
++--   5) 执行纪律：backend/scripts/sql-exec.sh 每条语句单独一次调用；该通道按「;\n」切分，
++--      故每条语句必须独占一行（含 PREPARE/EXECUTE/DEALLOCATE 分别成行），同行多语句会 SQLERROR。
+ -- ============================================================
+ 
+ -- ① 独立 schema（Q1 定版 A：同实例分 schema，iot_calc 与业务库同 MySQL 实例）
+@@ -61,7 +62,9 @@ SET @rw_user_exists = (SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES W
+ SET @rw_create = IF(@rw_user_exists = 0,
+   'CREATE USER ''iot_calc_rw''@''%'' IDENTIFIED BY ''${IOT_CALC_RW_PASSWORD}''',
+   'SELECT 1');
+-PREPARE rw_stmt FROM @rw_create; EXECUTE rw_stmt; DEALLOCATE PREPARE rw_stmt;
++PREPARE rw_stmt FROM @rw_create;
++EXECUTE rw_stmt;
++DEALLOCATE PREPARE rw_stmt;
+ GRANT SELECT, INSERT, UPDATE ON `iot_calc`.* TO 'iot_calc_rw'@'%';
+ FLUSH PRIVILEGES;
+ 
+@@ -70,7 +73,9 @@ SET @ro_user_exists = (SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES W
+ SET @ro_create = IF(@ro_user_exists = 0,
+   'CREATE USER ''iot_calc_ro''@''%'' IDENTIFIED BY ''${IOT_CALC_RO_PASSWORD}''',
+   'SELECT 1');
+-PREPARE ro_stmt FROM @ro_create; EXECUTE ro_stmt; DEALLOCATE PREPARE ro_stmt;
++PREPARE ro_stmt FROM @ro_create;
++EXECUTE ro_stmt;
++DEALLOCATE PREPARE ro_stmt;
+ GRANT SELECT ON `iot_calc`.* TO 'iot_calc_ro'@'%';
+ FLUSH PRIVILEGES;
+ 

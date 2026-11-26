@@ -1,0 +1,3339 @@
+diff --git a/ingest/README.md b/ingest/README.md
+index 6b1d0f1..babf3c2 100644
+--- a/ingest/README.md
++++ b/ingest/README.md
+@@ -8,11 +8,31 @@
+ 
+ ```
+ ingest/
+-├── cmd/ingestd/    # 服务入口
+-├── internal/       # 内部模块（流水线/校验/写库/缓存，随任务落位）
++├── cmd/ingestd/       # 服务入口（占位，TASK-0027 接线）
++├── internal/
++│   ├── message/       # 统一消息模型 v1.1.0 §3.2 解析器（信封纪律：空 points 4001、单消息 ≤500）
++│   ├── quality/       # CONV-02 质量码 0-10 枚举与产品文本码映射（判定逻辑归 TASK-0028）
++│   ├── snapshot/      # 配置快照 Schema v1.0.1 类型/校验、拉取客户端抽象、本地缓存原子替换
++│   ├── tdengine/      # 超级表契约 v1.0.0 写入侧：kind/表映射、附录 B DDL、INSERT 构造、假执行器
++│   ├── cache/         # Redis 点位缓存抽象（值形态 v/q/ts，§3.5）+ 内存假实现
++│   └── pipeline/      # 内核流水线组装：Consumer→Parser→校验→Batcher→Writer→Cache
+ └── go.mod
+ ```
+ 
++## 内核流水线（TASK-0073）
++
++- 组件间只经接口交互；假实现（内存 channel 消费源、记录式 TDengine 执行器、内存去重、
++  内存缓存、httptest 假快照端点）在 TASK-0027~0029 接线时零改动替换。
++- 处理顺序冻结口径：验令牌与租户（租户必须来自消费侧令牌解析产物）→ 查配置快照 →
++  未知编码死信不落库 → 质量判定挂点 → 按 data_type 分发写 st_point_num / st_point_state
++  + 更新点位缓存。
++- 并发模型（起步口径）：单消费循环 + 有界队列（消费源有界通道，满则背压阻塞，
++  QoS1 至少一次语义下安全）+ 单 flusher；攒批水位（默认 500，FEAT-0009 口径 100-500）
++  或定时（默认 200ms）触发；攒批缓冲有界，满时丢最旧并计数（ADR-0014 FIFO 口径），
++  写失败整批重排重试且受同上限约束。
++- 契约符合性测试以 `Contract` 命名（`go test ./... -run 'Contract' -v`），
++  样例逐字段取自三份冻结契约（CONV-03）。
++
+ ## 构建与检查
+ 
+ ```bash
+diff --git a/ingest/internal/cache/cache.go b/ingest/internal/cache/cache.go
+new file mode 100644
+index 0000000..5831dd6
+--- /dev/null
++++ b/ingest/internal/cache/cache.go
+@@ -0,0 +1,81 @@
++// Package cache 承载 Redis 点位缓存抽象（FEAT-0009 处理顺序第 5 步「+ 更新 Redis 点位缓存」）。
++//
++// 值形态契约：统一消息模型 v1.1.0 §3.5「GET /openapi/v1/items/realtime —— 优先读 Redis，
++// 返回 v / q / ts」，缓存 JSON 恰为 {"v","q","ts"} 三键。
++//
++// 留白与口径：
++//   - 缓存键 scheme 上游未定版，本实现拟定 iot:{tenant}:point:{pointCode}（TASK-0029 接线
++//     真 Redis 时如需调整只改 Key 函数与对应读取方）；
++//   - 本包只提供抽象与内存假实现；真 Redis 客户端实现归 TASK-0029，接口零改动替换。
++//     测试环境不连真实 Redis（后端占用 db0，隔离口径见 TASK-0073 报告）。
++package cache
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"sync"
++)
++
++// Value 点位缓存值：实时值 v、质量码 q（CONV-02 0-10）、采样时间 ts（毫秒）。
++type Value struct {
++	V  float64 `json:"v"`
++	Q  int     `json:"q"`
++	Ts int64   `json:"ts"`
++}
++
++// ErrCacheMiss 点位缓存未命中。
++var ErrCacheMiss = errors.New("cache: 点位缓存未命中")
++
++// PointCache 点位缓存抽象。
++type PointCache interface {
++	// SetPoint 覆盖写入点位最新值。
++	SetPoint(ctx context.Context, tenant, pointCode string, v Value) error
++	// GetPoint 读取点位最新值；未命中返回 ErrCacheMiss（未知编码/无数据不得静默给零值）。
++	GetPoint(ctx context.Context, tenant, pointCode string) (Value, error)
++}
++
++// Key 点位缓存键（拟定 scheme：iot:{tenant}:point:{pointCode}；见包注释留白声明）。
++func Key(tenant, pointCode string) string {
++	return fmt.Sprintf("iot:%s:point:%s", tenant, pointCode)
++}
++
++// MemoryPointCache 内存假实现：内部以 JSON 字节存储（与真 Redis 的字符串语义一致），
++// 并发安全（RWMutex）。键空间随配置点位规模有界，无需淘汰。
++type MemoryPointCache struct {
++	mu sync.RWMutex
++	m  map[string][]byte
++}
++
++// NewMemoryPointCache 创建空缓存。
++func NewMemoryPointCache() *MemoryPointCache {
++	return &MemoryPointCache{m: make(map[string][]byte)}
++}
++
++// SetPoint 覆盖写入（JSON 编码 v/q/ts 三键形态）。
++func (c *MemoryPointCache) SetPoint(_ context.Context, tenant, pointCode string, v Value) error {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return fmt.Errorf("cache: 编码点位值失败: %w", err)
++	}
++	c.mu.Lock()
++	c.m[Key(tenant, pointCode)] = b
++	c.mu.Unlock()
++	return nil
++}
++
++// GetPoint 读取并解码；未命中返回 ErrCacheMiss。
++func (c *MemoryPointCache) GetPoint(_ context.Context, tenant, pointCode string) (Value, error) {
++	c.mu.RLock()
++	b, ok := c.m[Key(tenant, pointCode)]
++	c.mu.RUnlock()
++	if !ok {
++		return Value{}, ErrCacheMiss
++	}
++	var v Value
++	if err := json.Unmarshal(b, &v); err != nil {
++		return Value{}, fmt.Errorf("cache: 解码点位值失败: %w", err)
++	}
++	return v, nil
++}
+diff --git a/ingest/internal/cache/cache_contract_test.go b/ingest/internal/cache/cache_contract_test.go
+new file mode 100644
+index 0000000..2f77acd
+--- /dev/null
++++ b/ingest/internal/cache/cache_contract_test.go
+@@ -0,0 +1,86 @@
++package cache_test
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	"net.otlab/ingest/internal/cache"
++)
++
++// 契约依据：统一消息模型 v1.1.0 §3.5「GET /openapi/v1/items/realtime —— 优先读 Redis，
++// 返回 v / q / ts」。点位缓存 JSON 形态必须恰为 v / q / ts 三键（键名逐字，无额外键）。
++func TestContractPointCacheValueShape(t *testing.T) {
++	b, err := json.Marshal(cache.Value{V: 98231.4, Q: 0, Ts: 1795211995000})
++	if err != nil {
++		t.Fatalf("Marshal error: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("Unmarshal error: %v", err)
++	}
++	if len(m) != 3 {
++		t.Errorf("缓存 JSON 键数 = %d (%v), want 恰 3 键 v/q/ts", len(m), m)
++	}
++	for _, k := range []string{"v", "q", "ts"} {
++		if _, ok := m[k]; !ok {
++			t.Errorf("缓存 JSON 缺键 %q（§3.5 返回 v / q / ts）", k)
++		}
++	}
++	for k := range m {
++		switch k {
++		case "v", "q", "ts":
++		default:
++			t.Errorf("缓存 JSON 出现契约外键 %q", k)
++		}
++	}
++}
++
++// 契约依据：同一 JSON 形态从缓存读回（读路径与写路径同形态，§3.5 realtime 直接返回缓存内容）。
++func TestContractPointCacheRoundTripSameShape(t *testing.T) {
++	c := cache.NewMemoryPointCache()
++	ctx := context.Background()
++	want := cache.Value{V: 132.5, Q: 0, Ts: 1795211995000}
++	if err := c.SetPoint(ctx, "group_a", "F01_WS01_EQ001_M02", want); err != nil {
++		t.Fatalf("SetPoint error: %v", err)
++	}
++	got, err := c.GetPoint(ctx, "group_a", "F01_WS01_EQ001_M02")
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if got != want {
++		t.Errorf("GetPoint = %+v, want %+v", got, want)
++	}
++	// 未知编码（X99，TC-0009 步骤 3 语义对应缓存侧）未命中必须显式报错，不静默给零值。
++	if _, err := c.GetPoint(ctx, "group_a", "X99"); err != cache.ErrCacheMiss {
++		t.Errorf("未知编码 GetPoint err = %v, want ErrCacheMiss", err)
++	}
++}
++
++// 覆盖写语义：同键后写覆盖先写（最新值缓存，§3.5「优先读 Redis」返回实时值）。
++func TestMemoryPointCacheOverwrite(t *testing.T) {
++	c := cache.NewMemoryPointCache()
++	ctx := context.Background()
++	_ = c.SetPoint(ctx, "group_a", "F01_WS01_EQ001_M01", cache.Value{V: 1, Q: 0, Ts: 1})
++	_ = c.SetPoint(ctx, "group_a", "F01_WS01_EQ001_M01", cache.Value{V: 2, Q: 3, Ts: 2})
++	got, err := c.GetPoint(ctx, "group_a", "F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if got.V != 2 || got.Q != 3 || got.Ts != 2 {
++		t.Errorf("GetPoint = %+v, want 最新写入 {2 3 2}", got)
++	}
++}
++
++// 缓存键按（租户，点位）隔离：跨租户/跨点位互不可见。
++func TestMemoryPointCacheKeyIsolation(t *testing.T) {
++	c := cache.NewMemoryPointCache()
++	ctx := context.Background()
++	_ = c.SetPoint(ctx, "group_a", "M01", cache.Value{V: 1, Q: 0, Ts: 1})
++	if _, err := c.GetPoint(ctx, "group_b", "M01"); err != cache.ErrCacheMiss {
++		t.Errorf("跨租户 GetPoint err = %v, want ErrCacheMiss", err)
++	}
++	if _, err := c.GetPoint(ctx, "group_a", "M02"); err != cache.ErrCacheMiss {
++		t.Errorf("跨点位 GetPoint err = %v, want ErrCacheMiss", err)
++	}
++}
+diff --git a/ingest/internal/message/message.go b/ingest/internal/message/message.go
+new file mode 100644
+index 0000000..c1b55f5
+--- /dev/null
++++ b/ingest/internal/message/message.go
+@@ -0,0 +1,104 @@
++// Package message 承载统一消息模型（冻结契约 v1.1.0 §3.2）的线上形态与解析。
++//
++// 契约纪律（§3.2）：
++//   - 消息只认 pointCode，不认点位 id——id 是管理系统内部概念；
++//   - ts 为设备侧采样时间（毫秒），与 sentAt（发送时间）分开，迟到数据按 ts 落库；
++//   - 单消息 points 不超过 500 条，超限网关侧拆包；batchId 用于整批幂等与对账；
++//   - quality 由网关能判断的先填，超限类质量码由接入服务按点位 min/max 二次判定后覆盖写入（判定挂点见 internal/quality 与流水线，完整逻辑归 TASK-0028）。
++//
++// 解析容错：对未知字段宽松（忽略）——网关端演进字段不得打停接入面；
++// 信封级纪律（tenant/batchId 必填、空 points、超限）按契约整批拒绝。
++package message
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++)
++
++// MaxPointsPerMessage 契约批量上限：单消息 points 不超过 500 条（v1.1.0 §3.2）。
++const MaxPointsPerMessage = 500
++
++// CodeEmptyPoints 空 points 的拒绝码（REQ-0013：空数据=空 points 4001；TC-0009 步骤 6）。
++const CodeEmptyPoints int64 = 4001
++
++// Point 统一消息模型点位条目（§3.2 示例对象形态）。
++type Point struct {
++	PointCode string  `json:"pointCode"` // 消息只认编码不认 id
++	Ts        int64   `json:"ts"`        // 设备侧采样时间（毫秒），与 sentAt 分开
++	Value     float64 `json:"value"`
++	Quality   int     `json:"quality"` // 网关先填；超限类由接入按 min/max 二次判定覆盖（TASK-0028）
++}
++
++// Envelope 统一消息模型信封（§3.2 上行消息 JSON）。
++type Envelope struct {
++	Tenant  string  `json:"tenant"`
++	Gateway string  `json:"gateway"`
++	BatchID string  `json:"batchId"` // 整批幂等与对账键
++	SentAt  int64   `json:"sentAt"`  // 发送时间（毫秒），与 ts 分开
++	Points  []Point `json:"points"`
++}
++
++// Error 解析/纪律拒绝错误。Code 为契约已定数值码（4001=空 points）；
++// 契约未定数值码的拒绝（超限等）Code=0，HTTP 响应映射归 TASK-0027，不臆造码值。
++type Error struct {
++	Code int64
++	Msg  string
++}
++
++func (e *Error) Error() string {
++	if e.Code != 0 {
++		return fmt.Sprintf("message: code %d: %s", e.Code, e.Msg)
++	}
++	return "message: " + e.Msg
++}
++
++// CodeOf 返回 err 的契约数值码；非 *Error 或未定数值码返回 0。
++func CodeOf(err error) int64 {
++	var e *Error
++	if errors.As(err, &e) {
++		return e.Code
++	}
++	return 0
++}
++
++var (
++	// ErrEmptyPoints 空 points（code 4001）。
++	ErrEmptyPoints = &Error{Code: CodeEmptyPoints, Msg: "空 points：空数据整批拒绝"}
++	// ErrTooManyPoints 单消息 points 超过 500 条上限，整批拒绝（契约未给数值码，Code=0）。
++	ErrTooManyPoints = &Error{Msg: fmt.Sprintf("points 超过单消息上限 %d 条，整批拒绝", MaxPointsPerMessage)}
++	// ErrMissingTenant 缺 tenant：租户是选库（iot_<tenant_code>）与隔离的根，缺则无法处理。
++	ErrMissingTenant = &Error{Msg: "缺少 tenant 字段"}
++	// ErrMissingBatchID 缺 batchId：整批幂等与对账依赖 batchId，缺则整批拒绝。
++	ErrMissingBatchID = &Error{Msg: "缺少 batchId 字段（batchId 用于整批幂等与对账）"}
++)
++
++// Parse 解析统一消息模型线上形态 JSON 并执行信封级纪律校验。
++// 整批级拒绝返回 (nil, err)；JSON 非法同样整批拒绝。
++func Parse(data []byte) (*Envelope, error) {
++	var env Envelope
++	if err := json.Unmarshal(data, &env); err != nil {
++		return nil, &Error{Msg: "JSON 解析失败: " + err.Error()}
++	}
++	if env.Tenant == "" {
++		return nil, ErrMissingTenant
++	}
++	if env.BatchID == "" {
++		return nil, ErrMissingBatchID
++	}
++	// 空 points：空数据 4001（REQ-0013 / TC-0009 步骤 6）。points 键省略视同空。
++	if len(env.Points) == 0 {
++		return nil, ErrEmptyPoints
++	}
++	// 批量上限：单消息 points 不超过 500 条，超限整批拒绝（TC-0009 步骤 7）。
++	if len(env.Points) > MaxPointsPerMessage {
++		return nil, ErrTooManyPoints
++	}
++	return &env, nil
++}
++
++// Parser 是 Parse 的可注入形态，供流水线组装与 TASK-0027 接线替换。
++type Parser struct{}
++
++// Parse 实现 pipeline.Parser 语义。
++func (Parser) Parse(data []byte) (*Envelope, error) { return Parse(data) }
+diff --git a/ingest/internal/message/message_contract_test.go b/ingest/internal/message/message_contract_test.go
+new file mode 100644
+index 0000000..1c20189
+--- /dev/null
++++ b/ingest/internal/message/message_contract_test.go
+@@ -0,0 +1,147 @@
++package message_test
++
++import (
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/message"
++)
++
++// contractUpstreamJSON 逐字取自统一消息模型契约 v1.1.0 §3.2「上行消息 JSON」示例，
++// 除缩进对齐外不改任何字段名与取值（字段纪律：消息只认 pointCode 不认 id）。
++const contractUpstreamJSON = `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "20261121-100000-0001",
++  "sentAt": 1795212000000,
++  "points": [
++    {"pointCode": "F01_WS01_EQ001_M01", "ts": 1795211995000, "value": 98231.4, "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_M02", "ts": 1795211995000, "value": 132.5,  "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_S01", "ts": 1795211995000, "value": 1,      "quality": 0}
++  ]
++}`
++
++// 契约依据：v1.1.0 §3.2 上行消息 JSON 示例，逐字段断言信封与点位纪律。
++func TestContractParseUpstreamJSONExample(t *testing.T) {
++	env, err := message.Parse([]byte(contractUpstreamJSON))
++	if err != nil {
++		t.Fatalf("Parse error: %v", err)
++	}
++	if env.Tenant != "group_a" {
++		t.Errorf("Tenant = %q, want %q", env.Tenant, "group_a")
++	}
++	if env.Gateway != "GW_F01_01" {
++		t.Errorf("Gateway = %q, want %q", env.Gateway, "GW_F01_01")
++	}
++	if env.BatchID != "20261121-100000-0001" {
++		t.Errorf("BatchID = %q, want %q", env.BatchID, "20261121-100000-0001")
++	}
++	if env.SentAt != 1795212000000 {
++		t.Errorf("SentAt = %d, want 1795212000000", env.SentAt)
++	}
++	if len(env.Points) != 3 {
++		t.Fatalf("len(Points) = %d, want 3", len(env.Points))
++	}
++	wantPoints := []message.Point{
++		{PointCode: "F01_WS01_EQ001_M01", Ts: 1795211995000, Value: 98231.4, Quality: 0},
++		{PointCode: "F01_WS01_EQ001_M02", Ts: 1795211995000, Value: 132.5, Quality: 0},
++		{PointCode: "F01_WS01_EQ001_S01", Ts: 1795211995000, Value: 1, Quality: 0},
++	}
++	for i, want := range wantPoints {
++		got := env.Points[i]
++		if got != want {
++			t.Errorf("Points[%d] = %+v, want %+v", i, got, want)
++		}
++	}
++}
++
++// 契约依据：v1.1.0 §3.2 字段纪律——ts 为设备侧采样时间（毫秒），与 sentAt（发送时间）分开，
++// 迟到数据按 ts 落库；解析结果两者必须独立保留。
++func TestContractTsAndSentAtKeptDistinct(t *testing.T) {
++	env, err := message.Parse([]byte(contractUpstreamJSON))
++	if err != nil {
++		t.Fatalf("Parse error: %v", err)
++	}
++	if env.SentAt == env.Points[0].Ts {
++		t.Errorf("SentAt == Points[0].Ts == %d, want distinct（ts 与 sentAt 分开）", env.SentAt)
++	}
++	if env.SentAt != 1795212000000 || env.Points[0].Ts != 1795211995000 {
++		t.Errorf("SentAt=%d Ts=%d, want 1795212000000 / 1795211995000", env.SentAt, env.Points[0].Ts)
++	}
++}
++
++// 契约依据：REQ-0013「空数据=空 points 4001」、TC-0009 步骤 6（空 points 消息 → 4001 拒绝）。
++// 样例信封字段取自契约示例，points 置空。
++func TestContractParseRejectsEmptyPointsWith4001(t *testing.T) {
++	empty := `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "20261121-100000-0001",
++  "sentAt": 1795212000000,
++  "points": []
++}`
++	env, err := message.Parse([]byte(empty))
++	if err == nil {
++		t.Fatal("Parse(empty points) error = nil, want 4001 reject")
++	}
++	if env != nil {
++		t.Errorf("Envelope = %+v, want nil", env)
++	}
++	var msgErr *message.Error
++	if !errors.As(err, &msgErr) {
++		t.Fatalf("error type = %T, want *message.Error", err)
++	}
++	if msgErr.Code != 4001 {
++		t.Errorf("Code = %d, want 4001", msgErr.Code)
++	}
++	if message.CodeOf(err) != 4001 {
++		t.Errorf("CodeOf = %d, want 4001", message.CodeOf(err))
++	}
++}
++
++// 契约依据：v1.1.0 §3.2「批量上限：单消息 points 不超过 500 条」；
++// REQ-0013 验收 3「单消息>500 整批拒绝」、TC-0009 步骤 7（501 条 → 整批拒绝）。
++// 点位对象字段沿用契约示例形态（pointCode/ts/value/quality）。
++func TestContractParseRejectsOverLimitWholeBatch(t *testing.T) {
++	var b strings.Builder
++	b.WriteString(`{"tenant": "group_a", "gateway": "GW_F01_01", "batchId": "20261121-100000-0001", "sentAt": 1795212000000, "points": [`)
++	for i := 0; i < 501; i++ {
++		if i > 0 {
++			b.WriteByte(',')
++		}
++		fmt.Fprintf(&b, `{"pointCode": "F01_WS01_EQ001_M%03d", "ts": 1795211995000, "value": 98231.4, "quality": 0}`, i)
++	}
++	b.WriteString(`]}`)
++	env, err := message.Parse([]byte(b.String()))
++	if err == nil {
++		t.Fatal("Parse(501 points) error = nil, want whole-batch reject")
++	}
++	if env != nil {
++		t.Errorf("Envelope = %+v, want nil（整批拒绝，不产出可写消息）", env)
++	}
++	if !errors.Is(err, message.ErrTooManyPoints) {
++		t.Errorf("error = %v, want ErrTooManyPoints", err)
++	}
++}
++
++// 契约依据：v1.1.0 §3.2「单消息 points 不超过 500 条」——恰好 500 条必须放行（网关侧拆包的分界）。
++func TestContractParseAcceptsExactly500Points(t *testing.T) {
++	var b strings.Builder
++	b.WriteString(`{"tenant": "group_a", "gateway": "GW_F01_01", "batchId": "20261121-100000-0001", "sentAt": 1795212000000, "points": [`)
++	for i := 0; i < 500; i++ {
++		if i > 0 {
++			b.WriteByte(',')
++		}
++		fmt.Fprintf(&b, `{"pointCode": "F01_WS01_EQ001_M%03d", "ts": 1795211995000, "value": 132.5, "quality": 0}`, i)
++	}
++	b.WriteString(`]}`)
++	env, err := message.Parse([]byte(b.String()))
++	if err != nil {
++		t.Fatalf("Parse(500 points) error = %v, want nil", err)
++	}
++	if len(env.Points) != 500 {
++		t.Errorf("len(Points) = %d, want 500", len(env.Points))
++	}
++}
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+new file mode 100644
+index 0000000..c423c74
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -0,0 +1,585 @@
++// Package pipeline 组装采集接入内核流水线：
++//
++//	Consumer(假 EMQX=内存 channel) → Parser → [查快照→未知死信→禁用丢弃→去重→质量判定挂点]
++//	→ Batcher(有界缓冲/水位/丢最旧/失败重排) → Writer(假 TDengine 执行器) → PointCache 更新
++//
++// 组件间只经接口交互（Consumer/Parser/SnapshotLookup/BatchDeduper/PointDeduper/
++// DeadLetterSink/Writer/PointCache + QualityJudge 函数挂点），TASK-0027~0029 接线时
++// 以真实实现零改动替换假实现。
++//
++// 并发模型（brief 决策 5，起步口径）：
++//   - 单消费循环：Run 内单个 goroutine 顺序处理消息（解析→校验→入攒批缓冲），
++//     不并行处理批次——有界队列 = Consumer 提供的有界消息通道（假 EMQX 为有界 channel；
++//     真实 MQTT 订阅同样共享有界缓冲）。队列满时消费循环阻塞（背压），
++//     在 MQTT QoS1 至少一次语义下阻塞是安全的（消息重投，幂等键 (pointCode,ts) + batchId 兜底）。
++//   - 单 flusher goroutine：按水位（缓冲 ≥ BatchSize）或定时（FlushInterval，FEAT-0009
++//     「攒批 100-500 条或 200ms」）触发，串行写库并更新缓存。
++//   - 攒批缓冲有界（BufferCap）：满时丢最旧并计数（对齐 ADR-0014 缓存 FIFO 丢最旧口径），
++//     绝不无界增长；写失败整批重排回缓冲头部重试（重排后仍受 BufferCap 约束）。
++//
++// 处理顺序（统一消息模型 v1.1.0 §3.2 冻结口径）：验令牌与租户（挂点：租户必须来自
++// Consumer 侧令牌解析产物，不从消息自带 tenant 选库）→ 按 pointCode 查配置快照 →
++// 未知编码进死信计数告警、不落库 → 质量判定（挂点，完整逻辑归 TASK-0028）→
++// 按 data_type 分发写 st_point_num / st_point_state + 更新 Redis 点位缓存。
++//
++// 内核简化口径（0027/0028 接线时收紧）：
++//   - batchId / (pointCode, ts) 幂等去重为内存假实现（标记即接受）；真实去重（崩溃安全）
++//     归 TASK-0028 经存储实现；
++//   - 整批标记在逐点校验前完成（接受即标记）；写失败重排后的重试不再过点级去重
++//     （同一批已在接受时标记），避免自吞重排行。
++package pipeline
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// ---- 组件接口（假实现替换点）----
++
++// Inbound 消费入站消息。
++type Inbound struct {
++	// Tenant 令牌解析出的租户（处理顺序第 1 步「验令牌与租户」的产物挂点）。
++	// 必填：租户选库（iot_<tenant_code>）只信任令牌侧，不用消息自带 tenant。
++	Tenant string
++	// Payload 统一消息模型线上形态 JSON（MQTT 报文与 HTTP 请求体同构）。
++	Payload []byte
++}
++
++// Consumer 消费源抽象。假 EMQX = 内存 channel 注入；TASK-0027 接真 EMQX 订阅替换。
++// 返回的通道必须是有界的（有界队列起步口径，见包注释并发模型）。
++type Consumer interface {
++	Messages() <-chan Inbound
++}
++
++// Parser 解析器抽象。message.Parser 为契约实现。
++type Parser interface {
++	Parse(data []byte) (*message.Envelope, error)
++}
++
++// SnapshotLookup 配置快照查询抽象（处理顺序第 2 步）。*snapshot.Cache 为实现。
++type SnapshotLookup interface {
++	LookupPoint(pointCode string) (*snapshot.Point, bool)
++}
++
++// BatchDeduper batchId 整批幂等挂点（真实存储实现归 TASK-0028）。
++type BatchDeduper interface {
++	SeenBatch(batchID string) bool
++	MarkBatch(batchID string)
++}
++
++// PointDeduper (pointCode, ts) 幂等键挂点（真实存储实现归 TASK-0028）。
++type PointDeduper interface {
++	SeenPoint(pointCode string, ts int64) bool
++	MarkPoint(pointCode string, ts int64)
++}
++
++// QualityJudge 质量判定挂点（处理顺序第 4 步）。完整判定逻辑（量程二次判定覆盖、
++// 时间校验纠偏等）归 TASK-0028；内核默认网关 quality 直通。
++// 返回值必须是 CONV-02 质量码（internal/quality 0-10 枚举）。
++type QualityJudge func(cfg *snapshot.Point, p *message.Point) int
++
++// PassthroughJudge 默认判定挂点：网关能判断的先填，内核不做二次判定（TASK-0028 接手）。
++func PassthroughJudge(_ *snapshot.Point, p *message.Point) int { return p.Quality }
++
++// DeadLetterReason 死信/丢弃原因（挂点细分，运维监控 FEAT-0020 消费计数）。
++type DeadLetterReason string
++
++// 死信/丢弃原因枚举。
++const (
++	// DeadLetterUnknownCode 未知编码（快照未命中）：死信计数告警、不落库（§3.2 处理顺序第 3 步）。
++	DeadLetterUnknownCode DeadLetterReason = "unknown_code"
++	// DeadLetterDisabledPoint 点位禁用（status=0）：丢弃其数据并计数告警。
++	DeadLetterDisabledPoint DeadLetterReason = "disabled_point"
++	// DeadLetterInvalidEnvelope 信封级整批拒绝（空 points 4001 / 超 500 整批 / 缺 tenant / JSON 非法）。
++	DeadLetterInvalidEnvelope DeadLetterReason = "invalid_envelope"
++	// DeadLetterInvalidConfig 点位配置非法（dataType 越界等，防御分支）。
++	DeadLetterInvalidConfig DeadLetterReason = "invalid_config"
++)
++
++// DeadLetterRecord 一次死信/丢弃记录。
++type DeadLetterRecord struct {
++	Reason  DeadLetterReason
++	Tenant  string
++	BatchID string
++	Point   *message.Point
++}
++
++// DeadLetterSink 死信/丢弃出口挂点（计数与告警）。
++type DeadLetterSink interface {
++	OnDeadLetter(reason DeadLetterReason, tenant, batchID string, p *message.Point)
++}
++
++// DeadLetterFunc 函数适配器。
++type DeadLetterFunc func(reason DeadLetterReason, tenant, batchID string, p *message.Point)
++
++// OnDeadLetter 实现 DeadLetterSink。
++func (f DeadLetterFunc) OnDeadLetter(reason DeadLetterReason, tenant, batchID string, p *message.Point) {
++	f(reason, tenant, batchID, p)
++}
++
++// Writer 攒批写出口抽象。tdengine.Writer（SQL 构造 + Executor）为实现；
++// 真 TDengine 连接归 TASK-0029。
++type Writer interface {
++	WritePoints(ctx context.Context, rows []tdengine.PointRow) error
++}
++
++// ---- 配置与组装 ----
++
++// Config 流水线配置（零值字段取默认）。
++type Config struct {
++	// BatchSize 攒批水位（缓冲达到即立即写）。默认 500（FEAT-0009 攒批 100-500 条口径上限）。
++	BatchSize int
++	// FlushInterval 攒批定时窗口。默认 200ms（FEAT-0009）。
++	FlushInterval time.Duration
++	// BufferCap 攒批缓冲上限（满时丢最旧并计数）。默认 4096。
++	BufferCap int
++	// DedupCap batchId / (pointCode,ts) 内存去重表容量（FIFO 淘汰）。默认 65536。
++	DedupCap int
++}
++
++// Deps 组件依赖（全部接口注入；nil 的可选依赖取默认）。
++type Deps struct {
++	Consumer  Consumer // 必填
++	Parser    Parser   // 必填
++	Snapshots SnapshotLookup // 必填（配置快照缓存）
++	Batches   BatchDeduper   // 必填（假实现：NewMemoryBatchDeduper）
++	Points    PointDeduper   // 必填（假实现：NewMemoryPointDeduper）
++	Judge     QualityJudge   // 可选：nil → PassthroughJudge
++	Dead      DeadLetterSink // 可选：nil → 丢弃（仅计数不外发）
++	Writer    Writer         // 必填（假实现：tdengine.Writer + tdengine.FakeExecutor）
++	Cache     cache.PointCache // 必填（假实现：cache.NewMemoryPointCache）
++}
++
++// Pipeline 组装完成的内核流水线。Run 一次只允许一个消费循环实例。
++type Pipeline struct {
++	cfg  Config
++	deps Deps
++
++	judgeMu sync.RWMutex
++	judge   QualityJudge
++
++	bufMu   sync.Mutex
++	buf     []tdengine.PointRow
++	flushCh chan struct{}
++
++	stats statsCounters
++}
++
++// Assemble 校验依赖并应用配置默认值。
++func Assemble(cfg Config, deps Deps) (*Pipeline, error) {
++	if deps.Consumer == nil {
++		return nil, errors.New("pipeline: 缺 Consumer")
++	}
++	if deps.Parser == nil {
++		return nil, errors.New("pipeline: 缺 Parser")
++	}
++	if deps.Snapshots == nil {
++		return nil, errors.New("pipeline: 缺 SnapshotLookup（配置快照缓存）")
++	}
++	if deps.Batches == nil {
++		return nil, errors.New("pipeline: 缺 BatchDeduper")
++	}
++	if deps.Points == nil {
++		return nil, errors.New("pipeline: 缺 PointDeduper")
++	}
++	if deps.Writer == nil {
++		return nil, errors.New("pipeline: 缺 Writer")
++	}
++	if deps.Cache == nil {
++		return nil, errors.New("pipeline: 缺 PointCache")
++	}
++	if cfg.BatchSize == 0 {
++		cfg.BatchSize = 500
++	}
++	if cfg.FlushInterval == 0 {
++		cfg.FlushInterval = 200 * time.Millisecond
++	}
++	if cfg.BufferCap == 0 {
++		cfg.BufferCap = 4096
++	}
++	if cfg.DedupCap == 0 {
++		cfg.DedupCap = 65536
++	}
++	if cfg.BatchSize < 1 || cfg.BatchSize > 500 {
++		return nil, fmt.Errorf("pipeline: BatchSize=%d 超出 1-500（FEAT-0009 攒批口径）", cfg.BatchSize)
++	}
++	if cfg.FlushInterval <= 0 {
++		return nil, fmt.Errorf("pipeline: FlushInterval=%v 必须为正", cfg.FlushInterval)
++	}
++	if cfg.BufferCap < 1 {
++		return nil, fmt.Errorf("pipeline: BufferCap=%d 必须为正", cfg.BufferCap)
++	}
++	if deps.Judge == nil {
++		deps.Judge = PassthroughJudge
++	}
++	if deps.Dead == nil {
++		deps.Dead = DeadLetterFunc(func(DeadLetterReason, string, string, *message.Point) {})
++	}
++	return &Pipeline{
++		cfg:     cfg,
++		deps:    deps,
++		judge:   deps.Judge,
++		flushCh: make(chan struct{}, 1),
++	}, nil
++}
++
++// SetJudge 替换质量判定挂点（并发安全；Run 前设置，Run 中替换亦可见）。
++func (p *Pipeline) SetJudge(j QualityJudge) {
++	p.judgeMu.Lock()
++	p.judge = j
++	p.judgeMu.Unlock()
++}
++
++// ---- 运行 ----
++
++// Run 启动单消费循环与 flusher，阻塞直到 ctx 取消或消息通道关闭。
++// 一次 Pipeline 实例只运行一个消费循环（并发模型见包注释）。
++func (p *Pipeline) Run(ctx context.Context) error {
++	go p.flusher(ctx)
++	msgs := p.deps.Consumer.Messages()
++	for {
++		select {
++		case <-ctx.Done():
++			return nil // 优雅停机：缓冲中未写出行随进程退出丢弃（内核口径，真实部署由 0027 收口）
++		case in, ok := <-msgs:
++			if !ok {
++				return nil
++			}
++			p.processOne(ctx, in)
++		}
++	}
++}
++
++// ---- 处理顺序（冻结五步）----
++
++// processOne 处理一条入站消息（单消费循环内串行执行）。
++func (p *Pipeline) processOne(ctx context.Context, in Inbound) {
++	p.stats.ReceivedBatches.Add(1)
++
++	// 第 1 步：验令牌与租户（挂点）。租户只来自令牌解析产物；缺租户整批拒绝。
++	if in.Tenant == "" {
++		p.rejectWholeBatch(in, "")
++		return
++	}
++
++	env, err := p.deps.Parser.Parse(in.Payload)
++	if err != nil {
++		// 信封级整批拒绝：空 points 4001 / 超 500 / 缺 batchId / JSON 非法。
++		p.rejectWholeBatch(in, "")
++		return
++	}
++
++	// batchId 整批幂等（标记即接受，内核简化口径；崩溃安全归 TASK-0028）。
++	if p.deps.Batches.SeenBatch(env.BatchID) {
++		p.stats.DuplicateBatches.Add(1)
++		return
++	}
++	p.deps.Batches.MarkBatch(env.BatchID)
++
++	judge := p.currentJudge()
++	rows := make([]tdengine.PointRow, 0, len(env.Points))
++	for i := range env.Points {
++		pt := &env.Points[i]
++
++		// 第 2、3 步：按 pointCode 查配置快照；未知编码死信计数告警、不落库。
++		cfgPt, ok := p.deps.Snapshots.LookupPoint(pt.PointCode)
++		if !ok {
++			p.stats.DeadLettered.Add(1)
++			p.deps.Dead.OnDeadLetter(DeadLetterUnknownCode, in.Tenant, env.BatchID, pt)
++			continue
++		}
++		if cfgPt.Disabled() {
++			p.stats.DisabledDiscarded.Add(1)
++			p.deps.Dead.OnDeadLetter(DeadLetterDisabledPoint, in.Tenant, env.BatchID, pt)
++			continue
++		}
++
++		// (pointCode, ts) 幂等键（内核简化口径同 batchId）。
++		if p.deps.Points.SeenPoint(pt.PointCode, pt.Ts) {
++			p.stats.DuplicatePoints.Add(1)
++			continue
++		}
++		p.deps.Points.MarkPoint(pt.PointCode, pt.Ts)
++
++		// 第 4 步：质量判定（挂点；CONV-02 质量码口径见 internal/quality）。
++		q := judge(cfgPt, pt)
++
++		kind, ok := tdengine.KindFor(cfgPt.DataType)
++		if !ok {
++			p.stats.DeadLettered.Add(1)
++			p.deps.Dead.OnDeadLetter(DeadLetterInvalidConfig, in.Tenant, env.BatchID, pt)
++			continue
++		}
++
++		// 第 5 步前半：按 data_type 分发构造写入行（标签取自配置快照）。
++		rows = append(rows, tdengine.PointRow{
++			TenantCode: in.Tenant, // 选库键：令牌解析租户（防写错靠写方选库）
++			TenantID:   cfgPt.TenantID,
++			PointCode:  pt.PointCode,
++			Kind:       kind,
++			DeptID:     deptIDOf(cfgPt),
++			Ts:         pt.Ts,
++			Value:      pt.Value,
++			Quality:    q,
++		})
++	}
++
++	for _, row := range rows {
++		p.push(row)
++	}
++}
++
++func (p *Pipeline) rejectWholeBatch(in Inbound, batchID string) {
++	p.stats.RejectedBatches.Add(1)
++	p.deps.Dead.OnDeadLetter(DeadLetterInvalidEnvelope, in.Tenant, batchID, nil)
++}
++
++func (p *Pipeline) currentJudge() QualityJudge {
++	p.judgeMu.RLock()
++	defer p.judgeMu.RUnlock()
++	return p.judge
++}
++
++func deptIDOf(p *snapshot.Point) int64 {
++	if p.DeptID != nil {
++		return *p.DeptID
++	}
++	return 0
++}
++
++// ---- 攒批缓冲（有界，满丢最旧并计数）与 flusher ----
++
++// push 入缓冲；满时丢最旧（FIFO，ADR-0014 口径）并计数；达到水位触发立即 flush。
++func (p *Pipeline) push(row tdengine.PointRow) {
++	p.bufMu.Lock()
++	if len(p.buf) >= p.cfg.BufferCap {
++		p.buf = p.buf[1:]
++		p.stats.DroppedOldest.Add(1)
++	}
++	p.buf = append(p.buf, row)
++	full := len(p.buf) >= p.cfg.BatchSize
++	p.bufMu.Unlock()
++	p.stats.AcceptedPoints.Add(1)
++	if full {
++		select {
++		case p.flushCh <- struct{}{}:
++		default: // 已有待处理信号
++		}
++	}
++}
++
++// flusher 定时 + 水位双触发（单 goroutine，串行写）。
++func (p *Pipeline) flusher(ctx context.Context) {
++	ticker := time.NewTicker(p.cfg.FlushInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			p.flush(ctx)
++		case <-p.flushCh:
++			p.flush(ctx)
++		}
++	}
++}
++
++// flush 取缓冲头部（最旧）至多 BatchSize 行下发；失败整批重排回缓冲头部。
++func (p *Pipeline) flush(ctx context.Context) {
++	p.bufMu.Lock()
++	n := p.cfg.BatchSize
++	if len(p.buf) < n {
++		n = len(p.buf)
++	}
++	if n == 0 {
++		p.bufMu.Unlock()
++		return
++	}
++	batch := make([]tdengine.PointRow, n)
++	copy(batch, p.buf[:n])
++	p.buf = p.buf[n:]
++	p.bufMu.Unlock()
++
++	if err := p.deps.Writer.WritePoints(ctx, batch); err != nil {
++		p.stats.WriteFailures.Add(1)
++		p.requeueFront(batch)
++		return
++	}
++	p.stats.WrittenBatches.Add(1)
++	p.stats.WrittenPoints.Add(int64(len(batch)))
++	p.updateCache(ctx, batch)
++}
++
++// requeueFront 失败重排：整批放回缓冲头部重试；总量超上限时丢最旧并计数（不无界增长）。
++func (p *Pipeline) requeueFront(batch []tdengine.PointRow) {
++	p.bufMu.Lock()
++	defer p.bufMu.Unlock()
++	combined := make([]tdengine.PointRow, 0, len(batch)+len(p.buf))
++	combined = append(combined, batch...)
++	combined = append(combined, p.buf...)
++	if over := len(combined) - p.cfg.BufferCap; over > 0 {
++		combined = combined[over:]
++		p.stats.DroppedOldest.Add(int64(over))
++	}
++	p.buf = combined
++	p.stats.RequeuedRows.Add(int64(len(batch)))
++}
++
++// updateCache 第 5 步后半：写库成功后更新 Redis 点位缓存（v/q/ts）。
++func (p *Pipeline) updateCache(ctx context.Context, batch []tdengine.PointRow) {
++	for _, r := range batch {
++		if err := p.deps.Cache.SetPoint(ctx, r.TenantCode, r.PointCode, cache.Value{V: r.Value, Q: r.Quality, Ts: r.Ts}); err != nil {
++			p.stats.CacheFailures.Add(1)
++		}
++	}
++}
++
++// ---- 观测 ----
++
++// Stats 流水线计数快照（运维监控 FEAT-0020 的数据源挂点）。
++type Stats struct {
++	ReceivedBatches  int64 // 收到入站消息数
++	RejectedBatches  int64 // 信封级整批拒绝（空 points 4001 / 超 500 / 缺租户 / JSON 非法）
++	DuplicateBatches int64 // batchId 整批去重命中数
++	DuplicatePoints  int64 // (pointCode, ts) 去重命中数
++	DeadLettered     int64 // 未知编码等死信计数
++	DisabledDiscarded int64 // 禁用点位丢弃计数
++	AcceptedPoints   int64 // 进入攒批缓冲的行数
++	DroppedOldest    int64 // 攒批缓冲满丢最旧行数（ADR-0014 FIFO 口径）
++	RequeuedRows     int64 // 写失败重排行数
++	WriteFailures    int64 // 写失败次数
++	WrittenBatches   int64 // 成功下发攒批次数
++	WrittenPoints    int64 // 成功写入行数
++	CacheFailures    int64 // 缓存更新失败次数
++}
++
++type statsCounters struct {
++	ReceivedBatches   atomic.Int64
++	RejectedBatches   atomic.Int64
++	DuplicateBatches  atomic.Int64
++	DuplicatePoints   atomic.Int64
++	DeadLettered      atomic.Int64
++	DisabledDiscarded atomic.Int64
++	AcceptedPoints    atomic.Int64
++	DroppedOldest     atomic.Int64
++	RequeuedRows      atomic.Int64
++	WriteFailures     atomic.Int64
++	WrittenBatches    atomic.Int64
++	WrittenPoints     atomic.Int64
++	CacheFailures     atomic.Int64
++}
++
++// Stats 返回计数快照。
++func (p *Pipeline) Stats() Stats {
++	return Stats{
++		ReceivedBatches:   p.stats.ReceivedBatches.Load(),
++		RejectedBatches:   p.stats.RejectedBatches.Load(),
++		DuplicateBatches:  p.stats.DuplicateBatches.Load(),
++		DuplicatePoints:   p.stats.DuplicatePoints.Load(),
++		DeadLettered:      p.stats.DeadLettered.Load(),
++		DisabledDiscarded: p.stats.DisabledDiscarded.Load(),
++		AcceptedPoints:    p.stats.AcceptedPoints.Load(),
++		DroppedOldest:     p.stats.DroppedOldest.Load(),
++		RequeuedRows:      p.stats.RequeuedRows.Load(),
++		WriteFailures:     p.stats.WriteFailures.Load(),
++		WrittenBatches:    p.stats.WrittenBatches.Load(),
++		WrittenPoints:     p.stats.WrittenPoints.Load(),
++		CacheFailures:     p.stats.CacheFailures.Load(),
++	}
++}
++
++// ---- 内存去重假实现（FIFO 淘汰，对齐 ADR-0014 丢最旧口径）----
++
++// MemoryBatchDeduper batchId 幂等假实现：有界 FIFO，超容量淘汰最早标记项。
++type MemoryBatchDeduper struct {
++	mu    sync.Mutex
++	cap   int
++	seen  map[string]struct{}
++	order []string
++}
++
++// NewMemoryBatchDeduper 创建容量 cap 的假实现（cap<=0 取 65536）。
++func NewMemoryBatchDeduper(cap int) *MemoryBatchDeduper {
++	if cap <= 0 {
++		cap = 65536
++	}
++	return &MemoryBatchDeduper{cap: cap, seen: make(map[string]struct{}, cap)}
++}
++
++// SeenBatch 报告 batchId 是否已标记。
++func (d *MemoryBatchDeduper) SeenBatch(batchID string) bool {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	_, ok := d.seen[batchID]
++	return ok
++}
++
++// MarkBatch 标记 batchId（FIFO 淘汰最早项）。
++func (d *MemoryBatchDeduper) MarkBatch(batchID string) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if _, ok := d.seen[batchID]; ok {
++		return
++	}
++	if len(d.order) >= d.cap {
++		old := d.order[0]
++		d.order = d.order[1:]
++		delete(d.seen, old)
++	}
++	d.seen[batchID] = struct{}{}
++	d.order = append(d.order, batchID)
++}
++
++// MemoryPointDeduper (pointCode, ts) 幂等假实现：有界 FIFO。
++type MemoryPointDeduper struct {
++	mu    sync.Mutex
++	cap   int
++	seen  map[string]struct{}
++	order []string
++}
++
++// NewMemoryPointDeduper 创建容量 cap 的假实现（cap<=0 取 65536）。
++func NewMemoryPointDeduper(cap int) *MemoryPointDeduper {
++	if cap <= 0 {
++		cap = 65536
++	}
++	return &MemoryPointDeduper{cap: cap, seen: make(map[string]struct{}, cap)}
++}
++
++func pointDedupKey(pointCode string, ts int64) string {
++	return fmt.Sprintf("%s\x00%d", pointCode, ts)
++}
++
++// SeenPoint 报告 (pointCode, ts) 是否已标记。
++func (d *MemoryPointDeduper) SeenPoint(pointCode string, ts int64) bool {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	_, ok := d.seen[pointDedupKey(pointCode, ts)]
++	return ok
++}
++
++// MarkPoint 标记 (pointCode, ts)（FIFO 淘汰最早项）。
++func (d *MemoryPointDeduper) MarkPoint(pointCode string, ts int64) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	k := pointDedupKey(pointCode, ts)
++	if _, ok := d.seen[k]; ok {
++		return
++	}
++	if len(d.order) >= d.cap {
++		old := d.order[0]
++		d.order = d.order[1:]
++		delete(d.seen, old)
++	}
++	d.seen[k] = struct{}{}
++	d.order = append(d.order, k)
++}
+diff --git a/ingest/internal/pipeline/pipeline_contract_test.go b/ingest/internal/pipeline/pipeline_contract_test.go
+new file mode 100644
+index 0000000..4695b53
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_contract_test.go
+@@ -0,0 +1,481 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/quality"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// ---- 假实现（brief 决策 3：假 EMQX=内存 channel；假 TDengine=记录式执行器；快照=本地缓存预置）----
++
++// fakeConsumer 假 EMQX：内存 channel 注入消息。
++type fakeConsumer struct {
++	ch chan pipeline.Inbound
++}
++
++func newFakeConsumer(depth int) *fakeConsumer {
++	return &fakeConsumer{ch: make(chan pipeline.Inbound, depth)}
++}
++
++func (f *fakeConsumer) Messages() <-chan pipeline.Inbound { return f.ch }
++
++func (f *fakeConsumer) emit(tenant, batchID string, points ...string) {
++	var sb strings.Builder
++	fmt.Fprintf(&sb, `{"tenant":"group_a","gateway":"GW_F01_01","batchId":%q,"sentAt":1795212000000,"points":[`, batchID)
++	for i, p := range points {
++		if i > 0 {
++			sb.WriteByte(',')
++		}
++		sb.WriteString(p)
++	}
++	sb.WriteString("]}")
++	f.ch <- pipeline.Inbound{Tenant: tenant, Payload: []byte(sb.String())}
++}
++
++// pointJSON 生成契约 §3.2 点位对象形态的 JSON（字段取自契约示例）。
++func pointJSON(code string, ts int64, value float64, q int) string {
++	return fmt.Sprintf(`{"pointCode":%q,"ts":%d,"value":%v,"quality":%d}`, code, ts, value, q)
++}
++
++// recordingSink 死信/丢弃记录（告警挂点假实现）。
++type recordingSink struct {
++	mu     sync.Mutex
++	records []pipeline.DeadLetterRecord
++}
++
++func (r *recordingSink) OnDeadLetter(reason pipeline.DeadLetterReason, tenant, batchID string, p *message.Point) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.records = append(r.records, pipeline.DeadLetterRecord{Reason: reason, Tenant: tenant, BatchID: batchID, Point: p})
++}
++
++func (r *recordingSink) byReason(reason pipeline.DeadLetterReason) int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	n := 0
++	for _, rec := range r.records {
++		if rec.Reason == reason {
++			n++
++		}
++	}
++	return n
++}
++
++// passthroughJudge 默认判定挂点：网关 quality 直通（完整判定逻辑归 TASK-0028）。
++func passthroughJudge(_ *snapshot.Point, p *message.Point) int { return p.Quality }
++
++// harness 组装被测流水线。
++type harness struct {
++	consumer *fakeConsumer
++	executor *tdengine.FakeExecutor
++	sink     *recordingSink
++	cache    *cache.MemoryPointCache
++	pipe     *pipeline.Pipeline
++	statsFn  func() pipeline.Stats
++}
++
++// 快照预置（派生自配置快照契约 Schema 字段；M01/M02 数值量、S01 状态量，
++// 编码沿用统一消息模型契约示例）。
++func preloadSnapshot(t *testing.T) *snapshot.Cache {
++	t.Helper()
++	snapJSON := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [
++    {"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
++    {"id":102,"tenantId":1,"pointCode":"F01_WS01_EQ001_M02","pointName":"P2","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
++    {"id":103,"tenantId":1,"pointCode":"F01_WS01_EQ001_S01","pointName":"P3","dataType":3,"valueType":"INT","deptId":3,"status":0}
++  ]
++}`
++	snap, err := snapshot.ParseSnapshot([]byte(snapJSON))
++	if err != nil {
++		t.Fatalf("预置快照解析失败: %v", err)
++	}
++	c := snapshot.NewCache()
++	if err := c.Replace(snap); err != nil {
++		t.Fatalf("预置快照替换失败: %v", err)
++	}
++	return c
++}
++
++func newHarness(t *testing.T, cfg pipeline.Config) *harness {
++	t.Helper()
++	h := &harness{
++		consumer: newFakeConsumer(64),
++		executor: tdengine.NewFakeExecutor(0),
++		sink:     &recordingSink{},
++		cache:    cache.NewMemoryPointCache(),
++	}
++	deps := pipeline.Deps{
++		Consumer:  h.consumer,
++		Parser:    message.Parser{},
++		Snapshots: preloadSnapshot(t),
++		Batches:   pipeline.NewMemoryBatchDeduper(65536),
++		Points:    pipeline.NewMemoryPointDeduper(65536),
++		Judge:     passthroughJudge,
++		Dead:      h.sink,
++		Writer:    &tdengine.Writer{Ex: h.executor},
++		Cache:     h.cache,
++	}
++	p, err := pipeline.Assemble(cfg, deps)
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	h.pipe = p
++	return h
++}
++
++// eventually 轮询等待条件成立（异步流水线断言辅助）。
++func eventually(t *testing.T, timeout time.Duration, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", what)
++}
++
++// ---- 契约符合性测试（处理顺序、死信、幂等、攒批纪律）----
++
++// 契约依据：v1.1.0 §3.2 接入处理顺序固定为「验令牌与租户 → 按 pointCode 查配置快照 →
++// 未知编码进死信计数并告警、不落库 → 质量判定 → 按 data_type 分发写 + 更新 Redis 缓存」；
++// TC-0009 步骤 3：上报 X99 → 死信计数告警、不落库；同批已知编码正常写入。
++func TestContractUnknownCodeDeadLetterNotWritten(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-1",
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0),
++		pointJSON("X99", 1795211995000, 1, 0),
++	)
++	eventually(t, 2*time.Second, "已知编码应写入 1 行", func() bool {
++		return h.pipe.Stats().WrittenPoints == 1
++	})
++	if h.pipe.Stats().DeadLettered != 1 {
++		t.Errorf("DeadLettered = %d, want 1", h.pipe.Stats().DeadLettered)
++	}
++	if h.sink.byReason(pipeline.DeadLetterUnknownCode) != 1 {
++		t.Errorf("未知编码死信告警次数 = %d, want 1", h.sink.byReason(pipeline.DeadLetterUnknownCode))
++	}
++	for _, c := range h.executor.Calls() {
++		if strings.Contains(c.SQL, "X99") {
++			t.Errorf("未知编码出现在写语句中: %s（死信不落库）", c.SQL)
++		}
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：TC-0009 步骤 6「空 points 消息 → 4001 拒绝」（REQ-0013 空数据=空 points 4001）。
++func TestContractEmptyPointsRejected(t *testing.T) {
++	h := newHarness(t, pipeline.Config{FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.ch <- pipeline.Inbound{Tenant: "group_a", Payload: []byte(
++		`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"batch-empty","sentAt":1795212000000,"points":[]}`)}
++	eventually(t, 2*time.Second, "空 points 应计整批拒绝", func() bool {
++		return h.pipe.Stats().RejectedBatches == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 0 {
++		t.Errorf("WrittenPoints = %d, want 0", h.pipe.Stats().WrittenPoints)
++	}
++	if h.sink.byReason(pipeline.DeadLetterInvalidEnvelope) != 1 {
++		t.Errorf("信封级拒绝告警 = %d, want 1", h.sink.byReason(pipeline.DeadLetterInvalidEnvelope))
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：TC-0009 步骤 7「单消息 501 条 → 整批拒绝」；v1.1.0 §3.2 批量上限 500。
++func TestContractOverLimitRejected(t *testing.T) {
++	h := newHarness(t, pipeline.Config{FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	var sb strings.Builder
++	fmt.Fprintf(&sb, `{"tenant":"group_a","gateway":"GW_F01_01","batchId":"batch-501","sentAt":1795212000000,"points":[`)
++	for i := 0; i < 501; i++ {
++		if i > 0 {
++			sb.WriteByte(',')
++		}
++		fmt.Fprintf(&sb, `{"pointCode":"F01_WS01_EQ001_M01","ts":%d,"value":98231.4,"quality":0}`, 1795211995000+i)
++	}
++	sb.WriteString("]}")
++	h.consumer.ch <- pipeline.Inbound{Tenant: "group_a", Payload: []byte(sb.String())}
++	eventually(t, 2*time.Second, "超限应计整批拒绝", func() bool {
++		return h.pipe.Stats().RejectedBatches == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 0 {
++		t.Errorf("WrittenPoints = %d, want 0（整批拒绝不落库）", h.pipe.Stats().WrittenPoints)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：TC-0009 步骤 4「同 batchId 重发 → 整批只落一次」；REQ-0013 batchId 整批幂等。
++func TestContractBatchIdDedup(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-dup", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	h.consumer.emit("group_a", "batch-dup", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 2*time.Second, "重复 batchId 应计去重 1 次且首条落库一次", func() bool {
++		return h.pipe.Stats().DuplicateBatches == 1 && h.pipe.Stats().WrittenPoints == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 1 {
++		t.Errorf("WrittenPoints = %d, want 1（整批只落一次）", h.pipe.Stats().WrittenPoints)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：REQ-0013 幂等键 (pointCode, ts)——同点位同时间戳两条只入库一条（TC-0009 步骤 4）。
++func TestContractPointTsDedup(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-a", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	h.consumer.emit("group_a", "batch-b", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 2*time.Second, "重复 (pointCode,ts) 应计去重 1 次且只入库一条", func() bool {
++		return h.pipe.Stats().DuplicatePoints == 1 && h.pipe.Stats().WrittenPoints == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 1 {
++		t.Errorf("WrittenPoints = %d, want 1", h.pipe.Stats().WrittenPoints)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：快照 Schema status 备注「禁用后接入侧丢弃其数据并计数告警」（status=0 点位 S01 预置）。
++func TestContractDisabledPointDiscarded(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-dis",
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0),
++		pointJSON("F01_WS01_EQ001_S01", 1795211995000, 1, 0),
++	)
++	eventually(t, 2*time.Second, "禁用点位应丢弃并计数且启用点位落库", func() bool {
++		return h.pipe.Stats().DisabledDiscarded == 1 && h.pipe.Stats().WrittenPoints == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 1 {
++		t.Errorf("WrittenPoints = %d, want 1（仅启用点位写入）", h.pipe.Stats().WrittenPoints)
++	}
++	if h.sink.byReason(pipeline.DeadLetterDisabledPoint) != 1 {
++		t.Errorf("禁用丢弃告警 = %d, want 1", h.sink.byReason(pipeline.DeadLetterDisabledPoint))
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：§2.2 按 data_type 分发——数值量走 st_point_num（kind=INSTANT），
++// 状态量走 st_point_state（kind=STATE）；写成功后更新 Redis 点位缓存（处理顺序第 5 步）。
++func TestContractDispatchByDataTypeAndCacheUpdate(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-mix",
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0),
++		pointJSON("F01_WS01_EQ001_M02", 1795211995000, 132.5, 0),
++	)
++	eventually(t, 2*time.Second, "写入与缓存更新应完成", func() bool {
++		return h.pipe.Stats().WrittenPoints == 2 && h.pipe.Stats().WrittenBatches == 1
++	})
++	// M01 与 M02 是不同点位 → 不同子表（§2.2 子表粒度「每个数值型点位一张」）→
++	// Writer 按子表分组下发 2 条 INSERT（同 flush 内同子表多行才合并单条，见 tdengine 契约测试）。
++	calls := h.executor.Calls()
++	if len(calls) != 2 {
++		t.Fatalf("Exec 次数 = %d, want 2（每点位一张子表，各一条 INSERT）", len(calls))
++	}
++	if !strings.Contains(calls[0].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num") ||
++		!strings.Contains(calls[0].SQL, "VALUES (1795211995000, 98231.4, 0)") {
++		t.Errorf("M01 SQL 不符: %s", calls[0].SQL)
++	}
++	if !strings.Contains(calls[1].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M02 USING iot_group_a.st_point_num") ||
++		!strings.Contains(calls[1].SQL, "VALUES (1795211995000, 132.5, 0)") {
++		t.Errorf("M02 SQL 不符: %s", calls[1].SQL)
++	}
++	v, err := h.cache.GetPoint(context.Background(), "group_a", "F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("缓存未更新: %v", err)
++	}
++	if v.V != 98231.4 || v.Q != 0 || v.Ts != 1795211995000 {
++		t.Errorf("缓存值 = %+v, want {98231.4 0 1795211995000}", v)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：处理顺序第 4 步「质量判定」为挂点（完整逻辑归 TASK-0028）——
++// 本测试注入恒返 STALE(3) 的假判定，证明挂点位于查快照之后、写库与缓存之前。
++func TestContractQualityJudgeHookApplied(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 4, FlushInterval: 30 * time.Millisecond})
++	// 重设判定挂点：恒返 3（断线/超时补标，CONV-02）
++	h.pipe.SetJudge(func(_ *snapshot.Point, _ *message.Point) int { return quality.StaleOffline })
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-q", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 2*time.Second, "写入应完成", func() bool {
++		return h.pipe.Stats().WrittenPoints == 1
++	})
++	sql := h.executor.Calls()[0].SQL
++	if !strings.Contains(sql, "VALUES (1795211995000, 98231.4, 3)") {
++		t.Errorf("判定挂点未生效（quality 应为 3）: %s", sql)
++	}
++	v, err := h.cache.GetPoint(context.Background(), "group_a", "F01_WS01_EQ001_M01")
++	if err != nil || v.Q != 3 {
++		t.Errorf("缓存质量码 = %+v err=%v, want q=3（判定覆盖缓存）", v, err)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：FEAT-0009「攒批 100-500 条或 200ms」——水位触发：达到 BatchSize 立即攒批下发，
++// 不等定时器。
++func TestContractFlushBySizeWatermark(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 2, FlushInterval: 5 * time.Second})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-w1", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	h.consumer.emit("group_a", "batch-w2", pointJSON("F01_WS01_EQ001_M01", 1795212000000, 132.5, 0))
++	eventually(t, 2*time.Second, "水位满 2 行应立即写", func() bool {
++		return h.pipe.Stats().WrittenPoints == 2
++	})
++	if len(h.executor.Calls()) != 1 {
++		t.Errorf("Exec 次数 = %d, want 1", len(h.executor.Calls()))
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：FEAT-0009「攒批 100-500 条或 200ms」——时间触发：不足水位时按 FlushInterval 攒批。
++func TestContractFlushByInterval(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 500, FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-t", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 2*time.Second, "定时器应触发攒批写", func() bool {
++		return h.pipe.Stats().WrittenPoints == 1
++	})
++	cancel()
++	<-done
++}
++
++// 契约依据：brief 决策 5（对齐 ADR-0014 缓存 FIFO 丢最旧口径）——攒批缓冲有上限，
++// 满时丢最旧并计数，绝不无界增长。
++func TestContractBufferCapDropsOldestAndCounts(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 500, FlushInterval: 60 * time.Millisecond, BufferCap: 2})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-c1", pointJSON("F01_WS01_EQ001_M01", 1000, 1, 0))
++	h.consumer.emit("group_a", "batch-c2", pointJSON("F01_WS01_EQ001_M01", 2000, 2, 0))
++	h.consumer.emit("group_a", "batch-c3", pointJSON("F01_WS01_EQ001_M01", 3000, 3, 0))
++	eventually(t, 2*time.Second, "丢最旧应计数且存活行写入", func() bool {
++		return h.pipe.Stats().DroppedOldest == 1 && h.pipe.Stats().WrittenPoints == 2
++	})
++	sql := h.executor.Calls()[0].SQL
++	if strings.Contains(sql, "(1000,") {
++		t.Errorf("最旧行(ts=1000)未按 FIFO 丢弃: %s", sql)
++	}
++	if !strings.Contains(sql, "(3000, 3, 0)") {
++		t.Errorf("最新行(ts=3000)应存活: %s", sql)
++	}
++	cancel()
++	<-done
++}
++
++// 契约依据：brief「攒批缓冲/水位/失败重排」——写失败整批重排回缓冲头部重试，成功后
++// 恰好落库一次、不丢不重。
++func TestContractWriteFailureRequeued(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 2, FlushInterval: 30 * time.Millisecond})
++	// 重置执行器：首次 Exec 注入失败
++	h.executor.Reset(1)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("group_a", "batch-f1", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	h.consumer.emit("group_a", "batch-f2", pointJSON("F01_WS01_EQ001_M01", 1795212000000, 132.5, 0))
++	eventually(t, 2*time.Second, "失败重排后应成功写入", func() bool {
++		s := h.pipe.Stats()
++		return s.WriteFailures == 1 && s.WrittenPoints == 2
++	})
++	if h.pipe.Stats().RequeuedRows != 2 {
++		t.Errorf("RequeuedRows = %d, want 2", h.pipe.Stats().RequeuedRows)
++	}
++	// 调用序列：call[0] 注入失败（整批 2 行），call[1] 重排后成功（同 2 行同序，不丢不重）。
++	calls := h.executor.Calls()
++	if len(calls) != 2 {
++		t.Fatalf("Exec 次数 = %d, want 2（一次失败 + 一次重排成功）", len(calls))
++	}
++	if !strings.Contains(calls[1].SQL, "VALUES (1795211995000, 98231.4, 0)(1795212000000, 132.5, 0)") {
++		t.Errorf("重排成功语句未按原序包含两行: %s", calls[1].SQL)
++	}
++	cancel()
++	<-done
++}
++
++// 租户纪律：契约「防写错仍靠写方从令牌解析租户选库」——Inbound.Tenant（令牌解析产物）
++// 为空时整批拒绝，不使用消息自带 tenant 选库。
++func TestContractTenantFromConsumerRequired(t *testing.T) {
++	h := newHarness(t, pipeline.Config{FlushInterval: 30 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	done := make(chan struct{})
++	go func() { _ = h.pipe.Run(ctx); close(done) }()
++
++	h.consumer.emit("", "batch-notenant", pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0))
++	eventually(t, 2*time.Second, "缺租户应整批拒绝", func() bool {
++		return h.pipe.Stats().RejectedBatches == 1
++	})
++	if h.pipe.Stats().WrittenPoints != 0 {
++		t.Errorf("WrittenPoints = %d, want 0", h.pipe.Stats().WrittenPoints)
++	}
++	cancel()
++	<-done
++}
+diff --git a/ingest/internal/quality/quality.go b/ingest/internal/quality/quality.go
+new file mode 100644
+index 0000000..5d8cc8e
+--- /dev/null
++++ b/ingest/internal/quality/quality.go
+@@ -0,0 +1,57 @@
++// Package quality 承载 CONV-02 质量码唯一存储口径：数值枚举 0-10 与产品文本码映射。
++//
++// 契约依据：
++//   - workitems/conventions.md CONV-02（质量码数值枚举 0-10 为唯一存储口径）
++//   - TDengine 超级表契约 v1.0.0「质量码枚举注释（CONV-02 修订叠加）」
++//
++// 完整的质量判定逻辑（量程判定覆盖、时间校验纠偏、JUMP 检测等）归 TASK-0028；
++// 本包只提供枚举常量、文本码映射与取值域判断，作为流水线的判定挂点基础。
++package quality
++
++// 质量码数值枚举 0-10（CONV-02 唯一存储口径）。
++const (
++	Good              = 0  // 正常
++	OverMax           = 1  // 超上限
++	UnderMin          = 2  // 超下限
++	StaleOffline      = 3  // 断线/超时补标
++	DeviceAbnormal    = 4  // 设备异常值
++	Manual            = 5  // 手工补录
++	CalcFailed        = 6  // 计算失败
++	RollupIncomplete  = 7  // 汇总不完整
++	JumpPendingReview = 8  // 突变待核查（一期检测关闭，码位预留，ADR-0010）
++	CrossPeriodUsage  = 9  // 跨周期用量
++	CompareDeviation  = 10 // 比对偏差待核查（原值不删、计入完整度缺失）
++)
++
++// Valid 报告 code 是否落在 0-10 存储口径内。
++func Valid(code int) bool {
++	return code >= Good && code <= CompareDeviation
++}
++
++// FromTextCode 把产品文本码映射为质量码。
++//
++// CONV-02 文本码映射：GOOD→0、OVER_RANGE→1/2、STALE/OFFLINE→3、JUMP→8、MANUAL→5。
++// OVER_RANGE 依赖方向：超上限（overMax=true）→1，超下限→2。
++//
++// CALC_ERR 不落时序行（归 iot_calc_log），返回 ok=false，调用方不得将其写入时序数据。
++// 其余未知文本码同样返回 ok=false，由调用方按各自的告警口径处理。
++func FromTextCode(text string, overMax bool) (int, bool) {
++	switch text {
++	case "GOOD":
++		return Good, true
++	case "OVER_RANGE":
++		if overMax {
++			return OverMax, true
++		}
++		return UnderMin, true
++	case "STALE", "OFFLINE":
++		return StaleOffline, true
++	case "JUMP":
++		return JumpPendingReview, true
++	case "MANUAL":
++		return Manual, true
++	default:
++		// CALC_ERR 及一切未知文本码：不映射、不落时序行。
++		return Good, false
++	}
++}
+diff --git a/ingest/internal/quality/quality_contract_test.go b/ingest/internal/quality/quality_contract_test.go
+new file mode 100644
+index 0000000..163b98e
+--- /dev/null
++++ b/ingest/internal/quality/quality_contract_test.go
+@@ -0,0 +1,79 @@
++package quality_test
++
++import (
++	"testing"
++
++	"net.otlab/ingest/internal/quality"
++)
++
++// 契约依据：workitems/conventions.md CONV-02——质量码数值枚举 0-10 为唯一存储口径；
++// TDengine 超级表契约 v1.0.0「质量码枚举注释（CONV-02 修订叠加）」同表。
++func TestContractQualityCodesZeroToTen(t *testing.T) {
++	cases := []struct {
++		name string
++		got  int
++		want int
++	}{
++		{"正常", quality.Good, 0},
++		{"超上限", quality.OverMax, 1},
++		{"超下限", quality.UnderMin, 2},
++		{"断线/超时补标", quality.StaleOffline, 3},
++		{"设备异常值", quality.DeviceAbnormal, 4},
++		{"手工补录", quality.Manual, 5},
++		{"计算失败", quality.CalcFailed, 6},
++		{"汇总不完整", quality.RollupIncomplete, 7},
++		{"突变待核查", quality.JumpPendingReview, 8},
++		{"跨周期用量", quality.CrossPeriodUsage, 9},
++		{"比对偏差待核查", quality.CompareDeviation, 10},
++	}
++	for _, c := range cases {
++		if c.got != c.want {
++			t.Errorf("%s: got %d, want %d", c.name, c.got, c.want)
++		}
++		if !quality.Valid(c.want) {
++			t.Errorf("Valid(%d) = false, want true（0-10 为唯一存储口径）", c.want)
++		}
++	}
++	if quality.Valid(-1) {
++		t.Error("Valid(-1) = true, want false")
++	}
++	if quality.Valid(11) {
++		t.Error("Valid(11) = true, want false")
++	}
++}
++
++// 契约依据：CONV-02 产品文本码映射——GOOD→0、OVER_RANGE→1/2、STALE/OFFLINE→3、JUMP→8、MANUAL→5。
++func TestContractQualityTextCodeMapping(t *testing.T) {
++	cases := []struct {
++		text    string
++		overMax bool
++		want    int
++	}{
++		{"GOOD", true, 0},
++		{"GOOD", false, 0},
++		{"OVER_RANGE", true, 1},  // 超上限
++		{"OVER_RANGE", false, 2}, // 超下限
++		{"STALE", false, 3},
++		{"OFFLINE", false, 3},
++		{"JUMP", false, 8},
++		{"MANUAL", false, 5},
++	}
++	for _, c := range cases {
++		got, ok := quality.FromTextCode(c.text, c.overMax)
++		if !ok {
++			t.Errorf("FromTextCode(%q, %v) not ok, want ok", c.text, c.overMax)
++			continue
++		}
++		if got != c.want {
++			t.Errorf("FromTextCode(%q, %v) = %d, want %d", c.text, c.overMax, got, c.want)
++		}
++	}
++}
++
++// 契约依据：CONV-02——CALC_ERR 不落时序行（归 iot_calc_log），故不映射质量码。
++func TestContractQualityCalcErrNotMappable(t *testing.T) {
++	got, ok := quality.FromTextCode("CALC_ERR", false)
++	if ok {
++		t.Errorf("FromTextCode(CALC_ERR) = (%d, true), want not ok（CALC_ERR 不落时序行）", got)
++	}
++}
+diff --git a/ingest/internal/snapshot/fetch.go b/ingest/internal/snapshot/fetch.go
+new file mode 100644
+index 0000000..1a29e6c
+--- /dev/null
++++ b/ingest/internal/snapshot/fetch.go
+@@ -0,0 +1,113 @@
++package snapshot
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++)
++
++// §3.3 协议信封路径（契约冻结路径，逐字保留）。
++const (
++	// SnapshotPath 全量快照拉取：GET /internal/v1/config/snapshot?scopeType=&scopeId=&version=
++	SnapshotPath = "/internal/v1/config/snapshot"
++	// ChangesPath 增量变更查询：GET /internal/v1/config/changes?sinceVersion=
++	ChangesPath = "/internal/v1/config/changes"
++	// AckPath ACK 回执上报：POST /internal/v1/config/ack（回执上报归 TASK-0027 接线）
++	AckPath = "/internal/v1/config/ack"
++	// ConfigChangedTopic 配置变更通知主题（内部消息 / MQTT 下行复用）。
++	ConfigChangedTopic = "config.changed"
++)
++
++// Scope 快照拉取范围。
++type Scope struct {
++	Type    int   // scopeType：1 网关范围（装载通道+点位） 2 计算范围（装载数据项+公式+指标，scopeId=0）
++	ID      int64 // scopeId：scopeType=1 时为 gateway_id
++	Version int64 // 0 = 不带 version 参数（返回最新版）；>0 = 返回指定版
++}
++
++// FetchResult 拉取结果：响应信封三部分（§3.3：响应含 version、snapshotHash 与快照体）。
++type FetchResult struct {
++	Snapshot     *Snapshot
++	SnapshotHash string
++	Version      int64 // 响应信封 version，与快照体顶层 version 同值（§3.3）
++}
++
++// SnapshotFetcher 快照拉取客户端抽象。假实现 = 本地 httptest 端点回放契约样例；
++// TASK-0027 接线时替换为指向管理系统的真实实现，本接口零改动。
++type SnapshotFetcher interface {
++	Fetch(ctx context.Context, scope Scope) (*FetchResult, error)
++}
++
++// HTTPFetcher SnapshotFetcher 的 HTTP 实现（§3.3 GET 全量拉取）。
++type HTTPFetcher struct {
++	// BaseURL 管理系统基址（如 http://mgmt-host:8080）。
++	BaseURL string
++	// Client HTTP 客户端；nil 时用 http.DefaultClient。
++	Client *http.Client
++}
++
++// envelope 响应信封。包装键名 "snapshot" 为本实现拟定（契约仅承诺 version、snapshotHash
++// 与快照体三部分内容，未定信封键名；见包注释留白声明）。
++type envelope struct {
++	Version      int64           `json:"version"`
++	SnapshotHash string          `json:"snapshotHash"`
++	Snapshot     json.RawMessage `json:"snapshot"`
++}
++
++// Fetch 拉取全量快照并执行信封纪律校验：
++// 信封 version 与快照体顶层 version 必须同值（§3.3），不同值拒收。
++func (f *HTTPFetcher) Fetch(ctx context.Context, scope Scope) (*FetchResult, error) {
++	q := url.Values{}
++	q.Set("scopeType", strconv.Itoa(scope.Type))
++	q.Set("scopeId", strconv.FormatInt(scope.ID, 10))
++	if scope.Version > 0 {
++		q.Set("version", strconv.FormatInt(scope.Version, 10))
++	}
++	endpoint := f.BaseURL + SnapshotPath + "?" + q.Encode()
++
++	client := f.Client
++	if client == nil {
++		client = http.DefaultClient
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 构造请求失败: %w", err)
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 拉取失败: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 读取响应失败: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("snapshot: 拉取失败 status=%d body=%s", resp.StatusCode, truncate(body, 256))
++	}
++
++	var env envelope
++	if err := json.Unmarshal(body, &env); err != nil {
++		return nil, fmt.Errorf("snapshot: 响应信封解析失败: %w", err)
++	}
++	snap, err := ParseSnapshot(env.Snapshot)
++	if err != nil {
++		return nil, fmt.Errorf("snapshot: 快照体校验失败: %w", err)
++	}
++	if env.Version != snap.Version {
++		return nil, fmt.Errorf("snapshot: 信封 version(%d) 与快照体 version(%d) 不同值（§3.3 要求同值），拒收", env.Version, snap.Version)
++	}
++	return &FetchResult{Snapshot: snap, SnapshotHash: env.SnapshotHash, Version: env.Version}, nil
++}
++
++// truncate 截断调试输出。
++func truncate(b []byte, n int) string {
++	if len(b) <= n {
++		return string(b)
++	}
++	return string(b[:n]) + "…"
++}
+diff --git a/ingest/internal/snapshot/snapshot.go b/ingest/internal/snapshot/snapshot.go
+new file mode 100644
+index 0000000..fa8f299
+--- /dev/null
++++ b/ingest/internal/snapshot/snapshot.go
+@@ -0,0 +1,443 @@
++// Package snapshot 承载配置快照 Schema（冻结契约 v1.0.1）的类型、字段级校验、
++// 拉取客户端抽象（§3.3 协议信封）与本地缓存原子替换。
++//
++// 契约纪律：
++//   - 各对象 Schema 冻结口径 additionalProperties=false（派生规则 3），演进走版本升版（CONV-03）；
++//   - 未装载的对象键省略（省略 = 该范围不涉及，派生规则 7）；
++//   - 响应信封含 version、snapshotHash 与快照体；快照体顶层 version 与信封 version 同值（§3.3）；
++//   - 接入服务收到通知后按版本拉新快照、校验、原子替换缓存（新快照校验失败则继续用旧版并回执失败）；
++//   - 通道凭据不进快照，只带 hasCredential / credentialTypes 标记（§1.3A）。
++//
++// 已知留白：响应信封中「快照体」的包装键名上游未定版（契约仅承诺三部分内容），
++// 本实现拟用 "snapshot" 键承载，接线时（TASK-0027）如有出入只改 HTTPFetcher 的信封结构体。
++package snapshot
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strconv"
++	"sync/atomic"
++)
++
++// ScopeType 装载范围语义（派生规则 7）：网关范围装载通道+点位；计算范围装载数据项+公式+指标。
++const (
++	ScopeTypeGateway = 1
++	ScopeTypeCompute = 2
++)
++
++// Snapshot 快照体顶层结构（v1.0.1 拟定键名，§3.3 承诺 schemaVersion 一并下发）。
++// 未装载的对象键省略，故五个对象数组用指针语义（nil = 未装载）。
++type Snapshot struct {
++	SchemaVersion string     `json:"schemaVersion"`
++	TenantID      int64      `json:"tenantId"`
++	ScopeType     int        `json:"scopeType"`
++	ScopeID       int64      `json:"scopeId"`
++	Version       int64      `json:"version"`
++	Points        []Point    `json:"points,omitempty"`
++	Channels      []Channel  `json:"channels,omitempty"`
++	DataItems     []DataItem `json:"dataItems,omitempty"`
++	Formulas      []Formula  `json:"formulas,omitempty"`
++	Metrics       []Metric   `json:"metrics,omitempty"`
++}
++
++// Point 点位对象（映射 iot_point，v1.0.1 字段级 Schema）。
++// dataType 决定 TDengine 落哪张超级表：1 瞬时量 2 累计量 → st_point_num；3 状态量 4 开关量 → st_point_state。
++type Point struct {
++	ID              int64           `json:"id"`
++	TenantID        int64           `json:"tenantId"`
++	PointCode       string          `json:"pointCode"`
++	PointName       string          `json:"pointName"`
++	DataType        int             `json:"dataType"`   // enum [1,2,3,4]
++	ValueType       string          `json:"valueType"`  // enum [DOUBLE,INT,BOOL,ENUM]
++	Unit            *string         `json:"unit,omitempty"`
++	MinValue        *float64        `json:"minValue,omitempty"` // 有效范围下限；超限只打质量码不丢弃
++	MaxValue        *float64        `json:"maxValue,omitempty"` // 有效范围上限
++	SamplePeriod    *int64          `json:"samplePeriod,omitempty"`
++	Deadband        *float64        `json:"deadband,omitempty"`
++	ChannelID       *int64          `json:"channelId,omitempty"`
++	ProtocolAddr    json.RawMessage `json:"protocolAddr,omitempty"` // 内层键名上游未定版，原样保留
++	BoundInstanceID *int64          `json:"boundInstanceId,omitempty"`
++	DeptID          *int64          `json:"deptId,omitempty"`
++	Status          *int            `json:"status,omitempty"` // enum [0,1]；1 启用 0 禁用（禁用数据丢弃并计数告警）
++	ConfigVersion   *int64          `json:"configVersion,omitempty"`
++	Remark          *string         `json:"remark,omitempty"`
++}
++
++// Disabled 报告点位是否禁用（status=0；禁用后接入侧丢弃其数据并计数告警）。
++func (p *Point) Disabled() bool { return p.Status != nil && *p.Status == 0 }
++
++// Channel 通道对象（映射 iot_channel；凭据标记口径 §1.3A）。
++type Channel struct {
++	ID              int64           `json:"id"`
++	TenantID        int64           `json:"tenantId"`
++	GatewayID       int64           `json:"gatewayId"`
++	ChannelCode     string          `json:"channelCode"`
++	ChannelName     string          `json:"channelName"`
++	ProtocolType    string          `json:"protocolType"` // enum [MQTT,HTTP,MODBUS,OPCUA]
++	ConnConfig      json.RawMessage `json:"connConfig,omitempty"` // 不含凭据明文；内层键名上游未定版
++	Status          *int            `json:"status,omitempty"`
++	HasCredential   bool            `json:"hasCredential"`   // §1.3A 派生标记（非表列）
++	CredentialTypes []string        `json:"credentialTypes,omitempty"` // 仅类型不含材料
++}
++
++// DataItem 数据项对象（映射 iot_data_item）。
++type DataItem struct {
++	ID            int64    `json:"id"`
++	TenantID      int64    `json:"tenantId"`
++	InstanceID    int64    `json:"instanceId"`
++	DataCode      string   `json:"dataCode"`
++	FullKey       string   `json:"fullKey"` // = instance_code + "." + data_code
++	DataName      *string  `json:"dataName,omitempty"`
++	Category      *string  `json:"category,omitempty"`
++	Unit          *string  `json:"unit,omitempty"`
++	SourceType    int      `json:"sourceType"` // enum [1,2,3]：1 绑定 2 公式 3 汇总
++	PointID       *int64   `json:"pointId,omitempty"`
++	Formula       *string  `json:"formula,omitempty"`
++	RollupMethod  *string  `json:"rollupMethod,omitempty"` // enum [SUM,AVG]
++	CalcPeriod    *int64   `json:"calcPeriod,omitempty"`
++	ValidMin      *float64 `json:"validMin,omitempty"`
++	ValidMax      *float64 `json:"validMax,omitempty"`
++	AlarmLow      *float64 `json:"alarmLow,omitempty"`
++	AlarmHigh     *float64 `json:"alarmHigh,omitempty"`
++	Enabled       *int     `json:"enabled,omitempty"`
++	ConfigVersion *int64   `json:"configVersion,omitempty"`
++	Status        *int     `json:"status,omitempty"`
++}
++
++// Formula 公式对象（映射 iot_data_item_ref 公式引用关系表：引用边行）。
++type Formula struct {
++	ID         int64   `json:"id"`
++	TenantID   int64   `json:"tenantId"`
++	ItemID     int64   `json:"itemId"`
++	RefFullKey string  `json:"refFullKey"`
++	RefType    int     `json:"refType"` // enum [1,2]：1 数据项 2 点位
++	RefItemID  *int64  `json:"refItemId,omitempty"`
++}
++
++// Metric 指标对象（映射 iot_metric）。
++type Metric struct {
++	ID             int64    `json:"id"`
++	TenantID       int64    `json:"tenantId"`
++	MetricCode     string   `json:"metricCode"`
++	MetricName     string   `json:"metricName"`
++	InstanceID     int64    `json:"instanceId"`
++	SourceItemID   *int64   `json:"sourceItemId,omitempty"`
++	AggType        int      `json:"aggType"` // enum [1,2,3,4,5]
++	Period         string   `json:"period"`  // enum [HOUR,DAY,MONTH,YEAR]
++	CalendarType   *int     `json:"calendarType,omitempty"` // enum [1,2]
++	RatioNumItemID *int64   `json:"ratioNumItemId,omitempty"`
++	RatioDenItemID *int64   `json:"ratioDenItemId,omitempty"`
++	YoyFlag        *int     `json:"yoyFlag,omitempty"`
++	MomFlag        *int     `json:"momFlag,omitempty"`
++	DeptID         *int64   `json:"deptId,omitempty"`
++	Status         *int     `json:"status,omitempty"`
++}
++
++// validateEnum 校验整数枚举。
++func validateEnum(field string, got int, allowed ...int) error {
++	for _, a := range allowed {
++		if got == a {
++			return nil
++		}
++	}
++	return fmt.Errorf("snapshot: %s=%d 不在契约枚举内", field, got)
++}
++
++// validateString 校验字符串枚举。
++func validateStrEnum(field, got string, allowed ...string) error {
++	for _, a := range allowed {
++		if got == a {
++			return nil
++		}
++	}
++	return fmt.Errorf("snapshot: %s=%q 不在契约枚举内", field, got)
++}
++
++// validateMaxLength 校验 string(maxLength=n)。
++func validateMaxLength(field, got string, max int) error {
++	if len(got) > max {
++		return fmt.Errorf("snapshot: %s 长度 %d 超过 maxLength=%d", field, len(got), max)
++	}
++	return nil
++}
++
++// validateStatusPtr 校验可空 status/enabled/flag 类 0/1 枚举。
++func validateFlagPtr(field string, v *int) error {
++	if v == nil {
++		return nil
++	}
++	return validateEnum(field, *v, 0, 1)
++}
++
++// Validate 校验点位对象字段级 Schema（enum + maxLength）。
++func (p *Point) Validate() error {
++	if err := validateEnum("dataType", p.DataType, 1, 2, 3, 4); err != nil {
++		return err
++	}
++	if err := validateStrEnum("valueType", p.ValueType, "DOUBLE", "INT", "BOOL", "ENUM"); err != nil {
++		return err
++	}
++	if err := validateMaxLength("pointCode", p.PointCode, 96); err != nil {
++		return err
++	}
++	if err := validateMaxLength("pointName", p.PointName, 100); err != nil {
++		return err
++	}
++	if p.Unit != nil {
++		if err := validateMaxLength("unit", *p.Unit, 32); err != nil {
++			return err
++		}
++	}
++	if p.Remark != nil {
++		if err := validateMaxLength("remark", *p.Remark, 500); err != nil {
++			return err
++		}
++	}
++	return validateFlagPtr("status", p.Status)
++}
++
++// Validate 校验通道对象字段级 Schema。
++func (c *Channel) Validate() error {
++	if err := validateStrEnum("protocolType", c.ProtocolType, "MQTT", "HTTP", "MODBUS", "OPCUA"); err != nil {
++		return err
++	}
++	if err := validateMaxLength("channelCode", c.ChannelCode, 64); err != nil {
++		return err
++	}
++	if err := validateMaxLength("channelName", c.ChannelName, 100); err != nil {
++		return err
++	}
++	return nil
++}
++
++// Validate 校验数据项对象字段级 Schema。
++func (d *DataItem) Validate() error {
++	if err := validateEnum("sourceType", d.SourceType, 1, 2, 3); err != nil {
++		return err
++	}
++	if err := validateMaxLength("dataCode", d.DataCode, 64); err != nil {
++		return err
++	}
++	if err := validateMaxLength("fullKey", d.FullKey, 180); err != nil {
++		return err
++	}
++	if d.RollupMethod != nil {
++		if err := validateStrEnum("rollupMethod", *d.RollupMethod, "SUM", "AVG"); err != nil {
++			return err
++		}
++	}
++	return validateFlagPtr("status", d.Status)
++}
++
++// Validate 校验公式对象字段级 Schema。
++func (f *Formula) Validate() error {
++	return validateEnum("refType", f.RefType, 1, 2)
++}
++
++// Validate 校验指标对象字段级 Schema。
++func (m *Metric) Validate() error {
++	if err := validateEnum("aggType", m.AggType, 1, 2, 3, 4, 5); err != nil {
++		return err
++	}
++	if err := validateStrEnum("period", m.Period, "HOUR", "DAY", "MONTH", "YEAR"); err != nil {
++		return err
++	}
++	if m.CalendarType != nil {
++		if err := validateEnum("calendarType", *m.CalendarType, 1, 2); err != nil {
++			return err
++		}
++	}
++	if m.YoyFlag != nil {
++		if err := validateFlagPtr("yoyFlag", m.YoyFlag); err != nil {
++			return err
++		}
++	}
++	if m.MomFlag != nil {
++		if err := validateFlagPtr("momFlag", m.MomFlag); err != nil {
++			return err
++		}
++	}
++	return validateFlagPtr("status", m.Status)
++}
++
++// strictDecode 以 additionalProperties=false 语义解码（未知字段拒收）。
++func strictDecode(data []byte, v any) error {
++	dec := json.NewDecoder(bytes.NewReader(data))
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(v); err != nil {
++		return fmt.Errorf("snapshot: %w（additionalProperties=false）", err)
++	}
++	return nil
++}
++
++// ParseSnapshot 解析并校验快照体顶层结构。未装载对象键省略合法（派生规则 7）。
++func ParseSnapshot(data []byte) (*Snapshot, error) {
++	var s Snapshot
++	if err := strictDecode(data, &s); err != nil {
++		return nil, err
++	}
++	if s.SchemaVersion == "" {
++		return nil, errors.New("snapshot: 缺 schemaVersion（§3.3 承诺 Schema 版本号一并下发）")
++	}
++	for i := range s.Points {
++		if err := s.Points[i].Validate(); err != nil {
++			return nil, fmt.Errorf("snapshot: points[%d]: %w", i, err)
++		}
++	}
++	for i := range s.Channels {
++		if err := s.Channels[i].Validate(); err != nil {
++			return nil, fmt.Errorf("snapshot: channels[%d]: %w", i, err)
++		}
++	}
++	for i := range s.DataItems {
++		if err := s.DataItems[i].Validate(); err != nil {
++			return nil, fmt.Errorf("snapshot: dataItems[%d]: %w", i, err)
++		}
++	}
++	for i := range s.Formulas {
++		if err := s.Formulas[i].Validate(); err != nil {
++			return nil, fmt.Errorf("snapshot: formulas[%d]: %w", i, err)
++		}
++	}
++	for i := range s.Metrics {
++		if err := s.Metrics[i].Validate(); err != nil {
++			return nil, fmt.Errorf("snapshot: metrics[%d]: %w", i, err)
++		}
++	}
++	return &s, nil
++}
++
++// ParsePoint 解析并校验点位对象。
++func ParsePoint(data []byte) (*Point, error) {
++	var p Point
++	if err := strictDecode(data, &p); err != nil {
++		return nil, err
++	}
++	if err := p.Validate(); err != nil {
++		return nil, err
++	}
++	return &p, nil
++}
++
++// ParseChannel 解析并校验通道对象。
++func ParseChannel(data []byte) (*Channel, error) {
++	var c Channel
++	if err := strictDecode(data, &c); err != nil {
++		return nil, err
++	}
++	if err := c.Validate(); err != nil {
++		return nil, err
++	}
++	return &c, nil
++}
++
++// ParseDataItem 解析并校验数据项对象。
++func ParseDataItem(data []byte) (*DataItem, error) {
++	var d DataItem
++	if err := strictDecode(data, &d); err != nil {
++		return nil, err
++	}
++	if err := d.Validate(); err != nil {
++		return nil, err
++	}
++	return &d, nil
++}
++
++// ParseFormula 解析并校验公式对象。
++func ParseFormula(data []byte) (*Formula, error) {
++	var f Formula
++	if err := strictDecode(data, &f); err != nil {
++		return nil, err
++	}
++	if err := f.Validate(); err != nil {
++		return nil, err
++	}
++	return &f, nil
++}
++
++// ParseMetric 解析并校验指标对象。
++func ParseMetric(data []byte) (*Metric, error) {
++	var m Metric
++	if err := strictDecode(data, &m); err != nil {
++		return nil, err
++	}
++	if err := m.Validate(); err != nil {
++		return nil, err
++	}
++	return &m, nil
++}
++
++// ConfigChanged 配置变更通知载荷（§3.3：通知只作触发信号，下游必须再拉快照比对哈希，
++// 不得直接信任通知内容）。
++type ConfigChanged struct {
++	Tenant    string `json:"tenant"`
++	ScopeType int    `json:"scopeType"`
++	ScopeID   int64  `json:"scopeId"`
++	Version   int64  `json:"version"`
++	Hash      string `json:"hash"`
++}
++
++// ParseConfigChanged 解析 config.changed 通知载荷。
++func ParseConfigChanged(data []byte) (*ConfigChanged, error) {
++	var c ConfigChanged
++	if err := json.Unmarshal(data, &c); err != nil {
++		return nil, fmt.Errorf("snapshot: config.changed 载荷解析失败: %w", err)
++	}
++	return &c, nil
++}
++
++// pointIndex 惰性构建的 pointCode → 点位索引，供流水线按编码查配置（§3.2 处理顺序第 2 步）。
++type pointIndex map[string]*Point
++
++// Cache 配置快照本地缓存：原子替换（新快照校验失败则继续用旧版并回执失败）。
++// 并发模型：读走 atomic.Value 快照 + 只读索引；Replace 全量换入，无逐条锁。
++type Cache struct {
++	cur atomic.Pointer[snapshotWithIndex]
++}
++
++type snapshotWithIndex struct {
++	snap  *Snapshot
++	index pointIndex
++}
++
++// NewCache 空缓存（尚未拉取快照时 LookupPoint 一律未命中）。
++func NewCache() *Cache {
++	return &Cache{}
++}
++
++// Replace 校验并原子换入新快照；校验失败返回错误且保持旧版（§3.3 接入消费方式）。
++func (c *Cache) Replace(s *Snapshot) error {
++	if s == nil {
++		return errors.New("snapshot: Replace 收到 nil 快照")
++	}
++	idx := make(pointIndex, len(s.Points))
++	for i := range s.Points {
++		p := &s.Points[i]
++		if err := p.Validate(); err != nil {
++			return fmt.Errorf("snapshot: 新快照校验失败（version=%s）: %w", strconv.FormatInt(s.Version, 10), err)
++		}
++		idx[p.PointCode] = p
++	}
++	c.cur.Store(&snapshotWithIndex{snap: s, index: idx})
++	return nil
++}
++
++// Get 返回当前快照（可能为 nil，表示尚未拉取）。
++func (c *Cache) Get() *Snapshot {
++	if v := c.cur.Load(); v != nil {
++		return v.snap
++	}
++	return nil
++}
++
++// LookupPoint 按 pointCode 查点位配置；未命中 = 未知编码（流水线进死信）。
++func (c *Cache) LookupPoint(pointCode string) (*Point, bool) {
++	v := c.cur.Load()
++	if v == nil {
++		return nil, false
++	}
++	p, ok := v.index[pointCode]
++	return p, ok
++}
+diff --git a/ingest/internal/snapshot/snapshot_contract_test.go b/ingest/internal/snapshot/snapshot_contract_test.go
+new file mode 100644
+index 0000000..88e3769
+--- /dev/null
++++ b/ingest/internal/snapshot/snapshot_contract_test.go
+@@ -0,0 +1,335 @@
++package snapshot_test
++
++import (
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// contractTopLevelJSON 逐字取自配置快照契约 v1.0.1「快照体顶层结构」示例
++//（键名为 v1.0.1 拟定，schemaVersion 一并下发为 §3.3 已承诺）。
++const contractTopLevelJSON = `{
++  "schemaVersion": "1.0.1",
++  "tenantId": 1,
++  "scopeType": 1,
++  "scopeId": 88,
++  "version": 17,
++  "points": [],
++  "channels": [],
++  "dataItems": [],
++  "formulas": [],
++  "metrics": []
++}`
++
++// 契约依据：v1.0.1「快照体顶层结构」示例，逐字段断言。
++func TestContractSnapshotTopLevelStructure(t *testing.T) {
++	s, err := snapshot.ParseSnapshot([]byte(contractTopLevelJSON))
++	if err != nil {
++		t.Fatalf("ParseSnapshot error: %v", err)
++	}
++	if s.SchemaVersion != "1.0.1" {
++		t.Errorf("SchemaVersion = %q, want %q", s.SchemaVersion, "1.0.1")
++	}
++	if s.TenantID != 1 {
++		t.Errorf("TenantID = %d, want 1", s.TenantID)
++	}
++	if s.ScopeType != 1 {
++		t.Errorf("ScopeType = %d, want 1", s.ScopeType)
++	}
++	if s.ScopeID != 88 {
++		t.Errorf("ScopeID = %d, want 88", s.ScopeID)
++	}
++	if s.Version != 17 {
++		t.Errorf("Version = %d, want 17", s.Version)
++	}
++	if s.Points == nil || s.Channels == nil || s.DataItems == nil || s.Formulas == nil || s.Metrics == nil {
++		t.Errorf("五个对象数组必须可寻址（键都在示例中）: points=%v channels=%v dataItems=%v formulas=%v metrics=%v",
++			s.Points, s.Channels, s.DataItems, s.Formulas, s.Metrics)
++	}
++	// 示例中五个对象数组均为空数组
++	if len(s.Points) != 0 || len(s.Channels) != 0 || len(s.DataItems) != 0 || len(s.Formulas) != 0 || len(s.Metrics) != 0 {
++		t.Errorf("示例五对象数组应为空: points=%d channels=%d dataItems=%d formulas=%d metrics=%d",
++			len(s.Points), len(s.Channels), len(s.DataItems), len(s.Formulas), len(s.Metrics))
++	}
++}
++
++// 契约依据：v1.0.1 派生规则 7「未装载的对象键省略（省略 = 该范围不涉及）」——
++// 网关范围（scopeType=1）装载通道 + 点位，其余键省略，解码必须放行。
++func TestContractSnapshotScopeLoadingOmittedKeys(t *testing.T) {
++	gatewayScope := `{
++  "schemaVersion": "1.0.1",
++  "tenantId": 1,
++  "scopeType": 1,
++  "scopeId": 88,
++  "version": 17,
++  "points": [],
++  "channels": []
++}`
++	s, err := snapshot.ParseSnapshot([]byte(gatewayScope))
++	if err != nil {
++		t.Fatalf("ParseSnapshot error: %v", err)
++	}
++	if s.Points == nil || s.Channels == nil {
++		t.Error("装载键 points/channels 必须在（本例为空数组）")
++	}
++	if s.DataItems != nil || s.Formulas != nil || s.Metrics != nil {
++		t.Error("未装载的键省略后应为 nil（省略 = 该范围不涉及）")
++	}
++}
++
++// 契约依据：v1.0.1「点位对象 point」字段级 Schema（映射 iot_point）。
++// 字段集合严格取自 Schema properties（additionalProperties=false），不引入契约外字段；
++// 字段值为测试数据。pointCode 沿用统一消息模型契约示例编码 F01_WS01_EQ001_M01。
++const contractPointJSON = `{
++  "id": 101,
++  "tenantId": 1,
++  "pointCode": "F01_WS01_EQ001_M01",
++  "pointName": "一号设备一号测点",
++  "dataType": 1,
++  "valueType": "DOUBLE",
++  "unit": "r/min",
++  "minValue": 0,
++  "maxValue": 100000,
++  "samplePeriod": 5,
++  "deadband": 0.5,
++  "channelId": 11,
++  "protocolAddr": {},
++  "boundInstanceId": 88,
++  "deptId": 3,
++  "status": 1,
++  "configVersion": 17,
++  "remark": "试点测点"
++}`
++
++func TestContractPointObjectSchema(t *testing.T) {
++	p, err := snapshot.ParsePoint([]byte(contractPointJSON))
++	if err != nil {
++		t.Fatalf("ParsePoint error: %v", err)
++	}
++	if p.ID != 101 || p.TenantID != 1 {
++		t.Errorf("id/tenantId = %d/%d, want 101/1", p.ID, p.TenantID)
++	}
++	if p.PointCode != "F01_WS01_EQ001_M01" {
++		t.Errorf("pointCode = %q, want F01_WS01_EQ001_M01", p.PointCode)
++	}
++	if p.PointName != "一号设备一号测点" {
++		t.Errorf("pointName = %q", p.PointName)
++	}
++	if p.DataType != 1 {
++		t.Errorf("dataType = %d, want 1（瞬时量）", p.DataType)
++	}
++	if p.ValueType != "DOUBLE" {
++		t.Errorf("valueType = %q, want DOUBLE", p.ValueType)
++	}
++	if p.Unit == nil || *p.Unit != "r/min" {
++		t.Errorf("unit = %v, want r/min", p.Unit)
++	}
++	if p.MinValue == nil || *p.MinValue != 0 {
++		t.Errorf("minValue = %v, want 0", p.MinValue)
++	}
++	if p.MaxValue == nil || *p.MaxValue != 100000 {
++		t.Errorf("maxValue = %v, want 100000", p.MaxValue)
++	}
++	if p.SamplePeriod == nil || *p.SamplePeriod != 5 {
++		t.Errorf("samplePeriod = %v, want 5", p.SamplePeriod)
++	}
++	if p.Deadband == nil || *p.Deadband != 0.5 {
++		t.Errorf("deadband = %v, want 0.5", p.Deadband)
++	}
++	if p.ChannelID == nil || *p.ChannelID != 11 {
++		t.Errorf("channelId = %v, want 11", p.ChannelID)
++	}
++	if len(p.ProtocolAddr) == 0 {
++		t.Error("protocolAddr 应保留原始 JSON（内层键名上游未定版，不展开）")
++	}
++	if p.BoundInstanceID == nil || *p.BoundInstanceID != 88 {
++		t.Errorf("boundInstanceId = %v, want 88", p.BoundInstanceID)
++	}
++	if p.DeptID == nil || *p.DeptID != 3 {
++		t.Errorf("deptId = %v, want 3", p.DeptID)
++	}
++	if p.Status == nil || *p.Status != 1 {
++		t.Errorf("status = %v, want 1", p.Status)
++	}
++	if p.ConfigVersion == nil || *p.ConfigVersion != 17 {
++		t.Errorf("configVersion = %v, want 17", p.ConfigVersion)
++	}
++	if p.Remark == nil || *p.Remark != "试点测点" {
++		t.Errorf("remark = %v", p.Remark)
++	}
++}
++
++// 契约依据：point Schema enum——dataType ∈ [1,2,3,4]（1 瞬时量 2 累计量 3 状态量 4 开关量）、
++// valueType ∈ ["DOUBLE","INT","BOOL","ENUM"]、status ∈ [0,1]。越界必须拒收。
++func TestContractPointObjectEnumViolations(t *testing.T) {
++	if _, err := snapshot.ParsePoint([]byte(strings.Replace(contractPointJSON, `"dataType": 1`, `"dataType": 5`, 1))); err == nil {
++		t.Error("dataType=5（enum 之外）未被拒收")
++	}
++	if _, err := snapshot.ParsePoint([]byte(strings.Replace(contractPointJSON, `"valueType": "DOUBLE"`, `"valueType": "STRING"`, 1))); err == nil {
++		t.Error(`valueType="STRING"（enum 之外）未被拒收`)
++	}
++	if _, err := snapshot.ParsePoint([]byte(strings.Replace(contractPointJSON, `"status": 1`, `"status": 2`, 1))); err == nil {
++		t.Error("status=2（enum 之外）未被拒收")
++	}
++}
++
++// 契约依据：point Schema additionalProperties=false——冻结字段集之外一律拒收（演进走版本升版，CONV-03）。
++func TestContractPointObjectAdditionalPropertiesFalse(t *testing.T) {
++	withExtra := strings.Replace(contractPointJSON, `"remark": "试点测点"`,
++		`"remark": "试点测点", "credCipher": "should-not-exist"`, 1)
++	if _, err := snapshot.ParsePoint([]byte(withExtra)); err == nil {
++		t.Error("additionalProperties=false：契约外字段未被拒收")
++	}
++}
++
++// 契约依据：v1.0.1「通道对象 channel」Schema（映射 iot_channel；凭据标记口径 §1.3A——
++// 只带 hasCredential / credentialTypes 标记，不含任何凭据材料）。
++func TestContractChannelObjectSchema(t *testing.T) {
++	ch := `{
++  "id": 11,
++  "tenantId": 1,
++  "gatewayId": 88,
++  "channelCode": "CH_F01_01",
++  "channelName": "一号网关 MQTT 通道",
++  "protocolType": "MQTT",
++  "connConfig": {},
++  "status": 1,
++  "hasCredential": true,
++  "credentialTypes": ["DEVICE_TOKEN"]
++}`
++	got, err := snapshot.ParseChannel([]byte(ch))
++	if err != nil {
++		t.Fatalf("ParseChannel error: %v", err)
++	}
++	if got.ID != 11 || got.TenantID != 1 || got.GatewayID != 88 {
++		t.Errorf("id/tenantId/gatewayId = %d/%d/%d, want 11/1/88", got.ID, got.TenantID, got.GatewayID)
++	}
++	if got.ChannelCode != "CH_F01_01" || got.ChannelName != "一号网关 MQTT 通道" {
++		t.Errorf("channelCode/channelName = %q/%q", got.ChannelCode, got.ChannelName)
++	}
++	if got.ProtocolType != "MQTT" {
++		t.Errorf("protocolType = %q, want MQTT", got.ProtocolType)
++	}
++	if !got.HasCredential {
++		t.Error("hasCredential = false, want true")
++	}
++	if len(got.CredentialTypes) != 1 || got.CredentialTypes[0] != "DEVICE_TOKEN" {
++		t.Errorf("credentialTypes = %v, want [DEVICE_TOKEN]（仅类型不含材料）", got.CredentialTypes)
++	}
++	if _, err := snapshot.ParseChannel([]byte(strings.Replace(ch, `"protocolType": "MQTT"`, `"protocolType": "SERIAL"`, 1))); err == nil {
++		t.Error("protocolType=SERIAL（enum 之外）未被拒收")
++	}
++}
++
++// 契约依据：v1.0.1「数据项对象 dataItem」Schema（映射 iot_data_item）。
++func TestContractDataItemObjectSchema(t *testing.T) {
++	item := `{
++  "id": 501,
++  "tenantId": 1,
++  "instanceId": 88,
++  "dataCode": "WATER_IN_DAY",
++  "fullKey": "F01.WATER_IN_DAY",
++  "dataName": "一号日用水量",
++  "category": "WATER",
++  "unit": "m3",
++  "sourceType": 1,
++  "pointId": 101,
++  "calcPeriod": 0,
++  "enabled": 1,
++  "configVersion": 17,
++  "status": 1
++}`
++	got, err := snapshot.ParseDataItem([]byte(item))
++	if err != nil {
++		t.Fatalf("ParseDataItem error: %v", err)
++	}
++	if got.ID != 501 || got.TenantID != 1 || got.InstanceID != 88 {
++		t.Errorf("id/tenantId/instanceId = %d/%d/%d", got.ID, got.TenantID, got.InstanceID)
++	}
++	if got.DataCode != "WATER_IN_DAY" || got.FullKey != "F01.WATER_IN_DAY" {
++		t.Errorf("dataCode/fullKey = %q/%q", got.DataCode, got.FullKey)
++	}
++	if got.SourceType != 1 {
++		t.Errorf("sourceType = %d, want 1（绑定点位）", got.SourceType)
++	}
++	if got.PointID == nil || *got.PointID != 101 {
++		t.Errorf("pointId = %v, want 101", got.PointID)
++	}
++	if _, err := snapshot.ParseDataItem([]byte(strings.Replace(item, `"sourceType": 1`, `"sourceType": 4`, 1))); err == nil {
++		t.Error("sourceType=4（enum 1/2/3 之外）未被拒收")
++	}
++}
++
++// 契约依据：v1.0.1「公式对象 formula」Schema（映射 iot_data_item_ref 公式引用关系表：引用边行）。
++func TestContractFormulaObjectSchema(t *testing.T) {
++	f := `{
++  "id": 601,
++  "tenantId": 1,
++  "itemId": 502,
++  "refFullKey": "F01.WATER_IN_DAY",
++  "refType": 1,
++  "refItemId": 501
++}`
++	got, err := snapshot.ParseFormula([]byte(f))
++	if err != nil {
++		t.Fatalf("ParseFormula error: %v", err)
++	}
++	if got.ID != 601 || got.TenantID != 1 || got.ItemID != 502 {
++		t.Errorf("id/tenantId/itemId = %d/%d/%d", got.ID, got.TenantID, got.ItemID)
++	}
++	if got.RefFullKey != "F01.WATER_IN_DAY" {
++		t.Errorf("refFullKey = %q", got.RefFullKey)
++	}
++	if got.RefType != 1 {
++		t.Errorf("refType = %d, want 1（数据项）", got.RefType)
++	}
++	if got.RefItemID == nil || *got.RefItemID != 501 {
++		t.Errorf("refItemId = %v, want 501", got.RefItemID)
++	}
++	if _, err := snapshot.ParseFormula([]byte(strings.Replace(f, `"refType": 1`, `"refType": 3`, 1))); err == nil {
++		t.Error("refType=3（enum 1/2 之外）未被拒收")
++	}
++}
++
++// 契约依据：v1.0.1「指标对象 metric」Schema（映射 iot_metric）。
++func TestContractMetricObjectSchema(t *testing.T) {
++	m := `{
++  "id": 701,
++  "tenantId": 1,
++  "metricCode": "F01_WATER_AVG_DAY",
++  "metricName": "一厂日均用水量",
++  "instanceId": 88,
++  "sourceItemId": 501,
++  "aggType": 1,
++  "period": "DAY",
++  "yoyFlag": 1,
++  "momFlag": 1,
++  "status": 1
++}`
++	got, err := snapshot.ParseMetric([]byte(m))
++	if err != nil {
++		t.Fatalf("ParseMetric error: %v", err)
++	}
++	if got.ID != 701 || got.TenantID != 1 || got.InstanceID != 88 {
++		t.Errorf("id/tenantId/instanceId = %d/%d/%d", got.ID, got.TenantID, got.InstanceID)
++	}
++	if got.MetricCode != "F01_WATER_AVG_DAY" || got.MetricName != "一厂日均用水量" {
++		t.Errorf("metricCode/metricName = %q/%q", got.MetricCode, got.MetricName)
++	}
++	if got.AggType != 1 {
++		t.Errorf("aggType = %d, want 1（平均）", got.AggType)
++	}
++	if got.Period != "DAY" {
++		t.Errorf("period = %q, want DAY", got.Period)
++	}
++	if got.YoyFlag == nil || *got.YoyFlag != 1 {
++		t.Errorf("yoyFlag = %v, want 1", got.YoyFlag)
++	}
++	if _, err := snapshot.ParseMetric([]byte(strings.Replace(m, `"aggType": 1`, `"aggType": 6`, 1))); err == nil {
++		t.Error("aggType=6（enum 1-5 之外）未被拒收")
++	}
++	if _, err := snapshot.ParseMetric([]byte(strings.Replace(m, `"period": "DAY"`, `"period": "WEEK"`, 1))); err == nil {
++		t.Error(`period="WEEK"（enum 之外）未被拒收`)
++	}
++}
+diff --git a/ingest/internal/snapshot/snapshot_fetch_contract_test.go b/ingest/internal/snapshot/snapshot_fetch_contract_test.go
+new file mode 100644
+index 0000000..2042629
+--- /dev/null
++++ b/ingest/internal/snapshot/snapshot_fetch_contract_test.go
+@@ -0,0 +1,206 @@
++package snapshot_test
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// contractBodyJSON：快照体，顶层结构逐字取自 v1.0.1「快照体顶层结构」示例。
++const contractBodyJSON = `{
++  "schemaVersion": "1.0.1",
++  "tenantId": 1,
++  "scopeType": 1,
++  "scopeId": 88,
++  "version": 17,
++  "points": [],
++  "channels": [],
++  "dataItems": [],
++  "formulas": [],
++  "metrics": []
++}`
++
++// 契约依据：§3.3 GET /internal/v1/config/snapshot?scopeType=&scopeId=&version=。
++// 假快照端点（httptest 回放契约样例）断言请求路径与查询参数形态。
++func TestContractSnapshotFetchRequestURL(t *testing.T) {
++	var gotPath, gotScopeType, gotScopeID, gotVersion string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotPath = r.URL.Path
++		q := r.URL.Query()
++		gotScopeType, gotScopeID, gotVersion = q.Get("scopeType"), q.Get("scopeId"), q.Get("version")
++		fmt.Fprintf(w, `{"version":17,"snapshotHash":"h17","snapshot":%s}`, contractBodyJSON)
++	}))
++	defer srv.Close()
++
++	f := &snapshot.HTTPFetcher{BaseURL: srv.URL}
++	res, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88, Version: 17})
++	if err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if gotPath != "/internal/v1/config/snapshot" {
++		t.Errorf("path = %q, want /internal/v1/config/snapshot", gotPath)
++	}
++	if gotScopeType != "1" || gotScopeID != "88" || gotVersion != "17" {
++		t.Errorf("query = scopeType=%q scopeId=%q version=%q, want 1/88/17", gotScopeType, gotScopeID, gotVersion)
++	}
++	if res == nil || res.Snapshot == nil {
++		t.Fatal("Fetch result body missing")
++	}
++}
++
++// 契约依据：§3.3「不带 version 返回最新版」——Scope.Version=0 时请求不带 version 参数。
++func TestContractSnapshotFetchWithoutVersionReturnsLatest(t *testing.T) {
++	var hadVersionParam bool
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, hadVersionParam = r.URL.Query()["version"]
++		fmt.Fprintf(w, `{"version":17,"snapshotHash":"h17","snapshot":%s}`, contractBodyJSON)
++	}))
++	defer srv.Close()
++
++	f := &snapshot.HTTPFetcher{BaseURL: srv.URL}
++	if _, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88}); err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if hadVersionParam {
++		t.Error("Scope.Version=0 时请求不应携带 version 参数（不带 version 返回最新版）")
++	}
++}
++
++// 契约依据：§3.3 响应信封——「响应含 version、snapshotHash 与快照体」；
++// 「顶层 version 与响应信封 version 同值」。信封包装键名上游未定版，本实现拟用 "snapshot"
++// （留白已在包注释与报告声明）。
++func TestContractSnapshotFetchEnvelope(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		fmt.Fprintf(w, `{"version":17,"snapshotHash":"h17","snapshot":%s}`, contractBodyJSON)
++	}))
++	defer srv.Close()
++
++	f := &snapshot.HTTPFetcher{BaseURL: srv.URL}
++	res, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88, Version: 17})
++	if err != nil {
++		t.Fatalf("Fetch error: %v", err)
++	}
++	if res.Version != 17 {
++		t.Errorf("envelope Version = %d, want 17", res.Version)
++	}
++	if res.SnapshotHash != "h17" {
++		t.Errorf("snapshotHash = %q, want h17", res.SnapshotHash)
++	}
++	if res.Snapshot.Version != 17 {
++		t.Errorf("body Version = %d, want 17", res.Snapshot.Version)
++	}
++	if res.Version != res.Snapshot.Version {
++		t.Errorf("信封 version(%d) 与快照体 version(%d) 不同值，违反 §3.3", res.Version, res.Snapshot.Version)
++	}
++}
++
++// 契约依据：§3.3「顶层 version 与响应信封 version 同值」——不同值必须拒收（校验失败不缓存）。
++func TestContractSnapshotFetchVersionMismatchRejected(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		fmt.Fprintf(w, `{"version":18,"snapshotHash":"h","snapshot":%s}`, contractBodyJSON)
++	}))
++	defer srv.Close()
++
++	f := &snapshot.HTTPFetcher{BaseURL: srv.URL}
++	res, err := f.Fetch(context.Background(), snapshot.Scope{Type: 1, ID: 88})
++	if err == nil {
++		t.Fatalf("Fetch error = nil, want version mismatch reject; result = %+v", res)
++	}
++	if res != nil {
++		t.Errorf("result = %+v, want nil", res)
++	}
++}
++
++// 契约依据：§3.3 接入消费方式——「收到通知后按版本拉新快照、校验、原子替换缓存
++//（新快照校验失败则继续用旧版并回执失败）」。
++func TestContractSnapshotCacheAtomicReplaceKeepsOldOnInvalid(t *testing.T) {
++	old := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":100000,"status":1}]
++}`
++	invalidNew := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 18,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":9,"valueType":"DOUBLE","status":1}]
++}`
++	validNew := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 18,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":200000,"status":1}]
++}`
++	c := snapshot.NewCache()
++	if err := c.Replace(mustParse(t, old)); err != nil {
++		t.Fatalf("Replace(old) error: %v", err)
++	}
++
++	err := c.Replace(mustParseRaw(invalidNew))
++	if err == nil {
++		t.Fatal("Replace(无效新快照) error = nil, want 校验失败")
++	}
++	if got := c.Get(); got == nil || got.Version != 17 {
++		t.Errorf("校验失败后缓存 version = %v, want 继续用旧版 17", got)
++	}
++
++	if err := c.Replace(mustParse(t, validNew)); err != nil {
++		t.Fatalf("Replace(validNew) error: %v", err)
++	}
++	if got := c.Get(); got.Version != 18 {
++		t.Errorf("成功替换后缓存 version = %d, want 18", got.Version)
++	}
++}
++
++// 契约依据：§3.2 处理顺序第 2 步「按 pointCode 查配置快照」；未知编码 → 死信（第 3 步）。
++func TestContractSnapshotCacheLookupUnknownPoint(t *testing.T) {
++	withPoint := `{
++  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++  "points": [{"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","status":1}]
++}`
++	c := snapshot.NewCache()
++	if _, ok := c.LookupPoint("F01_WS01_EQ001_M01"); ok {
++		t.Error("空缓存 LookupPoint ok = true, want false")
++	}
++	if err := c.Replace(mustParse(t, withPoint)); err != nil {
++		t.Fatalf("Replace error: %v", err)
++	}
++	p, ok := c.LookupPoint("F01_WS01_EQ001_M01")
++	if !ok || p == nil {
++		t.Fatal("已知编码 LookupPoint 未命中")
++	}
++	if _, ok := c.LookupPoint("X99"); ok {
++		t.Error("未知编码 X99 LookupPoint ok = true, want false（未知编码进死信）")
++	}
++}
++
++// 契约依据：§3.3 通知行——载荷 `{"tenant": "group_a", "scopeType": 1, "scopeId": 88, "version": 17, "hash": "..."}`；
++// 通知只作触发信号，不得直接信任通知内容。
++func TestContractConfigChangedNotificationPayload(t *testing.T) {
++	payload := `{"tenant": "group_a", "scopeType": 1, "scopeId": 88, "version": 17, "hash": "3f5a9c"}`
++	cc, err := snapshot.ParseConfigChanged([]byte(payload))
++	if err != nil {
++		t.Fatalf("ParseConfigChanged error: %v", err)
++	}
++	if cc.Tenant != "group_a" || cc.ScopeType != 1 || cc.ScopeID != 88 || cc.Version != 17 || cc.Hash != "3f5a9c" {
++		t.Errorf("config.changed = %+v", cc)
++	}
++}
++
++func mustParse(t *testing.T, jsonStr string) *snapshot.Snapshot {
++	t.Helper()
++	s, err := snapshot.ParseSnapshot([]byte(jsonStr))
++	if err != nil {
++		t.Fatalf("ParseSnapshot error: %v (json=%s)", err, jsonStr)
++	}
++	return s
++}
++
++func mustParseRaw(jsonStr string) *snapshot.Snapshot {
++	// 绕过测试辅助的错误路径：直接构造，注入无效点位由 Replace 内部校验拦截。
++	s, _ := snapshot.ParseSnapshot([]byte(strings.Replace(jsonStr, `"dataType":9`, `"dataType":1`, 1)))
++	if s != nil && len(s.Points) > 0 {
++		s.Points[0].DataType = 9 // 事后注入非法枚举，验证 Replace 的独立校验
++	}
++	return s
++}
+diff --git a/ingest/internal/tdengine/tdengine.go b/ingest/internal/tdengine/tdengine.go
+new file mode 100644
+index 0000000..3a0fbe2
+--- /dev/null
++++ b/ingest/internal/tdengine/tdengine.go
+@@ -0,0 +1,306 @@
++// Package tdengine 承载 TDengine 超级表契约（冻结稿 v1.0.0）的写入侧实现：
++// 数据种类 → 超级表 / kind 标签映射、附录 B 建库建表 DDL、写入语句构造与执行器抽象。
++//
++// 契约纪律：
++//   - 接入服务只写 st_point_num / st_point_state（st_item_value / st_metric_value 归计算引擎）；
++//   - 子表由写入方首次写入时自动创建（INSERT INTO 子表 USING 超级表 TAGS (...)），标签值取自配置快照；
++//   - 每租户一库，库名 iot_<tenant_code>；防写错靠写方从令牌解析租户选库；
++//   - 攒批写入（FEAT-0009：禁止逐条写库）——同一子表多行合并单条 INSERT 多 VALUES。
++//
++// 实现口径：子表名取点位编码（租户内唯一、每点位一张子表，符合 §2.2 子表粒度；
++// 命名方案契约未定版，接线时如需调整只改 childTable 函数）；instance_key 标签在快照
++// v1.0.1 点位对象中无对应字段（上游留白），暂写空串，见 TASK-0073 报告。
++package tdengine
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// 四张超级表名（附录 B 逐字）。
++const (
++	StablePointNum    = "st_point_num"
++	StablePointState  = "st_point_state"
++	StableItemValue   = "st_item_value"
++	StableMetricValue = "st_metric_value"
++)
++
++// kind 标签值（§2.2：num 表 INSTANT/CUMUL；state 表 STATE/SWITCH）。
++const (
++	KindInstant = "INSTANT"
++	KindCumul   = "CUMUL"
++	KindState   = "STATE"
++	KindSwitch  = "SWITCH"
++)
++
++// KindFor 数据种类（快照 dataType）→ kind 标签值：
++// 1 瞬时量 INSTANT、2 累计量 CUMUL、3 状态量 STATE、4 开关量 SWITCH。
++func KindFor(dataType int) (string, bool) {
++	switch dataType {
++	case 1:
++		return KindInstant, true
++	case 2:
++		return KindCumul, true
++	case 3:
++		return KindState, true
++	case 4:
++		return KindSwitch, true
++	default:
++		return "", false
++	}
++}
++
++// StableFor 数据种类（快照 dataType）→ 接入服务目标超级表：
++// 1,2 → st_point_num；3,4 → st_point_state（§2.2 按 data_type 分发）。
++func StableFor(dataType int) (string, bool) {
++	switch dataType {
++	case 1, 2:
++		return StablePointNum, true
++	case 3, 4:
++		return StablePointState, true
++	default:
++		return "", false
++	}
++}
++
++// DBName 每租户一库（附录 B）：iot_<tenant_code>。
++func DBName(tenantCode string) string {
++	return "iot_" + tenantCode
++}
++
++// PointRow 点位写入行（st_point_num / st_point_state）。
++// 标签值由流水线从配置快照填充（标签纪律：标签只放低基数维度，取自快照不取自消息）。
++type PointRow struct {
++	TenantCode  string  // 选库键（写方从令牌解析租户选库；iot_<tenant_code>）
++	TenantID    int64   // 标签 tenant_id
++	PointCode   string  // 标签 point_code，兼作子表名（实现口径见包注释）
++	Kind        string  // 标签 kind：INSTANT/CUMUL/STATE/SWITCH
++	InstanceKey string  // 标签 instance_key（快照 v1.0.1 无对应字段，暂空，见包注释）
++	DeptID      int64   // 标签 dept_id
++	Ts          int64   // 毫秒时间戳（设备侧采样时间，迟到数据按 ts 落库）
++	Value       float64 // num 表 DOUBLE；state 表 INT 枚举（按 INT 数值写入）
++	Quality     int     // 质量码（CONV-02 0-10）
++}
++
++// CreateDatabaseSQL 附录 B 建库语句（按租户参数化）。
++func CreateDatabaseSQL(tenantCode string) string {
++	return fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s KEEP 1825d DURATION 10d BUFFER 256;", DBName(tenantCode))
++}
++
++// UseSQL 附录 B 的 USE 语句（按租户参数化）。
++func UseSQL(tenantCode string) string {
++	return "USE " + DBName(tenantCode) + ";"
++}
++
++// CreateStableSQL 附录 B 四张超级表 DDL（语句逐字，仅随 USE 语境落库；顺序与附录 B 一致）。
++func CreateStableSQL(_ string) []string {
++	return []string{
++		"CREATE STABLE IF NOT EXISTS " + StablePointNum + " (ts TIMESTAMP, value DOUBLE, quality INT)\n" +
++			"  TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
++		"CREATE STABLE IF NOT EXISTS " + StablePointState + " (ts TIMESTAMP, value INT, quality INT)\n" +
++			"  TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
++		"CREATE STABLE IF NOT EXISTS " + StableItemValue + " (ts TIMESTAMP, value DOUBLE, quality INT)\n" +
++			"  TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT);",
++		"CREATE STABLE IF NOT EXISTS " + StableMetricValue + " (ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE)\n" +
++			"  TAGS (tenant_id BIGINT, metric_code BINARY(96), instance_code BINARY(96), period BINARY(8));",
++	}
++}
++
++// safeIdentifier 报告标识符（库名/子表名）是否安全：字母或下划线开头，仅字母数字下划线。
++func safeIdentifier(s string) bool {
++	if s == "" {
++		return false
++	}
++	for i, r := range s {
++		switch {
++		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
++			// 首字符与后续字符均合法
++		case r >= '0' && r <= '9':
++			if i == 0 {
++				return false // 标识符不能以数字开头
++			}
++		default:
++			return false
++		}
++	}
++	return true
++}
++
++// childTable 子表名（实现口径：点位编码即子表名，租户内每点位一张）。
++func childTable(row PointRow) (string, error) {
++	if !safeIdentifier(row.PointCode) {
++		return "", fmt.Errorf("tdengine: pointCode %q 不是安全子表名", row.PointCode)
++	}
++	return row.PointCode, nil
++}
++
++// InsertPointSQL 构造写入语句：同一子表多行合并单条 INSERT（USING 超级表 TAGS (...)）。
++// rows 必须同租户、同点位（Writer 已分组）；否则返回错误，绝不混写。
++func InsertPointSQL(rows []PointRow) (string, error) {
++	if len(rows) == 0 {
++		return "", fmt.Errorf("tdengine: 空 rows")
++	}
++	first := rows[0]
++	db := DBName(first.TenantCode)
++	if !safeIdentifier(first.TenantCode) {
++		return "", fmt.Errorf("tdengine: tenantCode %q 不是安全库名成分", first.TenantCode)
++	}
++	child, err := childTable(first)
++	if err != nil {
++		return "", err
++	}
++	stable := stableForKind(first.Kind)
++	if stable == "" {
++		return "", fmt.Errorf("tdengine: kind %q 不在 INSTANT/CUMUL/STATE/SWITCH 内", first.Kind)
++	}
++	var sb strings.Builder
++	fmt.Fprintf(&sb, "INSERT INTO %s.%s USING %s.%s TAGS (%d, '%s', '%s', '%s', %d) VALUES ",
++		db, child, db, stable,
++		first.TenantID, first.PointCode, first.Kind, first.InstanceKey, first.DeptID)
++	for i := range rows {
++		r := rows[i]
++		if r.TenantCode != first.TenantCode || r.PointCode != first.PointCode || r.Kind != first.Kind {
++			return "", fmt.Errorf("tdengine: rows 混入不同租户/点位/kind（%s/%s/%s），必须先分组", r.TenantCode, r.PointCode, r.Kind)
++		}
++		fmt.Fprintf(&sb, "(%d, %s, %d)", r.Ts, formatValue(r.Value), r.Quality)
++	}
++	return sb.String(), nil
++}
++
++// stableForKind kind → 超级表（与 KindFor/StableFor 一致的内部映射）。
++func stableForKind(kind string) string {
++	switch kind {
++	case KindInstant, KindCumul:
++		return StablePointNum
++	case KindState, KindSwitch:
++		return StablePointState
++	default:
++		return ""
++	}
++}
++
++// formatValue 数值列格式化：DOUBLE/INT 统一最短浮点表示（1 → "1"，98231.4 → "98231.4"）。
++func formatValue(v float64) string {
++	return strconv.FormatFloat(v, 'g', -1, 64)
++}
++
++// Executor SQL 执行器抽象。真 TDengine 连接归 TASK-0029 接线；
++// 假实现 FakeExecutor 只记录调用（brief 决策 3），零改动替换。
++type Executor interface {
++	Exec(ctx context.Context, sql string) error
++}
++
++// ExecCall 一次执行的记录：何时（At）以什么参数（SQL）调了什么。
++type ExecCall struct {
++	At  time.Time
++	SQL string
++}
++
++// FakeExecutor 假 TDengine 执行器：记录调用、不真执行。
++// failRemaining>0 时前 failRemaining 次 Exec 返回注入错误（攒批失败重排测试用）。
++type FakeExecutor struct {
++	mu           sync.Mutex
++	calls        []ExecCall
++	failRemaining int
++}
++
++// NewFakeExecutor 创建假执行器；failTimes 为连续注入失败的次数（0 = 永不失败）。
++func NewFakeExecutor(failTimes int) *FakeExecutor {
++	return &FakeExecutor{failRemaining: failTimes}
++}
++
++// Reset 重置失败注入额度与调用记录（测试编排用）。
++func (f *FakeExecutor) Reset(failTimes int) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.calls = nil
++	f.failRemaining = failTimes
++}
++
++// Exec 记录并按注入策略返回。
++func (f *FakeExecutor) Exec(_ context.Context, sql string) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.calls = append(f.calls, ExecCall{At: time.Now(), SQL: sql})
++	if f.failRemaining > 0 {
++		f.failRemaining--
++		return fmt.Errorf("tdengine: 注入执行失败（剩余额度外调用，sql=%s）", truncateSQL(sql))
++	}
++	return nil
++}
++
++// Calls 返回已记录调用的副本。
++func (f *FakeExecutor) Calls() []ExecCall {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	out := make([]ExecCall, len(f.calls))
++	copy(out, f.calls)
++	return out
++}
++
++// Writer 攒批写出口：把写入行按（租户，子表）分组，逐组下发单条 INSERT。
++// 分组下发保证「攒批写入、禁止逐条写库」；任一组失败即返回错误（重排归流水线攒批层）。
++type Writer struct {
++	// Ex SQL 执行器（假实现或真 TDengine 连接）。
++	Ex Executor
++}
++
++type groupKey struct {
++	tenant string
++	child  string
++	kind   string
++}
++
++// WritePoints 写入一批点位行。按（租户，子表，kind）分组，组间顺序稳定（字典序）。
++// 空 rows 直接返回 nil。
++func (w *Writer) WritePoints(ctx context.Context, rows []PointRow) error {
++	if len(rows) == 0 || w == nil || w.Ex == nil {
++		if w == nil || w.Ex == nil {
++			return fmt.Errorf("tdengine: Writer 未配置执行器")
++		}
++		return nil
++	}
++	groups := make(map[groupKey][]PointRow)
++	order := make([]groupKey, 0, len(rows))
++	for _, r := range rows {
++		child, err := childTable(r)
++		if err != nil {
++			return err
++		}
++		k := groupKey{tenant: r.TenantCode, child: child, kind: r.Kind}
++		if _, seen := groups[k]; !seen {
++			order = append(order, k)
++		}
++		groups[k] = append(groups[k], r)
++	}
++	// 稳定序：按租户、子表排序，保证失败重排与重试的语句顺序可预期。
++	sort.Slice(order, func(i, j int) bool {
++		if order[i].tenant != order[j].tenant {
++			return order[i].tenant < order[j].tenant
++		}
++		return order[i].child < order[j].child
++	})
++	for _, k := range order {
++		sql, err := InsertPointSQL(groups[k])
++		if err != nil {
++			return err
++		}
++		if err := w.Ex.Exec(ctx, sql); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// truncateSQL 截断 SQL 用于错误信息。
++func truncateSQL(sql string) string {
++	if len(sql) <= 120 {
++		return sql
++	}
++	return sql[:120] + "…"
++}
+diff --git a/ingest/internal/tdengine/tdengine_contract_test.go b/ingest/internal/tdengine/tdengine_contract_test.go
+new file mode 100644
+index 0000000..73f6a2e
+--- /dev/null
++++ b/ingest/internal/tdengine/tdengine_contract_test.go
+@@ -0,0 +1,194 @@
++package tdengine_test
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// 契约依据：TDengine 超级表契约 v1.0.0 §2.2——
++// st_point_num 列 ts TIMESTAMP, value DOUBLE, quality INT；标签 tenant_id、point_code、kind（INSTANT/CUMUL）、instance_key、dept_id。
++// 写入行取统一消息模型契约 §3.2 示例值（M01：ts=1795211995000 value=98231.4 quality=0），
++// 标签取自配置快照（tenant_id=1、dept_id=3），instance_key 为快照留白暂空。
++func TestContractInsertShapeNumInstant(t *testing.T) {
++	sql, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode:  "group_a",
++		TenantID:    1,
++		PointCode:   "F01_WS01_EQ001_M01",
++		Kind:        tdengine.KindInstant,
++		InstanceKey: "",
++		DeptID:      3,
++		Ts:          1795211995000,
++		Value:       98231.4,
++		Quality:     0,
++	}})
++	if err != nil {
++		t.Fatalf("InsertPointSQL error: %v", err)
++	}
++	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num " +
++		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) VALUES (1795211995000, 98231.4, 0)"
++	if sql != want {
++		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
++	}
++}
++
++// 契约依据：§2.2——st_point_state 列 ts TIMESTAMP, value INT, quality INT，kind（STATE/SWITCH）。
++// 状态量（dataType 3）与开关量（dataType 4）按 INT 枚举存（快照 Schema valueType 备注），
++// 示例值取统一消息模型 §3.2 S01 点位（value=1）。
++func TestContractInsertShapeStateAndKindMapping(t *testing.T) {
++	sql, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a",
++		TenantID:   1,
++		PointCode:  "F01_WS01_EQ001_S01",
++		Kind:       tdengine.KindState,
++		DeptID:     3,
++		Ts:         1795211995000,
++		Value:      1,
++		Quality:    0,
++	}})
++	if err != nil {
++		t.Fatalf("InsertPointSQL error: %v", err)
++	}
++	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_S01 USING iot_group_a.st_point_state " +
++		"TAGS (1, 'F01_WS01_EQ001_S01', 'STATE', '', 3) VALUES (1795211995000, 1, 0)"
++	if sql != want {
++		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
++	}
++
++	// kind 映射：1 瞬时量 INSTANT、2 累计量 CUMUL（num 表）；3 状态量 STATE、4 开关量 SWITCH（state 表）。
++	kindCases := []struct {
++		dataType  int
++		wantKind  string
++		wantTable string
++	}{
++		{1, "INSTANT", "st_point_num"},
++		{2, "CUMUL", "st_point_num"},
++		{3, "STATE", "st_point_state"},
++		{4, "SWITCH", "st_point_state"},
++	}
++	for _, c := range kindCases {
++		kind, ok := tdengine.KindFor(c.dataType)
++		if !ok || kind != c.wantKind {
++			t.Errorf("KindFor(%d) = (%q, %v), want (%q, true)", c.dataType, kind, ok, c.wantKind)
++		}
++		table, ok := tdengine.StableFor(c.dataType)
++		if !ok || table != c.wantTable {
++			t.Errorf("StableFor(%d) = (%q, %v), want (%q, true)", c.dataType, table, ok, c.wantTable)
++		}
++	}
++	if _, ok := tdengine.KindFor(5); ok {
++		t.Error("KindFor(5) ok = true, want false（data_type enum 只有 1-4）")
++	}
++}
++
++// 契约依据：附录 B「TDengine 建库建表」（每租户一库，库名 iot_<tenant_code>）——
++// 建库与四张超级表 DDL 逐字对齐（仅按租户参数化库名；比对前归一空白）。
++func TestContractSuperTableDefinitionsMatchAppendixB(t *testing.T) {
++	contract := []string{
++		"CREATE DATABASE IF NOT EXISTS iot_group_a KEEP 1825d DURATION 10d BUFFER 256;",
++		"USE iot_group_a;",
++		"CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
++		"CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
++		"CREATE STABLE IF NOT EXISTS st_item_value (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT);",
++		"CREATE STABLE IF NOT EXISTS st_metric_value (ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE) TAGS (tenant_id BIGINT, metric_code BINARY(96), instance_code BINARY(96), period BINARY(8));",
++	}
++	got := append([]string{tdengine.CreateDatabaseSQL("group_a"), tdengine.UseSQL("group_a")},
++		tdengine.CreateStableSQL("group_a")...)
++	if len(got) != len(contract) {
++		t.Fatalf("DDL 语句数 = %d, want %d", len(got), len(contract))
++	}
++	for i := range contract {
++		if normalize(got[i]) != normalize(contract[i]) {
++			t.Errorf("DDL[%d] 不符附录 B：\n  got:  %s\n  want: %s", i, got[i], contract[i])
++		}
++	}
++}
++
++func normalize(s string) string {
++	return strings.Join(strings.Fields(s), " ")
++}
++
++// 契约依据：§3.2「批量上限」与 FEAT-0009「攒批写入（禁止逐条写库）」——
++// 同一子表多行合并单条 INSERT 多 VALUES 元组。
++func TestContractBatchInsertMultiRowSameChild(t *testing.T) {
++	rows := []tdengine.PointRow{
++		{TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M01", Kind: tdengine.KindInstant, DeptID: 3, Ts: 1795211995000, Value: 98231.4, Quality: 0},
++		{TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M01", Kind: tdengine.KindInstant, DeptID: 3, Ts: 1795212000000, Value: 132.5, Quality: 0},
++	}
++	sql, err := tdengine.InsertPointSQL(rows)
++	if err != nil {
++		t.Fatalf("InsertPointSQL error: %v", err)
++	}
++	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num " +
++		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) " +
++		"VALUES (1795211995000, 98231.4, 0)(1795212000000, 132.5, 0)"
++	if sql != want {
++		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
++	}
++}
++
++// 契约依据：§2.2 子表粒度「每个数值型点位一张 / 每个状态开关点位一张」——
++// 不同点位分属不同子表，Writer 必须按子表分组逐表下发（一次一组）。
++func TestContractWriterGroupsByChildTable(t *testing.T) {
++	ex := tdengine.NewFakeExecutor(0)
++	w := &tdengine.Writer{Ex: ex}
++	rows := []tdengine.PointRow{
++		{TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M01", Kind: tdengine.KindInstant, DeptID: 3, Ts: 1795211995000, Value: 98231.4, Quality: 0},
++		{TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M02", Kind: tdengine.KindInstant, DeptID: 3, Ts: 1795211995000, Value: 132.5, Quality: 0},
++		{TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M01", Kind: tdengine.KindInstant, DeptID: 3, Ts: 1795212000000, Value: 90000, Quality: 0},
++	}
++	if err := w.WritePoints(context.Background(), rows); err != nil {
++		t.Fatalf("WritePoints error: %v", err)
++	}
++	calls := ex.Calls()
++	if len(calls) != 2 {
++		t.Fatalf("Exec 次数 = %d, want 2（M01 合并一组、M02 一组；禁止逐条写）", len(calls))
++	}
++	if strings.Count(calls[0].SQL, "F01_WS01_EQ001_M01") == 0 || !strings.Contains(calls[0].SQL, "VALUES (1795211995000, 98231.4, 0)(1795212000000, 90000, 0)") {
++		t.Errorf("call[0] SQL = %q, want M01 两行合并", calls[0].SQL)
++	}
++	if !strings.Contains(calls[1].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M02") {
++		t.Errorf("call[1] SQL = %q, want M02 子表", calls[1].SQL)
++	}
++	for _, c := range calls {
++		if c.At.IsZero() {
++			t.Error("FakeExecutor 必须记录调用时间（谁在何时以什么参数调了什么）")
++		}
++	}
++}
++
++// 假执行器口径（brief 决策 3）：记录「谁在何时以什么参数调了什么」，不真执行；
++// 置失败注入次数后按剩余次数失败，供攒批失败重排测试。
++func TestFakeExecutorRecordsCallsAndInjectsFailure(t *testing.T) {
++	ex := tdengine.NewFakeExecutor(1) // 首次调用失败，其后成功
++	if err := ex.Exec(context.Background(), "INSERT INTO t VALUES (1)"); err == nil {
++		t.Error("首次 Exec error = nil, want 注入失败")
++	}
++	if err := ex.Exec(context.Background(), "INSERT INTO t VALUES (2)"); err != nil {
++		t.Errorf("第二次 Exec error = %v, want nil（失败额度耗尽后成功）", err)
++	}
++	calls := ex.Calls()
++	if len(calls) != 2 {
++		t.Fatalf("记录条数 = %d, want 2", len(calls))
++	}
++	if !strings.Contains(calls[0].SQL, "INSERT INTO t VALUES (1)") {
++		t.Errorf("call[0].SQL = %q", calls[0].SQL)
++	}
++}
++
++// 契约依据：§2.2「标签值取自配置快照，不取自消息自带字段」+ 附录 B 库名纪律——
++// 子表名/库名必须是安全标识符，非法字符拒收（防注入，实现口径）。
++func TestUnsafeIdentifierRejected(t *testing.T) {
++	if _, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a", TenantID: 1, PointCode: "M01); DROP DATABASE x", Kind: tdengine.KindInstant,
++	}}); err == nil {
++		t.Error("非法子表名未被拒收")
++	}
++	if _, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a'; --", TenantID: 1, PointCode: "M01", Kind: tdengine.KindInstant,
++	}}); err == nil {
++		t.Error("非法租户码（库名）未被拒收")
++	}
++}

@@ -1,0 +1,225 @@
+commit eb01ba2d78e5a689fd21ba3292b5e4c90ae83937
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 08:27:41 2026 +0800
+
+    fix(iot): 实例详情读路径补 create_by=me 分支——与列表 OR 分支对齐（TASK-0007 修订轮，验收退回裁决）
+    
+    - 裁决：观察项（纯 scope=4 用户列表可见自建实例但详情 403）确认为口径不对称缺陷，授权修复
+    - IotModelInstanceServiceImpl.getInstanceDetail：可见性判定扩为 instanceIds.contains ||
+      (createByOnly && create_by=当前用户)——ADR-0016 裁决 3 仅本人适用集含详情类；写路径防线不变
+    - IotDataItemServiceImpl：item list / effective-params 读路径实例可见性同口径对齐
+      （自建实例可见即可开，否则 create_by 分支在实践中不可用）；overrideParams/regenerate
+      写防线维持 instanceIds 口径（红线一-B 改绑升级链防线不动）
+    - 红线套件转正：scenario5 断言自建详情 200/他建详情 403；DataItem 新增 scope=4 自建实例
+      清单/params 可读 + 他建仍拒用例（套件 14 跑：11 绿 + 3 占位 skip）
+    - create_by 语义确认=创建者 userId（MetaObjectHandler insertFill；dev 冒烟实测 createBy=8）
+    - 全量 1551（1550+1 新用例）0 失败 0 错误；dev 冒烟 S1-S6 全过，服务用毕即停、冒烟数据已清理
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index 2806026..71ce287 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -367,13 +367,17 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+ 
+     @Override
+     public List<IotDataItem> selectItemsByInstanceId(Long instanceId) {
+-        if (modelInstanceMapper.selectById(instanceId) == null) {
++        IotModelInstance instance = modelInstanceMapper.selectById(instanceId);
++        if (instance == null) {
+             throw paramError("实例不存在或已删除: " + instanceId);
+         }
+         // 数据权限裁剪（§3.1 查询类接口走 §4 过滤）：受限用户对不可见实例返回空清单
+-        // （集合类语义，ADR-0016 裁决 2/3 口径——不泄露不可见实例的存在与配置面）
++        // （集合类语义，ADR-0016 裁决 2/3 口径——不泄露不可见实例的存在与配置面）。
++        // 修订轮（TASK-0007）：实例可见性判定与实例列表 OR 分支对齐（ADR-0016 裁决 4）——
++        // createByOnly 且 create_by=当前用户的自建实例可见即开清单，否则 create_by 分支
++        // 在实践中不可用（裁决 3 适用集=iot_ 配置表的管理面查询）
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+-        if (!scope.allTenant() && !scope.instanceIds().contains(instanceId)) {
++        if (!scope.allTenant() && !isInstanceReadableByUser(scope, instance)) {
+             return List.of();
+         }
+         return this.list(new LambdaQueryWrapper<IotDataItem>()
+@@ -439,12 +443,18 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+ 
+     @Override
+     public IotItemEffectiveParamsVO getEffectiveParams(Long instanceId, Long itemId) {
+-        // 读单实例资源照 0012 详情口径：存在性 → 数据权限 403（不泄露实例标识）→ 归属
++        // 读单实例资源照 0012 详情口径：存在性 → 数据权限 403（不泄露实例标识）→ 归属。
++        // 修订轮（TASK-0007）：详情类可见性与实例列表 OR 分支对齐（ADR-0016 裁决 3/4，
++        // 仅本人适用集含详情类）——createByOnly 且 create_by=当前用户的自建实例可读；
++        // 写路径防线（overrideParams/regenerateForInstance）维持 instanceIds 口径不变
+         IotModelInstance instance = modelInstanceMapper.selectById(instanceId);
+         if (instance == null) {
+             throw paramError("实例不存在或已删除: " + instanceId);
+         }
+-        requireDataPerm(instanceId, "无权访问该实例（数据权限不命中）");
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !isInstanceReadableByUser(scope, instance)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）");
++        }
+         IotDataItem item = baseMapper.selectById(itemId);
+         if (item == null || !instanceId.equals(item.getInstanceId())) {
+             throw paramError("数据项不存在或不属于该实例: " + itemId);
+@@ -540,6 +550,8 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     /**
+      * 写路径数据权限防线（0012 修订轮 I-1 同源同口径）：resolve(当前用户) → VisibleScope，
+      * allTenant 直过；否则目标实例必须 ∈ 可见集，不在即 403——文案不泄露实例标识（照详情范式）。
++     * 修订轮（TASK-0007）：写原语不借 create_by 分支放行（改绑升级链防线，红线一-B），
++     * 仅读路径（清单/params 详情）对齐列表 OR 分支。
+      */
+     private void requireDataPerm(Long targetId, String message) {
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+@@ -548,6 +560,19 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+         }
+     }
+ 
++    /**
++     * 实例读路径可见性判定（TASK-0007 修订轮，ADR-0016 裁决 3/4）：id ∈ 可见集 OR
++     * (createByOnly 且实例 create_by=当前用户)——与实例列表 OR 分支完全对齐：自建实例
++     * 可见即可开（否则 create_by 分支在实践中不可用）；仅本人适用集=iot_ 配置表的
++     * 管理面查询含详情/清单类（裁决 3）。create_by 语义=创建者 userId
++     * （MetaObjectHandler insertFill 经 StpUtil.getLoginIdAsLong() 审计填充）。
++     */
++    private boolean isInstanceReadableByUser(VisibleScope scope, IotModelInstance instance) {
++        return scope.instanceIds().contains(instance.getId())
++                || (scope.createByOnly() && instance.getCreateBy() != null
++                    && instance.getCreateBy().equals(SecurityUtils.getUserId()));
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 模板项 → 实例项实体（字段白名单构建，映射口径见类注释；公式由调用方展开后回填） */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+index 71c9713..c7ede66 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+@@ -636,7 +636,7 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+             throw paramError("实例不存在或已删除");
+         }
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+-        if (!scope.allTenant() && !scope.instanceIds().contains(id)) {
++        if (!scope.allTenant() && !isInstanceReadableByUser(scope, instance)) {
+             // ADR-0016 裁决 2：空结果 vs 403 按接口形态判定——GET /iot/instance/{id} 尾段为
+             // 数字 id，组件 isDetailAccess 判定为详情类 → 选 SCOPE_FORBIDDEN（数据权限不命中
+             // 归 4xx 口径，§3 p20）——组件拒绝策略常量的首个真实消费点
+@@ -653,6 +653,20 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         return instance;
+     }
+ 
++    /**
++     * 实例读路径可见性判定（TASK-0007 修订轮，ADR-0016 裁决 3/4）：id ∈ 可见集 OR
++     * (createByOnly 且实例 create_by=当前用户)——与列表 OR 分支完全对齐：自建实例可见即可开
++     * （否则 create_by 分支在实践中不可用）；仅本人适用集=iot_ 配置表的管理面查询含详情类
++     * （裁决 3）。create_by 语义=创建者 userId（MetaObjectHandler insertFill 经
++     * StpUtil.getLoginIdAsLong() 审计填充）。写路径防线（{@link #requireDataPerm}）维持
++     * instanceIds 口径不变——写原语不得借 create_by 分支穿透（改绑升级链防线，红线一-B）。
++     */
++    private boolean isInstanceReadableByUser(VisibleScope scope, IotModelInstance instance) {
++        return scope.instanceIds().contains(instance.getId())
++                || (scope.createByOnly() && instance.getCreateBy() != null
++                    && instance.getCreateBy().equals(SecurityUtils.getUserId()));
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /**
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/DataItemRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/DataItemRedlineTest.java
+index a8086c3..d552aed 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/DataItemRedlineTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/DataItemRedlineTest.java
+@@ -96,4 +96,29 @@ class DataItemRedlineTest {
+         assertEquals(IotParamSource.NONE, vo.getValidMinSource());
+         assertEquals(IotParamSource.NONE, vo.getAlarmHighSource());
+     }
++
++    @Test
++    @DisplayName("params 同口径（修订轮） · 纯scope=4用户自建实例：item/list 返回清单、effective-params 200；他建实例仍空清单/403")
++    void params_ownCreatedInstance_byPureScope4User_visibleViaCreateByBranch() {
++        // 自建实例（create_by=USER_ME，dept_id=NULL——仅 create_by 分支可达，最锐利的对齐证明）
++        fx.addInstanceRow(RedlineFixture.newRow(30L, "ME.LINE01", 0, "0", 3, null, RedlineFixture.USER_ME));
++        fx.addItemRow(RedlineFixture.newItemRow(500L, 30L, "speed", "ME.LINE01.speed"));
++        fx.loginAs(RedlineFixture.USER_ME);
++
++        // 清单（集合类）：自建实例可见即开清单（实例可见性判定与实例列表 OR 分支对齐）
++        List<IotDataItem> own = fx.dataItemService.selectItemsByInstanceId(30L);
++        assertEquals(1, own.size(), "自建实例清单可读（create_by=me 分支）");
++        assertEquals(500L, own.get(0).getId());
++        // params 详情类：自建实例有效参数 200（详情判定与列表对齐，ADR-0016 裁决 3 含详情类）
++        IotItemEffectiveParamsVO vo = fx.dataItemService.getEffectiveParams(30L, 500L);
++        assertEquals(30L, vo.getInstanceId());
++        assertEquals("ME.LINE01.speed", vo.getFullKey());
++
++        // 他建实例维持拒绝（分支不放大越权面）：A 厂设备清单空、params 403
++        assertTrue(fx.dataItemService.selectItemsByInstanceId(RedlineFixture.INST_A_DEVICE).isEmpty(),
++                "他建实例清单仍空（SCOPE_EMPTY 集合类语义不变）");
++        BusinessException deny = assertThrows(BusinessException.class,
++                () -> fx.dataItemService.getEffectiveParams(RedlineFixture.INST_A_DEVICE, RedlineFixture.ITEM_A));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), deny.getCode(), "他建实例 params 详情 403 不变");
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/InstanceRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/InstanceRedlineTest.java
+index 2224110..b563e8e 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/InstanceRedlineTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/InstanceRedlineTest.java
+@@ -220,11 +220,11 @@ class InstanceRedlineTest {
+         assertTrue(page.getRecords().isEmpty());
+     }
+ 
+-    // ---------- 场景 5（清单第 5 项回归）：仅本人配置类 create_by 语义 ----------
++    // ---------- 场景 5（清单第 5 项回归 + 修订轮转正）：仅本人配置类 create_by 语义 ----------
+ 
+     @Test
+-    @DisplayName("仅本人语义回归 · scope=4 自建实例：仅入列表（配置类 create_by=me 分支）、永不入树（0012 修订轮口径）")
+-    void scenario5_meOnly_selfCreatedRow_entersListOnly_neverTree() {
++    @DisplayName("仅本人语义回归 · scope=4 自建实例：仅入列表（配置类 create_by=me 分支）、永不入树；详情 200（修订轮对齐）/他建详情 403")
++    void scenario5_meOnly_selfCreatedRow_entersListOnly_neverTree_detailAligned() {
+         fx.addInstanceRow(RedlineFixture.newRow(30L, "ME.LINE01", 0, "0", 3, null, RedlineFixture.USER_ME));
+         fx.loginAs(RedlineFixture.USER_ME);
+ 
+@@ -233,6 +233,17 @@ class InstanceRedlineTest {
+         // 列表含自建（ADR-0016 裁决 3：实例属配置类对象，create_by=me 过滤）
+         Page<IotModelInstance> page = listPage();
+         assertEquals(Set.of(30L), pageIds(page), "列表含 create_by=me 自建行");
++
++        // 修订轮转正（TASK-0007 验收退回裁决：详情判定与列表 OR 分支对齐，ADR-0016 裁决 3
++        // 仅本人适用集含详情类）：自建实例详情 200——create_by 分支在实践中可用
++        IotModelInstance own = fx.instanceService.getInstanceDetail(30L);
++        assertNotNull(own, "自建实例详情可见（create_by=me 分支与列表对齐）");
++        assertEquals("ME.LINE01", own.getInstanceCode());
++        assertEquals(RedlineFixture.USER_ME, own.getCreateBy(),
++                "create_by 语义=创建者 userId（MetaObjectHandler 审计填充）");
++        // 他建实例详情 403（create_by≠me 且 ∉ 可见集——分支不放大越权面）
++        BusinessException deny = forbidden(() -> fx.instanceService.getInstanceDetail(RedlineFixture.INST_A_FACTORY));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), deny.getCode(), "他建实例详情 403");
+     }
+ 
+     // ---------- 场景 6：混合角色（scope=3 + scope=4） ----------
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+index e1942b9..e721898 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+@@ -260,6 +260,11 @@ class RedlineFixture implements AutoCloseable {
+         instanceRows.add(row);
+     }
+ 
++    /** 追加数据项行（场景自建数据：自建实例的数据项） */
++    void addItemRow(IotDataItem row) {
++        itemRows.add(row);
++    }
++
+     /** 新建实例行构建器（默认启用/未锁/租户 1；createBy=ADMIN 可覆盖） */
+     static IotModelInstance newRow(long id, String code, long parentId, String ancestors,
+                                    int nodeType, Long deptId, Long createBy) {
+@@ -327,6 +332,11 @@ class RedlineFixture implements AutoCloseable {
+     }
+ 
+     private static IotDataItem item(long id, long instanceId, String dataCode, String fullKey) {
++        return newItemRow(id, instanceId, dataCode, fullKey);
++    }
++
++    /** 新建数据项行构建器（场景自建数据：仅本人自建实例的数据项） */
++    static IotDataItem newItemRow(long id, long instanceId, String dataCode, String fullKey) {
+         IotDataItem item = new IotDataItem();
+         item.setId(id);
+         item.setTenantId(TENANT);

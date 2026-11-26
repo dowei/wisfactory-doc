@@ -1,0 +1,217 @@
+commit fa12df937cde65f65d83f70002889bc575ade7f1
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 10:23:05 2026 +0800
+
+    fix(iot): 通道 conn_config 校验修订轮——required 值感知判定（显式 null/空白必填串按缺失报，前移至结构校验前）+ 凭据关键词全深度递归扫描（数组元素进扫描，路径可读 creds[0].password）+4 红转绿用例（TASK-0018 修订轮，评审 I-1/I-2）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java
+index 8640a95..0c626f3 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java
+@@ -32,11 +32,12 @@ import java.util.regex.Pattern;
+  * 二期词表扩张（MODBUS/OPCUA 完整字段集）时可直接切换到标准库实现而不改 Schema 文件。
+  *
+  * <p><b>凭据防线（ADR-0006，双保险之二）</b>：MQTT/HTTP Schema 定义 additionalProperties:
+- * false 之外，本校验器对 conn_config 全部层级键名做显式凭据关键词拒绝（credential/
++ * false 之外，本校验器对 conn_config 做<b>全深度递归</b>的显式凭据关键词拒绝（credential/
+  * password/passwd/secret/token/apikey/accesskey/privatekey，大小写不敏感子串匹配——
+- * 覆盖 mqttPassword/accessToken 等变体），含凭据字段的 conn_config 保存被拒。brief 口径
+- * 为「顶层禁」，本实现强化为递归全层级（宽松骨架协议 MODBUS/OPCUA 允许嵌套对象，仅查
+- * 顶层会漏 {@code {"tcp":{"password":...}}}）。
++ * 覆盖 mqttPassword/accessToken 等变体）：嵌套对象与<b>数组元素</b>均进扫描（修订轮 I-2——
++ * {@code {"creds":[{"password":...}]}} 类形状不得逃逸），含凭据字段的 conn_config 保存被拒。
++ * brief 口径为「顶层禁」，本实现强化为全深度递归（宽松骨架协议 MODBUS/OPCUA 允许嵌套
++ * 对象/数组，仅查顶层会漏 {@code {"tcp":{"password":...}}}）。
+  *
+  * <p><b>归一化</b>：校验通过后返回 Jackson 紧凑序列化原文（去空白，快照哈希确定性前置）；
+  * 入参 null/空白按空对象参与校验（MQTT/HTTP 必填字段即拒），宽松骨架协议返回 null 落库
+@@ -82,7 +83,7 @@ public class ChannelConnConfigValidator {
+ 
+         if (rawConnConfig == null || rawConnConfig.isBlank()) {
+             // 空白按空对象参与校验：必填协议（MQTT/HTTP）在此即拒；宽松骨架（MODBUS/OPCUA）落 NULL
+-            requireNoMissing(schema, Set.of());
++            requireNoMissing(schema, MAPPER.createObjectNode());
+             return null;
+         }
+         if (rawConnConfig.length() > MAX_CONN_CONFIG_LENGTH) {
+@@ -107,6 +108,10 @@ public class ChannelConnConfigValidator {
+                     + String.join("、", credentialKeys));
+         }
+ 
++        // required 判定（修订轮 I-1）先于结构校验：显式 null / 空白必填串按「缺失」报缺字段文案
++        // （membership 语义先于 type/format——否则 {"broker":null} 会被格式/类型错误掩盖）
++        requireNoMissing(schema, root);
++
+         List<String> errors = new ArrayList<>();
+         validateAgainstSchema("$", root, schema, errors);
+         if (!errors.isEmpty()) {
+@@ -114,7 +119,6 @@ public class ChannelConnConfigValidator {
+                     + String.join("; ", errors));
+         }
+ 
+-        requireNoMissing(schema, keySet(root));
+         return root.toString();
+     }
+ 
+@@ -227,14 +231,20 @@ public class ChannelConnConfigValidator {
+         // 未知词表属性类型：按宽松处理（与 draft 注解语义一致），不误伤二期扩展
+     }
+ 
+-    private Set<String> keySet(JsonNode object) {
+-        Set<String> keys = new LinkedHashSet<>();
+-        object.fieldNames().forEachRemaining(keys::add);
+-        return keys;
+-    }
+-
+-    private void requireNoMissing(JsonSchema schema, Set<String> presentKeys) {
+-        List<String> missing = schema.required.stream().filter(r -> !presentKeys.contains(r)).toList();
++    /**
++     * required 判定（修订轮 I-1）：键存在<b>且值非 null</b>（显式 null 按缺失处理，堵
++     * 「{@code {"broker":null}} 绕过 required」漏洞）<b>且字符串时非空白</b>（纯空白必填串
++     * 同按缺失）——键名在而值无效一律报「缺少必填字段」文案。
++     */
++    private void requireNoMissing(JsonSchema schema, JsonNode root) {
++        List<String> missing = new ArrayList<>();
++        for (String r : schema.required) {
++            JsonNode v = root.get(r);
++            boolean present = v != null && !v.isNull() && !(v.isTextual() && v.asText().isBlank());
++            if (!present) {
++                missing.add(r);
++            }
++        }
+         if (!missing.isEmpty()) {
+             throw paramError("conn_config 缺少必填字段: " + missing);
+         }
+@@ -251,7 +261,23 @@ public class ChannelConnConfigValidator {
+ 
+     // ---------- 凭据关键词扫描 ----------
+ 
++    /**
++     * 凭据关键词扫描（修订轮 I-2 强化为<b>全深度递归</b>）：对象逐层扫键名并递归成员值，
++     * <b>数组元素逐个递归</b>（{@code {"creds":[{"password":...}]}} 类形状修复前逃逸双保险）；
++     * 标量（字符串/数字/布尔）无键名可携带，递归终止。命中键报可读路径（如
++     * {@code creds[0].password}）。大小写不敏感子串匹配，覆盖 mqttPassword/accessToken 等变体。
++     */
+     private void collectCredentialKeys(String path, JsonNode node, Set<String> hits) {
++        if (node == null || node.isValueNode()) {
++            return;
++        }
++        if (node.isArray()) {
++            for (int i = 0; i < node.size(); i++) {
++                collectCredentialKeys(path + "[" + i + "]", node.get(i), hits);
++            }
++            return;
++        }
++        // 对象：扫本层键名 + 递归全部成员值（对象/数组均进）
+         node.fieldNames().forEachRemaining(name -> {
+             String normalized = name.toLowerCase(Locale.ROOT);
+             if (FORBIDDEN_KEY_WORDS.stream().anyMatch(normalized::contains)) {
+@@ -259,10 +285,8 @@ public class ChannelConnConfigValidator {
+             }
+         });
+         node.fields().forEachRemaining(e -> {
+-            JsonNode child = e.getValue();
+-            if (child.isObject()) {
+-                collectCredentialKeys(path.isEmpty() ? e.getKey() : path + "." + e.getKey(), child, hits);
+-            }
++            String childPath = path.isEmpty() ? e.getKey() : path + "." + e.getKey();
++            collectCredentialKeys(childPath, e.getValue(), hits);
+         });
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java
+index 766aaa6..747c0d0 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java
+@@ -84,15 +84,17 @@ class ChannelConnConfigValidatorTest {
+     }
+ 
+     @Test
+-    @DisplayName("MQTT - broker 非 URI 拒（format:uri——纯 host 或纯 IP 缺 scheme 即拒）")
++    @DisplayName("MQTT - broker 非 URI 拒（format:uri——纯 host 或纯 IP 缺 scheme 即拒）；空串必填串按缺失拒")
+     void testMqttBrokerNotUri() {
+-        for (String bad : new String[]{
+-                "{\"broker\":\"192.168.1.10\",\"topic\":\"t\"}",
+-                "{\"broker\":\"\",\"topic\":\"t\"}"}) {
+-            BusinessException e = assertThrows(BusinessException.class,
+-                    () -> validator.validateAndCanonicalize("MQTT", bad), bad + " 应被拒");
+-            assertTrue(e.getMessage().contains("URI"), e.getMessage());
+-        }
++        // 非 URI（有值但缺 scheme）：格式层拒
++        BusinessException e1 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"192.168.1.10\",\"topic\":\"t\"}"));
++        assertTrue(e1.getMessage().contains("URI"), e1.getMessage());
++        // 空串必填串（修订轮 I-1 排序：required 先于 format——空白按缺失报缺字段文案）
++        BusinessException e2 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"\",\"topic\":\"t\"}"));
++        assertTrue(e2.getMessage().contains("缺少必填字段"), e2.getMessage());
++        assertTrue(e2.getMessage().contains("broker"), e2.getMessage());
+     }
+ 
+     // ---------- HTTP v1 ----------
+@@ -129,6 +131,24 @@ class ChannelConnConfigValidatorTest {
+         assertTrue(e.getMessage().contains("未知字段"), e.getMessage());
+     }
+ 
++    @Test
++    @DisplayName("修订轮 I-1 - 显式 null 按缺失处理：{\"broker\":null} 拒（修复前静默通过为红）")
++    void testMqttExplicitNullBrokerRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":null,\"topic\":\"t\"}"));
++        assertTrue(e.getMessage().contains("缺少必填字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("broker"), e.getMessage());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 - 必填字符串空白按缺失处理：broker 纯空白拒（required=键存在且值非null且字符串非空白）")
++    void testMqttBlankBrokerRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"   \",\"topic\":\"t\"}"));
++        assertTrue(e.getMessage().contains("缺少必填字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("broker"), e.getMessage());
++    }
++
+     // ---------- MODBUS / OPCUA 宽松骨架 ----------
+ 
+     @Test
+@@ -175,6 +195,25 @@ class ChannelConnConfigValidatorTest {
+         assertTrue(e.getMessage().contains("tcp.password"), e.getMessage());
+     }
+ 
++    @Test
++    @DisplayName("修订轮 I-2 - 数组元素内凭据键拒（全深度递归）：{\"creds\":[{\"password\":\"x\"}]} 拒（修复前静默通过为红）")
++    void testCredentialInsideArrayRejected() {
++        // MODBUS 宽松骨架（additionalProperties=true）为唯一能落库该形状的协议——修复前数组内对象不进扫描即静默通过
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MODBUS",
++                "{\"creds\":[{\"password\":\"x\"}]}"));
++        assertTrue(e.getMessage().contains("凭据字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("password"), e.getMessage());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-2 - 深层嵌套数组路径：{\"signals\":[{\"group\":[{\"secret\":\"x\"}]}]} 拒且路径可读")
++    void testCredentialDeepNestedArrayRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("OPCUA",
++                "{\"signals\":[{\"group\":[{\"secret\":\"x\"}]}]}"));
++        assertTrue(e.getMessage().contains("凭据字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("secret"), e.getMessage());
++    }
++
+     private void assertThrowsWithCredential(ChannelConnConfigValidator v, String protocol, String config, String key) {
+         BusinessException e = assertThrows(BusinessException.class, () -> v.validateAndCanonicalize(protocol, config),
+                 protocol + " " + key + " 应被拒");
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java
+index 8110d28..543529b 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java
+@@ -409,7 +409,9 @@ class IotChannelServiceImplTest {
+         bad.setId(100L);
+         bad.setProtocolType("HTTP");
+         BusinessException e = assertThrows(BusinessException.class, () -> channelService.updateChannel(bad));
+-        assertTrue(e.getMessage().contains("HTTP v1 Schema"), "旧 MQTT 配置必须过 HTTP Schema: " + e.getMessage());
++        // 修订轮 I-1 排序：required（缺 reportPath）先于 unknown-key/format 报出——拒绝语义不变
++        assertTrue(e.getMessage().contains("缺少必填字段") && e.getMessage().contains("reportPath"),
++                "旧 MQTT 配置必须过 HTTP Schema（缺 reportPath 即拒）: " + e.getMessage());
+ 
+         IotChannelUpdateForm good = new IotChannelUpdateForm();
+         good.setId(100L);

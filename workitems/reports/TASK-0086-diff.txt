@@ -1,0 +1,861 @@
+diff --git a/calc/README.md b/calc/README.md
+index d0600e0..85234c7 100644
+--- a/calc/README.md
++++ b/calc/README.md
+@@ -128,6 +128,24 @@ calc/
+   - 真机写入 + 读回因 TDengine REST 故障（TD-0053）列为环境恢复后补验条件，当前以注入式 SqlRunner 契约测试 + 记录式写口捕获 INSERT SQL 闭合形态。
+ - 接入由 env 控制、默认关闭（0040/0041/0049 既有行为零回归）：`CALC_OPERATORS_ENABLED`、`CALC_HOMOGENEOUS_STORAGE_ENABLED`、`CALC_TENANT_ID`（默认 1）。契约测试 `DeltaOperatorContractTest` / `IntegralOperatorContractTest` / `EnergyDerivationContractTest` / `OperatorIntegrationContractTest` / `TdengineItemValueWriterContractTest` / `HomogeneousResultSinkContractTest`。
+ 
++## 试算端点（TASK-0086）
++
++`POST /internal/v1/calc/trial`（内网 8095，与管理面 preview 同请求响应规范——REQ-0016 §3.1）：
++
++- 请求：`formula`（表达式）+ `variables`（标识符→number 或 {value,quality,ts}）+ 可选
++  `history`（标识符→一窗样本，DELTA 用）、`atTime`（单点指定时刻）、`window`（{start,end,stepMs}
++  窗口曲线）。
++- 响应：`value` / `quality` / `missing` / `reason` / 可选 `curve`（逐点 ts/value/quality/missing/reason）
++  / `engineVersion`（同口径标识）。缺数 → value=null + missing 明确列出 + quality=6，**绝不以 0 冒充**。
++  手写 INTEGRAL / 未知函数 / 语法错误 → HTTP 400（与 FormulaExpressionValidator 白名单一致）。
++- **同引擎同口径**：求值经 `ArithmeticEvaluator.evaluate(expr, resolver, functionResolver)`，DELTA 经
++  `OperatorEvaluator` → `DeltaOperator`（窗口历史按 ts 升序逐点差分）；不另写求值逻辑。
++- **沙箱隔离**：`OperatorEvaluator` 每单点/每曲线点 new（不共享在线 baselines）；服务不注入
++  CalcStateStore / JdbcTemplate，不发事件、不触发调度、不查真库/Redis——trial 不写
++  iot_calc_state/log。调用方（0037 管理面）负责取数后传入，0038 再增强历史存储取数。
++- 契约测试：`trial/TrialEngineContractTest`（单点/缺数/DELTA/INTEGRAL/窗口曲线/沙箱/同口径）、
++  `trial/TrialControllerHttpTest`（HTTP 端点 + MockitoBean 断言 state store 零写）。
++
+ ## 构建与检查
+ 
+ ```bash
+@@ -144,7 +162,7 @@ JDK HttpServer 假端点）在接线时零改动替换。
+ - 执行器双触发/汇总算子（TASK-0041）、DELTA/INTEGRAL 原生算子与同构存储（TASK-0042，本工程 operator/ 与 storage/ 包）已交付；指标聚合（0045）、iot_calc_log/state 写（0063）仍按各自边界归后续道。
+ - 本执行器不写 st_metric_value（0045）；数据项结果表 st_item_value / Redis 缓存真实 Sink 已由 0042 交付（`storage/HomogeneousResultSink`，记录式写口为默认，真 REST/Redis 注入缝在 `TdengineItemValueWriter`/`RedisItemValueCache`）；Metric 节点本执行器不计算（0045 边界）。
+ - `/calc/v1/status` 为观测口（无鉴权，内网面）；`/internal/v1/**` 是 §3.3/§3.4 契约
+-  命名空间，本工程刻意不占用。
++  命名空间（TASK-0086 trial 端点已落 `/internal/v1/calc/trial`——纯计算沙箱，不写状态/日志）。
+ - 点位存在性不可校验：计算范围快照不装载点位/通道（派生规则 7）——refType=2 点位引用
+   建为输入节点，不判悬空。
+ - 三份冻结契约（统一消息模型 / 快照 Schema / 超级表结构，CONV-03）冻结后不擅自扩字段；
+diff --git a/calc/src/main/java/net/otlab/calc/trial/TrialEngine.java b/calc/src/main/java/net/otlab/calc/trial/TrialEngine.java
+new file mode 100644
+index 0000000..b69df57
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/trial/TrialEngine.java
+@@ -0,0 +1,253 @@
++package net.otlab.calc.trial;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Supplier;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import net.otlab.calc.executor.ArithmeticEvaluator;
++import net.otlab.calc.executor.ValueSample;
++import net.otlab.calc.graph.FormulaExpressionValidator;
++import net.otlab.calc.operator.OperatorEvaluator;
++
++/**
++ * TASK-0086 · 试算求值引擎（纯计算沙箱）。
++ *
++ * <p><b>同引擎同口径</b>（brief D2 核心）：所有求值经真算的
++ * {@link ArithmeticEvaluator#evaluate(String, ArithmeticEvaluator.Resolver,
++ * ArithmeticEvaluator.FunctionResolver)}；原生算子经 {@link OperatorEvaluator} → DeltaOperator。
++ * 本类只做「请求数据 → resolver/functionResolver 适配 + 缺数收集 + 窗口逐点驱动」，
++ * **不另写一套求值逻辑**。手写 INTEGRAL/未知函数先经 {@link FormulaExpressionValidator} 白名单
++ * 校验拒绝（与管理面 validate 口径一致）。
++ *
++ * <p><b>DELTA 参数识别</b>：ArithmeticEvaluator.FunctionResolver 只给函数名 + 已求值 double 入参，
++ * 不给原标识符字符串。为把 DELTA(key) 关联到 history[key]，本类在求值前从已通过白名单校验的
++ * 公式文本中提取 DELTA 单参标识符（仅识别参数键，求值仍完全由 ArithmeticEvaluator 完成），
++ * 并把它绑定到本次求值的 functionResolver——与真算 0042 evaluateDeltaFormula 识别 DELTA(key)
++ * 的形态对齐，不新增求值分支。
++ *
++ * <p><b>沙箱隔离</b>（brief D3）：{@link OperatorEvaluator} 每单点求值 new
++ * （内部 baselines 是实例状态），不共享在线算子状态；不注入 CalcStateStore / JdbcTemplate /
++ * 事件发布 / 调度器，不查真库/Redis。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class TrialEngine {
++
++    /** DELTA(function) 单参标识符提取（已由白名单保证只有 DELTA 是合法函数） */
++    private static final Pattern DELTA_ARG = Pattern.compile("DELTA\\s*\\(\\s*([A-Za-z_][\\w.]*)\\s*\\)",
++            Pattern.CASE_INSENSITIVE);
++
++    private final Supplier<OperatorEvaluator> operatorFactory;
++
++    public TrialEngine() {
++        this(OperatorEvaluator::new);
++    }
++
++    public TrialEngine(Supplier<OperatorEvaluator> operatorFactory) {
++        this.operatorFactory = operatorFactory;
++    }
++
++    /** 统一入口：window 存在 → 窗口曲线；否则单点求值 */
++    public TrialResponse evaluateSingle(TrialRequest req) {
++        if (req == null || req.formula() == null || req.formula().isBlank()) {
++            return TrialResponse.reject("公式空白（试算须提供 formula）");
++        }
++        FormulaExpressionValidator.ExpressionCheck check = FormulaExpressionValidator.validate(req.formula());
++        if (!check.ok()) {
++            return TrialResponse.reject(check.error());
++        }
++        if (req.window() != null) {
++            return evaluateCurve(req, check.identifiers());
++        }
++        return evaluatePoint(req, req.atTime(), check.identifiers());
++    }
++
++    // ---------- 单点 ----------
++
++    private TrialResponse evaluatePoint(TrialRequest req, Long atTime, List<String> identifiers) {
++        Map<String, Object> snapshot = snapshotAt(req, atTime, false);
++        long pointTs = atTime == null ? Long.MAX_VALUE : atTime;
++        EvalContext ctx = new EvalContext(req, operatorFactory.get(), identifiers, snapshot, pointTs);
++        try {
++            double value = ArithmeticEvaluator.evaluate(req.formula(), ctx::resolve, ctx::callFunction);
++            if (!ctx.missing().isEmpty()) {
++                return TrialResponse.failure(List.copyOf(ctx.missing()),
++                        "缺数: " + String.join(", ", ctx.missing()) + "（不以 0 代入）");
++            }
++            return TrialResponse.ok(value, ctx.lastQuality());
++        } catch (RuntimeException e) {
++            return TrialResponse.failure(List.copyOf(ctx.missing()), reasonOf(e));
++        }
++    }
++
++    // ---------- 窗口曲线 ----------
++
++    private TrialResponse evaluateCurve(TrialRequest req, List<String> identifiers) {
++        TrialRequest.TrialWindow w = req.window();
++        if (w.stepMs() <= 0 || w.end() < w.start()) {
++            return TrialResponse.reject("window 参数非法（stepMs>0 且 end>=start）");
++        }
++        List<TrialResponse.CurvePoint> curve = new ArrayList<>();
++        for (long ts = w.start(); ts <= w.end(); ts += w.stepMs()) {
++            // 每点新建算子实例——曲线各点基线互不污染（沙箱隔离）
++            EvalContext ctx = new EvalContext(req, operatorFactory.get(), identifiers, snapshotAt(req, ts, true), ts);
++            try {
++                double value = ArithmeticEvaluator.evaluate(req.formula(), ctx::resolve, ctx::callFunction);
++                if (ctx.missing().isEmpty()) {
++                    curve.add(new TrialResponse.CurvePoint(ts, value, ctx.lastQuality(), List.of(), ""));
++                } else {
++                    curve.add(new TrialResponse.CurvePoint(ts, null, TrialResponse.QUALITY_MISSING,
++                            List.copyOf(ctx.missing()),
++                            "缺数: " + String.join(", ", ctx.missing()) + "（不以 0 代入）"));
++                }
++            } catch (RuntimeException e) {
++                curve.add(new TrialResponse.CurvePoint(ts, null, TrialResponse.QUALITY_MISSING,
++                        List.copyOf(ctx.missing()), reasonOf(e)));
++            }
++            if (w.end() - ts < w.stepMs()) {
++                break; // 防长窗溢出
++            }
++        }
++        return TrialResponse.curve(curve);
++    }
++
++    /** 取 t 时刻可见的样本快照：variables 注入值 + history 中 ts<=t 的最新样本 */
++    private static Map<String, Object> snapshotAt(TrialRequest req, Long atTime, boolean curvePoint) {
++        long t = atTime != null ? atTime : Long.MAX_VALUE;
++        Map<String, Object> snapshot = new LinkedHashMap<>();
++        if (req.variables() != null) {
++            snapshot.putAll(req.variables());
++        }
++        for (Map.Entry<String, List<TrialRequest.VariableSample>> e : req.history().entrySet()) {
++            TrialRequest.VariableSample best = null;
++            if (e.getValue() != null) {
++                for (TrialRequest.VariableSample s : e.getValue()) {
++                    // 单点 atTime/缺省：取 <=t 最新样本；曲线点严格匹配 ts（缺数段不沿用旧值冒充）
++                    boolean visible = curvePoint ? s != null && s.ts() == t : s != null && s.ts() <= t;
++                    if (visible && (best == null || s.ts() >= best.ts())) {
++                        best = s;
++                    }
++                }
++            }
++            if (best != null) {
++                snapshot.put(e.getKey(), best); // history 覆盖同名 variables（时序数据优先）
++            }
++        }
++        return snapshot;
++    }
++
++    private static String reasonOf(RuntimeException e) {
++        String msg = e.getMessage();
++        return (msg == null || msg.isBlank()) ? e.getClass().getSimpleName() : msg;
++    }
++
++    // ---------- 求值上下文（resolver / functionResolver 适配器） ----------
++
++    private final class EvalContext {
++        private final TrialRequest req;
++        private final OperatorEvaluator operators;
++        private final Map<String, Object> snapshot;
++        private final Set<String> missing = new LinkedHashSet<>();
++        private final String deltaKey;
++        private final long currentTs;
++        private int lastQuality = 0;
++
++        EvalContext(TrialRequest req, OperatorEvaluator operators,
++                    List<String> identifiers, Map<String, Object> snapshot, long currentTs) {
++            this.req = req;
++            this.operators = operators;
++            this.snapshot = snapshot;
++            this.currentTs = currentTs;
++            this.deltaKey = extractDeltaKey(req.formula());
++            for (String id : identifiers) {
++                // history 中存在的标识符视为「已提供」（DELTA 从 history 取数，不在 variables 里）；
++                // 其余未提供的标识符 = 缺数（RD-缺数语义）
++                if (!snapshot.containsKey(id) && !req.history().containsKey(id)) {
++                    missing.add(id);
++                }
++            }
++        }
++
++        Set<String> missing() {
++            return missing;
++        }
++
++        int lastQuality() {
++            return lastQuality;
++        }
++
++        /** 标识符解析：number / sample / 缺失(null→抛异常由求值器隔离) */
++        Double resolve(String identifier) {
++            Object v = snapshot.get(identifier);
++            if (v == null) {
++                missing.add(identifier);
++                return null; // ArithmeticEvaluator 抛「无值输入」→ 转缺数响应
++            }
++            if (v instanceof Number n) {
++                return n.doubleValue();
++            }
++            if (v instanceof TrialRequest.VariableSample s) {
++                lastQuality = s.quality();
++                return s.value();
++            }
++            if (v instanceof Map<?, ?> m && m.get("value") instanceof Number n) {
++                Object q = m.get("quality");
++                lastQuality = q instanceof Number nq ? nq.intValue() : 0;
++                return n.doubleValue();
++            }
++            missing.add(identifier);
++            return null;
++        }
++
++        /**
++         * 函数求值：supports 交给 OperatorEvaluator；DELTA 按已提取的 key 从 history 取一窗样本，
++         * 在本次求值上下文内按 ts 升序逐点调用原生 delta(...) 得到差分（与真算同引擎口径）；
++         * INTEGRAL 手写已被白名单拒绝，其余函数返回 null → 求值器抛异常。
++         */
++        Double callFunction(String name, double arg) {
++            if (!operators.supports(name) || deltaKey == null) {
++                return null;
++            }
++            List<TrialRequest.VariableSample> samples = req.history().get(deltaKey);
++            if (samples == null || samples.isEmpty()) {
++                missing.add(deltaKey);
++                return null;
++            }
++            List<TrialRequest.VariableSample> sorted = new ArrayList<>();
++            for (TrialRequest.VariableSample s : samples) {
++                if (s != null && s.ts() <= currentTs) {
++                    sorted.add(s);
++                }
++            }
++            sorted.sort(java.util.Comparator.comparingLong(TrialRequest.VariableSample::ts));
++            if (sorted.isEmpty()) {
++                missing.add(deltaKey);
++                return null;
++            }
++            ValueSample result = null;
++            for (TrialRequest.VariableSample s : sorted) {
++                result = operators.delta(deltaKey,
++                        new ValueSample(s.value(), s.quality(), s.ts()), null, null, false);
++            }
++            if (result == null) {
++                missing.add(deltaKey);
++                return null;
++            }
++            lastQuality = result.quality();
++            return result.value();
++        }
++    }
++
++    /** 从已通过白名单的公式中提取 DELTA(key) 的 key（只识别参数名，不求值） */
++    private static String extractDeltaKey(String formula) {
++        Matcher m = DELTA_ARG.matcher(formula);
++        return m.find() ? m.group(1) : null;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/trial/TrialRequest.java b/calc/src/main/java/net/otlab/calc/trial/TrialRequest.java
+new file mode 100644
+index 0000000..3609b9b
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/trial/TrialRequest.java
+@@ -0,0 +1,55 @@
++package net.otlab.calc.trial;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0086：试算请求（{@code POST /internal/v1/calc/trial} 请求体）。
++ *
++ * <p>与管理面 preview 同请求规范（REQ-0016 / 详细设计 §3.1）：formula=表达式；
++ * variables=标识符→值/样本（未提供的标识符视为缺数，绝不以 0 代入）；history=标识符→一窗历史样本
++ * （DELTA 用，按 ts 升序逐点建立沙箱基线）；atTime=指定时刻（preview 用，不落库）；window=窗口
++ * 曲线试算参数（0038 用）。
++ *
++ * <p>沙箱纪律：trial 端点自己去查真库/Redis 不在本任务范围（0037 管理面负责取数后传入）；
++ * 本 DTO 只承载调用方注入的数据。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record TrialRequest(
++        String formula,
++        Map<String, Object> variables,
++        Map<String, List<VariableSample>> history,
++        Long atTime,
++        TrialWindow window) {
++
++    /** 窗口曲线参数：start/end 闭区间，stepMs 步长（>0） */
++    public record TrialWindow(long start, long end, long stepMs) {}
++
++    /** 统一样本形态（value/quality/ts 三键，与 ValueSample / 统一消息模型同义） */
++    public record VariableSample(double value, int quality, long ts) {}
++
++    /** 无参构造：Jackson 通过 record 规范构造绑定；缺省字段补 null/空 map */
++    public TrialRequest {
++        variables = variables == null ? Map.of() : variables;
++        history = history == null ? Map.of() : history;
++    }
++
++    /** 便于 Java 测试/调用方构造（不引入 builder 依赖） */
++    public static TrialRequest of(String formula, Map<String, Object> variables) {
++        return new TrialRequest(formula, variables, Map.of(), null, null);
++    }
++
++    /** 便于测试/调用方构造窗口请求 */
++    public static TrialRequest window(String formula, Map<String, Object> variables,
++                                      Map<String, List<VariableSample>> history, long start, long end, long stepMs) {
++        return new TrialRequest(formula, variables, history, null, new TrialWindow(start, end, stepMs));
++    }
++
++    /** 以 atTime 覆盖的请求副本（管理面 preview 指定时刻用；不落库） */
++    public TrialRequest withAtTime(Long at) {
++        return new TrialRequest(formula, variables, history, at, window);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/trial/TrialResponse.java b/calc/src/main/java/net/otlab/calc/trial/TrialResponse.java
+new file mode 100644
+index 0000000..59f740d
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/trial/TrialResponse.java
+@@ -0,0 +1,90 @@
++package net.otlab.calc.trial;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * TASK-0086：试算响应（{@code POST /internal/v1/calc/trial} 响应体）。
++ *
++ * <p>缺数语义（REQ-0016 验收 4）：identifier 未提供 / 无样本 → value=null、quality=6（计算失败）、
++ * missing 列出具体 key、reason 明确说明，**绝不以 0 冒充**。
++ *
++ * <p>语法/白名单拒绝（如手写 INTEGRAL）→ rejected=true、missing 为空，由控制器映射为 400；
++ * 缺数是业务结果（HTTP 200 + quality=6），二者严格区分。
++ *
++ * @param value         单点结果（缺数/拒绝时 null）
++ * @param quality       质量码（0 正常 / 6 计算失败 / 7 汇总不完整 / 9 跨周期等既有 CONV-02 码）
++ * @param missing       缺数标识符清单（明确返回）
++ * @param reason        失败/缺数原因说明（成功为空串）
++ * @param curve         窗口试算曲线点集（单点试算为 null）
++ * @param engineVersion 同口径标识——声明与真算共享 ArithmeticEvaluator/OperatorEvaluator/DeltaOperator
++ * @param rejected      语法/白名单校验拒绝（true → HTTP 400）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record TrialResponse(
++        Double value,
++        int quality,
++        List<String> missing,
++        String reason,
++        List<CurvePoint> curve,
++        String engineVersion,
++        boolean rejected) {
++
++    /** 窗口曲线单点：逐点独立标注缺数（缺数段 value=null、missing 非空） */
++    public record CurvePoint(long ts, Double value, int quality, List<String> missing, String reason) {}
++
++    /** 与真算同口径的版本标识（算术求值器 + 原生算子桥同版本；随 calc 构建演进可更新） */
++    public static final String ENGINE_VERSION = "calc-engine/1.0.0/trial-v1";
++
++    /** 质量码：计算失败 / 缺数（CONV-02 码 6） */
++    public static final int QUALITY_MISSING = 6;
++
++    public TrialResponse {
++        missing = missing == null ? List.of() : List.copyOf(missing);
++        reason = reason == null ? "" : reason;
++    }
++
++    /** 单点成功 */
++    public static TrialResponse ok(double value, int quality) {
++        return new TrialResponse(value, quality, List.of(), "", null, ENGINE_VERSION, false);
++    }
++
++    /** 单点缺数/求值失败（value=null，绝不以 0 冒充；HTTP 200 + quality=6） */
++    public static TrialResponse failure(List<String> missing, String reason) {
++        return new TrialResponse(null, QUALITY_MISSING, missing, reason, null, ENGINE_VERSION, false);
++    }
++
++    /** 语法/白名单拒绝（如手写 INTEGRAL；HTTP 400） */
++    public static TrialResponse reject(String reason) {
++        return new TrialResponse(null, QUALITY_MISSING, List.of(), reason, null, ENGINE_VERSION, true);
++    }
++
++    /** 窗口曲线（每点独立标注缺数；单点 value 为 null，避免误导） */
++    public static TrialResponse curve(List<CurvePoint> curve) {
++        return new TrialResponse(null, 0, List.of(), "", List.copyOf(curve), ENGINE_VERSION, false);
++    }
++
++    /** HTTP 契约友好 Map 形态（仿 CalcRecalculateController 的 ResponseEntity<Map> 风格） */
++    public Map<String, Object> toMap() {
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("value", value);
++        body.put("quality", quality);
++        body.put("missing", missing);
++        body.put("reason", reason);
++        body.put("engineVersion", engineVersion);
++        if (curve != null) {
++            body.put("curve", curve.stream().map(p -> {
++                Map<String, Object> m = new LinkedHashMap<>();
++                m.put("ts", p.ts());
++                m.put("value", p.value());
++                m.put("quality", p.quality());
++                m.put("missing", p.missing());
++                m.put("reason", p.reason());
++                return m;
++            }).toList());
++        }
++        return body;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/TrialController.java b/calc/src/main/java/net/otlab/calc/web/TrialController.java
+new file mode 100644
+index 0000000..28f10c9
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/web/TrialController.java
+@@ -0,0 +1,49 @@
++package net.otlab.calc.web;
++
++import java.util.Map;
++
++import net.otlab.calc.trial.TrialEngine;
++import net.otlab.calc.trial.TrialRequest;
++import net.otlab.calc.trial.TrialResponse;
++
++import org.springframework.http.ResponseEntity;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * TASK-0086：计算引擎试算内部端点 {@code POST /internal/v1/calc/trial}（calc 8095）。
++ *
++ * <p>为 0037（manage validate/preview 转发）与 0038（窗口曲线增强）提供权威转发目标，解开
++ * 「转发目标不存在」死锁。同请求响应规范（REQ-0016 / 详细设计 §3.1），风格仿
++ * {@link CalcRecalculateController}（POST + ResponseEntity&lt;Map&gt;）。
++ *
++ * <p><b>沙箱纪律</b>（brief D3）：仅依赖 {@link TrialEngine}（纯计算）；不注入 CalcStateStore /
++ * JdbcTemplate / 事件发布 / 调度器，不查真库/Redis；缺数 value=null + missing 明示不用 0；
++ * 手写 INTEGRAL 等白名单拒绝 → 400。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@RestController
++public class TrialController {
++
++    private final TrialEngine engine;
++
++    public TrialController() {
++        this(new TrialEngine());
++    }
++
++    public TrialController(TrialEngine engine) {
++        this.engine = engine;
++    }
++
++    /** 试算：单点 value/quality/missing/reason，或窗口 curve 点集（含 engineVersion 同口径声明） */
++    @PostMapping("/internal/v1/calc/trial")
++    public ResponseEntity<Map<String, Object>> trial(@RequestBody TrialRequest req) {
++        TrialResponse response = engine.evaluateSingle(req);
++        return response.rejected()
++                ? ResponseEntity.badRequest().body(response.toMap())
++                : ResponseEntity.ok(response.toMap());
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/trial/TrialControllerHttpTest.java b/calc/src/test/java/net/otlab/calc/trial/TrialControllerHttpTest.java
+new file mode 100644
+index 0000000..79aa39b
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/trial/TrialControllerHttpTest.java
+@@ -0,0 +1,108 @@
++package net.otlab.calc.trial;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.util.List;
++import java.util.Map;
++
++import net.otlab.calc.state.CalcState;
++import net.otlab.calc.state.CalcStateStore;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.core.env.Environment;
++import org.springframework.test.context.bean.override.mockito.MockitoBean;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++/**
++ * TASK-0086 · D4 HTTP 契约（端点形态 D1 + 沙箱隔离 D3）：
++ *
++ * <p>POST /internal/v1/calc/trial 直达 8095 HTTP 面；state store 被 MockitoBean 替换后断言
++ * trial 调用全程零 upsert——沙箱不写 iot_calc_state（也不注入写口/不发事件/不触发调度）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++@org.springframework.test.context.TestPropertySource(properties = {
++        "calc.backend-base-url=http://127.0.0.1:1",
++        "calc.internal-token=ctx-test-token",
++        "calc.tenant=trial-http",
++        "calc.reconcile-seconds=3600",
++        "calc.http-addr=:18096"
++})
++class TrialControllerHttpTest {
++
++    @Autowired
++    private Environment environment;
++
++    /** 替换真实 CalcStateStore（内存/JDBC）——验证 trial 不触碰写口 */
++    @MockitoBean
++    private CalcStateStore calcStateStore;
++
++    private String url(String path) {
++        return "http://127.0.0.1:" + environment.getProperty("local.server.port") + path;
++    }
++
++    private HttpResponse<String> post(String body) throws Exception {
++        return HttpClient.newHttpClient().send(
++                HttpRequest.newBuilder(URI.create(url("/internal/v1/calc/trial")))
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
++                HttpResponse.BodyHandlers.ofString());
++    }
++
++    @Test
++    void trialEndpointReturnsValueAndDeclaresEngineVersion() throws Exception {
++        HttpResponse<String> resp = post("{\"formula\":\"A*2+B\",\"variables\":{\"A\":6,\"B\":5}}");
++        assertEquals(200, resp.statusCode(), resp.body());
++        assertTrue(resp.body().contains("\"value\":17.0"), resp.body());
++        assertTrue(resp.body().contains("\"quality\":0"), resp.body());
++        assertTrue(resp.body().contains("\"engineVersion\""), resp.body());
++    }
++
++    @Test
++    void trialMissingIsExplicitNotZero() throws Exception {
++        HttpResponse<String> resp = post("{\"formula\":\"A+B\",\"variables\":{\"A\":1}}");
++        assertEquals(200, resp.statusCode(), resp.body());
++        assertTrue(resp.body().contains("\"value\":null"), resp.body());
++        assertTrue(resp.body().contains("\"B\""), "missing 含标识符 B: " + resp.body());
++        assertTrue(resp.body().contains("\"quality\":6"), resp.body());
++    }
++
++    @Test
++    void handWrittenIntegralRejectedWithHttp400() throws Exception {
++        HttpResponse<String> resp = post("{\"formula\":\"INTEGRAL(FLOW)\",\"variables\":{\"FLOW\":1}}");
++        assertEquals(400, resp.statusCode(), resp.body());
++        assertTrue(resp.body().contains("INTEGRAL"), resp.body());
++    }
++
++    @Test
++    void trialDoesNotWriteCalcStateStore() throws Exception {
++        post("{\"formula\":\"DELTA(METER)\",\"history\":{\"METER\":["
++                + "{\"value\":100,\"quality\":0,\"ts\":1000},"
++                + "{\"value\":105,\"quality\":0,\"ts\":2000}]}}");
++        // 沙箱硬约束：trial 不写 iot_calc_state/log、不发事件、不触发调度
++        verify(calcStateStore, never()).upsert(any(CalcState.class));
++    }
++
++    @Test
++    void sandboxRepeatsIdenticallyOverHttp() throws Exception {
++        String body = "{\"formula\":\"DELTA(METER)\",\"history\":{\"METER\":["
++                + "{\"value\":100,\"quality\":0,\"ts\":1000},"
++                + "{\"value\":105,\"quality\":0,\"ts\":2000}]}}";
++        HttpResponse<String> one = post(body);
++        HttpResponse<String> two = post(body);
++        assertEquals(200, one.statusCode(), one.body());
++        assertEquals(one.body(), two.body(), "同一试算连发两次结果一致（跨请求算子新实例）");
++        assertTrue(one.body().contains("\"value\":5.0"), one.body());
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/trial/TrialEngineContractTest.java b/calc/src/test/java/net/otlab/calc/trial/TrialEngineContractTest.java
+new file mode 100644
+index 0000000..2d637c3
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/trial/TrialEngineContractTest.java
+@@ -0,0 +1,232 @@
++package net.otlab.calc.trial;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import net.otlab.calc.executor.ArithmeticEvaluator;
++import net.otlab.calc.operator.OperatorEvaluator;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0086 · D4 契约测试（TrialEngine，纯计算沙箱——不启 Spring 上下文）。
++ *
++ * <p>覆盖：单点四则/括号/三元；缺标识符明示不用 0；DELTA 两点历史差分 + quality 透传；
++ * 手写 INTEGRAL 拒绝；窗口曲线逐点输出 + 缺数段明示；沙箱两次隔离（算子每请求 new）；
++ * 同口径（与直接调 ArithmeticEvaluator 一致）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class TrialEngineContractTest {
++
++    private final TrialEngine engine = new TrialEngine();
++
++    // ---------- 单点 ----------
++
++    @Test
++    void arithmeticBracketsTernaryEvaluateCorrectly() {
++        assertEquals(17.0, engine.evaluateSingle(TrialRequest.of("A*2+B", vars("A", 6, "B", 5))).value());
++        assertEquals(18.0, engine.evaluateSingle(TrialRequest.of("(A+B)*2", vars("A", 4, "B", 5))).value());
++        // A=10,B=3 → A>B?1:0 = 1
++        assertEquals(1.0, engine.evaluateSingle(TrialRequest.of("A>B?1:0", vars("A", 10, "B", 3))).value());
++        assertEquals(0.0, engine.evaluateSingle(TrialRequest.of("A>B?1:0", vars("A", 3, "B", 10))).value());
++    }
++
++    @Test
++    void missingIdentifierReportsNullValueAndNamedKeyNeverZero() {
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("A*2+B", vars("A", 3)));
++        assertNull(r.value(), "缺数价值必须 null，绝不以 0 冒充");
++        assertEquals(TrialResponse.QUALITY_MISSING, r.quality(), "缺数质量码 6（CONV-02 计算失败）");
++        assertTrue(r.missing().contains("B"), "missing 明确列出缺的标识符 B: " + r.missing());
++        assertTrue(r.reason().contains("B"), "reason 明确说明缺 B: " + r.reason());
++        assertFalse(r.rejected(), "缺数是业务结果（HTTP 200），非语法拒绝");
++    }
++
++    @Test
++    void missingAllVariablesDoesNotReturnZero() {
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("A+B", Map.of()));
++        assertNull(r.value());
++        assertTrue(r.missing().containsAll(List.of("A", "B")), "两个缺失标识符都列出: " + r.missing());
++    }
++
++    // ---------- DELTA ----------
++
++    @Test
++    void deltaUsesHistoryWindowPointwiseAndTransportsQuality() {
++        // 两点历史：100(t1000) → 108(t2000)，差分 8；再一点质量码 4（上游坏样本）→ BAD_INPUT 保留码 4
++        Map<String, List<TrialRequest.VariableSample>> history = Map.of(
++                "METER", List.of(
++                        new TrialRequest.VariableSample(100, 0, 1000),
++                        new TrialRequest.VariableSample(108, 0, 2000),
++                        new TrialRequest.VariableSample(200, 4, 3000)));
++        // 单点 atTime=2000：history 两点建沙箱基线，差分 108-100=8（与 DeltaOperator 真算同口径）
++        TrialRequest req = new TrialRequest("DELTA(METER)", Map.of(), history, 2000L, null);
++        TrialResponse r = engine.evaluateSingle(req);
++        assertEquals(8.0, r.value(), 1e-6, "差分 108-100=8");
++        assertEquals(0, r.quality(), "正常差分 quality=0");
++        assertTrue(r.missing().isEmpty(), r.reason());
++
++        // atTime=3000：上游坏样本 → 不差分、保留码 4（不冒充正常差分 92）
++        TrialResponse bad = engine.evaluateSingle(new TrialRequest("DELTA(METER)", Map.of(), history, 3000L, null));
++        assertEquals(0.0, bad.value(), 1e-6, "上游质量码非0 不差分（DeltaOperator.BAD_INPUT 口径）");
++        assertEquals(4, bad.quality(), "DELTA 结果质量码透传上游 4");
++    }
++
++    @Test
++    void deltaCompositeExpressionUsesSameEvaluator() {
++        // DELTA(x)/2 —— 函数结果与算术同引擎（ArithmeticEvaluator FunctionResolver 注入）
++        Map<String, List<TrialRequest.VariableSample>> history = Map.of(
++                "METER", List.of(
++                        new TrialRequest.VariableSample(100, 0, 1000),
++                        new TrialRequest.VariableSample(106, 0, 2000)));
++        TrialRequest req = new TrialRequest("DELTA(METER)/2", Map.of(), history, 2000L, null);
++        TrialResponse r = engine.evaluateSingle(req);
++        assertEquals(3.0, r.value(), 1e-6, "差分 6 / 2 = 3（复合表达式同引擎求值）");
++        assertEquals(0, r.quality());
++    }
++
++    @Test
++    void deltaWithOnlyBaselinePointYieldsZeroNewBaseline() {
++        Map<String, List<TrialRequest.VariableSample>> history = Map.of(
++                "METER", List.of(new TrialRequest.VariableSample(100, 0, 1000)));
++        TrialRequest req = new TrialRequest("DELTA(METER)", Map.of(), history, 1000L, null);
++        TrialResponse r = engine.evaluateSingle(req);
++        assertEquals(0.0, r.value(), 1e-6, "首样本仅建基线，差分 0（DeltaOperator.NEW_BASELINE 口径）");
++    }
++
++    // ---------- INTEGRAL 拒绝 ----------
++
++    @Test
++    void handWrittenIntegralIsRejected() {
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("INTEGRAL(FLOW)", vars("FLOW", 1)));
++        assertTrue(r.rejected(), "手写 INTEGRAL 被拒绝（与 FormulaExpressionValidator 白名单一致）");
++        assertNull(r.value());
++        assertTrue(r.reason().contains("INTEGRAL"), "拒绝原因点名 INTEGRAL: " + r.reason());
++    }
++
++    @Test
++    void unknownFunctionIsRejected() {
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("FOO(A)", vars("A", 1)));
++        assertTrue(r.rejected());
++        assertTrue(r.reason().contains("FOO"));
++    }
++
++    // ---------- 窗口曲线 ----------
++
++    @Test
++    void windowCurveEmitsPointPerStepAndMarksMissingSegment() {
++        // 窗口 1000..4000 step=1000 → 4 点；历史仅 t=1000/2000 有 METER，t=3000/4000 缺数
++        Map<String, List<TrialRequest.VariableSample>> history = new LinkedHashMap<>();
++        history.put("A", List.of(
++                new TrialRequest.VariableSample(10, 0, 1000),
++                new TrialRequest.VariableSample(20, 0, 2000),
++                new TrialRequest.VariableSample(30, 0, 3000),
++                new TrialRequest.VariableSample(40, 0, 4000)));
++        history.put("METER", List.of(
++                new TrialRequest.VariableSample(100, 0, 1000),
++                new TrialRequest.VariableSample(108, 0, 2000)));
++        // 用 A 保证每点有值，同时公式里引用 METER 制造后段缺数（复合形态）
++        TrialResponse r = engine.evaluateSingle(
++                TrialRequest.window("A + METER", Map.of(), history, 1000, 4000, 1000));
++        assertNotNull(r.curve(), "窗口试算返回 curve");
++        assertEquals(4, r.curve().size(), "stepMs=1000，1000..4000 共 4 点");
++        assertEquals(110.0, r.curve().get(0).value(), 1e-6, "t1000: 10 + 100");
++        assertEquals(128.0, r.curve().get(1).value(), 1e-6, "t2000: 20 + 108");
++        // t3000/t4000：METER 无对应历史点 → 缺数明示，value=null（不是 0）
++        for (int i = 2; i < 4; i++) {
++            TrialResponse.CurvePoint p = r.curve().get(i);
++            assertNull(p.value(), "t=" + (1000 + i * 1000) + " 缺数价值 null: " + p);
++            assertTrue(p.missing().contains("METER"), "缺数点标明 METER: " + p.missing());
++            assertEquals(TrialResponse.QUALITY_MISSING, p.quality());
++        }
++    }
++
++    @Test
++    void deltaWindowCurveEachPointIsolated() {
++        // DELTA(METER) 窗口：每点用「该点之前的全部历史」重建沙箱基线；
++        // t1000 首基线 0，t2000 差分 5，t3000 差分 7（每点互不污染）。
++        Map<String, List<TrialRequest.VariableSample>> history = Map.of(
++                "METER", List.of(
++                        new TrialRequest.VariableSample(100, 0, 1000),
++                        new TrialRequest.VariableSample(105, 0, 2000),
++                        new TrialRequest.VariableSample(112, 0, 3000)));
++        TrialResponse r = engine.evaluateSingle(
++                TrialRequest.window("DELTA(METER)", Map.of(), history, 1000, 3000, 1000));
++        assertEquals(3, r.curve().size());
++        assertEquals(0.0, r.curve().get(0).value(), 1e-6);
++        assertEquals(5.0, r.curve().get(1).value(), 1e-6, "t2000: 105-100");
++        assertEquals(7.0, r.curve().get(2).value(), 1e-6, "t3000: 112-105");
++    }
++
++    // ---------- 沙箱隔离 ----------
++
++    @Test
++    void sandboxCreatesFreshOperatorPerRequestAndReplaysIdentically() {
++        AtomicInteger created = new AtomicInteger();
++        TrialEngine counted = new TrialEngine(() -> {
++            created.incrementAndGet();
++            return new OperatorEvaluator();
++        });
++        Map<String, List<TrialRequest.VariableSample>> history = Map.of(
++                "METER", List.of(
++                        new TrialRequest.VariableSample(100, 0, 1000),
++                        new TrialRequest.VariableSample(105, 0, 2000)));
++        // 单点 atTime=2000，两次请求各自新建算子，结果一致（第二次不受第一次基线影响）
++        TrialRequest req = new TrialRequest("DELTA(METER)", Map.of(), history, 2000L, null);
++        TrialResponse one = counted.evaluateSingle(req);
++        TrialResponse two = counted.evaluateSingle(req);
++        assertEquals(5.0, one.value(), 1e-6);
++        assertEquals(5.0, two.value(), 1e-6, "同一请求连试两次结果一致——第二次不受第一次基线影响");
++        assertEquals(2, created.get(), "每请求新建 OperatorEvaluator 实例（沙箱隔离，不共享在线 baselines）");
++    }
++
++    // ---------- 同口径 ----------
++
++    @Test
++    void sameEngineParityWithDirectArithmeticEvaluator() {
++        Map<String, Object> vars = vars("A", 6, "B", 5);
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("A*2+B", vars));
++        double direct = ArithmeticEvaluator.evaluate("A*2+B", id -> {
++            Object v = vars.get(id);
++            return v instanceof Number n ? n.doubleValue() : null;
++        });
++        assertEquals(direct, r.value(), 1e-9, "trial 与直接调 ArithmeticEvaluator 同口径");
++        assertTrue(r.reason().isEmpty());
++    }
++
++    @Test
++    void variableSampleObjectIsSupported() {
++        Map<String, Object> vars = new LinkedHashMap<>();
++        vars.put("A", new TrialRequest.VariableSample(7, 0, 1000));
++        vars.put("B", 3);
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("A*2+B", vars));
++        assertEquals(17.0, r.value(), 1e-6, "variables 支持 number|sample 两种形态");
++    }
++
++    @Test
++    void engineVersionIsDeclaredForParityClaim() {
++        TrialResponse r = engine.evaluateSingle(TrialRequest.of("1+1", Map.of()));
++        assertEquals(2.0, r.value());
++        assertNotNull(r.engineVersion(), "响应声明 engineVersion（同口径标识）");
++        assertTrue(r.engineVersion().contains("calc-engine"));
++    }
++
++    // ---------- helpers ----------
++
++    private static Map<String, Object> vars(Object... kv) {
++        Map<String, Object> m = new LinkedHashMap<>();
++        for (int i = 0; i < kv.length; i += 2) {
++            m.put((String) kv[i], kv[i + 1]);
++        }
++        return m;
++    }
++}

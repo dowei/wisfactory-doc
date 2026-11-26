@@ -1,0 +1,1401 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index 9c5e64c..cda3256 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -1156,7 +1156,7 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+      * SECOND→1 / MINUTE→60 / HOUR→3600 / DAY→86400（大小写不敏感）；其余→整批失败
+      * （fail-closed：不静默折算到 0，避免「配了周期却被当成到达驱动」的语义漂移）。
+      */
+-    static int mapCalcPeriod(String templatePeriod) {
++    public static int mapCalcPeriod(String templatePeriod) {
+         if (templatePeriod == null || templatePeriod.isBlank()) {
+             return 0;
+         }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java
+index a476fa7..703b2cc 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotTemplateUpgradeController.java
+@@ -6,6 +6,7 @@ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
+ import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
+ import net.otlab.core.annotation.OperateLog;
+@@ -19,6 +20,8 @@ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+ 
++import java.util.List;
++
+ /**
+  * 待升级清单控制器（TASK-0016，brief 接口 2/3——0070 待升级清单页的前端 API）
+  *
+@@ -65,8 +68,7 @@ public class IotTemplateUpgradeController {
+             + "整批原子；locked 实例可确认；权限复用 iot:instance:edit）")
+     @PostMapping("/confirm")
+     @SaCheckPermission("iot:instance:edit")
+-    public Result<Void> confirm(@Valid @RequestBody TemplateUpgradeConfirmForm form) {
+-        instanceUpgradeService.confirmUpgrade(form);
+-        return Result.success();
++    public Result<List<TemplateUpgradeResultVO>> confirm(@Valid @RequestBody TemplateUpgradeConfirmForm form) {
++        return Result.success(instanceUpgradeService.confirmUpgrade(form));
+     }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeResultVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeResultVO.java
+new file mode 100644
+index 0000000..7c94c30
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/entity/dto/TemplateUpgradeResultVO.java
+@@ -0,0 +1,94 @@
++package net.otlab.admin.module.iot.template.entity.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.ArrayList;
++import java.util.List;
++
++/**
++ * 确认升级逐台结果 VO（TASK-0081，POST /iot/template/upgrade/confirm 响应 records 元素）。
++ *
++ * <p>ADR-0008 三档政策明文「第三档：逐台确认迁移，每台出 diff 与迁移结果」——本 VO 是该
++ * 义务在确认接口响应面的载体（过渡留痕口径：响应逐台 VO + 服务逐台 INFO 日志 + 控制器
++ * @OperateLog 请求级；不建表、不写 iot_data_item_history——归 TASK-0039、不改 0014 NoOp）。
++ *
++ * <p>字段面：
++ * <ul>
++ * <li>{@code diff} = applied 版本 content vs 目标版本 content 的档位化变更清单（0015 引擎，
++ *     逐条目带 T1/T2/T3 档位）——「每台出 diff」；</li>
++ * <li>{@code actions} = 数据面实际应用的迁移动作描述（T1 补插 / T2 三方合并重写 /
++ *     T3 逻辑删停用 / 结构迁移+边重建；每条含 dataCode 与写入值摘要）——「每台出迁移结果」；</li>
++ * <li>{@code rowUpdated} = 本台是否发生数据项行变更（false=diff 空零操作——空数据边界）。</li>
++ * </ul>
++ *
++ * <p>0070 前端消费面登记：确认响应由「计数 int」扩为「逐台结果 VO 列表」属增量契约变化，
++ * 前端逐台展示后续批次接入；本 VO 对既有调用方按 JSON 数组增量兼容（旧计数可从
++ * {@code results.size()} 取得）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "确认升级逐台结果（TASK-0081：每台出 diff 与迁移结果）")
++public class TemplateUpgradeResultVO {
++
++    @Schema(description = "实例 ID")
++    private Long instanceId;
++
++    @Schema(description = "实例编码")
++    private String instanceCode;
++
++    @Schema(description = "确认前已应用模板版本")
++    private Integer appliedVersion;
++
++    @Schema(description = "本次确认目标版本")
++    private Integer targetVersion;
++
++    @Schema(description = "档位摘要（如 T1:1,T2:2,T3:1；无差异 null）")
++    private String tierSummary;
++
++    @Schema(description = "applied → target 逐条目档位化 diff（每台出 diff）")
++    private List<TemplateChangeEntryVO> diff = new ArrayList<>();
++
++    @Schema(description = "数据面迁移动作结果（逐条含 dataCode/档位/动作/结果；每台出迁移结果）")
++    private List<String> actions = new ArrayList<>();
++
++    @Schema(description = "本台是否发生数据项行变更（false=diff 空零操作）")
++    private boolean rowUpdated;
++
++    /** 三档档位判定助手（供服务层填 tierSummary，避免重复拼装逻辑） */
++    public static String summarize(List<TemplateChangeEntryVO> entries) {
++        if (entries == null || entries.isEmpty()) {
++            return null;
++        }
++        int t1 = 0, t2 = 0, t3 = 0;
++        for (TemplateChangeEntryVO e : entries) {
++            String tier = e.getTier();
++            if ("T1".equals(tier)) {
++                t1++;
++            } else if ("T2".equals(tier)) {
++                t2++;
++            } else if ("T3".equals(tier)) {
++                t3++;
++            }
++        }
++        StringBuilder sb = new StringBuilder();
++        if (t1 > 0) {
++            sb.append("T1:").append(t1);
++        }
++        if (t2 > 0) {
++            if (sb.length() > 0) {
++                sb.append(',');
++            }
++            sb.append("T2:").append(t2);
++        }
++        if (t3 > 0) {
++            if (sb.length() > 0) {
++                sb.append(',');
++            }
++            sb.append("T3:").append(t3);
++        }
++        return sb.length() > 0 ? sb.toString() : null;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java
+index c0f8e6f..6928665 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotInstanceUpgradeService.java
+@@ -3,8 +3,11 @@ package net.otlab.admin.module.iot.template.service;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
+ 
++import java.util.List;
++
+ /**
+  * 实例版本锁定与待升级清单服务（TASK-0016，ADR-0008 落地件最后一环——brief 三接口）。
+  *
+@@ -68,7 +71,8 @@ public interface IotInstanceUpgradeService {
+      * 快照消费面（0024 组装）不受本接口影响（brief：本任务不改 publish）。
+      *
+      * @param form 表单（instanceIds[] + targetVersion）
+-     * @return 确认台数
++     * @return 逐台结果列表（TASK-0081：每台出 diff + 迁移结果；顺序与入参一致；台数=size()
++     *         即旧「确认台数」契约的增量兼容面）
+      */
+-    int confirmUpgrade(TemplateUpgradeConfirmForm form);
++    List<TemplateUpgradeResultVO> confirmUpgrade(TemplateUpgradeConfirmForm form);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotUpgradeApplyService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotUpgradeApplyService.java
+new file mode 100644
+index 0000000..4d9b7dd
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotUpgradeApplyService.java
+@@ -0,0 +1,59 @@
++package net.otlab.admin.module.iot.template.service;
++
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
++
++import java.util.List;
++
++/**
++ * 确认升级数据面编排服务（TASK-0081，ADR-0008 确认链路最后一环）。
++ *
++ * <p><b>职责</b>：把「实例已应用模板版本 → 目标模板版本」的内容 diff（0015
++ * {@code TemplateContentDiffEngine} 产出）落到实例数据项行（iot_data_item），使
++ * ConfigSnapshotAssembler 读行即为新版本生效值——闭合 TASK-0016 仅推进版本簿记留下的
++ * 数据面缺口。三档政策（ADR-0008）在确认链路逐台兑现：
++ * <ol>
++ * <li><b>T1 新增项</b>：按 0013 生成范式补插缺失行（相对引用展开 + 引用边落库）——委托
++ *     {@code IotDataItemService#regenerateForInstance}（幂等，已占用含逻辑删行跳过）；</li>
++ * <li><b>T2 语义变更</b>：三方合并（applied 版本 content 基线 vs 目标版本 vs 实例行）——
++ *     行值为空或等于旧默认的实例态形态视为未覆盖，写新默认实例态（公式按本实例展开 +
++ *     引用边先删后插重建）；否则保留实例已覆盖值；</li>
++ * <li><b>T3 结构破坏</b>：删项=逻辑删（@TableLogic 退出快照、双 uk 不含 deleted——键永久
++ *     占用防 full_key 复用污染 TDengine 历史标签；被引用入边与指标引用按 ADR 明示不清理）；
++ *     改类型/改取值方式=结构迁移 + 边重建；</li>
++ * </ol>
++ *
++ * <p><b>可复用接缝</b>（计划评审 D-1）：{@link #applyToVersion} 按实例维度封装「按目标版本
++ * 对齐数据面」的完整语义，供 TASK-0083（发布自动跟随——已拆独立任务，前置=0081）复用；
++ * 本任务不实现发布侧接线，仅留接缝。
++ *
++ * <p><b>事务与留痕</b>：由调用方（0016 确认事务）并入同一 {@code @Transactional}——簿记 +
++ * 行应用 + 留痕单原子单位，任一实例失败整批回滚（4002 口径）；本服务方法不另起事务边界
++ * （加入调用方事务）。每台返回 {@link TemplateUpgradeResultVO}（diff + 迁移动作结果），
++ * 逐台 INFO 日志由实现承载。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface IotUpgradeApplyService {
++
++    /**
++     * 单实例应用：按目标模板版本对齐该实例的数据项行（三档语义逐条落地）。
++     *
++     * <p>可复用边界（TASK-0083 发布自动跟随将复用本方法）——本任务只由确认链路调用。
++     *
++     * @param instance      实例行（含 id/instanceCode/parentId/appliedTemplateVersion）
++     * @param targetVersion 目标模板版本（=当前版本，确认链路已校验；发布链路届时自行校验）
++     * @return 本台逐台结果（diff + 迁移动作 + 是否发生行变更）；diff 空=零操作
++     */
++    TemplateUpgradeResultVO applyToVersion(IotModelInstance instance, Integer targetVersion);
++
++    /**
++     * 批量应用（确认链路）：逐台调用 {@link #applyToVersion}，整批原子由调用方事务保证。
++     *
++     * @param instances     实例列表（同模板、已过校验链）
++     * @param targetVersion 目标模板版本
++     * @return 逐台结果列表（顺序与入参一致）
++     */
++    List<TemplateUpgradeResultVO> applyToVersionBatch(List<IotModelInstance> instances, Integer targetVersion);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java
+index 4e5e4a2..937de6d 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImpl.java
+@@ -14,12 +14,14 @@ import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
+ import net.otlab.admin.module.iot.template.entity.dto.IotInstanceLockForm;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeConfirmForm;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
+ import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeRowVO;
+ import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
+ import net.otlab.admin.module.iot.template.service.IotInstanceUpgradeService;
+ import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
++import net.otlab.admin.module.iot.template.service.IotUpgradeApplyService;
+ import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
+ import net.otlab.admin.module.iot.template.tier.TemplateContentDiffEngine;
+ import net.otlab.admin.module.iot.template.tier.TemplateTierRuleTable;
+@@ -93,6 +95,9 @@ public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService
+     @Autowired
+     private IotTemplateVersionService templateVersionService;
+ 
++    @Autowired
++    private IotUpgradeApplyService upgradeApplyService;
++
+     // ---------- 锁定开关 ----------
+ 
+     @Override
+@@ -229,7 +234,7 @@ public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService
+ 
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+-    public int confirmUpgrade(TemplateUpgradeConfirmForm form) {
++    public List<TemplateUpgradeResultVO> confirmUpgrade(TemplateUpgradeConfirmForm form) {
+         List<Long> ids = form.getInstanceIds();
+         if (ids == null || ids.isEmpty()) {
+             throw paramError("请选择要确认升级的实例");
+@@ -274,8 +279,10 @@ public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService
+             throw paramError("目标版本必须等于模板当前版本 " + currentVersion + "（不允许任意目标版）");
+         }
+ 
+-        // 逐台乐观锁更新：SET applied=target WHERE id=? AND applied=旧值（任一失败整批回滚）
+-        int confirmed = 0;
++        // 逐台：数据面应用（TASK-0081）+ 乐观锁簿记推进——单事务原子单位，任一失败整批回滚。
++        // applyToVersion 先于簿记推进调用（读实例对象携带的 applied 旧值；簿记 UPDATE 不改对象），
++        // 数据面行变更与版本簿记在同一 @Transactional 内，发布组装侧 MVCC 读不到半态。
++        List<TemplateUpgradeResultVO> results = new ArrayList<>(existingList.size());
+         for (IotModelInstance target : existingList) {
+             Integer applied = target.getAppliedTemplateVersion();
+             if (applied == null) {
+@@ -291,6 +298,12 @@ public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService
+                 throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
+                         "实例已在目标版本（并发确认或重复提交），请刷新待升级清单后重试: " + target.getInstanceCode());
+             }
++
++            // 数据面应用（TASK-0081）：按目标版本重写实例行（T1 补插/T2 三方合并/T3 迁移+边重建）
++            // ——失败（如新公式引用缺失、展开失败）抛异常 → @Transactional 整批回滚（fail-closed）
++            TemplateUpgradeResultVO result = upgradeApplyService.applyToVersion(target, currentVersion);
++            results.add(result);
++
+             LambdaUpdateWrapper<IotModelInstance> upd = new LambdaUpdateWrapper<IotModelInstance>()
+                     .eq(IotModelInstance::getId, target.getId())
+                     .eq(IotModelInstance::getAppliedTemplateVersion, applied)
+@@ -298,16 +311,15 @@ public class IotInstanceUpgradeServiceImpl implements IotInstanceUpgradeService
+             int rows = instanceMapper.update(null, upd);
+             if (rows == 0) {
+                 // 乐观锁冲突（并发确认已推进该实例版本）→ 映射 4002 业务码（0015 修订轮 M-2 范式，
+-                // 不裸 500）；@Transactional 整批回滚——不半成功
++                // 不裸 500）；@Transactional 整批回滚——不半成功（含上一步数据面行变更一并回滚）
+                 throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
+                         "实例版本并发确认冲突，请重试（刷新待升级清单）: instanceId=" + target.getId());
+             }
+-            confirmed++;
+             // 逐台留痕（控制器 @OperateLog 记请求级；此处逐台 INFO 补运行轨迹）
+-            log.info("[INSTANCE-UPGRADE] confirmed instanceId={} templateId={} applied {} -> {} (userId={})",
+-                    target.getId(), templateId, applied, currentVersion, SecurityUtils.getUserId());
++            log.info("[INSTANCE-UPGRADE] confirmed instanceId={} templateId={} applied {} -> {} rowUpdated={} (userId={})",
++                    target.getId(), templateId, applied, currentVersion, result.isRowUpdated(), SecurityUtils.getUserId());
+         }
+-        return confirmed;
++        return results;
+     }
+ 
+     // ---------- 内部辅助 ----------
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java
+new file mode 100644
+index 0000000..329f0ef
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImpl.java
+@@ -0,0 +1,540 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
++import net.otlab.admin.module.iot.dataitem.service.impl.IotDataItemServiceImpl;
++import net.otlab.admin.module.iot.dataitem.service.support.RelativeRefExpander;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.admin.module.iot.template.service.IotUpgradeApplyService;
++import net.otlab.admin.module.iot.template.tier.TemplateChangeEntry;
++import net.otlab.admin.module.iot.template.tier.TemplateContentDiffEngine;
++import net.otlab.core.tenant.TenantContext;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.stream.Collectors;
++
++/**
++ * 确认升级数据面编排服务实现（TASK-0081，ADR-0008 确认链路最后一环）。
++ *
++ * <p><b>生效机制=拷贝传播</b>（计划评审裁决①）：applied 版本 content 基线 vs 目标版本 content
++ * 经 0015 {@link TemplateContentDiffEngine} 产出逐条目档位化 diff，按条目落到实例数据项行
++ * （iot_data_item）——ConfigSnapshotAssembler 读行即为新版本生效值，组装器零改动。
++ *
++ * <p><b>三方合并</b>（裁决①）：字段级 CHANGED 条目——取 applied content 的旧默认（模板态）
++ * 与 target content 的新默认（模板态），与实例行现值做三方比对。行值为空或等于旧默认的
++ * <b>实例态形态</b>（公式经 {@link RelativeRefExpander} 按本实例展开、calc_period 经
++ * {@link IotDataItemServiceImpl#mapCalcPeriod} 换算、source_type 复现生成兜底 null→1）
++ * 视为未覆盖 → 写新默认实例态（公式展开 + 引用边先删后插重建）；否则保留实例已覆盖值。
++ * 判定误向（显式覆盖为旧默认同值）方向保守，符合「模板批量一致」核心价值。
++ *
++ * <p><b>T1 补插</b>（brief 接口 2）：ADDED 数据项委托 {@code IotDataItemService#regenerateForInstance}
++ * ——0013 生成范式补插缺失行（相对引用展开 + 引用边落库；已占用含逻辑删行幂等跳过）。
++ *
++ * <p><b>T3 迁移</b>（裁决③）：REMOVED 数据项=逻辑删（SET deleted=1，@TableLogic 退出快照、
++ * 双 uk 不含 deleted——键永久占用防 full_key 复用污染 TDengine 历史标签；行自身承载历史）；
++ * valueKind/defaultSourceType CHANGED=结构迁移（重写 source_type/formula/rollup 并边重建）。
++ * 被引用入边与指标引用<b>不清理</b>（ADR 明示后果，逐台 diff 明示）。
++ *
++ * <p><b>留痕</b>：逐台返回 {@link TemplateUpgradeResultVO}（diff + 迁移动作结果）+ 逐台 INFO
++ * 日志（[UPGRADE-APPLY] 范式）；本类不另起事务边界——由调用方 confirm 事务包裹（单原子单位）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Slf4j
++@Service
++public class IotUpgradeApplyServiceImpl implements IotUpgradeApplyService {
++
++    private static final ObjectMapper PARSE_MAPPER = new ObjectMapper();
++
++    private static final String OBJ_DATA_ITEM = TemplateChangeEntry.OBJECT_DATA_ITEM;
++    private static final String CHG_ADDED = TemplateChangeEntry.CHANGE_ADDED;
++    private static final String CHG_REMOVED = TemplateChangeEntry.CHANGE_REMOVED;
++    private static final String CHG_CHANGED = TemplateChangeEntry.CHANGE_CHANGED;
++
++    private static final int SOURCE_TYPE_BIND = 1;
++    private static final int SOURCE_TYPE_ROLLUP = 3;
++    private static final int REF_TYPE_DATA_ITEM = 1;
++
++    @Autowired private IotDataItemMapper dataItemMapper;
++    @Autowired private IotDataItemRefMapper dataItemRefMapper;
++    @Autowired private IotModelInstanceMapper instanceMapper;
++    @Autowired private IotModelTemplateMapper modelTemplateMapper;
++    @Autowired private IotDataItemTemplateMapper dataItemTemplateMapper;
++    @Autowired private IotModelTemplateVersionMapper versionMapper;
++    @Autowired private IotDataItemService dataItemService;
++
++    @Override
++    public TemplateUpgradeResultVO applyToVersion(IotModelInstance instance, Integer targetVersion) {
++        TemplateUpgradeResultVO result = new TemplateUpgradeResultVO();
++        result.setInstanceId(instance.getId());
++        result.setInstanceCode(instance.getInstanceCode());
++        result.setAppliedVersion(instance.getAppliedTemplateVersion());
++        result.setTargetVersion(targetVersion);
++
++        Integer appliedVersion = instance.getAppliedTemplateVersion();
++        Long templateId = instance.getTemplateId();
++        if (appliedVersion == null || templateId == null) {
++            // 脏数据防御——无基线可比对，零操作（等价于「空=零操作」边界）
++            result.setRowUpdated(false);
++            return result;
++        }
++
++        // 1) applied content 基线 + target content（版本历史行；无基线降级=零操作）
++        String appliedContent = loadContent(templateId, appliedVersion);
++        String targetContent = loadContent(templateId, targetVersion);
++        if (appliedContent == null || targetContent == null) {
++            log.warn("[UPGRADE-APPLY] content baseline missing instanceId={} templateId={} applied={} target={}",
++                    instance.getId(), templateId, appliedVersion, targetVersion);
++            result.setRowUpdated(false);
++            return result;
++        }
++        JsonNode appliedNode = parse(appliedContent);
++        JsonNode targetNode = parse(targetContent);
++
++        // 2) 0015 diff 引擎——档位化逐条目（diff 空=零操作）
++        List<TemplateChangeEntry> entries = TemplateContentDiffEngine.diff(appliedNode, targetNode);
++        List<TemplateChangeEntryVO> diffVos = entries.stream()
++                .map(TemplateChangeEntryVO::from).collect(Collectors.toList());
++        result.setDiff(diffVos);
++        result.setTierSummary(TemplateUpgradeResultVO.summarize(diffVos));
++        if (entries.isEmpty()) {
++            result.setRowUpdated(false);
++            return result;
++        }
++
++        // 3) 索引：两版模板项（dataCode → content JSON 对象）
++        Map<String, JsonNode> appliedItems = indexItems(appliedNode);
++        Map<String, JsonNode> targetItems = indexItems(targetNode);
++
++        // 4) 实例数据项行（@TableLogic 过滤已删行；仅本实例）
++        List<IotDataItem> rows = dataItemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
++                .eq(IotDataItem::getInstanceId, instance.getId()));
++        Map<String, IotDataItem> rowsByCode = new HashMap<>();
++        for (IotDataItem row : rows) {
++            rowsByCode.put(row.getDataCode(), row);
++        }
++
++        List<String> actions = result.getActions();
++        boolean rowUpdated = false;
++
++        // 5) 对象级 ADDED（T1）：委托 regenerate 补插缺失行（0013 生成范式）
++        List<String> addedCodes = entries.stream()
++                .filter(e -> OBJ_DATA_ITEM.equals(e.getObjectType()) && CHG_ADDED.equals(e.getChangeType()))
++                .map(TemplateChangeEntry::getObjectKey)
++                .distinct().collect(Collectors.toList());
++        if (!addedCodes.isEmpty()) {
++            dataItemService.regenerateForInstance(instance.getId());
++            actions.add("新增项补插: " + String.join(",", addedCodes) + "（0013 生成范式）");
++            rowUpdated = true;
++        }
++
++        // 6) 对象级 REMOVED（T3）：逻辑删停用（保留历史行自身，键永久占用）
++        List<String> removedCodes = entries.stream()
++                .filter(e -> OBJ_DATA_ITEM.equals(e.getObjectType()) && CHG_REMOVED.equals(e.getChangeType()))
++                .map(TemplateChangeEntry::getObjectKey)
++                .distinct().collect(Collectors.toList());
++        for (String code : removedCodes) {
++            IotDataItem row = rowsByCode.get(code);
++            if (row == null) {
++                continue; // 实例本就无该行——无需删
++            }
++            LambdaUpdateWrapper<IotDataItem> del = new LambdaUpdateWrapper<IotDataItem>()
++                    .eq(IotDataItem::getId, row.getId())
++                    .set(IotDataItem::getDeleted, 1);
++            dataItemMapper.update(null, del);
++            // 被删项自身出边随之清理（其公式不再生效）；入边与指标引用不清理（ADR 明示后果）
++            dataItemRefMapper.deleteByItemIdPhysical(TenantContext.getTenantId(), row.getId());
++            actions.add(code + " 逻辑删停用（键永久占用，历史行保留；入边与指标引用不清理）");
++            rowUpdated = true;
++        }
++
++        // 7) 字段级 CHANGED：三方合并（按 dataCode 分组，逐字段比对）
++        Map<String, List<TemplateChangeEntry>> changedByCode = entries.stream()
++                .filter(e -> OBJ_DATA_ITEM.equals(e.getObjectType()) && CHG_CHANGED.equals(e.getChangeType()))
++                .collect(Collectors.groupingBy(TemplateChangeEntry::getObjectKey, LinkedHashMap::new,
++                        Collectors.toList()));
++        for (Map.Entry<String, List<TemplateChangeEntry>> group : changedByCode.entrySet()) {
++            String code = group.getKey();
++            IotDataItem row = rowsByCode.get(code);
++            if (row == null) {
++                continue; // 新增项已由 regenerate 处理；无行可合并
++            }
++            JsonNode oldItem = appliedItems.get(code);
++            JsonNode newItem = targetItems.get(code);
++            if (oldItem == null || newItem == null) {
++                continue;
++            }
++            if (applyFieldChanges(instance, row, code, group.getValue(), oldItem, newItem, actions)) {
++                rowUpdated = true;
++            }
++        }
++
++        result.setRowUpdated(rowUpdated);
++        log.info("[UPGRADE-APPLY] instanceId={} templateId={} applied={} target={} summary={} actions={}",
++                instance.getId(), templateId, appliedVersion, targetVersion, result.getTierSummary(), actions);
++        return result;
++    }
++
++    @Override
++    public List<TemplateUpgradeResultVO> applyToVersionBatch(List<IotModelInstance> instances, Integer targetVersion) {
++        List<TemplateUpgradeResultVO> results = new ArrayList<>(instances.size());
++        for (IotModelInstance instance : instances) {
++            results.add(applyToVersion(instance, targetVersion));
++        }
++        return results;
++    }
++
++    /**
++     * 单数据项字段级三方合并：逐 CHANGED 字段判定「未覆盖→写新默认 / 已覆盖→保留」。
++     *
++     * @return 是否发生行写（任一字段写入即 true）
++     */
++    private boolean applyFieldChanges(IotModelInstance instance, IotDataItem row, String code,
++                                      List<TemplateChangeEntry> changes, JsonNode oldItem, JsonNode newItem,
++                                      List<String> actions) {
++        Long tenant = TenantContext.getTenantId();
++        IotDataItem patch = new IotDataItem();
++        patch.setId(row.getId());
++        boolean anyWrite = false;
++        boolean formulaChanged = false;
++        boolean sourceTypeChanged = false;
++        boolean formulaCleared = false;
++        LinkedHashSet<String> newRefs = new LinkedHashSet<>();
++
++        for (TemplateChangeEntry change : changes) {
++            String field = change.getField();
++            if (field == null) {
++                continue;
++            }
++            switch (field) {
++                case "defaultFormula" -> {
++                    String oldTemplate = text(oldItem, field);
++                    String newTemplate = text(newItem, field);
++                    String oldInstanceForm = expandFormula(oldTemplate, instance);
++                    if (isBlank(row.getFormula()) || eq(row.getFormula(), oldInstanceForm)) {
++                        String newInstanceForm = expandFormula(newTemplate, instance);
++                        patch.setFormula(newInstanceForm);
++                        anyWrite = true;
++                        formulaChanged = true;
++                        newRefs.addAll(expandRefs(newTemplate, instance));
++                        actions.add(code + " 公式继承新默认: " + newInstanceForm);
++                    }
++                }
++                case "defaultCalcPeriod" -> {
++                    Integer oldSeconds = safeMapPeriod(text(oldItem, field));
++                    Integer newSeconds = safeMapPeriod(text(newItem, field));
++                    if (row.getCalcPeriod() == null || row.getCalcPeriod().equals(oldSeconds)) {
++                        patch.setCalcPeriod(newSeconds == null ? 0 : newSeconds);
++                        anyWrite = true;
++                        actions.add(code + " 计算周期继承新默认: " + newSeconds + "s");
++                    }
++                }
++                case "defaultSourceType" -> {
++                    Integer oldDefault = intVal(oldItem, field);
++                    Integer newDefault = intVal(newItem, field);
++                    int oldFallback = oldDefault == null ? SOURCE_TYPE_BIND : oldDefault;
++                    int newFallback = newDefault == null ? SOURCE_TYPE_BIND : newDefault;
++                    if (row.getSourceType() == null || row.getSourceType() == oldFallback) {
++                        patch.setSourceType(newFallback);
++                        anyWrite = true;
++                        sourceTypeChanged = true;
++                        actions.add(code + " 取值方式结构迁移: " + oldFallback + "→" + newFallback);
++                        // 取值方式互斥：新默认非公式时清公式/汇总，是公式时写新公式展开
++                        if (newFallback == SOURCE_TYPE_BIND) {
++                            patch.setFormula(null);
++                            patch.setRollupMethod(null);
++                            formulaCleared = true;
++                            newRefs.clear();
++                        } else if (newFallback == SOURCE_TYPE_ROLLUP) {
++                            patch.setFormula(null);
++                            patch.setRollupMethod(text(newItem, "aggMethod"));
++                            formulaCleared = true;
++                            newRefs.clear();
++                        } else {
++                            String newFormula = expandFormula(text(newItem, "defaultFormula"), instance);
++                            patch.setFormula(newFormula);
++                            patch.setRollupMethod(null);
++                            newRefs.addAll(expandRefs(text(newItem, "defaultFormula"), instance));
++                        }
++                    }
++                }
++                case "aggMethod" -> {
++                    String oldAgg = text(oldItem, field);
++                    String newAgg = text(newItem, field);
++                    if (isBlank(row.getRollupMethod()) || eq(row.getRollupMethod(), oldAgg)) {
++                        patch.setRollupMethod(newAgg);
++                        anyWrite = true;
++                        actions.add(code + " 汇总方式继承新默认: " + newAgg);
++                    }
++                }
++                case "defaultValidMin" -> {
++                    BigDecimal oldV = decimal(oldItem, field);
++                    BigDecimal newV = decimal(newItem, field);
++                    if (row.getValidMin() == null || eq(row.getValidMin(), oldV)) {
++                        patch.setValidMin(newV);
++                        anyWrite = true;
++                        actions.add(code + " 有效下限继承新默认: " + newV);
++                    }
++                }
++                case "defaultValidMax" -> {
++                    BigDecimal oldV = decimal(oldItem, field);
++                    BigDecimal newV = decimal(newItem, field);
++                    if (row.getValidMax() == null || eq(row.getValidMax(), oldV)) {
++                        patch.setValidMax(newV);
++                        anyWrite = true;
++                        actions.add(code + " 有效上限继承新默认: " + newV);
++                    }
++                }
++                case "defaultAlarmLow" -> {
++                    BigDecimal oldV = decimal(oldItem, field);
++                    BigDecimal newV = decimal(newItem, field);
++                    if (row.getAlarmLow() == null || eq(row.getAlarmLow(), oldV)) {
++                        patch.setAlarmLow(newV);
++                        anyWrite = true;
++                        actions.add(code + " 告警低阈值继承新默认: " + newV);
++                    }
++                }
++                case "defaultAlarmHigh" -> {
++                    BigDecimal oldV = decimal(oldItem, field);
++                    BigDecimal newV = decimal(newItem, field);
++                    if (row.getAlarmHigh() == null || eq(row.getAlarmHigh(), oldV)) {
++                        patch.setAlarmHigh(newV);
++                        anyWrite = true;
++                        actions.add(code + " 告警高阈值继承新默认: " + newV);
++                    }
++                }
++                case "dataName" -> {
++                    String oldV = text(oldItem, field);
++                    String newV = text(newItem, field);
++                    if (isBlank(row.getDataName()) || eq(row.getDataName(), oldV)) {
++                        patch.setDataName(newV);
++                        anyWrite = true;
++                        actions.add(code + " 名称继承新默认: " + newV);
++                    }
++                }
++                case "category" -> {
++                    String oldV = text(oldItem, field);
++                    String newV = text(newItem, field);
++                    if (isBlank(row.getCategory()) || eq(row.getCategory(), oldV)) {
++                        patch.setCategory(newV);
++                        anyWrite = true;
++                    }
++                }
++                case "unit" -> {
++                    String oldV = text(oldItem, field);
++                    String newV = text(newItem, field);
++                    if (isBlank(row.getUnit()) || eq(row.getUnit(), oldV)) {
++                        patch.setUnit(newV);
++                        anyWrite = true;
++                        actions.add(code + " 单位继承新默认: " + newV);
++                    }
++                }
++                case "valueKind" -> {
++                    // valueKind（数据类型）不落实例行（0013「留模板不落实例」，实例表无该列）——
++                    // T3 迁移经继承判定覆盖的公式/结构字段重物化承载，此处仅记逐台 diff 明示。
++                    actions.add(code + " 数据类型变更（T3，模板态承载，经结构字段重物化承载）");
++                }
++                default -> {
++                    // 未登记字段（diff 引擎 fail-closed 归 T2）——保守不动实例行，仅记 diff 明示
++                    actions.add(code + " 字段 " + field + " 变更（无实例行载体，逐台 diff 明示）");
++                }
++            }
++        }
++
++        if (anyWrite) {
++            // 白名单更新集：仅写本轮判定的列（patch 中 null 列不进 SET，保留实例已覆盖值）
++            LambdaUpdateWrapper<IotDataItem> upd = lambdaUpdate(patch);
++            dataItemMapper.update(null, upd);
++            // 公式或取值方式变更 → 引用边先删后插重建（0013/0036 regenerate 范式）
++            // formulaCleared（取值方式切到直绑/汇总）=只删不插（无公式则无出边）
++            if (formulaChanged || sourceTypeChanged) {
++                dataItemRefMapper.deleteByItemIdPhysical(tenant, row.getId());
++                if (!formulaCleared) {
++                    insertRefs(tenant, row.getId(), newRefs);
++                }
++            }
++        }
++        return anyWrite;
++    }
++
++    /** 构建仅含非 null 字段的白名单更新包装器（id 作 WHERE 守卫） */
++    private LambdaUpdateWrapper<IotDataItem> lambdaUpdate(IotDataItem patch) {
++        LambdaUpdateWrapper<IotDataItem> upd = new LambdaUpdateWrapper<IotDataItem>()
++                .eq(IotDataItem::getId, patch.getId());
++        if (patch.getFormula() != null) {
++            upd.set(IotDataItem::getFormula, patch.getFormula());
++        } else if (patch.getSourceType() != null && (patch.getSourceType() == SOURCE_TYPE_BIND
++                || patch.getSourceType() == SOURCE_TYPE_ROLLUP)) {
++            // 取值方式切换离公式时显式清公式（互斥）——用 set 覆盖为 NULL
++            upd.set(IotDataItem::getFormula, null);
++        }
++        if (patch.getSourceType() != null) {
++            upd.set(IotDataItem::getSourceType, patch.getSourceType());
++        }
++        if (patch.getRollupMethod() != null) {
++            upd.set(IotDataItem::getRollupMethod, patch.getRollupMethod());
++        } else if (patch.getSourceType() != null && patch.getSourceType() == SOURCE_TYPE_BIND) {
++            upd.set(IotDataItem::getRollupMethod, null);
++        }
++        if (patch.getCalcPeriod() != null) {
++            upd.set(IotDataItem::getCalcPeriod, patch.getCalcPeriod());
++        }
++        if (patch.getValidMin() != null) {
++            upd.set(IotDataItem::getValidMin, patch.getValidMin());
++        }
++        if (patch.getValidMax() != null) {
++            upd.set(IotDataItem::getValidMax, patch.getValidMax());
++        }
++        if (patch.getAlarmLow() != null) {
++            upd.set(IotDataItem::getAlarmLow, patch.getAlarmLow());
++        }
++        if (patch.getAlarmHigh() != null) {
++            upd.set(IotDataItem::getAlarmHigh, patch.getAlarmHigh());
++        }
++        if (patch.getDataName() != null) {
++            upd.set(IotDataItem::getDataName, patch.getDataName());
++        }
++        if (patch.getCategory() != null) {
++            upd.set(IotDataItem::getCategory, patch.getCategory());
++        }
++        if (patch.getUnit() != null) {
++            upd.set(IotDataItem::getUnit, patch.getUnit());
++        }
++        return upd;
++    }
++
++    /** 引用边落库（ref_type=1；ref_item_id 按 full_key 查活跃行尽力回填，查不到置 NULL 不阻断） */
++    private void insertRefs(Long tenant, Long itemId, LinkedHashSet<String> refFullKeys) {
++        for (String fullKey : refFullKeys) {
++            IotDataItemRef ref = new IotDataItemRef();
++            ref.setTenantId(tenant);
++            ref.setItemId(itemId);
++            ref.setRefFullKey(fullKey);
++            ref.setRefType(REF_TYPE_DATA_ITEM);
++            IotDataItem target = dataItemMapper.selectOne(new LambdaQueryWrapper<IotDataItem>()
++                    .select(IotDataItem::getId).eq(IotDataItem::getFullKey, fullKey));
++            ref.setRefItemId(target == null ? null : target.getId());
++            dataItemRefMapper.insert(ref);
++        }
++    }
++
++    /** 模板公式 → 本实例展开态（相对引用 {SELF}/{PARENT} 按 0013 RelativeRefExpander） */
++    private String expandFormula(String templateFormula, IotModelInstance instance) {
++        if (isBlank(templateFormula)) {
++            return templateFormula;
++        }
++        String parentCode = null;
++        if (RelativeRefExpander.containsParentRef(templateFormula)) {
++            Long pid = instance.getParentId();
++            if (pid != null && pid != 0L) {
++                IotModelInstance parent = instanceMapper.selectById(pid);
++                parentCode = parent == null ? null : parent.getInstanceCode();
++            }
++        }
++        return RelativeRefExpander.expand(templateFormula, instance.getInstanceCode(), parentCode).expandedFormula();
++    }
++
++    /** 模板公式 → 解析后的被引用全键集（用于引用边重建） */
++    private LinkedHashSet<String> expandRefs(String templateFormula, IotModelInstance instance) {
++        if (isBlank(templateFormula)) {
++            return new LinkedHashSet<>();
++        }
++        String parentCode = null;
++        if (RelativeRefExpander.containsParentRef(templateFormula)) {
++            Long pid = instance.getParentId();
++            if (pid != null && pid != 0L) {
++                IotModelInstance parent = instanceMapper.selectById(pid);
++                parentCode = parent == null ? null : parent.getInstanceCode();
++            }
++        }
++        return new LinkedHashSet<>(RelativeRefExpander.expand(
++                templateFormula, instance.getInstanceCode(), parentCode).resolvedRefs());
++    }
++
++    private String loadContent(Long templateId, int version) {
++        IotModelTemplateVersion row = versionMapper.selectOne(new LambdaQueryWrapper<IotModelTemplateVersion>()
++                .eq(IotModelTemplateVersion::getTemplateId, templateId)
++                .eq(IotModelTemplateVersion::getVersion, version)
++                .last("LIMIT 1"));
++        return row == null ? null : row.getContent();
++    }
++
++    private Map<String, JsonNode> indexItems(JsonNode content) {
++        Map<String, JsonNode> map = new TreeMap<>();
++        JsonNode items = content == null ? null : content.get("dataItems");
++        if (items != null && items.isArray()) {
++            for (JsonNode item : items) {
++                if (item.hasNonNull("dataCode")) {
++                    map.put(item.get("dataCode").asText(), item);
++                }
++            }
++        }
++        return map;
++    }
++
++    private JsonNode parse(String json) {
++        try {
++            return PARSE_MAPPER.readTree(json);
++        } catch (Exception e) {
++            throw new IllegalStateException("模板内容快照解析失败: " + e.getMessage(), e);
++        }
++    }
++
++    private String text(JsonNode node, String field) {
++        JsonNode v = node == null ? null : node.get(field);
++        return v == null || v.isNull() ? null : v.asText();
++    }
++
++    private Integer intVal(JsonNode node, String field) {
++        JsonNode v = node == null ? null : node.get(field);
++        return v == null || v.isNull() ? null : v.asInt();
++    }
++
++    private BigDecimal decimal(JsonNode node, String field) {
++        JsonNode v = node == null ? null : node.get(field);
++        return v == null || v.isNull() ? null : v.decimalValue();
++    }
++
++    private Integer safeMapPeriod(String period) {
++        try {
++            return IotDataItemServiceImpl.mapCalcPeriod(period);
++        } catch (RuntimeException e) {
++            return null; // 坏周期码——不误判为覆盖，留待新默认重写修正
++        }
++    }
++
++    private boolean isBlank(String s) {
++        return s == null || s.isBlank();
++    }
++
++    private boolean eq(Object a, Object b) {
++        return a == null ? b == null : a.equals(b);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java
+index 7cd2472..75d1138 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotInstanceUpgradeServiceImplTest.java
+@@ -85,6 +85,9 @@ class IotInstanceUpgradeServiceImplTest {
+     @Mock
+     private IotTemplateVersionService templateVersionService;
+ 
++    @Mock
++    private net.otlab.admin.module.iot.template.service.IotUpgradeApplyService upgradeApplyService;
++
+     private IotInstanceUpgradeServiceImpl service;
+ 
+     private AutoCloseable mocks;
+@@ -111,9 +114,21 @@ class IotInstanceUpgradeServiceImplTest {
+         ReflectionTestUtils.setField(service, "versionMapper", versionMapper);
+         ReflectionTestUtils.setField(service, "dataPermService", dataPermService);
+         ReflectionTestUtils.setField(service, "templateVersionService", templateVersionService);
++        ReflectionTestUtils.setField(service, "upgradeApplyService", upgradeApplyService);
+         // 默认全租户可见域（0012 测试同款）；受限场景在各用例内显式覆盖 resolve(1L)
+         when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
+         when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(template(CURRENT_VERSION));
++        // TASK-0081：数据面编排默认返回零操作逐台结果（各确认用例聚焦簿记 0016 语义）
++        when(upgradeApplyService.applyToVersion(any(), any())).thenAnswer(inv -> {
++            IotModelInstance inst = inv.getArgument(0);
++            net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO vo =
++                    new net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO();
++            if (inst != null) {
++                vo.setInstanceId(inst.getId());
++                vo.setInstanceCode(inst.getInstanceCode());
++            }
++            return vo;
++        });
+     }
+ 
+     @AfterEach
+@@ -407,7 +422,7 @@ class IotInstanceUpgradeServiceImplTest {
+         when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a));
+         when(instanceMapper.update(isNull(), any())).thenReturn(1);
+ 
+-        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)).size());
+ 
+         ArgumentCaptor<LambdaUpdateWrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
+         verify(instanceMapper).update(isNull(), captor.capture());
+@@ -421,7 +436,7 @@ class IotInstanceUpgradeServiceImplTest {
+         IotModelInstance locked = instance(12L, 2, 1);
+         when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(locked));
+         when(instanceMapper.update(isNull(), any())).thenReturn(1);
+-        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(12L), CURRENT_VERSION)));
++        assertEquals(1, service.confirmUpgrade(confirmForm(List.of(12L), CURRENT_VERSION)).size());
+         verify(instanceMapper, times(2)).update(isNull(), any());
+     }
+ 
+@@ -433,7 +448,7 @@ class IotInstanceUpgradeServiceImplTest {
+         when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a, b));
+         when(instanceMapper.update(isNull(), any())).thenReturn(1);
+ 
+-        assertEquals(2, service.confirmUpgrade(confirmForm(List.of(11L, 12L), CURRENT_VERSION)));
++        assertEquals(2, service.confirmUpgrade(confirmForm(List.of(11L, 12L), CURRENT_VERSION)).size());
+         verify(instanceMapper, times(2)).update(isNull(), any());
+     }
+ 
+@@ -531,4 +546,43 @@ class IotInstanceUpgradeServiceImplTest {
+         assertTrue(e.getMessage().contains("高于目标版本"));
+         verify(instanceMapper, never()).update(isNull(), any());
+     }
++
++    // ---------- TASK-0081：确认链路数据面编排接线（同事务 + 逐台结果） ----------
++
++    @Test
++    @DisplayName("TASK-0081 接线 - 确认调 applyToVersion 同事务：先数据面应用后簿记推进，逐台结果随响应返回")
++    void confirmWiresDataPlaneApply() {
++        IotModelInstance a = instance(11L, 2, 0);
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(a));
++        when(instanceMapper.update(isNull(), any())).thenReturn(1);
++        // 逐台结果带 diff/actions（模拟数据面确有行变更）
++        net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO applyResult =
++                new net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO();
++        applyResult.setInstanceId(11L);
++        applyResult.setRowUpdated(true);
++        applyResult.getActions().add("LOAD_RATE 公式继承新默认");
++        when(upgradeApplyService.applyToVersion(any(), eq(CURRENT_VERSION))).thenReturn(applyResult);
++
++        java.util.List<net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO> results =
++                service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION));
++
++        assertEquals(1, results.size());
++        assertTrue(results.get(0).isRowUpdated(), "逐台结果原样透传（数据面迁移动作结果）");
++        // 调用序：applyToVersion 先于 applied 簿记 UPDATE（同一事务上下文，无半态窗口）
++        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(upgradeApplyService, instanceMapper);
++        inOrder.verify(upgradeApplyService).applyToVersion(any(), eq(CURRENT_VERSION));
++        inOrder.verify(instanceMapper).update(isNull(), any());
++    }
++
++    @Test
++    @DisplayName("TASK-0081 边界并发 - 数据面已应用但簿记乐观锁冲突 → 整批回滚（apply 调用发生但抛 4002）")
++    void confirmDataPlaneAppliedButOptimisticConflictRollsBack() {
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(11L, 2, 0)));
++        when(instanceMapper.update(isNull(), any())).thenReturn(0); // 并发推进导致守卫失配
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.confirmUpgrade(confirmForm(List.of(11L), CURRENT_VERSION)));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        verify(upgradeApplyService).applyToVersion(any(), eq(CURRENT_VERSION));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java
+new file mode 100644
+index 0000000..57aeb95
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotUpgradeApplyServiceImplTest.java
+@@ -0,0 +1,420 @@
++package net.otlab.admin.module.iot.template.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplateVersion;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateChangeEntryVO;
++import net.otlab.admin.module.iot.template.entity.dto.TemplateUpgradeResultVO;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateVersionMapper;
++import net.otlab.core.base.BaseEntity;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.*;
++import static org.mockito.ArgumentMatchers.*;
++import static org.mockito.Mockito.*;
++
++/**
++ * 确认升级数据面编排服务单元测试（TASK-0081，TDD）。
++ *
++ * <p>覆盖 brief 测试口径：T2 三方合并（未覆盖继承新默认/已覆盖保留/公式展开比对/
++ * calc_period 换算比对/source_type 兜底）、T1 补插、T3 逻辑删+结构迁移+边重建、
++ * 四类边界（空/越权/并发/超限由 confirm 层另测——本类测 apply 层空=零操作）、
++ * 快照组装体字段值断言（行态承载——组装器零改动实证见报告）。
++ *
++ * <p>standalone Mockito 范式（照 IotInstanceUpgradeServiceImplTest）：Mapper/服务全 mock；
++ * TenantContext 静态 mock；版本历史 content 以 canonical JSON 字面提供（与 buildContentJson
++ * 同形态——TemplateContentDiffEngine 只依赖结构）；真实 0015 diff 引擎/规则表判档。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class IotUpgradeApplyServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long TEMPLATE_ID = 9L;
++    private static final int APPLIED = 2;
++    private static final int TARGET = 3;
++
++    @Mock private IotDataItemMapper dataItemMapper;
++    @Mock private IotDataItemRefMapper dataItemRefMapper;
++    @Mock private IotModelInstanceMapper instanceMapper;
++    @Mock private IotModelTemplateMapper modelTemplateMapper;
++    @Mock private IotModelTemplateVersionMapper versionMapper;
++    @Mock private IotDataItemTemplateMapper dataItemTemplateMapper;
++    @Mock private IotDataItemService dataItemService;
++
++    private IotUpgradeApplyServiceImpl service;
++    private AutoCloseable mocks;
++    private MockedStatic<net.otlab.core.tenant.TenantContext> tenantContext;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemRef.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplateVersion.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = mockStatic(net.otlab.core.tenant.TenantContext.class);
++        tenantContext.when(net.otlab.core.tenant.TenantContext::getTenantId).thenReturn(TENANT);
++        service = new IotUpgradeApplyServiceImpl();
++        ReflectionTestUtils.setField(service, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(service, "dataItemRefMapper", dataItemRefMapper);
++        ReflectionTestUtils.setField(service, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(service, "versionMapper", versionMapper);
++        ReflectionTestUtils.setField(service, "dataItemService", dataItemService);
++        ReflectionTestUtils.setField(service, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(service, "dataItemTemplateMapper", dataItemTemplateMapper);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- T2 三方合并 ----------
++
++    @Test
++    @DisplayName("T2 未覆盖-继承新默认：实例公式=旧默认展开值 → 写新默认展开值 + 引用边先删后插")
++    void t2InheritNewFormulaDefault() {
++        // applied content (v2): LOAD_RATE defaultFormula={SELF.ELEC}/100
++        // target content (v3): LOAD_RATE defaultFormula={SELF.ELEC}/1000
++        mockVersionContent(v2Content("{SELF.ELEC}/100"), v3Content("{SELF.ELEC}/1000"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100"); // 旧默认展开值 → 未覆盖
++        IotDataItem elec = dataItem(100L, inst.getId(), "ELEC", "EQ.A.ELEC");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate, elec));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.isRowUpdated());
++        assertEquals(1, result.getActions().size());
++        assertTrue(result.getActions().get(0).contains("LOAD_RATE"));
++        // 断言写库更新集：公式写新默认展开值
++        ArgumentCaptor<LambdaUpdateWrapper> upd = ArgumentCaptor.captor();
++        verify(dataItemMapper, atLeastOnce()).update(isNull(), upd.capture());
++        boolean formulaUpdated = upd.getAllValues().stream()
++                .anyMatch(w -> w.getParamNameValuePairs().values().stream()
++                        .anyMatch(v -> v instanceof String && ((String) v).contains("/1000")));
++        assertTrue(formulaUpdated, "实例公式应写新默认展开值 EQ.A.ELEC/1000");
++        // 引用边先删后插重建
++        verify(dataItemRefMapper).deleteByItemIdPhysical(TENANT, loadRate.getId());
++        verify(dataItemRefMapper).insert(any(IotDataItemRef.class));
++    }
++
++    @Test
++    @DisplayName("T2 覆盖-保留：实例公式为用户覆盖值（不等于旧默认展开）→ 保留不写")
++    void t2KeepOverriddenFormula() {
++        mockVersionContent(v2Content("{SELF.ELEC}/100"), v3Content("{SELF.ELEC}/1000"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC * 0.777"); // 用户覆盖
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        // diff 仍产出（T2 档位），但无数据行写动作
++        assertTrue(result.getDiff().stream().anyMatch(e -> "T2".equals(e.getTier())));
++        assertFalse(result.isRowUpdated(), "覆盖值保留——不应产生行写动作");
++        verify(dataItemMapper, never()).update(isNull(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(anyLong(), anyLong());
++    }
++
++    @Test
++    @DisplayName("T2 calc_period 换算比对：实例 calc=60 等于旧默认 MINUTE 展开 → 未覆盖写新默认 HOUR=3600")
++    void t2CalcPeriodConvertedComparison() {
++        mockVersionContent(v2ContentWithPeriod("{SELF.ELEC}/100", "MINUTE"),
++                v3ContentWithPeriod("{SELF.ELEC}/100", "HOUR"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100"); // 公式不变
++        loadRate.setCalcPeriod(60); // 旧默认 MINUTE 展开值 → 未覆盖
++        IotDataItem elec = dataItem(100L, inst.getId(), "ELEC", "EQ.A.ELEC");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate, elec));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.isRowUpdated());
++        ArgumentCaptor<LambdaUpdateWrapper> upd = ArgumentCaptor.captor();
++        verify(dataItemMapper, atLeastOnce()).update(isNull(), upd.capture());
++        assertTrue(upd.getAllValues().stream().anyMatch(w ->
++                        w.getParamNameValuePairs().containsValue(3600)),
++                "calc_period 应写新默认 HOUR→3600（经 mapCalcPeriod 换算比对）");
++    }
++
++    @Test
++    @DisplayName("T2 null→1 兜底：旧默认 sourceType=null 落 1 → 实例值 1 视为未覆盖；新默认改 2 → 写 2")
++    void t2SourceTypeNullFallback() {
++        mockVersionContent(v2ContentWithSource("{SELF.ELEC}/100", null),
++                v3ContentWithSource("{SELF.ELEC}/100", 2));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(1); // 旧默认 null → 生成兜底 1 → 未覆盖
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.isRowUpdated());
++        ArgumentCaptor<LambdaUpdateWrapper> upd = ArgumentCaptor.captor();
++        verify(dataItemMapper, atLeastOnce()).update(isNull(), upd.capture());
++        assertTrue(upd.getAllValues().stream().anyMatch(w ->
++                        w.getParamNameValuePairs().containsValue(2)),
++                "source_type 应写新默认 2（旧默认 null→1 兜底复现比对）");
++    }
++
++    // ---------- T1 补插 ----------
++
++    @Test
++    @DisplayName("T1 新增项：applied→target 新增数据项 → 委托 regenerate 补插缺失行（相对引用展开+引用边）")
++    void t1InsertNewItem() {
++        mockVersionContent(v2Content("{SELF.ELEC}/100"),
++                v3ContentWithNewItem("{SELF.ELEC}/100", "POWER", "{SELF.ELEC}*2"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        // 实例行只有 LOAD_RATE；POWER 为新增项（diff ADDED）
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++        when(dataItemService.regenerateForInstance(inst.getId())).thenReturn(1);
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.getDiff().stream().anyMatch(e ->
++                "ADDED".equals(e.getChangeType()) && "POWER".equals(e.getObjectKey())));
++        assertTrue(result.getActions().stream().anyMatch(a -> a.contains("POWER") && a.contains("补插")));
++        verify(dataItemService).regenerateForInstance(inst.getId());
++    }
++
++    // ---------- T3 逻辑删 + 结构迁移 ----------
++
++    @Test
++    @DisplayName("T3 删项：目标模板删除数据项 → 实例行逻辑删（deleted=1）+ 留存行自身历史；入边不清理")
++    void t3LogicalDeleteRemovedItem() {
++        mockVersionContent(v2ContentWithExtra("{SELF.ELEC}/100", "OLD_ITEM"),
++                v3Content("{SELF.ELEC}/100"));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem elec = dataItem(100L, inst.getId(), "ELEC", "EQ.A.ELEC");
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2);
++        loadRate.setFormula("EQ.A.ELEC/100");
++        IotDataItem oldItem = dataItem(102L, inst.getId(), "OLD_ITEM", "EQ.A.OLD_ITEM");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class)))
++                .thenReturn(List.of(elec, loadRate, oldItem));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.getDiff().stream().anyMatch(e ->
++                "REMOVED".equals(e.getChangeType()) && "OLD_ITEM".equals(e.getObjectKey()) && "T3".equals(e.getTier())));
++        assertTrue(result.getActions().stream().anyMatch(a -> a.contains("OLD_ITEM") && a.contains("逻辑删")));
++        // 逻辑删：更新 deleted=1（@TableLogic），不是物理删
++        ArgumentCaptor<LambdaUpdateWrapper> upd = ArgumentCaptor.captor();
++        verify(dataItemMapper, atLeastOnce()).update(isNull(), upd.capture());
++        assertTrue(upd.getAllValues().stream().anyMatch(w ->
++                        w.getSqlSet().contains("deleted") && w.getParamNameValuePairs().containsValue(1)),
++                "删项应逻辑删（SET deleted=1 留历史行）");
++        // 入边不清理：不删引用了 OLD_ITEM 的其他行边（本服务不主动清别人的引用边）
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(TENANT, elec.getId());
++    }
++
++    @Test
++    @DisplayName("T3 改取值方式：旧默认 2 改 3(汇总) → 结构迁移覆写 source_type/rollup_method + 边重建（入边不清理）")
++    void t3SourceTypeChangeStructuralMigration() {
++        mockVersionContent(v2ContentWithSource("{SELF.ELEC}/100", 2),
++                v3ContentWithSource("{SELF.ELEC}/100", 3));
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem loadRate = dataItem(101L, inst.getId(), "LOAD_RATE", "EQ.A.LOAD_RATE");
++        loadRate.setSourceType(2); // 旧默认 2 → 未覆盖（等于旧默认落库形态）
++        loadRate.setFormula("EQ.A.ELEC/100");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(loadRate));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.getDiff().stream().anyMatch(e ->
++                "T3".equals(e.getTier()) && "defaultSourceType".equals(e.getField())));
++        assertTrue(result.getActions().stream().anyMatch(a -> a.contains("LOAD_RATE")
++                && (a.contains("结构迁移") || a.contains("取值方式"))));
++        verify(dataItemRefMapper).deleteByItemIdPhysical(TENANT, loadRate.getId());
++    }
++
++    // ---------- 边界：空=零操作 ----------
++
++    @Test
++    @DisplayName("边界空：applied→target 无差异（diff 空）→ 零操作（不写行、不重建边、结果 rowUpdated=false）")
++    void emptyDiffZeroOperations() {
++        String same = v3Content("{SELF.ELEC}/100");
++        mockVersionContent(same, same);
++        IotModelInstance inst = instance(11L, "EQ.A", 2);
++        IotDataItem elec = dataItem(100L, inst.getId(), "ELEC", "EQ.A.ELEC");
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of(elec));
++
++        TemplateUpgradeResultVO result = service.applyToVersion(inst, TARGET);
++
++        assertTrue(result.getDiff().isEmpty());
++        assertFalse(result.isRowUpdated());
++        assertTrue(result.getActions().isEmpty());
++        verify(dataItemMapper, never()).update(isNull(), any());
++        verify(dataItemRefMapper, never()).deleteByItemIdPhysical(anyLong(), anyLong());
++        verify(dataItemService, never()).regenerateForInstance(anyLong());
++    }
++
++    // ---------- 可复用边界：applyToVersionBatch ----------
++
++    @Test
++    @DisplayName("applyToVersionBatch 逐台调用 applyToVersion——结果与入参顺序一致（发布自动跟随接缝实证）")
++    void batchCallsApplyPerInstance() {
++        mockVersionContent(v2Content("{SELF.ELEC}/100"), v3Content("{SELF.ELEC}/1000"));
++        when(dataItemMapper.selectList(any(LambdaQueryWrapper.class))).thenReturn(List.of());
++        IotModelInstance a = instance(11L, "EQ.A", 2);
++        IotModelInstance b = instance(12L, "EQ.B", 2);
++
++        List<TemplateUpgradeResultVO> results = service.applyToVersionBatch(List.of(a, b), TARGET);
++
++        assertEquals(2, results.size());
++        assertEquals(11L, results.get(0).getInstanceId());
++        assertEquals(12L, results.get(1).getInstanceId());
++        verify(dataItemMapper, times(2)).selectList(any(LambdaQueryWrapper.class));
++    }
++
++    // ---------- fixtures ----------
++
++    private void mockVersionContent(String appliedContent, String targetContent) {
++        // 实现先查 applied 版本行、再查 target 版本行——按调用序返回（MP standalone 下 params 脱敏，
++        // 用 getSqlSegment 中 LIMIT 1 无法区分版本，故以固定两连调用序桩，实例内连续两次即为一对）
++        org.mockito.stubbing.Answer<IotModelTemplateVersion> answer = new org.mockito.stubbing.Answer<>() {
++            private int call = 0;
++            @Override
++            public IotModelTemplateVersion answer(org.mockito.invocation.InvocationOnMock inv) {
++                call++;
++                return (call % 2 == 1) ? versionRow(APPLIED, appliedContent) : versionRow(TARGET, targetContent);
++            }
++        };
++        when(versionMapper.selectOne(any(LambdaQueryWrapper.class))).thenAnswer(answer);
++    }
++
++    private IotModelTemplateVersion versionRow(int version, String content) {
++        IotModelTemplateVersion row = new IotModelTemplateVersion();
++        row.setTemplateId(TEMPLATE_ID);
++        row.setVersion(version);
++        row.setContent(content);
++        return row;
++    }
++
++    private IotModelInstance instance(long id, String code, int applied) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setInstanceCode(code);
++        inst.setTemplateId(TEMPLATE_ID);
++        inst.setAppliedTemplateVersion(applied);
++        inst.setParentId(0L);
++        inst.setStatus(1);
++        return inst;
++    }
++
++    private IotDataItem dataItem(long id, Long instanceId, String code, String fullKey) {
++        IotDataItem item = new IotDataItem();
++        item.setId(id);
++        item.setInstanceId(instanceId);
++        item.setDataCode(code);
++        item.setFullKey(fullKey);
++        item.setTenantId(TENANT);
++        item.setDeleted(0);
++        item.setEnabled(1);
++        item.setStatus(1);
++        return item;
++    }
++
++    /** canonical content JSON（与 buildContentJson 同形态：template/dataItems 键，yTreeMap 顺序无关 diff） */
++    private String v2Content(String formula) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", null)));
++    }
++
++    private String v3Content(String formula) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", null)));
++    }
++
++    private String v2ContentWithPeriod(String formula, String period) {
++        return content(List.of(elecItem(period), loadItem(formula, period, null)));
++    }
++
++    private String v3ContentWithPeriod(String formula, String period) {
++        return content(List.of(elecItem(period), loadItem(formula, period, null)));
++    }
++
++    private String v2ContentWithSource(String formula, Integer sourceType) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", sourceType)));
++    }
++
++    private String v3ContentWithSource(String formula, Integer sourceType) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", sourceType)));
++    }
++
++    private String v2ContentWithExtra(String formula, String extraCode) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", null),
++                "{\"dataCode\":\"" + extraCode + "\",\"dataName\":\"Old\",\"defaultCalcPeriod\":\"MINUTE\"}"));
++    }
++
++    private String v3ContentWithNewItem(String formula, String newCode, String newFormula) {
++        return content(List.of(elecItem("MINUTE"), loadItem(formula, "MINUTE", null),
++                "{\"dataCode\":\"" + newCode + "\",\"dataName\":\"New\",\"defaultCalcPeriod\":\"MINUTE\","
++                + "\"defaultFormula\":\"" + newFormula + "\"}"));
++    }
++
++    private String content(List<String> items) {
++        return "{\"template\":{\"nodeType\":4,\"remark\":null,\"templateCode\":\"TPL\","
++                + "\"templateName\":\"T\"},\"dataItems\":[" + String.join(",", items) + "]}";
++    }
++
++    private String elecItem(String period) {
++        return "{\"dataCode\":\"ELEC\",\"dataName\":\"ELEC\",\"defaultCalcPeriod\":\""
++                + period + "\",\"defaultSourceType\":1}";
++    }
++
++    private String loadItem(String formula, String period, Integer sourceType) {
++        String s = "{\"dataCode\":\"LOAD_RATE\",\"dataName\":\"Load\",\"defaultCalcPeriod\":\""
++                + period + "\",\"defaultFormula\":\"" + formula + "\"";
++        if (sourceType != null) {
++            s += ",\"defaultSourceType\":" + sourceType;
++        }
++        return s + "}";
++    }
++}

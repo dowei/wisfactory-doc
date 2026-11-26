@@ -1,0 +1,611 @@
+commit 2fc80ba8895e21ad5d8d9df3829aa912d6f9a281
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 01:44:16 2026 +0800
+
+    TASK-0074: 子表名/租户库名转义映射定长化修复（单射性，BUG-0002/复评 N1）
+    
+    转义集定长化：字面集收窄为 [A-Za-z0-9]，下划线本身纳入转义（_5f）——所有非
+    字面字节与下划线均有唯一展开且输出中下划线只作转义引导（自同步码），恒等像
+    （无下划线）与转义像（有下划线）天然分区，消除首轮 FNV 后缀方案与恒等集的
+    构造性碰撞。数字开头编码加不可达标记 _74（'t' 属字面集恒不转义，自然转义像
+    不可能以 _74 开头）；截断移至转义后进行，超长截断像加违反转义文法的 _Z+16hex
+    后缀（恰 192 字节），与其余三像不相交；同长不同输入经 FNV-1a 逐步双射可证
+    散列不同。租户库名 iot_<tenant> 同口径映射。
+    
+    先红后绿：TC-0023 探针对（F01-WS01 vs F01_2dWS01_2aad8c0256245aa0、租户
+    t-1 vs t_2d1_5627091943b2a601）实测复现 BUG-0002 碰撞后修复转绿；新增 4 项
+    单射性契约测试（探针对/成组单射/租户域/端到端 SQL）+ 确定性断言。全仓扫描
+    确认映射实现点唯一（internal/tdengine），无绕过路径。
+    
+    BASE: 509a82b
+
+diff --git a/ingest/internal/pipeline/pipeline_contract_test.go b/ingest/internal/pipeline/pipeline_contract_test.go
+index 61450e3..d8c5fac 100644
+--- a/ingest/internal/pipeline/pipeline_contract_test.go
++++ b/ingest/internal/pipeline/pipeline_contract_test.go
+@@ -321,15 +321,25 @@ func TestContractDispatchByDataTypeAndCacheUpdate(t *testing.T) {
+ 	})
+ 	// M01 与 M02 是不同点位 → 不同子表（§2.2 子表粒度「每个数值型点位一张」）→
+ 	// Writer 按子表分组下发 2 条 INSERT（同 flush 内同子表多行才合并单条，见 tdengine 契约测试）。
++	// 库名/子表名经确定性映射（BUG-0002 修订），断言用映射函数动态取值。
++	db := tdengine.DBName("group_a")
++	childM01, err := tdengine.ChildTableName("F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
++	childM02, err := tdengine.ChildTableName("F01_WS01_EQ001_M02")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
+ 	calls := h.executor.Calls()
+ 	if len(calls) != 2 {
+ 		t.Fatalf("Exec 次数 = %d, want 2（每点位一张子表，各一条 INSERT）", len(calls))
+ 	}
+-	if !strings.Contains(calls[0].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num") ||
++	if !strings.Contains(calls[0].SQL, "INSERT INTO "+db+"."+childM01+" USING "+db+".st_point_num") ||
+ 		!strings.Contains(calls[0].SQL, "VALUES (1795211995000, 98231.4, 0)") {
+ 		t.Errorf("M01 SQL 不符: %s", calls[0].SQL)
+ 	}
+-	if !strings.Contains(calls[1].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M02 USING iot_group_a.st_point_num") ||
++	if !strings.Contains(calls[1].SQL, "INSERT INTO "+db+"."+childM02+" USING "+db+".st_point_num") ||
+ 		!strings.Contains(calls[1].SQL, "VALUES (1795211995000, 132.5, 0)") {
+ 		t.Errorf("M02 SQL 不符: %s", calls[1].SQL)
+ 	}
+@@ -561,16 +571,17 @@ func TestContractNonAsciiPointCodeEndToEnd(t *testing.T) {
+ 		allSQL.WriteString(c.SQL)
+ 		allSQL.WriteByte('\n')
+ 	}
++	db := tdengine.DBName("group_a")
+ 	for name := range want {
+-		if !strings.Contains(allSQL.String(), "INSERT INTO iot_group_a."+name+" USING") {
++		if !strings.Contains(allSQL.String(), "INSERT INTO "+db+"."+name+" USING") {
+ 			t.Errorf("写语句未使用映射后的子表名 %q:\n%s", name, allSQL.String())
+ 		}
+ 	}
+ 	// 状态量走 st_point_state、数值量走 st_point_num（分发不受编码字符集影响）
+-	if !strings.Contains(allSQL.String(), "USING iot_group_a.st_point_state") {
++	if !strings.Contains(allSQL.String(), "USING "+db+".st_point_state") {
+ 		t.Errorf("01_M01（dataType=3）应落 st_point_state:\n%s", allSQL.String())
+ 	}
+-	if !strings.Contains(allSQL.String(), "USING iot_group_a.st_point_num") {
++	if !strings.Contains(allSQL.String(), "USING "+db+".st_point_num") {
+ 		t.Errorf("数值量应落 st_point_num:\n%s", allSQL.String())
+ 	}
+ 	// TAGS 保留原编码
+diff --git a/ingest/internal/tdengine/tdengine.go b/ingest/internal/tdengine/tdengine.go
+index f17bc03..b149465 100644
+--- a/ingest/internal/tdengine/tdengine.go
++++ b/ingest/internal/tdengine/tdengine.go
+@@ -9,11 +9,10 @@
+ //
+ // 实现口径：子表名 = 点位编码的确定性映射（租户内每点位一张子表，符合 §2.2 子表粒度；
+ // 命名方案契约未定版，接线时如需调整只改 ChildTableName 函数）。快照 point 对象对
+-// pointCode 只约束 maxLength 96、无字符集约束，故映射必须覆盖全部契约合法编码：
+-// 全安全字节（[A-Za-z0-9_]）恒等；非安全字节逐字节 _XX 十六进制转义（加 FNV 后缀与
+-// 恒等集区分）；首字符数字加前缀；超长截断加哈希后缀（TDengine 标识符上限 192 字节）。
+-// 详见 escapeIdentifier。instance_key 标签在快照 v1.0.1 点位对象中无对应字段
+-// （上游留白），暂写空串，见 TASK-0073 报告。
++// pointCode 只约束 maxLength 96、无字符集约束，故映射必须覆盖全部契约合法编码且在
++// 合法域单射（BUG-0002：转义集定长化，`_` 纳入转义 _5f；四像分区论证见
++// escapeIdentifier）。租户库名 iot_<tenant_code> 同口径映射。instance_key 标签在
++// 快照 v1.0.1 点位对象中无对应字段（上游留白），暂写空串，见 TASK-0073 报告。
+ package tdengine
+ 
+ import (
+@@ -76,49 +75,30 @@ func StableFor(dataType int) (string, bool) {
+ // maxIdentifierLen TDengine 标识符长度上限（192 字节）。
+ const maxIdentifierLen = 192
+ 
+-// isSafeIdentByte 报告字节是否属于标识符安全集 [A-Za-z0-9_]。
+-func isSafeIdentByte(b byte) bool {
+-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
++// isNameByte 报告字节是否属于标识符字面集 [A-Za-z0-9]。
++// 注意：`_` 不在字面集内——它必须转义（_5f），否则转义展开 `_XX` 与字面 `_XX`
++// 构造性碰撞（BUG-0002：转义集与恒等集重叠，映射不单射）。
++func isNameByte(b byte) bool {
++	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+ }
+ 
+-// fnv64Hex 原文 FNV-64 哈希的 16 位十六进制表示（确定性、定长）。
++// fnv64Hex 原文 FNV-64 哈希的 16 位小写十六进制表示（确定性、定长）。
+ func fnv64Hex(s string) string {
+ 	h := fnv.New64a()
+ 	_, _ = h.Write([]byte(s))
+ 	return fmt.Sprintf("%016x", h.Sum64())
+ }
+ 
+-// escapeIdentifier 把任意字符串确定性映射为 TDengine 合法标识符（字母或下划线开头、
+-// 仅 [A-Za-z0-9_]、≤192 字节）：
+-//   - 全安全字节（[A-Za-z0-9_]）且非数字开头：恒等映射（契约示例编码 group_a、
+-//     F01_WS01_EQ001_M01 等不受影响）；
+-//   - 含非安全字节：逐字节 '_XX' 十六进制转义，并追加 '_' + 原文 FNV-64 后缀——
+-//     后缀使转义结果与恒等集区分（如「F01-M01」不会撞上字面编码「F01_2dM01…」），
+-//     且逐字节转义本身单射，同一批非安全编码之间互不冲突；
+-//   - 首字符为数字：加前缀 "t_"（TDengine 标识符不能以数字开头）；
+-//   - 超长：截断 + 哈希后缀保持 ≤192 字节与确定性。
+-func escapeIdentifier(s string) string {
+-	if s == "" {
+-		return ""
+-	}
+-	allSafe := true
+-	for i := 0; i < len(s); i++ {
+-		if !isSafeIdentByte(s[i]) {
+-			allSafe = false
+-			break
+-		}
+-	}
+-	if allSafe {
+-		if s[0] >= '0' && s[0] <= '9' {
+-			return "t_" + s
+-		}
+-		return s
+-	}
++// escapeBody 逐字节展开为转义文法串：[A-Za-z0-9] 原样，其余字节（含 `_`）→
++// '_' + 2 位小写十六进制。展开唯一且自同步（输出中 `_` 只作为转义引导出现、
++// 后随恰好 2 位小写十六进制），逐字节展开单射 → 整体单射、可唯一解码。
++func escapeBody(s string) string {
+ 	const hexd = "0123456789abcdef"
+ 	var sb strings.Builder
++	sb.Grow(len(s))
+ 	for i := 0; i < len(s); i++ {
+ 		b := s[i]
+-		if isSafeIdentByte(b) {
++		if isNameByte(b) {
+ 			sb.WriteByte(b)
+ 			continue
+ 		}
+@@ -126,19 +106,73 @@ func escapeIdentifier(s string) string {
+ 		sb.WriteByte(hexd[b>>4])
+ 		sb.WriteByte(hexd[b&0xF])
+ 	}
+-	out := sb.String()
+-	if out[0] >= '0' && out[0] <= '9' {
+-		out = "t_" + out
++	return sb.String()
++}
++
++// digitStartMark 数字开头编码的标记前缀："t" 的转义形。't' 属字面集、永远不会被
++// 转义，故任何自然转义输出都不可能以 "_74" 开头——标记像与转义像不相交。
++const digitStartMark = "_74"
++
++// truncateMark 截断后缀的文法破坏引导：'Z' 不是小写十六进制，任何合法转义输出
++// 都不可能出现 "_Z"——截断像与恒等像/转义像/标记像均不相交。
++const truncateMark = "_Z"
++
++// escapeIdentifier 把任意字符串确定性、可单射地映射为 TDengine 合法标识符
++// （字母或下划线开头、仅 [A-Za-z0-9_]、≤192 字节）。四个像两两不相交、类内单射：
++//   - 恒等像：全字面字节（[A-Za-z0-9]）且字母开头 → 原样（不含 `_`）；
++//   - 转义像：其余编码逐字节展开（`_`→_5f）→ 至少含一个 `_`，与恒等像不相交；
++//   - 标记像：数字开头编码加 "_74" 前缀（不可达标记）→ 与恒等像/转义像不相交；
++//   - 截断像：转文体超 192 字节（如 96 个汉字=288 字节）→ 截断至 174（数字开头
++//     171）字节 + "_Z"+16 位小写十六进制（FNV-64）= 恰 192 字节，"_Z" 违反转义
++//     文法故与其余三像不相交；类内对「同长度、任意位置不同」的输入可证不同
++//     （FNV-1a 每步 (h XOR b)·p 且 p 为奇数，XOR 与乘法皆双射，状态差保持到末步）。
++//
++// 单射域说明：契约合法域（≤96 字符任意 UTF-8，至多 288 字节）到 192 字节标识符的
++// 全域严格单射受鸽笼定理限制不可能（2^2304 > 2^1165），截断像以 64 位 FNV 工程抗
++// 碰撞兜底；TC-0023 全部断言域落在严格单射区（探针对/下划线/下划线编码/中文/首
++// 数字/恒等）或可证区分区（满长仅末尾不同）。
++func escapeIdentifier(s string) string {
++	if s == "" {
++		return ""
+ 	}
+-	out += "_" + fnv64Hex(s)
+-	if len(out) > maxIdentifierLen {
+-		out = out[:maxIdentifierLen-17] + "_" + fnv64Hex(s)
++	allName := true
++	for i := 0; i < len(s); i++ {
++		if !isNameByte(s[i]) {
++			allName = false
++			break
++		}
+ 	}
+-	return out
++	if allName {
++		if s[0] >= 'a' && s[0] <= 'z' || s[0] >= 'A' && s[0] <= 'Z' {
++			return s // 恒等像
++		}
++		return digitStartMark + s // 标记像（全字面数字开头）
++	}
++	e := escapeBody(s)
++	if len(e) > maxIdentifierLen {
++		return truncateName(e, s)
++	}
++	if e[0] >= '0' && e[0] <= '9' {
++		return digitStartMark + e // 标记像（含转义、数字开头）
++	}
++	return e // 转义像
++}
++
++// truncateName 截断像：恰 192 字节。"_Z" 后缀违反转义文法（与其余三像不相交）；
++// 数字开头时加 "_74" 标记保合法开头（此时截 171 字节，总长仍恰 192）。
++func truncateName(e string, s string) string {
++	suffix := truncateMark + fnv64Hex(s)   // "_Z" + 16 hex = 18 字节
++	body := maxIdentifierLen - len(suffix) // 174
++	if e[0] >= '0' && e[0] <= '9' {
++		body = maxIdentifierLen - len(suffix) - len(digitStartMark) // 171
++		return digitStartMark + e[:body] + suffix
++	}
++	return e[:body] + suffix
+ }
+ 
+-// DBName 每租户一库（附录 B）：iot_<tenant_code>。tenant_code 按确定性映射转义
+-// （契约示例等安全编码恒等不变），写库层不因编码字符集拒绝契约合法数据。
++// DBName 每租户一库（附录 B）：iot_<tenant_code>。tenant_code 与点位编码同口径
++// 经确定性单射映射转义（BUG-0002：两租户不得收敛同库），写库层不因编码字符集
++// 拒绝契约合法数据。
+ func DBName(tenantCode string) string {
+ 	return "iot_" + escapeIdentifier(tenantCode)
+ }
+diff --git a/ingest/internal/tdengine/tdengine_contract_test.go b/ingest/internal/tdengine/tdengine_contract_test.go
+index b8bb63d..a13b4fb 100644
+--- a/ingest/internal/tdengine/tdengine_contract_test.go
++++ b/ingest/internal/tdengine/tdengine_contract_test.go
+@@ -2,6 +2,8 @@ package tdengine_test
+ 
+ import (
+ 	"context"
++	"fmt"
++	"regexp"
+ 	"strings"
+ 	"testing"
+ 
+@@ -27,8 +29,15 @@ func TestContractInsertShapeNumInstant(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("InsertPointSQL error: %v", err)
+ 	}
+-	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num " +
+-		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) VALUES (1795211995000, 98231.4, 0)"
++	// 子表名/库名经确定性映射（BUG-0002 修订：`_` 纳入转义保单射）；
++	// 契约锚点在 USING 超级表、TAGS 值（原编码）与 VALUES，命名映射由专测覆盖。
++	db := tdengine.DBName("group_a")
++	child, err := tdengine.ChildTableName("F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
++	want := fmt.Sprintf("INSERT INTO %s.%s USING %s.st_point_num "+
++		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) VALUES (1795211995000, 98231.4, 0)", db, child, db)
+ 	if sql != want {
+ 		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
+ 	}
+@@ -51,8 +60,13 @@ func TestContractInsertShapeStateAndKindMapping(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("InsertPointSQL error: %v", err)
+ 	}
+-	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_S01 USING iot_group_a.st_point_state " +
+-		"TAGS (1, 'F01_WS01_EQ001_S01', 'STATE', '', 3) VALUES (1795211995000, 1, 0)"
++	db := tdengine.DBName("group_a")
++	child, err := tdengine.ChildTableName("F01_WS01_EQ001_S01")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
++	want := fmt.Sprintf("INSERT INTO %s.%s USING %s.st_point_state "+
++		"TAGS (1, 'F01_WS01_EQ001_S01', 'STATE', '', 3) VALUES (1795211995000, 1, 0)", db, child, db)
+ 	if sql != want {
+ 		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
+ 	}
+@@ -85,10 +99,17 @@ func TestContractInsertShapeStateAndKindMapping(t *testing.T) {
+ 
+ // 契约依据：附录 B「TDengine 建库建表」（每租户一库，库名 iot_<tenant_code>）——
+ // 建库与四张超级表 DDL 逐字对齐（仅按租户参数化库名；比对前归一空白）。
++// 库名映射说明：附录 B 示例租户 group_a 的字面库名为 iot_group_a；BUG-0002 修复裁决
++// （租户域与点位域同口径单射映射）使含下划线的租户编码转义为 group_5fa，库名经
++// DBName 映射（无下划线租户编码仍恒等，如 groupa → iot_groupa），偏离已在报告声明。
+ func TestContractSuperTableDefinitionsMatchAppendixB(t *testing.T) {
++	if got := tdengine.DBName("groupa"); got != "iot_groupa" {
++		t.Errorf("无下划线租户编码应恒等映射: DBName(groupa) = %q, want iot_groupa", got)
++	}
++	db := tdengine.DBName("group_a")
+ 	contract := []string{
+-		"CREATE DATABASE IF NOT EXISTS iot_group_a KEEP 1825d DURATION 10d BUFFER 256;",
+-		"USE iot_group_a;",
++		"CREATE DATABASE IF NOT EXISTS " + db + " KEEP 1825d DURATION 10d BUFFER 256;",
++		"USE " + db + ";",
+ 		"CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
+ 		"CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT) TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);",
+ 		"CREATE STABLE IF NOT EXISTS st_item_value (ts TIMESTAMP, value DOUBLE, quality INT) TAGS (tenant_id BIGINT, full_key BINARY(180), instance_code BINARY(96), data_code BINARY(64), category BINARY(32), source_type INT);",
+@@ -121,9 +142,14 @@ func TestContractBatchInsertMultiRowSameChild(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("InsertPointSQL error: %v", err)
+ 	}
+-	want := "INSERT INTO iot_group_a.F01_WS01_EQ001_M01 USING iot_group_a.st_point_num " +
+-		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) " +
+-		"VALUES (1795211995000, 98231.4, 0)(1795212000000, 132.5, 0)"
++	db := tdengine.DBName("group_a")
++	child, err := tdengine.ChildTableName("F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
++	want := fmt.Sprintf("INSERT INTO %s.%s USING %s.st_point_num "+
++		"TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) "+
++		"VALUES (1795211995000, 98231.4, 0)(1795212000000, 132.5, 0)", db, child, db)
+ 	if sql != want {
+ 		t.Errorf("SQL =\n  %s\nwant\n  %s", sql, want)
+ 	}
+@@ -149,7 +175,12 @@ func TestContractWriterGroupsByChildTable(t *testing.T) {
+ 	if strings.Count(calls[0].SQL, "F01_WS01_EQ001_M01") == 0 || !strings.Contains(calls[0].SQL, "VALUES (1795211995000, 98231.4, 0)(1795212000000, 90000, 0)") {
+ 		t.Errorf("call[0] SQL = %q, want M01 两行合并", calls[0].SQL)
+ 	}
+-	if !strings.Contains(calls[1].SQL, "INSERT INTO iot_group_a.F01_WS01_EQ001_M02") {
++	db := tdengine.DBName("group_a")
++	childM02, err := tdengine.ChildTableName("F01_WS01_EQ001_M02")
++	if err != nil {
++		t.Fatalf("ChildTableName error: %v", err)
++	}
++	if !strings.Contains(calls[1].SQL, "INSERT INTO "+db+"."+childM02) {
+ 		t.Errorf("call[1] SQL = %q, want M02 子表", calls[1].SQL)
+ 	}
+ 	for _, c := range calls {
+@@ -188,7 +219,8 @@ func TestContractPointCodeMappedNotRejected(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatalf("含连字符 pointCode 被拒收: %v", err)
+ 	}
+-	if !strings.Contains(sql, "INSERT INTO iot_group_a.F01_2dWS01_2dM01_") {
++	db := tdengine.DBName("group_a")
++	if !strings.Contains(sql, "INSERT INTO "+db+".F01_2dWS01_2dM01 USING "+db+".st_point_num") {
+ 		t.Errorf("子表名未按 _XX 十六进制转义（连字符 0x2D → _2d）: %s", sql)
+ 	}
+ 	if !strings.Contains(sql, "'F01-WS01-M01'") {
+@@ -202,54 +234,79 @@ func TestContractPointCodeMappedNotRejected(t *testing.T) {
+ 		t.Fatalf("含非安全字节租户码被拒收: %v", err)
+ 	}
+ 	wantDB := tdengine.DBName("tenant; drop")
+-	if !strings.HasPrefix(wantDB, "iot_tenant_3b_20drop_") || len(wantDB) <= len("iot_tenant_3b_20drop_") {
+-		t.Errorf("DBName 未按 _XX 转义（分号 0x3B/空格 0x20）: %q", wantDB)
++	if wantDB != "iot_tenant_3b_20drop" {
++		t.Errorf("DBName 未按 _XX 转义（分号 0x3B → _3b、空格 0x20 → _20）: %q", wantDB)
+ 	}
+ 	if !strings.Contains(sql2, "INSERT INTO "+wantDB+".M01") {
+ 		t.Errorf("SQL 未使用映射后的库名: %s", sql2)
+ 	}
+ }
+ 
+-// 契约依据（I2 修订）：childTable 确定性转义规则——非 [A-Za-z0-9_] 字节 → _XX 十六进制；
+-// 首字符数字加前缀；任何契约合法 pointCode（≤96 字符，含中文）都映射到合法且
+-// 定长的子表名，映射可复现。
++// 契约依据（BUG-0002 修订裁决）：转义集定长化——`_` 本身纳入转义（_5f），非
++// [A-Za-z0-9] 字节与 `_` 都有唯一展开；首字符数字加不可达标记 "_74"；截断在转义后
++// 进行，超长加违反文法的 "_Z"+十六进制后缀。任何契约合法 pointCode（≤96 字符，含
++// 中文）都映射到合法、定长、可复现的子表名，且映射在合法域单射（见单射性专测）。
+ func TestContractChildTableNameEscaping(t *testing.T) {
+-	// 恒等：全安全字节且字母开头
+-	got, err := tdengine.ChildTableName("F01_WS01_EQ001_M01")
+-	if err != nil || got != "F01_WS01_EQ001_M01" {
+-		t.Errorf("safe pointCode = (%q, %v), want 恒等映射", got, err)
++	// 恒等：全字面字节（[A-Za-z0-9]，不含 `_`）且字母开头
++	got, err := tdengine.ChildTableName("F01WS01EQ001M01")
++	if err != nil || got != "F01WS01EQ001M01" {
++		t.Errorf("pure-alnum pointCode = (%q, %v), want 恒等映射", got, err)
++	}
++	// 含下划线：`_` 纳入转义（_5f）——单射性的关键展开
++	got, err = tdengine.ChildTableName("F01_WS01_EQ001_M01")
++	if err != nil || got != "F01_5fWS01_5fEQ001_5fM01" {
++		t.Errorf("underscore pointCode = (%q, %v), want F01_5fWS01_5fEQ001_5fM01", got, err)
+ 	}
+-	// 首字符数字：加前缀
++	// 首字符数字：不可达标记 "_74"（'t' 属字面集、恒不转义 → 自然转义像不可达）
+ 	got, err = tdengine.ChildTableName("01_M01")
+-	if err != nil || got != "t_01_M01" {
+-		t.Errorf("digit-first = (%q, %v), want t_01_M01", got, err)
++	if err != nil || got != "_7401_5fM01" {
++		t.Errorf("digit-first = (%q, %v), want _7401_5fM01", got, err)
+ 	}
+-	// 连字符 0x2D → _2d（确定性前缀 + 哈希后缀）
+-	got, err = tdengine.ChildTableName("F01-WS01-EQ001-M01")
+-	if err != nil || !strings.HasPrefix(got, "F01_2dWS01_2dEQ001_2dM01_") {
+-		t.Errorf("hyphen = (%q, %v), want F01_2dWS01_2dEQ001_2dM01_<hash>", got, err)
++	got, err = tdengine.ChildTableName("01M01")
++	if err != nil || got != "_7401M01" {
++		t.Errorf("digit-first pure-alnum = (%q, %v), want _7401M01", got, err)
+ 	}
+-	// 中文（UTF-8 多字节）：逐字节转义，确定性
++	// 连字符 0x2D → _2d（无 FNV 后缀：转义像与恒等像已靠 `_` 展开天然分区）
++	got, err = tdengine.ChildTableName("F01-WS01")
++	if err != nil || got != "F01_2dWS01" {
++		t.Errorf("hyphen = (%q, %v), want F01_2dWS01", got, err)
++	}
++	// 中文逐字节转义
+ 	got, err = tdengine.ChildTableName("点位一")
+-	if err != nil || !strings.HasPrefix(got, "_e7_82_b9_e4_bd_8d_e4_b8_80_") {
+-		t.Errorf("chinese = (%q, %v), want _e7_82_b9_e4_bd_8d_e4_b8_80_<hash>", got, err)
++	if err != nil || got != "_e7_82_b9_e4_bd_8d_e4_b8_80" {
++		t.Errorf("chinese = (%q, %v), want _e7_82_b9_e4_bd_8d_e4_b8_80", got, err)
+ 	}
+ 	// 确定性可复现：两次调用一致
+ 	again, _ := tdengine.ChildTableName("点位一")
+ 	if again != got {
+ 		t.Errorf("映射不可复现: %q vs %q", got, again)
+ 	}
+-	// 96 个中文字符（契约 maxLength 上限）：映射后不超过 192 字节且确定性
++	// 96 个中文字符（契约 maxLength 上限）：转义超长 → 截断 + "_Z"+16hex = 192 字节，
++	// 合法、确定性、后缀违反转义文法（与未截断像不相交）
+ 	long := strings.Repeat("点", 96)
+ 	got, err = tdengine.ChildTableName(long)
+ 	if err != nil {
+ 		t.Fatalf("long pointCode error: %v", err)
+ 	}
+-	if len(got) > 192 {
+-		t.Errorf("映射后长度 %d 超过 TDengine 标识符上限 192 字节", len(got))
++	if len(got) != 192 {
++		t.Errorf("截断像长度 = %d, want 恰 192 字节", len(got))
++	}
++	if !regexp.MustCompile(`_Z[0-9a-f]{16}$`).MatchString(got) {
++		t.Errorf("截断像缺少 _Z+16hex 违法文法后缀: %q", got)
+ 	}
++	assertLegalIdentifier(t, "96 中文", got)
+ 	again, _ = tdengine.ChildTableName(long)
+ 	if again != got {
+ 		t.Errorf("长编码映射不可复现")
+ 	}
++	// 超长且数字开头：截断像带 "_74" 标记保合法开头
++	digitLong := "0" + strings.Repeat("-", 95)
++	got, err = tdengine.ChildTableName(digitLong)
++	if err != nil {
++		t.Fatalf("digit long pointCode error: %v", err)
++	}
++	if !strings.HasPrefix(got, "_74") || len(got) != 192 {
++		t.Errorf("超长数字开头映射 = %q, want _74 前缀 + 192 字节", got)
++	}
++	assertLegalIdentifier(t, "超长数字开头", got)
+ }
+diff --git a/ingest/internal/tdengine/tdengine_injective_contract_test.go b/ingest/internal/tdengine/tdengine_injective_contract_test.go
+new file mode 100644
+index 0000000..05ae439
+--- /dev/null
++++ b/ingest/internal/tdengine/tdengine_injective_contract_test.go
+@@ -0,0 +1,155 @@
++package tdengine_test
++
++import (
++	"regexp"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TC-0023 · 子表名与租户库名转义映射单射性回归（BUG-0002）。
++//
++// 契约依据：config-snapshot-schema.md point 对象 pointCode 仅 maxLength 96（字符）、
++// 无字符集约束——映射必须在契约合法编码域上单射：不同 pointCode 不碰撞同子表、
++// 不同 tenantCode 不碰撞同库名（附录 B「每租户一库 iot_<tenant_code>」）。
++//
++// 标识符合法性独立判定（测试侧自行实现，不依赖实现侧 safeIdentifier）。
++var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
++
++func assertLegalIdentifier(t *testing.T, what, name string) {
++	t.Helper()
++	if len(name) == 0 || len(name) > 192 {
++		t.Errorf("%s: 标识符长度 %d 越界（1-192 字节）: %q", what, len(name), name)
++	}
++	if !identRe.MatchString(name) {
++		t.Errorf("%s: 非法标识符: %q", what, name)
++	}
++}
++
++// TC-0023 步骤 2：BUG-0002 探针对——`F01-WS01` 与字面编码 `F01_2dWS01_2aad8c0256245aa0`
++// 的子表名必须不相等（首轮映射的构造性碰撞复现锚点）。
++func TestContractChildTableNameProbePairNotColliding(t *testing.T) {
++	a, err := tdengine.ChildTableName("F01-WS01")
++	if err != nil {
++		t.Fatalf("ChildTableName(F01-WS01) error: %v", err)
++	}
++	b, err := tdengine.ChildTableName("F01_2dWS01_2aad8c0256245aa0")
++	if err != nil {
++		t.Fatalf("ChildTableName(F01_2dWS01_2aad8c0256245aa0) error: %v", err)
++	}
++	assertLegalIdentifier(t, "F01-WS01 映射", a)
++	assertLegalIdentifier(t, "字面编码映射", b)
++	if a == b {
++		t.Fatalf("BUG-0002 复现：不同 pointCode 映射到同一子表名 %q（探针对碰撞）", a)
++	}
++}
++
++// TC-0023 步骤 3：任取不同契约合法 pointCode（含探针对、纯字母数字、下划线编码、
++// 中文、首字符数字、满长仅末尾不同）映射结果两两不等。
++func TestContractChildTableNameInjective(t *testing.T) {
++	codes := []string{
++		// BUG-0002 探针对
++		"F01-WS01",
++		"F01_2dWS01_2aad8c0256245aa0",
++		// 契约示例形态（含下划线）与无下划线形态
++		"F01_WS01_EQ001_M01",
++		"F01WS01EQ001M01",
++		// 中文
++		"点位一",
++		"点位二",
++		// 首字符数字（含下划线与连字符两种）
++		"01_M01",
++		"01-M01",
++		// 96 字节满长（仅末尾不同）：全字母数字（恒等域）
++		strings.Repeat("M", 95) + "A",
++		strings.Repeat("M", 95) + "B",
++		// 96 字节满长（仅末尾不同）：连字符（转义超长 → 截断域）
++		strings.Repeat("-", 95) + "A",
++		strings.Repeat("-", 95) + "B",
++		// 96 字符满长中文（仅末尾不同，UTF-8 288 字节 → 截断域）
++		strings.Repeat("点", 95) + "一",
++		strings.Repeat("点", 95) + "二",
++	}
++	names := make([]string, len(codes))
++	for i, code := range codes {
++		name, err := tdengine.ChildTableName(code)
++		if err != nil {
++			t.Fatalf("ChildTableName(%q) error: %v", code, err)
++		}
++		assertLegalIdentifier(t, code, name)
++		// TC-0023 步骤 5：同一编码重复映射结果稳定（确定性）
++		again, err := tdengine.ChildTableName(code)
++		if err != nil || again != name {
++			t.Errorf("映射不可复现: %q → %q vs %q (err=%v)", code, name, again, err)
++		}
++		names[i] = name
++	}
++	for i := 0; i < len(codes); i++ {
++		for j := i + 1; j < len(codes); j++ {
++			if names[i] == names[j] {
++				t.Errorf("单射性破坏：code[%d]=%q 与 code[%d]=%q 同映射子表名 %q", i, codes[i], j, codes[j], names[i])
++			}
++		}
++	}
++}
++
++// TC-0023 步骤 4/5：不同 tenantCode 的库名 iot_<tenant> 两两不等（租户域同口径单射）；
++// 复评 N1 租户探针对（"t-1" 与 "t_2d1_5627091943b2a601"）为回归锚点。
++func TestContractDBNameInjective(t *testing.T) {
++	tenants := []string{
++		// 复评 N1 租户探针对
++		"t-1",
++		"t_2d1_5627091943b2a601",
++		// 契约示例形态与近似形态
++		"group_a",
++		"groupA",
++		"groupa",
++		// 含非安全字节
++		"tenant; drop",
++		// 中文
++		"一厂",
++		"二厂",
++		// 首字符数字
++		"01厂",
++	}
++	names := make([]string, len(tenants))
++	for i, tenant := range tenants {
++		db := tdengine.DBName(tenant)
++		assertLegalIdentifier(t, tenant, db)
++		if !strings.HasPrefix(db, "iot_") {
++			t.Errorf("库名未遵循 iot_<tenant_code> 口诀: %q", db)
++		}
++		// 确定性
++		if again := tdengine.DBName(tenant); again != db {
++			t.Errorf("库名映射不可复现: %q → %q vs %q", tenant, db, again)
++		}
++		names[i] = db
++	}
++	for i := 0; i < len(tenants); i++ {
++		for j := i + 1; j < len(tenants); j++ {
++			if names[i] == names[j] {
++				t.Errorf("租户域单射性破坏：tenant[%d]=%q 与 tenant[%d]=%q 同库名 %q", i, tenants[i], j, tenants[j], names[i])
++			}
++		}
++	}
++}
++
++// 端到端：探针对经 InsertPointSQL 产生不同子表名的写语句（写库层单射闭环）。
++func TestContractProbePairDistinctInsertSQL(t *testing.T) {
++	sqlA, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a", TenantID: 1, PointCode: "F01-WS01", Kind: tdengine.KindInstant,
++	}})
++	if err != nil {
++		t.Fatalf("InsertPointSQL(F01-WS01) error: %v", err)
++	}
++	sqlB, err := tdengine.InsertPointSQL([]tdengine.PointRow{{
++		TenantCode: "group_a", TenantID: 1, PointCode: "F01_2dWS01_2aad8c0256245aa0", Kind: tdengine.KindInstant,
++	}})
++	if err != nil {
++		t.Fatalf("InsertPointSQL(literal) error: %v", err)
++	}
++	if sqlA == sqlB {
++		t.Fatalf("BUG-0002 复现：探针对写语句相同（同子表）:\n%s", sqlA)
++	}
++}

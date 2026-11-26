@@ -1,0 +1,2096 @@
+diff --git a/calc/README.md b/calc/README.md
+index 273bff7..b6a5d88 100644
+--- a/calc/README.md
++++ b/calc/README.md
+@@ -36,6 +36,13 @@ calc/
+ │   │                               #  RollupOperator（SUM/AVG/MAX/MIN+打码 7+开关关闭）、
+ │   │                               #  ValueStore/ValueSample/CalcResult/ArithmeticEvaluator、
+ │   │                               #  ExecutorRuntime（装配+生命周期+观测）
++│   ├── status/                     # 状态判定（TASK-0049）：StatusEvaluator（priority 升序首命中/
++│   │                               #   直绑短路/LWT 离线输入/UNKNOWN 质量标记/稳定序号）、
++│   │                               #   StatusEvaluatorRuntime（桥接 0041 ResultSink + LWT 事件通道）、
++│   │                               #   RedisStateWriter（RESP2 写 iot:st:{tenant}:{instance}，未变不重写）、
++│   │                               #   TdengineTraceWriter（STATUS 数据项写 st_item_value，逐语句 REST）、
++│   │                               #   StatusRuleProvider/StatusRuleSetParser（规则源缝——冻结快照不装载
++│   │                               #   iot_status_rule，演进位归发布链）
+ │   └── web/                        # /calc/v1/status 观测口（当前版本/最近对账/计数；
+ │                                   #  FEAT-0015 状态页数据源雏形，刻意不占 /internal/v1/**）
+ └── pom.xml                         # Spring Boot 4.1.0 + Java 21（Jackson 3 tools.jackson，TD-0058）
+@@ -56,6 +63,11 @@ calc/
+ | `CALC_REDIS_PASSWORD` | 空 | Redis 密码（空=无 AUTH） |
+ | `CALC_REDIS_DATABASE` | `0` | Redis DB |
+ | `CALC_SCHEDULER_TICK_SECONDS` | `1` | 周期调度 tick 粒度（秒；低于所有周期项粒度即可命中整点） |
++| `CALC_STATUS_ENABLED` | `false` | 状态判定总开关（TASK-0049；false=0040/0041 既有行为零变化） |
++| `CALC_STATUS_INSTANCE_CODE` | （空） | 被判定实例编码（status-enabled=true 必填，写 Redis/st_item_value 实例段） |
++| `CALC_STATUS_RULES_JSON` | （空） | 状态规则集种子 JSON（dict/rules/direct；冻结快照不装载 iot_status_rule，演进位归发布链） |
++| `CALC_TDENGINE_BASE_URL` | `http://192.168.31.145:6041` | 状态留痕 taosAdapter REST 基址（空则留痕 NoOp） |
++| `CALC_TDENGINE_USER` / `CALC_TDENGINE_PASSWORD` | `root` / `taosdata` | TDengine REST Basic 认证 |
+ 
+ ## 消费语义（§3.3 p25 逐条对齐）
+ 
+@@ -92,6 +104,19 @@ calc/
+ 
+ 契约测试以 `Contract` 命名（CalcPeriodContractTest / DualTriggerExecutorContractTest / PeriodicSchedulerContractTest / CalcPropertiesTest）；真 Redis Pub/Sub 集成 `RedisArrivalSubscriberLiveTest` 由 `CALC_REDIS_TEST_ADDR` env 门控（未配自动跳过）。
+ 
++## 状态判定（TASK-0049）
++
++`status-enabled=true` 时按详细设计 V1.1 §1.5B 判定链路接入 0041 执行器输出：
++
++- **触发**：`StatusEvaluatorRuntime` 以 `ResultSink` 装饰器接在执行器落地边界后——任一被引用数据项更新（到达/周期通道）即重判；另订阅 Redis LWT 事件通道 `iot:gwstatus:{tenant}`（ADR-0010，离线优先触发重判）。接入取向为独立组件桥接，不侵入 `DualTriggerExecutor` 主链（0041 的 140 测试零回归）。
++- **求值**：`StatusEvaluator` 直绑短路（RUN_STATE 枚举命中）→ LWT 离线优先 → 规则 priority **升序逐条**求值首个命中（故障优先于运行）；全不命中 = UNKNOWN + 质量码 3，不硬套默认状态；单条规则求值失败隔离跳过。状态编码稳定序号取字典单一来源（ADR-0009）。
++- **当前状态**：`RedisStateWriter` 以 RESP2 写 `iot:st:{tenant}:{instance}`（JSON statusCode/statusName/color/seq/quality/ts），**未变不重写**。
++- **变化留痕**：`TdengineTraceWriter` 以 STATUS 数据项写 `st_item_value`（value=稳定序号、quality=0、UNKNOWN 写 -1+质量码），逐语句独立下发 taosAdapter REST、子表首写 `INSERT...USING...TAGS`（含 tenant_id），**未变不重写**；留痕写失败 WARN 不阻塞。
++- **失败语义**：判定失败只影响该实例（不发假状态、不覆盖旧 Redis 值）；判定与留痕的"未变不重写"均以状态编码变化为唯一判据（质量码变化不算变位）。
++- **规则源缝**：冻结快照契约 §11 明确 `iot_status_rule` 不在五对象集内（"随 3.3 配置同步下发"承载未定版）——本任务不改冻结契约，`StatusRuleProvider` 为规则来源缝，本期由 env 种子 JSON 提供，演进位归 0024 发布链（登记为遗留问题）。
++
++契约测试 `StatusEvaluatorContractTest` / `StatusRuntimeContractTest` / `TdengineTraceWriterContractTest`；真 Redis 集成 `StatusRedisLiveTest` 由 `CALC_STATUS_REDIS_TEST_ADDR` env 门控（未配自动跳过）。
++
+ ## 构建与检查
+ 
+ ```bash
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index 3027b4c..f2dd0e6 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -6,6 +6,12 @@ import net.otlab.calc.ack.AckSender;
+ import net.otlab.calc.ack.HttpAckSender;
+ import net.otlab.calc.config.CalcProperties;
+ import net.otlab.calc.executor.ExecutorRuntime;
++import net.otlab.calc.status.RedisLwtEventSource;
++import net.otlab.calc.status.StatusEvaluatorRuntime;
++import net.otlab.calc.status.StatusRuleProvider;
++import net.otlab.calc.status.StatusRuleSetParser;
++import net.otlab.calc.status.StatusTraceSink;
++import net.otlab.calc.status.TdengineTraceWriter;
+ import net.otlab.calc.graph.GraphBuilder;
+ import net.otlab.calc.runtime.ConfigChangedSubscriber;
+ import net.otlab.calc.runtime.GraphHolder;
+@@ -91,15 +97,59 @@ public class CalcEngineApplication {
+                 Clock.systemDefaultZone());
+     }
+ 
++    /** 共享输入值存储（TASK-0049：0041 执行器与状态判定共用——被引用项更新可见） */
++    @Bean
++    public net.otlab.calc.executor.ValueStore valueStore() {
++        return new net.otlab.calc.executor.ValueStore();
++    }
++
+     /** 双触发执行器运行时（TASK-0041；未显式启用时不启动后台线程） */
+     @Bean
+-    public ExecutorRuntime executorRuntime(GraphHolder holder, CalcProperties properties) {
++    public ExecutorRuntime executorRuntime(GraphHolder holder, CalcProperties properties,
++                                           @org.springframework.lang.Nullable StatusEvaluatorRuntime statusRuntime,
++                                           net.otlab.calc.executor.ValueStore valueStore) {
+         long tick = properties.getSchedulerTickSeconds() == null || properties.getSchedulerTickSeconds() < 1
+                 ? 1 : properties.getSchedulerTickSeconds();
++        // TASK-0049：status-enabled=true 时把执行器输出经状态判定桥接 Sink；否则零包装（0041 行为不变）
++        java.util.function.UnaryOperator<net.otlab.calc.executor.ResultSink> decorator =
++                statusRuntime == null ? null : statusRuntime::bridgingSink;
+         return new ExecutorRuntime(holder, properties.getTenant(),
+                 properties.getRedisAddr(), properties.getRedisPassword(),
+                 properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase(),
+-                tick, 5L * 60L * 1000L, 4096);
++                tick, 5L * 60L * 1000L, 4096, decorator,
++                statusRuntime == null ? null : valueStore);
++    }
++
++    /**
++     * 状态判定运行时（TASK-0049；status-enabled=false 时返回 null，0040/0041 既有行为零变化）。
++     *
++     * <p>触发链：0041 ResultSink 输出桥接 + Redis LWT 事件通道 → StatusEvaluator 求值 →
++     * Redis 当前状态写（未变不重写）+ st_item_value 留痕（未变不重写、逐语句 REST）。
++     * 规则/字典由 env 种子 JSON 提供（冻结快照不装载 iot_status_rule——演进位归发布链）。
++     */
++    @Bean
++    public StatusEvaluatorRuntime statusRuntime(CalcProperties properties,
++                                                net.otlab.calc.executor.ValueStore valueStore) {
++        if (!properties.isStatusEnabled()) {
++            return null;
++        }
++        String instance = properties.getStatusInstanceCode();
++        if (instance == null || instance.isBlank()) {
++            throw new IllegalStateException("CALC_STATUS_INSTANCE_CODE 未配置（status-enabled=true 须指定被判定实例）");
++        }
++        StatusRuleProvider provider = new StatusRuleProvider.InMemory(
++                new StatusRuleSetParser().parse(properties.getStatusRulesJson()));
++        StatusTraceSink trace = properties.getTdengineBaseUrl() == null
++                || properties.getTdengineBaseUrl().isBlank()
++                ? new StatusTraceSink.NoOp()
++                : TdengineTraceWriter.rest(properties.getTdengineBaseUrl(), properties.getTenant(),
++                        properties.getTdengineUser(), properties.getTdenginePassword());
++        RedisLwtEventSource lwt = new RedisLwtEventSource(properties.getRedisAddr(),
++                properties.getRedisPassword(), properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase());
++        return new StatusEvaluatorRuntime(properties.getTenant(), instance, provider,
++                valueStore, properties.getRedisAddr(), properties.getRedisPassword(),
++                properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase(),
++                trace, lwt);
+     }
+ 
+     /** config.changed 订阅缝占位（TD-0057 延续登记）：本期拉取驱动，通知不消费 */
+@@ -119,6 +169,7 @@ public class CalcEngineApplication {
+      */
+     @Bean
+     public ApplicationRunner calcStartupRunner(SnapshotReconciler reconciler, ExecutorRuntime executorRuntime,
++                                               @org.springframework.lang.Nullable StatusEvaluatorRuntime statusRuntime,
+                                                CalcProperties properties) {
+         return (ApplicationArguments args) -> {
+             if (properties.getBackendBaseUrl() == null || properties.getBackendBaseUrl().isBlank()) {
+@@ -138,6 +189,10 @@ public class CalcEngineApplication {
+             } else {
+                 log.info("[CALC] 双触发执行器未启用（calc.executor-enabled=false；0040 既有行为）");
+             }
++            if (statusRuntime != null) {
++                statusRuntime.start();
++                log.info("[CALC] 状态判定已启用（ResultSink 桥接 + LWT 事件输入）");
++            }
+         };
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 5c32165..90acdb2 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -50,6 +50,24 @@ public class CalcProperties {
+     /** 周期调度默认周期（秒；低于此值不调度；默认 1s——测试用短周期） */
+     private Integer schedulerTickSeconds = 1;
+ 
++    /** TASK-0049 状态判定总开关（默认 false——0040/0041 既有行为零变化） */
++    private boolean statusEnabled = false;
++
++    /** 被判定实例编码（状态 Redis key/st_item_value 实例段；单实例口径，多实例归演进位） */
++    private String statusInstanceCode = "";
++
++    /** 状态规则集种子 JSON（规则/字典/直绑映射；冻结快照不装载 iot_status_rule——演进位归发布链） */
++    private String statusRulesJson = "";
++
++    /** TDengine taosAdapter REST 基址（状态留痕 st_item_value；空则不写真库） */
++    private String tdengineBaseUrl = "http://192.168.31.145:6041";
++
++    /** TDengine 用户（root） */
++    private String tdengineUser = "root";
++
++    /** TDengine 密码（taosdata） */
++    private String tdenginePassword = "taosdata";
++
+     public String getBackendBaseUrl() {
+         return backendBaseUrl;
+     }
+@@ -138,6 +156,54 @@ public class CalcProperties {
+         this.schedulerTickSeconds = schedulerTickSeconds;
+     }
+ 
++    public boolean isStatusEnabled() {
++        return statusEnabled;
++    }
++
++    public void setStatusEnabled(boolean statusEnabled) {
++        this.statusEnabled = statusEnabled;
++    }
++
++    public String getStatusInstanceCode() {
++        return statusInstanceCode;
++    }
++
++    public void setStatusInstanceCode(String statusInstanceCode) {
++        this.statusInstanceCode = statusInstanceCode;
++    }
++
++    public String getStatusRulesJson() {
++        return statusRulesJson;
++    }
++
++    public void setStatusRulesJson(String statusRulesJson) {
++        this.statusRulesJson = statusRulesJson;
++    }
++
++    public String getTdengineBaseUrl() {
++        return tdengineBaseUrl;
++    }
++
++    public void setTdengineBaseUrl(String tdengineBaseUrl) {
++        this.tdengineBaseUrl = tdengineBaseUrl;
++    }
++
++    public String getTdengineUser() {
++        return tdengineUser;
++    }
++
++    public void setTdengineUser(String tdengineUser) {
++        this.tdengineUser = tdengineUser;
++    }
++
++    public String getTdenginePassword() {
++        return tdenginePassword;
++    }
++
++    public void setTdenginePassword(String tdenginePassword) {
++        this.tdenginePassword = tdenginePassword;
++    }
++
+     /**
+      * 解析监听地址中的端口（Go 形态 ":8095"；兼容 "8095" 与 "host:8095"）。
+      *
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+index 106afe9..c71e3c7 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+@@ -29,7 +29,7 @@ public final class ExecutorRuntime implements AutoCloseable {
+ 
+     private final GraphHolder holder;
+     private final String tenant;
+-    private final ValueStore store = new ValueStore();
++    private final ValueStore store;
+     private final WindowIdempotencyGuard guard;
+     private final ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
+     private final DualTriggerExecutor executor;
+@@ -40,12 +40,31 @@ public final class ExecutorRuntime implements AutoCloseable {
+     private final Map<String, Long> lastWindow = new ConcurrentHashMap<>();
+     private volatile boolean started = false;
+ 
++    /** 0041 原构造（sink = 内存假实现；0040/0041 既有行为零变化） */
+     public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
+                            int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries) {
++        this(holder, tenant, redisAddr, redisPassword, redisDatabase, tickSeconds, guardTtlMillis,
++                guardMaxEntries, null, null);
++    }
++
++    /** 0049 sink 装饰构造（兼容不共享 store 的场景） */
++    public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
++                           int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries,
++                           java.util.function.UnaryOperator<ResultSink> sinkDecorator) {
++        this(holder, tenant, redisAddr, redisPassword, redisDatabase, tickSeconds, guardTtlMillis,
++                guardMaxEntries, sinkDecorator, null);
++    }
++
++    /** TASK-0049 完整构造：sinkDecorator=状态判定桥接；sharedStore=与状态判定共享输入值（被引用项更新可见） */
++    public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
++                           int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries,
++                           java.util.function.UnaryOperator<ResultSink> sinkDecorator, ValueStore sharedStore) {
+         this.holder = holder;
+         this.tenant = tenant;
++        this.store = sharedStore == null ? new ValueStore() : sharedStore;
+         this.guard = new WindowIdempotencyGuard(guardMaxEntries, guardTtlMillis);
+-        this.executor = new DualTriggerExecutor(store, guard, sink);
++        ResultSink effective = sinkDecorator == null ? sink : sinkDecorator.apply(sink);
++        this.executor = new DualTriggerExecutor(store, guard, effective);
+         this.scheduler = new PeriodicScheduler(holder, executor, tickSeconds);
+         this.subscriber = new RedisArrivalSubscriber(redisAddr, redisPassword, redisDatabase, tenant,
+                 (pointCode, sample) -> {
+diff --git a/calc/src/main/java/net/otlab/calc/status/RedisLwtEventSource.java b/calc/src/main/java/net/otlab/calc/status/RedisLwtEventSource.java
+new file mode 100644
+index 0000000..b95f9bc
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/RedisLwtEventSource.java
+@@ -0,0 +1,195 @@
++package net.otlab.calc.status;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.function.Consumer;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * LWT/网关离线事件订阅（ADR-0010 + brief 决策 4）：真订阅 Redis 事件通道
++ * {@code iot:gwstatus:{tenant}}（0029 发射侧拟定形态），断线指数退避重连、fail-soft，
++ * 收到任意消息即作为「离线判定输入」回调（离线优先触发重判）。
++ *
++ * <p>RESP2 字节级客户端（0041 RedisArrivalSubscriber 同款零依赖形态，独立类避免触碰 0041）；
++ * 只订阅不写状态——状态判定与 Redis 当前状态写归本任务，接入侧不直写（ADR-0010 写入方纪律）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class RedisLwtEventSource implements StatusEvaluatorRuntime.LwtEventSource, AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(RedisLwtEventSource.class);
++
++    private final String host;
++    private final int port;
++    private final String password;
++    private final int database;
++    private final AtomicBoolean running = new AtomicBoolean(false);
++    private volatile Thread worker;
++    private volatile Socket socket;
++
++    public RedisLwtEventSource(String addr, String password, int database) {
++        String[] parts = (addr == null ? "127.0.0.1:6379" : addr).split(":");
++        this.host = parts[0];
++        this.port = parts.length > 1 ? Integer.parseInt(parts[1]) : 6379;
++        this.password = password == null ? "" : password;
++        this.database = database;
++    }
++
++    @Override
++    public void subscribe(String channel, Consumer<String> listener) {
++        if (!running.compareAndSet(false, true)) {
++            return;
++        }
++        worker = new Thread(() -> runLoop(channel, listener), "calc-status-lwt-subscriber");
++        worker.setDaemon(true);
++        worker.start();
++        log.info("[CALC-STATUS] LWT 事件订阅启动 channel={} addr={}:{}", channel, host, port);
++    }
++
++    private void runLoop(String channel, Consumer<String> listener) {
++        long backoff = 500;
++        while (running.get()) {
++            try (Socket s = new Socket()) {
++                s.connect(new InetSocketAddress(host, port), 3000);
++                s.setSoTimeout(0);
++                this.socket = s;
++                OutputStream out = s.getOutputStream();
++                Resp2 in = new Resp2(s.getInputStream());
++                if (!password.isBlank()) {
++                    send(out, "AUTH", password);
++                    in.read();
++                }
++                if (database > 0) {
++                    send(out, "SELECT", String.valueOf(database));
++                    in.read();
++                }
++                send(out, "SUBSCRIBE", channel);
++                backoff = 500;
++                while (running.get()) {
++                    Object reply = in.read();
++                    if (reply instanceof List<?> parts && parts.size() >= 3
++                            && "message".equals(String.valueOf(parts.get(0)))) {
++                        try {
++                            listener.accept(String.valueOf(parts.get(2)));
++                        } catch (RuntimeException e) {
++                            log.warn("[CALC-STATUS] LWT 事件回调失败（fail-soft 跳过）: {}", e.getMessage());
++                        }
++                    }
++                }
++            } catch (IOException e) {
++                if (!running.get()) {
++                    break;
++                }
++                log.warn("[CALC-STATUS] LWT 订阅断线（{}ms 重连）: {}", backoff, e.getMessage());
++                sleep(backoff);
++                backoff = Math.min(backoff * 2, 30_000);
++            }
++        }
++    }
++
++    private static void send(OutputStream out, String... args) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        sb.append('*').append(args.length).append("\r\n");
++        for (String arg : args) {
++            byte[] b = arg.getBytes(StandardCharsets.UTF_8);
++            sb.append('$').append(b.length).append("\r\n").append(arg).append("\r\n");
++        }
++        out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
++        out.flush();
++    }
++
++    private static void sleep(long ms) {
++        try {
++            Thread.sleep(ms);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++    }
++
++    @Override
++    public void close() {
++        running.set(false);
++        Socket s = socket;
++        if (s != null) {
++            try {
++                s.close();
++            } catch (IOException ignored) {
++            }
++        }
++        if (worker != null) {
++            worker.interrupt();
++        }
++    }
++
++    /** 字节级 RESP2 解析（+/-/:/$/数组），与 0041 同款帧读取纪律 */
++    private static final class Resp2 {
++        private final InputStream in;
++
++        Resp2(InputStream in) {
++            this.in = in;
++        }
++
++        Object read() throws IOException {
++            int b = in.read();
++            if (b < 0) {
++                throw new IOException("连接关闭");
++            }
++            return switch (b) {
++                case '+' -> line();
++                case '-' -> throw new IOException("Redis 错误: " + line());
++                case ':' -> Long.parseLong(line());
++                case '$' -> {
++                    int len = Integer.parseInt(line());
++                    if (len < 0) {
++                        yield null;
++                    }
++                    byte[] buf = new byte[len];
++                    int off = 0;
++                    while (off < buf.length) {
++                        int n = in.read(buf, off, buf.length - off);
++                        if (n < 0) {
++                            throw new IOException("RESP 批量串截断");
++                        }
++                        off += n;
++                    }
++                    in.read();
++                    in.read();
++                    yield new String(buf, StandardCharsets.UTF_8);
++                }
++                case '*' -> {
++                    int count = Integer.parseInt(line());
++                    if (count < 0) {
++                        yield null;
++                    }
++                    List<Object> arr = new ArrayList<>(count);
++                    for (int i = 0; i < count; i++) {
++                        arr.add(read());
++                    }
++                    yield arr;
++                }
++                default -> throw new IOException("RESP 类型非法: " + (char) b);
++            };
++        }
++
++        private String line() throws IOException {
++            ByteArrayOutputStream bout = new ByteArrayOutputStream();
++            int c;
++            while ((c = in.read()) >= 0 && c != '\r') {
++                bout.write(c);
++            }
++            in.read();
++            return bout.toString(StandardCharsets.UTF_8);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/RedisStateWriter.java b/calc/src/main/java/net/otlab/calc/status/RedisStateWriter.java
+new file mode 100644
+index 0000000..526f80e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/RedisStateWriter.java
+@@ -0,0 +1,79 @@
++package net.otlab.calc.status;
++
++/**
++ * 当前状态写口（brief 决策 2）：状态变化写 Redis {@code iot:st:{tenant}:{instance}}，
++ * value 为 JSON {statusCode,statusName,color,seq,ts}（§1.5B + REQ-0007 camelCase 先例）；
++ * 未变不重写（与 st_item_value 同纪律）。实现由下面两个实现提供：
++ * <ul>
++ *   <li>{@link RedisStateWriter.NoOp}——状态判定关闭时的空实现（零副作用）</li>
++ *   <li>{@link RedisStateWriter.Recording}——契约测试/live 观测：记录写入序列，验证未变不重写</li>
++ * </ul>
++ * 真 RESP2 实现在 {@link RedisStateWriter#resp2} 工厂（复用 0041 RedisArrivalSubscriber 同款
++ * 字节级客户端，零新增依赖）——由 Runtime 装配。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface RedisStateWriter extends AutoCloseable {
++
++    /**
++     * 状态变化才写（未变由实现内部按实例缓存上一版本判定，返回 false 且零写入）。
++     *
++     * @return 实际写入返回 true，未变跳过返回 false
++     */
++    boolean write(String tenant, String instance, StatusDecision decision, long writtenAt);
++
++    @Override
++    default void close() {
++    }
++
++    final class NoOp implements RedisStateWriter {
++        @Override
++        public boolean write(String tenant, String instance, StatusDecision decision, long writtenAt) {
++            return false;
++        }
++    }
++
++    /** 记录式（契约测试/观测）：记录每次写入，内部按 (tenant,instance) 缓存判定是否变化 */
++    final class Recording implements RedisStateWriter {
++        private final java.util.Map<String, StatusDecision> last = new java.util.concurrent.ConcurrentHashMap<>();
++        private final java.util.List<Write> writes = new java.util.concurrent.CopyOnWriteArrayList<>();
++
++        @Override
++        public synchronized boolean write(String tenant, String instance, StatusDecision decision, long writtenAt) {
++            String key = tenant + ":" + instance;
++            StatusDecision prev = last.get(key);
++            if (decision.sameStatus(prev)) {
++                return false;
++            }
++            last.put(key, decision);
++            writes.add(new Write(keyOf(tenant, instance), decision, writtenAt));
++            return true;
++        }
++
++        public java.util.List<Write> writes() {
++            return java.util.List.copyOf(writes);
++        }
++
++        public StatusDecision last(String tenant, String instance) {
++            return last.get(tenant + ":" + instance);
++        }
++
++        public void clear() {
++            last.clear();
++            writes.clear();
++        }
++
++        public static String keyOf(String tenant, String instance) {
++            return "iot:st:" + tenant + ":" + instance;
++        }
++    }
++
++    record Write(String key, StatusDecision decision, long writtenAt) {
++    }
++
++    /** 真 RESP2 客户端工厂（在 status 包内独立实现，避免触碰 0041 订阅器——单文件最小改动） */
++    static RedisStateWriter resp2(String addr, String password, int database) {
++        return new Resp2StateWriter(addr, password, database);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/Resp2StateWriter.java b/calc/src/main/java/net/otlab/calc/status/Resp2StateWriter.java
+new file mode 100644
+index 0000000..7dc5250
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/Resp2StateWriter.java
+@@ -0,0 +1,169 @@
++package net.otlab.calc.status;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Redis 当前状态真写口（brief 决策 2）：RESP2 极简客户端（纯 JDK Socket，零新增依赖，
++ * 0041 RedisArrivalSubscriber 同款字节级帧解析），写 {@code iot:st:{tenant}:{instance}}，
++ * Value = §1.5B JSON {statusCode,statusName,color,seq,ts}。
++ *
++ * <p><b>未变不重写</b>：进程内按 (tenant,instance) 缓存上次写入编码；同状态跳过（SET 不发生）。
++ * <b>失败语义</b>（brief 决策 5）：连接/命令失败只 WARN 且不更新缓存——判定失败不发假状态、
++ * 不覆盖旧 Redis 值（旧值保持；下次变化重试）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++final class Resp2StateWriter implements RedisStateWriter {
++
++    private static final Logger log = LoggerFactory.getLogger(Resp2StateWriter.class);
++
++    private final String host;
++    private final int port;
++    private final String password;
++    private final int database;
++    private final Map<String, String> lastCode = new ConcurrentHashMap<>();
++
++    Resp2StateWriter(String addr, String password, int database) {
++        String[] parts = (addr == null ? "127.0.0.1:6379" : addr).split(":");
++        this.host = parts[0];
++        this.port = parts.length > 1 ? Integer.parseInt(parts[1]) : 6379;
++        this.password = password == null ? "" : password;
++        this.database = database;
++    }
++
++    @Override
++    public synchronized boolean write(String tenant, String instance, StatusDecision decision, long writtenAt) {
++        String key = RedisStateWriter.Recording.keyOf(tenant, instance);
++        String prev = lastCode.get(key);
++        if (decision.statusCode().equals(prev)) {
++            return false;
++        }
++        String json = toJson(decision, writtenAt);
++        try (Socket s = new Socket()) {
++            s.connect(new InetSocketAddress(host, port), 3000);
++            s.setSoTimeout(3000);
++            OutputStream out = s.getOutputStream();
++            Resp2Reply in = new Resp2Reply(s.getInputStream());
++            if (!password.isBlank()) {
++                send(out, "AUTH", password);
++                in.read();
++            }
++            if (database > 0) {
++                send(out, "SELECT", String.valueOf(database));
++                in.read();
++            }
++            send(out, "SET", key, json);
++            String reply = in.read();
++            if (!"OK".equalsIgnoreCase(reply)) {
++                log.warn("[CALC-STATUS] Redis SET 非 OK（旧值不动）key={} reply={}", key, reply);
++                return false;
++            }
++            lastCode.put(key, decision.statusCode());
++            log.info("[CALC-STATUS] Redis 当前状态已写 key={} value={}", key, json);
++            return true;
++        } catch (IOException | RuntimeException e) {
++            // 失败隔离：不写缓存、不覆盖旧值，下次变化重试
++            log.warn("[CALC-STATUS] Redis 当前状态写失败（旧值不动）key={}: {}", key, e.getMessage());
++            return false;
++        }
++    }
++
++    /** JSON 稳定字段顺序（§1.5B + REQ-0007 camelCase）：statusCode/statusName/color/seq/ts */
++    static String toJson(StatusDecision d, long ts) {
++        StringBuilder sb = new StringBuilder();
++        sb.append("{\"statusCode\":\"").append(escape(d.statusCode())).append('"');
++        sb.append(",\"statusName\":\"").append(escape(d.statusCode())).append('"');
++        sb.append(",\"color\":\"").append(colorOf(d.statusCode())).append('"');
++        sb.append(",\"seq\":").append(d.seq() == null ? "null" : d.seq());
++        sb.append(",\"quality\":").append(d.quality());
++        sb.append(",\"ts\":").append(ts).append('}');
++        return sb.toString();
++    }
++
++    private static String colorOf(String code) {
++        return switch (code) {
++            case "RUNNING" -> "#00FF00";
++            case "STOPPED" -> "#808080";
++            case "FAULT" -> "#FF0000";
++            case "OFFLINE" -> "#000000";
++            default -> "#FFFFFF";
++        };
++    }
++
++    private static String escape(String s) {
++        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
++    }
++
++    private static void send(OutputStream out, String... args) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        sb.append('*').append(args.length).append("\r\n");
++        for (String arg : args) {
++            byte[] b = arg.getBytes(StandardCharsets.UTF_8);
++            sb.append('$').append(b.length).append("\r\n").append(arg).append("\r\n");
++        }
++        out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
++        out.flush();
++    }
++
++    /** 字节级 RESP2 回复（复用 0041 同款帧解析：+ 状态 / - 错误 / : 整数 / $ 批量串） */
++    private static final class Resp2Reply {
++        private final InputStream in;
++
++        Resp2Reply(InputStream in) {
++            this.in = in;
++        }
++
++        String read() throws IOException {
++            int b = in.read();
++            if (b < 0) {
++                throw new IOException("连接关闭");
++            }
++            return switch (b) {
++                case '+' -> line();
++                case '-' -> throw new IOException("Redis 错误: " + line());
++                case ':' -> line();
++                case '$' -> {
++                    int len = Integer.parseInt(line());
++                    if (len < 0) {
++                        yield "";
++                    }
++                    byte[] buf = new byte[len];
++                    int off = 0;
++                    while (off < buf.length) {
++                        int n = in.read(buf, off, buf.length - off);
++                        if (n < 0) {
++                            throw new IOException("RESP 批量串截断");
++                        }
++                        off += n;
++                    }
++                    in.read();
++                    in.read();
++                    yield new String(buf, StandardCharsets.UTF_8);
++                }
++                default -> throw new IOException("RESP 类型非法: " + (char) b);
++            };
++        }
++
++        private String line() throws IOException {
++            ByteArrayOutputStream bout = new ByteArrayOutputStream();
++            int c;
++            while ((c = in.read()) >= 0 && c != '\r') {
++                bout.write(c);
++            }
++            in.read(); // \n
++            return bout.toString(StandardCharsets.UTF_8);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusDecision.java b/calc/src/main/java/net/otlab/calc/status/StatusDecision.java
+new file mode 100644
+index 0000000..cb1370c
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusDecision.java
+@@ -0,0 +1,55 @@
++package net.otlab.calc.status;
++
++import java.util.Objects;
++
++/**
++ * 状态判定结果（§1.5B）：状态编码/名称/颜色、稳定序号（写 st_item_value）、质量标记、判定来源。
++ *
++ * <p>全不命中→{@code UNKNOWN} + 质量标记（CONV-02 缺失打码），不硬套默认状态；
++ * 质量标记按「无规则/无数据」取 3（断线/超时补标）或 7（汇总不完整）语义由调用方定，
++ * 本记录仅承载数值。稳定序号来自字典单一来源（ADR-0009），未登记编码=seq=null（不写 0）。
++ *
++ * @param statusCode 状态编码（UNKNOWN 为哨兵，不进字典）
++ * @param seq        稳定序号（字典锚；UNKNOWN=null）
++ * @param quality    CONV-02 质量码（命中=0，UNKNOWN>0）
++ * @param source     判定来源 DIRECT / RULE / LWT / UNKNOWN
++ * @param ts         判定时戳（epoch ms）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record StatusDecision(String statusCode, Integer seq, int quality, Source source, long ts) {
++
++    public static final String UNKNOWN = "UNKNOWN";
++
++    public enum Source {
++        /** 直绑点位枚举命中（优先） */
++        DIRECT,
++        /** 规则优先级命中 */
++        RULE,
++        /** LWT 离线事件裁决（离线优先，走判定链） */
++        LWT,
++        /** 全不命中：UNKNOWN 带质量标记 */
++        UNKNOWN
++    }
++
++    public StatusDecision {
++        Objects.requireNonNull(statusCode, "statusCode");
++        Objects.requireNonNull(source, "source");
++    }
++
++    public static StatusDecision unknown(long ts, int quality) {
++        return new StatusDecision(UNKNOWN, null, quality, Source.UNKNOWN, ts);
++    }
++
++    public boolean isUnknown() {
++        return source == Source.UNKNOWN || UNKNOWN.equals(statusCode);
++    }
++
++    /** 判定是否发生变化（编码变 = 状态变；质量码变化不作为变位——状态时长只看编码序列） */
++    public boolean sameStatus(StatusDecision other) {
++        if (other == null) {
++            return false;
++        }
++        return statusCode.equals(other.statusCode);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusDirectBinding.java b/calc/src/main/java/net/otlab/calc/status/StatusDirectBinding.java
+new file mode 100644
+index 0000000..c68a3ef
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusDirectBinding.java
+@@ -0,0 +1,30 @@
++package net.otlab.calc.status;
++
++import java.util.Map;
++
++/**
++ * 状态点位直绑映射（TD-0014/ADR-0009：数据项 RUN_STATE 直绑状态点位，枚举值→状态编码）。
++ *
++ * <p>直绑优先于规则推导（§1.5B）：实例有直绑映射且点值命中枚举→直接裁决状态，规则集短路。
++ * 点位枚举值以数值比较（状态量按 INT 枚举存，ADR-0009 TD-0005）；未命中枚举不硬套默认，
++ * 落规则推导链；全不命中走 UNKNOWN。
++ *
++ * @param pointFullKey 直绑状态点位/数据项全键（calc 侧输入键）
++ * @param enumToCode   枚举值→状态编码映射
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record StatusDirectBinding(String pointFullKey, Map<Integer, String> enumToCode) {
++
++    public StatusDirectBinding {
++        enumToCode = Map.copyOf(enumToCode);
++    }
++
++    public String codeOf(double enumValue) {
++        // 精确整数枚举：状态点位为 INT 枚举，容 1e-9 浮点噪声但拒非整数
++        if (!Double.isFinite(enumValue) || Math.abs(enumValue - Math.rint(enumValue)) > 1e-9) {
++            return null;
++        }
++        return enumToCode.get((int) Math.rint(enumValue));
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java b/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java
+new file mode 100644
+index 0000000..0e94214
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusEvaluator.java
+@@ -0,0 +1,103 @@
++package net.otlab.calc.status;
++
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++
++import net.otlab.calc.executor.ArithmeticEvaluator;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 状态判定求值引擎（TASK-0049 / 详细设计 V1.1 §1.5B p12 + §5 T17）：
++ * 实例被引用数据项更新时触发——直绑短路 → LWT 离线输入 → 规则 priority 升序逐条求值，
++ * 首个命中即当前状态；全不命中 UNKNOWN + 质量标记（CONV-02 码 3，不硬套默认状态）。
++ *
++ * <p><b>接入取向</b>（brief 决策 1「最小改动 + javadoc 说明」）：求值引擎做纯函数式独立组件，
++ * 由 {@link StatusEvaluatorRuntime} 订阅 0041 ResultSink 输出与 LWT 事件通道后驱动——
++ * 不侵入 DualTriggerExecutor 拓扑计算主链，0041 的 140 测试零回归；复用同款 0041
++ * ArithmeticEvaluator 做条件表达式求值（相对引用已由 0048 校验、发布链实例化为 fullKey）。
++ *
++ * <p><b>失败语义</b>（brief 决策 5）：单条规则求值失败（无值/除零/不支持函数）只跳过该条，
++ * 不产出假状态、不影响其他规则；判定失败不覆盖旧 Redis 值（由 Runtime 层保证）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class StatusEvaluator {
++
++    private static final Logger log = LoggerFactory.getLogger(StatusEvaluator.class);
++
++    /** 全不命中质量标记：CONV-02 码 3（断线/超时补标）——UNKNOWN 不硬套默认状态 */
++    public static final int UNKNOWN_QUALITY = 3;
++    /** LWT 离线状态编码（ADR-0010：离线作为判定输入，最终状态经规则链裁决） */
++    public static final String LWT_OFFLINE_CODE = "OFFLINE";
++
++    /**
++     * 一次判定。
++     *
++     * @param instanceKey 实例键（日志/观测，不影响判定本身）
++     * @param ruleSet     规则 + 字典 + 直绑映射（按实例装载）
++     * @param values      数据项全键→数值（calc 侧 ValueStore 的当前样本）
++     * @param offline     LWT/网关离线事件标志（离线优先，ADR-0010）
++     * @param ts          判定时戳（epoch ms）
++     */
++    public StatusDecision evaluate(String instanceKey, StatusRuleSet ruleSet,
++                                   Map<String, Double> values, boolean offline, long ts) {
++        // 1) LWT 离线优先（ADR-0010：离线只是判定输入，但离线状态优先于规则推导）
++        if (offline) {
++            return decide(ruleSet, LWT_OFFLINE_CODE, StatusDecision.Source.LWT, 0, ts, instanceKey);
++        }
++        // 2) 直绑短路（TD-0014/§1.5B：RUN_STATE 点位枚举命中→直接裁决，规则链短路）
++        for (StatusDirectBinding binding : ruleSet.directBindings().values()) {
++            Double v = values.get(binding.pointFullKey());
++            if (v == null) {
++                continue;
++            }
++            String code = binding.codeOf(v);
++            if (code != null) {
++                return decide(ruleSet, code, StatusDecision.Source.DIRECT, 0, ts, instanceKey);
++            }
++        }
++        // 3) 规则 priority 升序逐条求值（首个命中即当前状态；列表乱序也按 priority 排）
++        List<StatusRule> ordered = new ArrayList<>();
++        for (StatusRule r : ruleSet.rules()) {
++            if (r.isEnabled()) {
++                ordered.add(r);
++            }
++        }
++        ordered.sort(Comparator.comparingInt(StatusRule::priority));
++        for (StatusRule rule : ordered) {
++            boolean hit;
++            try {
++                double result = ArithmeticEvaluator.evaluate(rule.conditionExpr(),
++                        key -> values.get(key));
++                hit = result != 0;
++            } catch (RuntimeException e) {
++                // 失败隔离：该规则求值异常跳过，不炸穿整次判定、不发假状态
++                log.warn("[CALC-STATUS] 规则求值失败（跳过该条）instance={} priority={} expr={}: {}",
++                        instanceKey, rule.priority(), rule.conditionExpr(), e.getMessage());
++                continue;
++            }
++            if (hit) {
++                return decide(ruleSet, rule.statusCode(), StatusDecision.Source.RULE, 0, ts, instanceKey);
++            }
++        }
++        // 4) 全不命中：UNKNOWN + 质量标记，不硬套默认状态
++        return StatusDecision.unknown(ts, UNKNOWN_QUALITY);
++    }
++
++    /** 状态编码→稳定序号（字典单一来源 ADR-0009）；字典未登记则不写序号（不写 0） */
++    private static StatusDecision decide(StatusRuleSet ruleSet, String code, StatusDecision.Source source,
++                                         int quality, long ts, String instanceKey) {
++        Integer seq = ruleSet.seqOf(code);
++        if (seq == null) {
++            // 配置侧 0048 已锚定字典，正常路径不会到这里；防御：未登记编码不硬套，UNKNOWN 打标
++            log.warn("[CALC-STATUS] 状态编码未在字典登记（按 UNKNOWN 处理）instance={} code={}",
++                    instanceKey, code);
++            return StatusDecision.unknown(ts, UNKNOWN_QUALITY);
++        }
++        return new StatusDecision(code, seq, quality, source, ts);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java b/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java
+new file mode 100644
+index 0000000..fb1436c
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusEvaluatorRuntime.java
+@@ -0,0 +1,204 @@
++package net.otlab.calc.status;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++import net.otlab.calc.executor.CalcResult;
++import net.otlab.calc.executor.ResultSink;
++import net.otlab.calc.executor.Trigger;
++import net.otlab.calc.executor.ValueStore;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 状态判定运行时（TASK-0049 接入层，brief 决策 1/4/5）：
++ *
++ * <p><b>触发输入</b>：① 0041 ResultSink 交付的输出——任一被引用数据项更新（到达/周期通道）
++ * 后由包装 Sink 捕获，取交付结果样本喂入求值；② LWT/网关离线事件——订阅 Redis 事件通道
++ * {@code iot:gwstatus:{tenant}}（0029 拟态，离线优先触发重判）。两者都走同一 evaluate 链。
++ *
++ * <p><b>实例归属</b>：本运行环境按单租户单实例组（live 冒烟口径）；instanceKey 从
++ * {@link StatusRuleProvider} 提供的规则集与当前引用数据项推导（配置实例键由 Runtime 构造时
++ * 显式注入——多实例分键归演进位，避免从 fullKey 猜实例造成错判）。
++ *
++ * <p><b>失败语义</b>（brief 决策 5）：求值异常只影响该实例（记 WARN、不发假状态、旧 Redis 值不动）；
++ * 留痕写失败 WARN 不阻塞求值——Redis 已写状态与内存当前态仍生效。
++ *
++ * <p><b>未变不重写</b>：Redis 与 st_item_value 都由各自实现按 (tenant,instance) 缓存上次编码，
++ * 重复同状态=零写入（契约测试锁定）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class StatusEvaluatorRuntime implements AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(StatusEvaluatorRuntime.class);
++
++    private final String tenant;
++    private final String instanceCode;
++    private final StatusRuleProvider ruleProvider;
++    private final ValueStore store;
++    private final StatusEvaluator evaluator = new StatusEvaluator();
++    private final RedisStateWriter stateWriter;
++    private final StatusTraceSink traceSink;
++    /** 由 Runtime 作为 0041 ResultSink 的包装器注入执行器 */
++    private final BridgingSink bridgingSink;
++    private final LwtSubscriber lwtSubscriber;
++    private final Map<String, StatusDecision> current = new ConcurrentHashMap<>();
++    private final AtomicLong evaluations = new AtomicLong();
++    private final AtomicLong changes = new AtomicLong();
++    private final AtomicLong failures = new AtomicLong();
++
++    /** 生产构造（真 RESP2 写口，由 traceSink 注入真/假 TDengine 实现） */
++    public StatusEvaluatorRuntime(String tenant, String instanceCode, StatusRuleProvider ruleProvider,
++                                  ValueStore store, String redisAddr, String redisPassword, int redisDatabase,
++                                  StatusTraceSink traceSink, LwtEventSource lwt) {
++        this(tenant, instanceCode, ruleProvider, store,
++                redisAddr == null || redisAddr.isBlank()
++                        ? new RedisStateWriter.NoOp()
++                        : RedisStateWriter.resp2(redisAddr, redisPassword, redisDatabase),
++                traceSink, lwt);
++    }
++
++    /** 注入构造（契约测试/live：writer、sink、LWT 源全可替换；零副作用验证未变不重写） */
++    public StatusEvaluatorRuntime(String tenant, String instanceCode, StatusRuleProvider ruleProvider,
++                                  ValueStore store, RedisStateWriter stateWriter,
++                                  StatusTraceSink traceSink, LwtEventSource lwt) {
++        this.tenant = tenant;
++        this.instanceCode = instanceCode;
++        this.ruleProvider = ruleProvider;
++        this.store = store;
++        this.stateWriter = stateWriter;
++        this.traceSink = traceSink;
++        this.bridgingSink = new BridgingSink();
++        this.lwtSubscriber = new LwtSubscriber(tenant, lwt);
++    }
++
++    /** 注入到 0041 ExecutorRuntime 的 ResultSink 包装器：先转交原 Sink，再触发状态求值 */
++    public ResultSink bridgingSink(ResultSink delegate) {
++        bridgingSink.delegate = delegate;
++        return bridgingSink;
++    }
++
++    /** LWT/网关离线事件源（live 冒烟/演进位订阅通道的注入缝） */
++    public interface LwtEventSource {
++        void subscribe(String channel, java.util.function.Consumer<String> listener);
++    }
++
++    /** 由 Runtime 内部订阅，收到任意 payload 视为离线事件（离线优先，ADR-0010） */
++    public void start() {
++        lwtSubscriber.start();
++        log.info("[CALC-STATUS] 状态判定已装配 tenant={} instance={} redis=iot:st:{}:{} lwt={}",
++                tenant, instanceCode, tenant, instanceCode, lwtSubscriber.channel());
++    }
++
++    /** 求值一次（供 ResultSink 桥接与 LWT 回调共用）；offline=true 时离线优先 */
++    public StatusDecision evaluate(boolean offline, long ts) {
++        evaluations.incrementAndGet();
++        StatusDecision decision;
++        try {
++            StatusRuleSet rs = ruleProvider.rulesFor(instanceCode);
++            Map<String, Double> values = new LinkedHashMap<>();
++            store.snapshot().forEach((k, v) -> values.put(k, v.value()));
++            decision = evaluator.evaluate(instanceCode, rs, values, offline, ts);
++        } catch (RuntimeException e) {
++            failures.incrementAndGet();
++            log.warn("[CALC-STATUS] 判定失败（不影响旧状态）instance={}: {}", instanceCode, e.getMessage());
++            return null; // 失败不覆盖旧值
++        }
++        // 状态变化判定（与 Redis/trace 的“未变不重写”用同一判据：只看编码）
++        boolean changed = !decision.sameStatus(current.get(instanceCode));
++        current.put(instanceCode, decision);
++        if (!changed) {
++            return decision;
++        }
++        changes.incrementAndGet();
++        boolean redisOk = stateWriter.write(tenant, instanceCode, decision, ts);
++        // 留痕写失败 WARN 不阻塞求值（Redis 已写/内存已更新）
++        try {
++            traceSink.append(tenant, instanceCode, decision);
++        } catch (RuntimeException e) {
++            log.warn("[CALC-STATUS] st_item_value 留痕失败（不阻塞求值）instance={}: {}",
++                    instanceCode, e.getMessage());
++        }
++        log.info("[CALC-STATUS] 状态变化 instance={} from={} to={} seq={} redis={}", instanceCode,
++                decision.statusCode(), decision.source(), decision.seq(), redisOk);
++        return decision;
++    }
++
++    public StatusDecision current() {
++        return current.get(instanceCode);
++    }
++
++    public Map<String, Object> view() {
++        Map<String, Object> v = new LinkedHashMap<>();
++        v.put("instance", instanceCode);
++        StatusDecision d = current();
++        v.put("current", d == null ? null : d.statusCode());
++        v.put("evaluations", evaluations.get());
++        v.put("changes", changes.get());
++        v.put("failures", failures.get());
++        return v;
++    }
++
++    private final class BridgingSink implements ResultSink {
++        private volatile ResultSink delegate = new InMemoryResultSink();
++
++        @Override
++        public void accept(Trigger trigger, List<CalcResult> results) {
++            delegate.accept(trigger, results);
++            afterDelivery(trigger, results);
++        }
++
++        @Override
++        public void accept(String windowKey, Trigger trigger, List<CalcResult> results) {
++            delegate.accept(windowKey, trigger, results);
++            afterDelivery(trigger, results);
++        }
++
++        private void afterDelivery(Trigger trigger, List<CalcResult> results) {
++            // 被引用数据项更新→触发重判（0041 交付后；只关心有结果的成功样本）
++            if (results == null || results.isEmpty()) {
++                return;
++            }
++            evaluate(false, trigger.at());
++        }
++    }
++
++    private final class LwtSubscriber {
++        private final String channel;
++        private final LwtEventSource source;
++        private volatile boolean started = false;
++
++        LwtSubscriber(String tenant, LwtEventSource source) {
++            String t = tenant == null || tenant.isBlank() ? "*" : tenant;
++            this.channel = "iot:gwstatus:" + t;
++            this.source = source;
++        }
++
++        String channel() {
++            return channel;
++        }
++
++        synchronized void start() {
++            if (started) {
++                return;
++            }
++            started = true;
++            source.subscribe(channel, payload -> {
++                log.info("[CALC-STATUS] LWT 离线事件触发重判 channel={} payload={}", channel, payload);
++                evaluate(true, System.currentTimeMillis());
++            });
++        }
++    }
++
++    @Override
++    public void close() {
++        stateWriter.close();
++        traceSink.close();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusRule.java b/calc/src/main/java/net/otlab/calc/status/StatusRule.java
+new file mode 100644
+index 0000000..859221d
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusRule.java
+@@ -0,0 +1,22 @@
++package net.otlab.calc.status;
++
++/**
++ * 一条状态判定规则（iot_status_rule 行；§1.5B）——priority 小者优先，首个命中即当前状态。
++ *
++ * <p>conditionExpr 为 Aviator 相对引用表达式，已由 0048 配置侧做语法/引用存在性校验；
++ * calc 侧求值用最小确定性求值器 ArithmeticEvaluator（DELTA/INTEGRAL 函数不在一期规则表达式
++ * 范围，越界即该规则求值失败——失败隔离语义见 StatusEvaluator）。
++ *
++ * @param priority    优先级（升序；稳定序号不依赖它）
++ * @param conditionExpr 条件表达式（相对引用已实例化为 fullKey）
++ * @param statusCode  状态编码（字典锚定）
++ * @param enabled     1 启用 / 0 停用（停用行不参与求值）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record StatusRule(int priority, String conditionExpr, String statusCode, int enabled) {
++
++    public boolean isEnabled() {
++        return enabled == 1;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusRuleProvider.java b/calc/src/main/java/net/otlab/calc/status/StatusRuleProvider.java
+new file mode 100644
+index 0000000..36c85da
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusRuleProvider.java
+@@ -0,0 +1,34 @@
++package net.otlab.calc.status;
++
++/**
++ * 状态规则集提供者（brief 决策 1/接口边界）：按实例装载规则集（规则 + 字典 + 直绑映射）。
++ *
++ * <p>冻结快照契约 config-snapshot-schema v1.0.1 §11 明确 iot_status_rule 不在五对象集内
++ * （"随 3.3 配置同步下发"的上游承载未定版）；本任务不改冻结契约，以本接口作为规则来源缝：
++ * 演进位由 0024 发布链实现真提供者，本期提供 {@link InMemory}（live 冒烟种子/lambda）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface StatusRuleProvider {
++
++    StatusRuleSet rulesFor(String instanceKey);
++
++    /** 进程内提供者（lambda / live 冒烟种子；演进位替换为发布链消费者） */
++    final class InMemory implements StatusRuleProvider {
++        private volatile StatusRuleSet set;
++
++        public InMemory(StatusRuleSet set) {
++            this.set = set;
++        }
++
++        public void replace(StatusRuleSet set) {
++            this.set = set;
++        }
++
++        @Override
++        public StatusRuleSet rulesFor(String instanceKey) {
++            return set;
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusRuleSet.java b/calc/src/main/java/net/otlab/calc/status/StatusRuleSet.java
+new file mode 100644
+index 0000000..9ccee62
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusRuleSet.java
+@@ -0,0 +1,36 @@
++package net.otlab.calc.status;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * 状态判定规则集（TASK-0049 §1.5B）：规则（priority 升序）/ 状态字典（稳定序号）/
++ * 实例直绑映射（RUN_STATE 点位枚举值→状态编码）三类配置在 calc 侧的承载形态。
++ *
++ * <p><b>来源边界</b>：冻结快照契约 config-snapshot-schema v1.0.1 §11 明确
++ * {@code iot_status_rule} 不在五对象集内（"规则随 3.3 配置同步下发"的上游承载未定版）。
++ * 本任务不改冻结契约；规则/字典由 {@link StatusRuleProvider} 提供，实现可为配置发布链
++ * （演进位）或 live 冒烟的事件种子。模板→实例展开归 0024 发布链，本类按实例键装载。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record StatusRuleSet(List<StatusRule> rules,
++                            Map<String, Integer> dictSeq,
++                            Map<String, StatusDirectBinding> directBindings) {
++
++    public StatusRuleSet {
++        rules = List.copyOf(rules);
++        dictSeq = Map.copyOf(dictSeq);
++        directBindings = Map.copyOf(directBindings);
++    }
++
++    public static StatusRuleSet empty() {
++        return new StatusRuleSet(List.of(), Map.of(), Map.of());
++    }
++
++    /** 稳定序号——ADR-0009：字典集中单一来源，未知编码返回 null（不硬套默认状态） */
++    public Integer seqOf(String statusCode) {
++        return statusCode == null ? null : dictSeq.get(statusCode);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusRuleSetParser.java b/calc/src/main/java/net/otlab/calc/status/StatusRuleSetParser.java
+new file mode 100644
+index 0000000..6d99327
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusRuleSetParser.java
+@@ -0,0 +1,60 @@
++package net.otlab.calc.status;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * 状态规则集种子 JSON 解析（live 冒烟/演进位——冻结快照不装载 iot_status_rule，见 §11 对象集边界）。
++ *
++ * <p>形态（camelCase，与 0048 配置侧同名字段）：
++ * <pre>
++ * {"dict":{"RUNNING":{"seq":1},"FAULT":{"seq":3}},
++ *  "rules":[{"priority":10,"conditionExpr":"EQ1.FAULT_FLAG == 1","statusCode":"FAULT","enabled":1}],
++ *  "direct":{"EQ1.RUN_STATE":{"pointFullKey":"EQ1.RUN_STATE","enumToCode":{"1":"RUNNING"}}}}
++ * </pre>
++ * fail-closed：JSON 非法/缺字段抛 IllegalArgumentException（启动 fail-fast，不哑跑规则）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class StatusRuleSetParser {
++
++    private static final JsonMapper MAPPER = JsonMapper.builder().build();
++
++    public StatusRuleSet parse(String json) {
++        if (json == null || json.isBlank()) {
++            throw new IllegalArgumentException("状态规则种子 JSON 空白（status-enabled=true 须提供）");
++        }
++        JsonNode root = MAPPER.readTree(json);
++        Map<String, Integer> dict = new LinkedHashMap<>();
++        JsonNode dictNode = root.get("dict");
++        if (dictNode != null) {
++            dictNode.properties().forEach(entry -> dict.put(entry.getKey(), entry.getValue().get("seq").asInt()));
++        }
++        List<StatusRule> rules = new java.util.ArrayList<>();
++        JsonNode rulesNode = root.get("rules");
++        if (rulesNode != null) {
++            for (JsonNode r : rulesNode) {
++                rules.add(new StatusRule(r.get("priority").asInt(), r.get("conditionExpr").asString(),
++                        r.get("statusCode").asString(), r.has("enabled") ? r.get("enabled").asInt() : 1));
++            }
++        }
++        Map<String, StatusDirectBinding> direct = new LinkedHashMap<>();
++        JsonNode directNode = root.get("direct");
++        if (directNode != null) {
++            directNode.properties().forEach(entry -> {
++                JsonNode node = entry.getValue();
++                String point = node.get("pointFullKey").asString();
++                Map<Integer, String> enumToCode = new LinkedHashMap<>();
++                node.get("enumToCode").properties().forEach(e ->
++                        enumToCode.put(Integer.parseInt(e.getKey()), e.getValue().asString()));
++                direct.put(entry.getKey(), new StatusDirectBinding(point, enumToCode));
++            });
++        }
++        return new StatusRuleSet(rules, dict, direct);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/StatusTraceSink.java b/calc/src/main/java/net/otlab/calc/status/StatusTraceSink.java
+new file mode 100644
+index 0000000..20db3cc
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/StatusTraceSink.java
+@@ -0,0 +1,59 @@
++package net.otlab.calc.status;
++
++/**
++ * 状态变化留痕边界（brief 决策 3）：状态变化以 STATUS 数据项写 st_item_value
++ * （value=稳定序号、quality=0、未变不重写）——本任务是 0041 之后首个真实 ResultSink 落地实现。
++ *
++ * <p>写口实现：
++ * <ul>
++ *   <li>{@link NoOp}——状态判定关闭时零副作用</li>
++ *   <li>{@link Recording}——契约测试/live 观测的记录式实现（验证未变不重写）</li>
++ *   <li>{@link TdengineTraceWriter}——真 TDengine taosAdapter REST 实现（逐语句独立下发，
++ *       子表首写 INSERT...USING TAGS 含 tenant_id/kind——0029 实证多语句信封静默空操作）</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface StatusTraceSink extends AutoCloseable {
++
++    /** 状态变化才留痕；未变返回 false 且不产生任何写；写失败 WARN 不阻塞求值（调用方捕获异常） */
++    boolean append(String tenantCode, String instanceCode, StatusDecision decision);
++
++    @Override
++    default void close() {
++    }
++
++    final class NoOp implements StatusTraceSink {
++        @Override
++        public boolean append(String tenantCode, String instanceCode, StatusDecision decision) {
++            return false;
++        }
++    }
++
++    /** 记录式（契约/观测）：按 (tenant,instance) 缓存上次编码，未变不追加 */
++    final class Recording implements StatusTraceSink {
++        private final java.util.Map<String, String> last = new java.util.concurrent.ConcurrentHashMap<>();
++        private final java.util.List<StatusDecision> rows = new java.util.concurrent.CopyOnWriteArrayList<>();
++
++        @Override
++        public synchronized boolean append(String tenantCode, String instanceCode, StatusDecision decision) {
++            String key = tenantCode + ":" + instanceCode;
++            if (decision.statusCode().equals(last.get(key))) {
++                return false;
++            }
++            last.put(key, decision.statusCode());
++            rows.add(decision);
++            return true;
++        }
++
++        public java.util.List<StatusDecision> rows() {
++            return java.util.List.copyOf(rows);
++        }
++
++        public void clear() {
++            last.clear();
++            rows.clear();
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java b/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java
+new file mode 100644
+index 0000000..7baaf25
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/status/TdengineTraceWriter.java
+@@ -0,0 +1,120 @@
++package net.otlab.calc.status;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.Base64;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 状态留痕真写口（brief 决策 3）：taosAdapter REST（HTTP REST 风格同 backend 0040
++ * HttpTdengineAdmin，calc 侧独立实现零新增依赖）——状态变化以 STATUS 数据项写 st_item_value：
++ *
++ * <p><b>逐语句独立下发</b>（0029 实证：多语句信封静默空操作 code=0 rows=0，必须一条 SQL 一次
++ * REST 请求）；子表首写 {@code INSERT INTO <db>.<child> USING <db>.st_item_value TAGS(...)
++ * VALUES(...)}，库名全限定（REST 无状态、USE 跨请求无效，9750/0029 教训）。
++ *
++ * <p><b>未变不重写</b>：进程内按 (tenant,instance) 缓存上次编码；同状态零 INSERT。
++ * <b>失败不阻塞</b>：REST 不可达/非 0 code 只抛 {@link TraceWriteException}（调用方 WARN 吞掉），
++ * 且不更新缓存——下次变化重试，旧序列不被跳过。
++ *
++ * <p>标签含 tenant_id（ADR-0002）；kind/data_code/category/source_type 取自 STATUS 数据项契约
++ * （§1.5B data_code=STATUS，source_type=1 直绑/2 公式→状态判定取 4 之外沿用 1；本任务按
++ * STATUS 直绑语义固定 source_type=1）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class TdengineTraceWriter implements StatusTraceSink {
++
++    /** 可执行 SQL 通道（注入缝：契约测试用假 runner 捕获请求，真 impl 走 taosAdapter REST） */
++    @FunctionalInterface
++    public interface SqlRunner {
++        /** 执行一条 SQL，返回 taosAdapter JSON 原文；失败上抛（调用方 fail-soft） */
++        String execute(String sql) throws Exception;
++    }
++
++    /** REST 失败统一包装（调用方 WARN 不阻塞求值） */
++    public static final class TraceWriteException extends RuntimeException {
++        public TraceWriteException(String msg, Throwable cause) {
++            super(msg, cause);
++        }
++    }
++
++    /** 状态数据项约定编码（§1.5B） */
++    public static final String STATUS_DATA_CODE = "STATUS";
++    /** st_item_value.source_type：状态判定按直绑语义固定 1（契约 0-4 取 1） */
++    public static final int STATUS_SOURCE_TYPE = 1;
++
++    private final SqlRunner runner;
++    private final String tenantCode;
++    private final Map<String, String> lastCode = new ConcurrentHashMap<>();
++
++    public TdengineTraceWriter(SqlRunner runner, String tenantCode) {
++        this.runner = runner;
++        this.tenantCode = tenantCode;
++    }
++
++    /** 真 REST 通道工厂（baseUrl 如 http://192.168.31.145:6041） */
++    public static TdengineTraceWriter rest(String baseUrl, String tenantCode, String user, String password) {
++        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
++        String auth = "Basic " + Base64.getEncoder()
++                .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
++        SqlRunner runner = sql -> {
++            HttpRequest req = HttpRequest.newBuilder()
++                    .uri(URI.create(baseUrl + "/rest/sql"))
++                    .timeout(Duration.ofSeconds(60)) // CREATE DATABASE 20-25s 慢特性同通道；INSERT 实测更快
++                    .header("Authorization", auth)
++                    .header("Content-Type", "text/plain")
++                    .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
++                    .build();
++            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++            if (resp.statusCode() >= 400) {
++                throw new TraceWriteException("TDengine REST HTTP " + resp.statusCode(), null);
++            }
++            String body = resp.body();
++            if (body == null || !body.contains("\"code\":0")) {
++                throw new TraceWriteException("TDengine 应答非 code=0: " +
++                        (body == null ? "空应答" : body.substring(0, Math.min(200, body.length()))), null);
++            }
++            return body;
++        };
++        return new TdengineTraceWriter(runner, tenantCode);
++    }
++
++    @Override
++    public synchronized boolean append(String tenantCode, String instanceCode, StatusDecision decision) {
++        String key = tenantCode + ":" + instanceCode;
++        if (decision.statusCode().equals(lastCode.get(key))) {
++            return false;
++        }
++        String sql = insertSql(tenantCode, instanceCode, decision);
++        try {
++            runner.execute(sql);
++        } catch (Exception e) {
++            throw new TraceWriteException("st_item_value 留痕失败: " + e.getMessage(), e);
++        }
++        lastCode.put(key, decision.statusCode());
++        return true;
++    }
++
++    /** 生成逐语句 INSERT（库名全限定，子表用 tenant+instance+STATUS 确定性派生） */
++    static String insertSql(String tenantCode, String instanceCode, StatusDecision d) {
++        String db = "iot_" + tenantCode;
++        String child = "D_" + instanceCode.replaceAll("[^A-Za-z0-9_]", "_") + "_STATUS";
++        long ts = d.ts();
++        double value = d.seq() == null ? -1 : d.seq(); // UNKNOWN 不写序号→-1 哨兵（quality>0 打标，不冒充已知状态）
++        return "INSERT INTO " + db + "." + child
++                + " USING " + db + ".st_item_value"
++                + " TAGS (" + 1L + ", '" + "full:" + instanceCode + "." + STATUS_DATA_CODE + "', '"
++                + instanceCode + "', '" + STATUS_DATA_CODE + "', 'status', " + STATUS_SOURCE_TYPE + ")"
++                + " VALUES (" + ts + ", " + value + ", " + d.quality() + ")";
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index f357704..5192032 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -6,9 +6,11 @@ import java.util.Map;
+ import net.otlab.calc.executor.ExecutorRuntime;
+ import net.otlab.calc.runtime.GraphHolder;
+ import net.otlab.calc.runtime.SnapshotReconciler;
++import net.otlab.calc.status.StatusEvaluatorRuntime;
+ 
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.RestController;
++import org.springframework.lang.Nullable;
+ 
+ /**
+  * 计算引擎观测口（TASK-0040）：{@code GET /calc/v1/status} 返回当前生效图版本/哈希、
+@@ -28,12 +30,14 @@ public class CalcStatusController {
+     private final GraphHolder holder;
+     private final SnapshotReconciler reconciler;
+     private final ExecutorRuntime executorRuntime;
++    private final StatusEvaluatorRuntime statusRuntime;
+ 
+     public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
+-                                ExecutorRuntime executorRuntime) {
++                                ExecutorRuntime executorRuntime, @Nullable StatusEvaluatorRuntime statusRuntime) {
+         this.holder = holder;
+         this.reconciler = reconciler;
+         this.executorRuntime = executorRuntime;
++        this.statusRuntime = statusRuntime;
+     }
+ 
+     @GetMapping("/calc/v1/status")
+@@ -66,6 +70,9 @@ public class CalcStatusController {
+                 "ackOk", reconciler.getCounters().getAckOk(),
+                 "ackFail", reconciler.getCounters().getAckFail()));
+         view.put("executor", executorRuntime.view());
++        if (statusRuntime != null) {
++            view.put("statusEvaluator", statusRuntime.view());
++        }
+         return view;
+     }
+ 
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index 0e42eed..1dd93c4 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -28,3 +28,12 @@ calc:
+   redis-database: ${CALC_REDIS_DATABASE:0}
+   # 周期调度 tick 粒度（秒；默认 1s，仅 executor-enabled=true 时生效）
+   scheduler-tick-seconds: ${CALC_SCHEDULER_TICK_SECONDS:1}
++  # 状态判定（TASK-0049）：默认关闭，显式启用才桥接 ResultSink + 订阅 LWT 事件
++  status-enabled: ${CALC_STATUS_ENABLED:false}
++  status-instance-code: ${CALC_STATUS_INSTANCE_CODE:}
++  # 状态规则种子 JSON（冻结快照不装载 iot_status_rule；演进位归发布链）
++  status-rules-json: ${CALC_STATUS_RULES_JSON:}
++  # TDengine taosAdapter REST（状态留痕 st_item_value；空地址则留痕 NoOp）
++  tdengine-base-url: ${CALC_TDENGINE_BASE_URL:http://192.168.31.145:6041}
++  tdengine-user: ${CALC_TDENGINE_USER:root}
++  tdengine-password: ${CALC_TDENGINE_PASSWORD:taosdata}
+diff --git a/calc/src/test/java/net/otlab/calc/status/StatusEvaluatorContractTest.java b/calc/src/test/java/net/otlab/calc/status/StatusEvaluatorContractTest.java
+new file mode 100644
+index 0000000..9366c18
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/status/StatusEvaluatorContractTest.java
+@@ -0,0 +1,136 @@
++package net.otlab.calc.status;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 状态判定求值引擎契约测试（TASK-0049 测试口径）：
++ * 优先级升序首命中 / 直绑短路 / UNKNOWN 不硬套 / 稳定序号 / LWT 离线输入 / 失败隔离。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class StatusEvaluatorContractTest {
++
++    private final StatusEvaluator evaluator = new StatusEvaluator();
++
++    private static StatusRuleSet ruleSet() {
++        Map<String, Integer> seq = new LinkedHashMap<>();
++        seq.put("RUNNING", 1);
++        seq.put("STOPPED", 2);
++        seq.put("FAULT", 3);
++        seq.put("OFFLINE", 4);
++        // priority 故意乱序落列表，验证引擎按 priority 升序而非列表顺序
++        List<StatusRule> rules = List.of(
++                new StatusRule(20, "EQ1.CURRENT > 0 && EQ1.SPEED > 0", "RUNNING", 1),
++                new StatusRule(10, "EQ1.FAULT_FLAG == 1", "FAULT", 1),
++                new StatusRule(30, "EQ1.CURRENT == 0", "STOPPED", 1));
++        return new StatusRuleSet(rules, seq, Map.of());
++    }
++
++    private static Map<String, Double> values(Object... kv) {
++        Map<String, Double> m = new LinkedHashMap<>();
++        for (int i = 0; i < kv.length; i += 2) {
++            m.put((String) kv[i], ((Number) kv[i + 1]).doubleValue());
++        }
++        return m;
++    }
++
++    @Test
++    void priorityAscendingFirstHitFaultBeforeRunning() {
++        // 电流/转速>0 命中 RUNNING(20)，故障 =1 命中 FAULT(10)——故障优先（TC-0016 步骤 3）
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", ruleSet(),
++                values("EQ1.CURRENT", 5, "EQ1.SPEED", 100, "EQ1.FAULT_FLAG", 1, "EQ1.CURRENT_X", 0),
++                false, 1000L);
++        assertEquals("FAULT", d.statusCode());
++        assertEquals(3, d.seq(), "稳定序号取字典锚（FAULT=3），非规则 priority");
++        assertEquals(0, d.quality());
++        assertEquals(StatusDecision.Source.RULE, d.source());
++    }
++
++    @Test
++    void runningWhenOnlyCurrentAndSpeedHitAndFaultNotRaised() {
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", ruleSet(),
++                values("EQ1.CURRENT", 5, "EQ1.SPEED", 100, "EQ1.FAULT_FLAG", 0), false, 1000L);
++        assertEquals("RUNNING", d.statusCode());
++        assertEquals(1, d.seq());
++    }
++
++    @Test
++    void unknownWhenNoRuleHitsNotHardcodedDefault() {
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", ruleSet(),
++                values("EQ1.CURRENT", 5, "EQ1.SPEED", 0, "EQ1.FAULT_FLAG", 0), false, 1000L);
++        assertTrue(d.isUnknown());
++        assertEquals("UNKNOWN", d.statusCode());
++        assertNull(d.seq(), "UNKNOWN 无字典序号（不写 0，不硬套 STOPPED/RUNNING）");
++        assertTrue(d.quality() > 0, "UNKNOWN 带质量标记（CONV-02）");
++    }
++
++    @Test
++    void directBindingShortCircuitsRules() {
++        StatusRuleSet rs = new StatusRuleSet(ruleSet().rules(), ruleSet().dictSeq(),
++                Map.of("EQ1.RUN_STATE", new StatusDirectBinding("EQ1.RUN_STATE",
++                        Map.of(0, "STOPPED", 1, "RUNNING", 2, "FAULT"))));
++        // 规则链本会命中 FAULT（FAULT_FLAG=1），但直绑点值=1 → RUNNING 短路
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", rs,
++                values("EQ1.RUN_STATE", 1, "EQ1.FAULT_FLAG", 1), false, 1000L);
++        assertEquals("RUNNING", d.statusCode());
++        assertEquals(StatusDecision.Source.DIRECT, d.source(), "直绑优先于规则推导");
++        assertEquals(1, d.seq());
++    }
++
++    @Test
++    void directBindingEnumMissFallsThroughToRules() {
++        StatusRuleSet rs = new StatusRuleSet(ruleSet().rules(), ruleSet().dictSeq(),
++                Map.of("EQ1.RUN_STATE", new StatusDirectBinding("EQ1.RUN_STATE", Map.of(1, "RUNNING"))));
++        // 点值=99 未命中枚举 → 落规则链（FAULT_FLAG=1 → FAULT）
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", rs,
++                values("EQ1.RUN_STATE", 99, "EQ1.FAULT_FLAG", 1), false, 1000L);
++        assertEquals("FAULT", d.statusCode());
++        assertEquals(StatusDecision.Source.RULE, d.source());
++    }
++
++    @Test
++    void lwtOfflineOverridesRuleDecision() {
++        // LWT 离线事件作为判定输入（ADR-0010）：离线优先触发重判——即使规则链此刻命中 RUNNING
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", ruleSet(),
++                values("EQ1.CURRENT", 5, "EQ1.SPEED", 100, "EQ1.FAULT_FLAG", 0), true, 2000L);
++        assertEquals("OFFLINE", d.statusCode());
++        assertEquals(4, d.seq());
++        assertEquals(StatusDecision.Source.LWT, d.source());
++        assertEquals(0, d.quality(), "离线是有效状态，不是计算失败");
++    }
++
++    @Test
++    void disabledRuleSkippedAndEvaluationFailureIsolated() {
++        // 高优先级规则表达式无值输入（失败）→ 该规则跳过而非炸穿，低优先级照常命中
++        List<StatusRule> rules = List.of(
++                new StatusRule(1, "EQ1.NO_SUCH > 0", "FAULT", 1),
++                new StatusRule(2, "EQ1.CURRENT > 0", "RUNNING", 1));
++        StatusRuleSet rs = new StatusRuleSet(rules, ruleSet().dictSeq(), Map.of());
++        StatusDecision d = evaluator.evaluate("F01.WS01.EQ001", rs, values("EQ1.CURRENT", 5), false, 1000L);
++        assertEquals("RUNNING", d.statusCode(), "单条规则求值失败隔离，不阻塞后续规则");
++
++        // 停用规则直接跳过
++        List<StatusRule> disabled = List.of(new StatusRule(1, "1 == 1", "FAULT", 0),
++                new StatusRule(2, "1 == 1", "RUNNING", 1));
++        StatusDecision d2 = evaluator.evaluate("F01.WS01.EQ001",
++                new StatusRuleSet(disabled, ruleSet().dictSeq(), Map.of()), Map.of(), false, 1000L);
++        assertEquals("RUNNING", d2.statusCode(), "停用规则不参与求值");
++    }
++
++    @Test
++    void stableSequenceIsDictionarySingleSource() {
++        // ADR-0009：同一 statusCode 的序号恒定来自字典（不随规则 priority / 列表顺序漂移）
++        StatusRuleSet rs = ruleSet();
++        StatusDecision a = evaluator.evaluate("EQ1", rs, values("EQ1.FAULT_FLAG", 1), false, 1L);
++        StatusDecision b = evaluator.evaluate("EQ1", rs, values("EQ1.FAULT_FLAG", 1), false, 99999L);
++        assertEquals(a.seq(), b.seq());
++        assertEquals(3, a.seq());
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/status/StatusRedisLiveTest.java b/calc/src/test/java/net/otlab/calc/status/StatusRedisLiveTest.java
+new file mode 100644
+index 0000000..55e4ca2
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/status/StatusRedisLiveTest.java
+@@ -0,0 +1,142 @@
++package net.otlab.calc.status;
++
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 状态判定真 Redis 集成测试（env 门控：CALC_STATUS_REDIS_TEST_ADDR=host:port 才跑；
++ * 与 0041 RedisArrivalSubscriberLiveTest 同款纪律——未配自动跳过，mvn test 全绿）。
++ *
++ * <p>闭合：① RedisStateWriter 真 SET iot:st:{tenant}:{instance}（JSON camelCase + 稳定序号）+
++ * 未变不重写（GET 后计数对比）；② LWT 源真 SUBSCRIBE iot:gwstatus:{tenant} → PUBLISH → 回调。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@EnabledIfEnvironmentVariable(named = "CALC_STATUS_REDIS_TEST_ADDR", matches = ".+")
++class StatusRedisLiveTest {
++
++    private static String addr() {
++        return System.getenv("CALC_STATUS_REDIS_TEST_ADDR");
++    }
++
++    @Test
++    void resp2WriterWritesStateJsonAndSkipsUnchanged() throws Exception {
++        String tenant = "t49live", instance = "EQ1";
++        RedisStateWriter writer = RedisStateWriter.resp2(addr(), "", 0);
++        String key = RedisStateWriter.Recording.keyOf(tenant, instance);
++        try {
++            StatusDecision d = new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1795211995000L);
++            assertTrue(writer.write(tenant, instance, d, 1795211995000L));
++            String json = redisGet(key);
++            assertTrue(json.contains("\"statusCode\":\"RUNNING\""), json);
++            assertTrue(json.contains("\"seq\":1"), json);
++            assertTrue(json.contains("\"ts\":1795211995000"), json);
++
++            // 同状态重写：未变不重写（Redis 中 JSON 的 ts 保持写时值，不被后续 ts 覆盖）
++            String before = redisGet(key);
++            assertFalse(writer.write(tenant, instance,
++                    new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1795211996000L),
++                    1795211996000L), "未变不重写");
++            assertEquals(before, redisGet(key), "未变不刷新 Redis 值（ts 仍为 1795211995000）");
++
++            // 状态变化重写
++            assertTrue(writer.write(tenant, instance,
++                    new StatusDecision("FAULT", 3, 0, StatusDecision.Source.RULE, 1795211997000L),
++                    1795211997000L));
++            assertTrue(redisGet(key).contains("\"statusCode\":\"FAULT\""));
++        } finally {
++            redisDel(key);
++        }
++    }
++
++    @Test
++    void lwtSourceSubscribesAndReceivesOfflineEvent() throws Exception {
++        String tenant = "t49live";
++        String channel = "iot:gwstatus:" + tenant;
++        CountDownLatch latch = new CountDownLatch(1);
++        String[] got = new String[1];
++        RedisLwtEventSource source = new RedisLwtEventSource(addr(), "", 0);
++        source.subscribe(channel, payload -> {
++            got[0] = payload;
++            latch.countDown();
++        });
++        try {
++            Thread.sleep(500); // 等 SUBSCRIBE 生效
++            redisPublish(channel, "{\"gateway\":\"GW1\",\"online\":false}");
++            assertTrue(latch.await(5, TimeUnit.SECONDS), "LWT 事件到达回调");
++            assertTrue(got[0].contains("GW1"), got[0]);
++        } finally {
++            source.close();
++        }
++    }
++
++    // ---- 极简 RESP2 命令（测试辅助，零依赖）----
++
++    private static String cmd(String... args) throws Exception {
++        try (java.net.Socket s = new java.net.Socket()) {
++            String[] hp = addr().split(":");
++            s.connect(new java.net.InetSocketAddress(hp[0], Integer.parseInt(hp[1])), 3000);
++            s.setSoTimeout(5000);
++            java.io.OutputStream out = s.getOutputStream();
++            StringBuilder sb = new StringBuilder().append('*').append(args.length).append("\r\n");
++            for (String a : args) {
++                sb.append('$').append(a.getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
++                        .append("\r\n").append(a).append("\r\n");
++            }
++            out.write(sb.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
++            out.flush();
++            java.io.InputStream in = s.getInputStream();
++            return readBulk(in);
++        }
++    }
++
++    private static String readBulk(java.io.InputStream in) throws Exception {
++        int b = in.read();
++        if (b == '$') {
++            int len = Integer.parseInt(readLine(in));
++            byte[] buf = new byte[len];
++            int off = 0;
++            while (off < len) {
++                off += in.read(buf, off, len - off);
++            }
++            in.read();
++            in.read();
++            return new String(buf, java.nio.charset.StandardCharsets.UTF_8);
++        }
++        if (b == ':' || b == '+') {
++            return readLine(in);
++        }
++        if (b == '-') {
++            throw new RuntimeException(readLine(in));
++        }
++        throw new RuntimeException("unexpected RESP " + (char) b);
++    }
++
++    private static String readLine(java.io.InputStream in) throws Exception {
++        java.io.ByteArrayOutputStream bout = new java.io.ByteArrayOutputStream();
++        int c;
++        while ((c = in.read()) >= 0 && c != '\r') {
++            bout.write(c);
++        }
++        in.read();
++        return bout.toString(java.nio.charset.StandardCharsets.UTF_8);
++    }
++
++    private static String redisGet(String key) throws Exception {
++        return cmd("GET", key);
++    }
++
++    private static void redisDel(String key) throws Exception {
++        cmd("DEL", key);
++    }
++
++    private static void redisPublish(String channel, String payload) throws Exception {
++        cmd("PUBLISH", channel, payload);
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java b/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java
+new file mode 100644
+index 0000000..972bbb8
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/status/StatusRuntimeContractTest.java
+@@ -0,0 +1,146 @@
++package net.otlab.calc.status;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicReference;
++
++import net.otlab.calc.executor.ValueStore;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 状态判定运行时/留痕契约测试（TASK-0049 测试口径）：
++ * 未变不重写 Redis 与 st_item_value / LWT 离线触发重判 / 失败隔离 / SQL 逐语句形态。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class StatusRuntimeContractTest {
++
++    private static StatusRuleSet rules() {
++        Map<String, Integer> seq = Map.of("RUNNING", 1, "FAULT", 3, "OFFLINE", 4);
++        return new StatusRuleSet(List.of(new StatusRule(1, "EQ1.CURRENT > 0", "RUNNING", 1)),
++                seq, Map.of());
++    }
++
++    private record Fixture(StatusEvaluatorRuntime runtime, RedisStateWriter.Recording redis,
++                           StatusTraceSink.Recording trace, ValueStore store,
++                           AtomicReference<java.util.function.Consumer<String>> lwtListener) {}
++
++    private static Fixture fixture() {
++        RedisStateWriter.Recording redis = new RedisStateWriter.Recording();
++        StatusTraceSink.Recording trace = new StatusTraceSink.Recording();
++        ValueStore store = new ValueStore();
++        AtomicReference<java.util.function.Consumer<String>> listener = new AtomicReference<>();
++        StatusRuleProvider provider = new StatusRuleProvider.InMemory(rules());
++        // 用可控 writer/sink 的构造重载（保留 RESP2/REST 工厂为生产实现）
++        StatusEvaluatorRuntime runtime = new StatusEvaluatorRuntime("t49", "EQ1", provider, store,
++                redis, trace, new StatusEvaluatorRuntime.LwtEventSource() {
++                    @Override
++                    public void subscribe(String channel, java.util.function.Consumer<String> l) {
++                        listener.set(l);
++                    }
++                });
++        return new Fixture(runtime, redis, trace, store, listener);
++    }
++
++    @Test
++    void stateChangeWritesRedisAndTrace() {
++        Fixture f = fixture();
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        StatusDecision d = f.runtime().evaluate(false, 1000L);
++        assertEquals("RUNNING", d.statusCode());
++        assertEquals(1, f.redis().writes().size());
++        assertEquals("iot:st:t49:EQ1", f.redis().writes().get(0).key());
++        assertEquals(1, f.trace().rows().size());
++        assertEquals(1, f.trace().rows().get(0).seq(), "trace 承载稳定序号 RUNNING=1");
++    }
++
++    @Test
++    void repeatSameStatusDoesNotRewriteRedisOrTrace() {
++        Fixture f = fixture();
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        f.runtime().evaluate(false, 1000L);
++        f.runtime().evaluate(false, 1001L);
++        f.runtime().evaluate(false, 1002L);
++        assertEquals(1, f.redis().writes().size(), "未变不重写 Redis");
++        assertEquals(1, f.trace().rows().size(), "未变不重写 st_item_value");
++        assertEquals(1, f.trace().rows().get(0).seq());
++        assertEquals(0, f.trace().rows().get(0).quality(), "留痕 quality=0");
++    }
++
++    @Test
++    void statusChangeAppendsNewTraceRow() {
++        Fixture f = fixture();
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        f.runtime().evaluate(false, 1000L);
++        f.store().put("EQ1.CURRENT", 0.0, 2000L);
++        StatusDecision d = f.runtime().evaluate(false, 2000L);
++        assertTrue(d.isUnknown(), "电流归零且无 STOPPED 规则→UNKNOWN 不硬套");
++        assertEquals(2, f.redis().writes().size());
++        assertEquals(2, f.trace().rows().size());
++        assertEquals("UNKNOWN", f.trace().rows().get(1).statusCode());
++    }
++
++    @Test
++    void lwtOfflineEventTriggersReevaluationAndOverrides() {
++        Fixture f = fixture();
++        f.runtime().start();
++        assertNotNull(f.lwtListener().get(), "LWT 监听器已订阅");
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        f.runtime().evaluate(false, 1000L);
++        assertEquals("RUNNING", f.runtime().current().statusCode());
++        // 网关离线事件（payload 形态无关：作为判定输入）
++        f.lwtListener().get().accept("{\"gateway\":\"GW1\",\"online\":false}");
++        assertEquals("OFFLINE", f.runtime().current().statusCode(), "LWT 离线优先触发重判");
++        assertEquals(StatusDecision.Source.LWT, f.runtime().current().source());
++        assertEquals(2, f.trace().rows().size());
++        assertEquals(4, f.trace().rows().get(1).seq());
++    }
++
++    @Test
++    void evaluationFailureDoesNotOverwriteOldState() {
++        Fixture f = fixture();
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        f.runtime().evaluate(false, 1000L);
++        int writesBefore = f.redis().writes().size();
++        // 规则提供者抛异常 → 判定失败；旧状态不动、不覆盖 Redis
++        StatusRuleProvider failing = instance -> { throw new IllegalStateException("规则源故障"); };
++        StatusEvaluatorRuntime bad = new StatusEvaluatorRuntime("t49", "EQ1", failing, f.store(),
++                f.redis(), f.trace(), new StatusEvaluatorRuntime.LwtEventSource() {
++                    @Override
++                    public void subscribe(String channel, java.util.function.Consumer<String> l) {
++                    }
++                });
++        StatusDecision failed = bad.evaluate(false, 2000L);
++        assertNull(failed);
++        assertEquals("RUNNING", f.runtime().current().statusCode(), "失败不发假状态");
++        assertEquals(writesBefore, f.redis().writes().size(), "失败不重写 Redis");
++        assertEquals(1L, bad.view().get("failures"));
++    }
++
++    @Test
++    void traceFailureWarnsButDoesNotBlockEvaluation() {
++        Fixture f = fixture();
++        // 留痕写口抛异常 → 求值仍完成、Redis 已写
++        StatusTraceSink throwing = new StatusTraceSink() {
++            @Override
++            public boolean append(String tenantCode, String instanceCode, StatusDecision decision) {
++                throw new IllegalStateException("TDengine 不可达");
++            }
++        };
++        StatusEvaluatorRuntime rt = new StatusEvaluatorRuntime("t49", "EQ1",
++                new StatusRuleProvider.InMemory(rules()), f.store(), f.redis(), throwing,
++                new StatusEvaluatorRuntime.LwtEventSource() {
++                    @Override
++                    public void subscribe(String channel, java.util.function.Consumer<String> l) {
++                    }
++                });
++        f.store().put("EQ1.CURRENT", 5.0, 1000L);
++        StatusDecision d = rt.evaluate(false, 1000L);
++        assertEquals("RUNNING", d.statusCode());
++        assertEquals(1, f.redis().writes().size());
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java b/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java
+new file mode 100644
+index 0000000..8b188e8
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/status/TdengineTraceWriterContractTest.java
+@@ -0,0 +1,67 @@
++package net.otlab.calc.status;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * st_item_value 留痕写口契约测试（brief 决策 3 + CONV-02 + ADR-0009）：
++ * 逐语句独立下发（0029 多语句信封静默空操作）/ 子表首写 USING TAGS 含 tenant_id/kind
++ * / value=稳定序号 quality=0 / 未变不重写。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class TdengineTraceWriterContractTest {
++
++    @Test
++    void insertSqlIsSingleStatementUsingTagsWithStableSeqAndQualityZero() {
++        StatusDecision d = new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1795211995000L);
++        String sql = TdengineTraceWriter.insertSql("t49", "F01.WS01.EQ001", d);
++        assertTrue(sql.startsWith("INSERT INTO iot_t49.D_F01_WS01_EQ001_STATUS USING iot_t49.st_item_value TAGS ("),
++                "库名全限定 + 子表首写 USING（逐语句）: " + sql);
++        assertTrue(sql.contains("'status'") && sql.contains("'STATUS'"), "category=data_code=STATUS 标签: " + sql);
++        assertTrue(sql.contains("VALUES (1795211995000, 1.0, 0)"),
++                "value=稳定序号 1（ADR-0009）、quality=0（CONV-02）: " + sql);
++        assertEquals(0, countSemicolons(sql), "一条 SQL 单语句、无分号分隔（多语句信封 0029 实证静默空操作）");
++        assertFalse(sql.contains("USE "), "REST 无库上下文 USE");
++    }
++
++    @Test
++    void appendWritesOnlyOnceForSameStatusAndRunnerCapturesSingleSql() {
++        List<String> captured = new ArrayList<>();
++        TdengineTraceWriter w = new TdengineTraceWriter(sql -> {
++            captured.add(sql);
++            return "{\"code\":0}";
++        }, "t49");
++        StatusDecision d = new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1000L);
++        assertTrue(w.append("t49", "EQ1", d));
++        assertFalse(w.append("t49", "EQ1", new StatusDecision("RUNNING", 1, 0,
++                StatusDecision.Source.RULE, 2000L)), "同状态不重写");
++        assertEquals(1, captured.size());
++        assertTrue(w.append("t49", "EQ1", new StatusDecision("FAULT", 3, 0,
++                StatusDecision.Source.RULE, 3000L)), "状态变化追加");
++        assertEquals(2, captured.size());
++        assertTrue(captured.get(1).contains("VALUES (3000, 3.0, 0)"));
++    }
++
++    @Test
++    void restFailurePropagatesTraceWriteExceptionForCallerWarn() {
++        TdengineTraceWriter w = new TdengineTraceWriter(sql -> { throw new Exception("不可达"); }, "t49");
++        StatusDecision d = new StatusDecision("RUNNING", 1, 0, StatusDecision.Source.RULE, 1000L);
++        assertThrows(TdengineTraceWriter.TraceWriteException.class, () -> w.append("t49", "EQ1", d),
++                "失败上抛由 Runtime WARN 吞掉——不阻塞求值");
++    }
++
++    private static int countSemicolons(String s) {
++        int n = 0;
++        for (char c : s.toCharArray()) {
++            if (c == ';') n++;
++        }
++        return n;
++    }
++}

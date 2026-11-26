@@ -1,0 +1,513 @@
+commit 9a4c6efe4ebe0df03230c02f2a520601cf0776cb
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 02:58:11 2026 +0800
+
+    feat(iot): 模板数据项字典校验联动公共校验器——validateForTemplateRef 三态纯查询（TASK-0010）
+    
+    - IotDataDictService 新增 validateForTemplateRef(tenantId, dataCodes)：按 (tenant_id, data_code) 一次 IN 预检，
+      返回每个编码三态 DictCodeStatus（OK/NOT_REGISTERED/DISABLED），纯查询语义不抛异常（4002 映射归 TASK-0011）
+    - DictCodeStatus 枚举含「未登记/已停用」文案常量（数据编码未在字典登记:/数据编码已停用:），供模板保存报错直接复用
+    - tenant_id 显式入参并体现在查询条件（不做会话假设）；deleted 行按未登记口径（@TableLogic 过滤）；
+      fail-closed：null 租户/空编码判 NOT_REGISTERED
+    - 新增单测 17 例（三态/批内混合/单次 IN/显式租户条件/跨租户不可见/文案常量/fail-closed 边界），全量 1260 绿
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/DictCodeStatus.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/DictCodeStatus.java
+new file mode 100644
+index 0000000..008f97a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/DictCodeStatus.java
+@@ -0,0 +1,56 @@
++package net.otlab.admin.module.iot.service;
++
++/**
++ * 数据编码字典核对状态（TASK-0010 模板引用公共校验器）
++ *
++ * <p>校验器纯查询语义的返回三态：只报告核对结论、不抛异常——异常转换与 4002 错误码
++ * 映射由调用方（TASK-0011 模板保存流程）决定，便于单测与多场景复用。
++ * 口径来源 REQ-0003 / FEAT-0003：模板数据项保存时按 (tenant_id, data_code) 校验
++ * 存在且启用，不在字典或已禁用返回校验错误不许落库。
++ *
++ * <ul>
++ * <li>{@link #OK}：已登记且启用，允许引用；</li>
++ * <li>{@link #NOT_REGISTERED}：未登记（租户内查无此码；deleted 行按本口径——
++ * {@code @TableLogic} 自动过滤后等价于从未登记，编码语义不漂移）；</li>
++ * <li>{@link #DISABLED}：已登记但已停用（status=0；行仍在、编码不复用，
++ * 既有引用可解析、新引用被拒）。</li>
++ * </ul>
++ *
++ * <p>报错文案区分「未登记/已停用」（任务正文硬要求）：两份文案前缀常量供调用方
++ * 直接复用（拼上编码即完整文案），格式在本枚举内唯一维护、避免调用方各自硬编码漂移。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public enum DictCodeStatus {
++
++    /** 已登记且启用，允许引用 */
++    OK,
++
++    /** 未登记（租户内查无此码；deleted 行按本口径） */
++    NOT_REGISTERED,
++
++    /** 已登记但已停用（status=0），新引用被拒 */
++    DISABLED;
++
++    /** 未登记文案前缀（完整文案 = 前缀 + 数据编码），供调用方报错直接复用 */
++    public static final String MSG_NOT_REGISTERED = "数据编码未在字典登记: ";
++
++    /** 已停用文案前缀（完整文案 = 前缀 + 数据编码），供调用方报错直接复用 */
++    public static final String MSG_DISABLED = "数据编码已停用: ";
++
++    /**
++     * 按状态拼接完整报错文案。
++     *
++     * @param dataCode 数据编码
++     * @return NOT_REGISTERED → {@code 数据编码未在字典登记: <code>}；
++     *         DISABLED → {@code 数据编码已停用: <code>}；OK → null（无报错文案）
++     */
++    public String messageFor(String dataCode) {
++        return switch (this) {
++            case NOT_REGISTERED -> MSG_NOT_REGISTERED + dataCode;
++            case DISABLED -> MSG_DISABLED + dataCode;
++            case OK -> null;
++        };
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+index d673704..8737b3b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/IotDataDictService.java
+@@ -6,7 +6,9 @@ import net.otlab.admin.module.iot.entity.IotDataDict;
+ import net.otlab.admin.module.iot.entity.dto.DictImportReceipt;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRow;
+ 
++import java.util.Collection;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * 业务数据字典服务接口（TASK-0008）
+@@ -55,4 +57,27 @@ public interface IotDataDictService extends IService<IotDataDict> {
+      * @return 导入回执（成败计数 + 逐行清单，persisted 标记整批是否落库）
+      */
+     DictImportReceipt importDicts(List<DictImportRow> rows);
++
++    /**
++     * 模板引用公共校验器（TASK-0010，FEAT-0004 模板数据项保存调用）：按
++     * (tenant_id, data_code) 批量核对编码是否「已登记且启用」，返回每个编码的三态
++     * {@link DictCodeStatus}（OK / NOT_REGISTERED / DISABLED）。
++     *
++     * <p>纯查询语义：只返回状态、不抛异常——异常转换与 4002 错误码映射由调用方
++     * （TASK-0011 模板保存流程）决定。deleted 行按未登记口径（{@code @TableLogic}
++     * 自动过滤）；已停用行（status=0）判 DISABLED；文案区分见
++     * {@link DictCodeStatus#MSG_NOT_REGISTERED} / {@link DictCodeStatus#MSG_DISABLED}
++     * （或直接用 {@link DictCodeStatus#messageFor(String)} 拼完整文案）。
++     *
++     * <p>批量入口一次 IN 预检（模板一次保存 N 个数据项，不逐个 count）；重复入参
++     * 编码去重。tenant_id 显式入参（校验器不做会话假设，保持组件纯函数风格）并
++     * 体现在查询条件中——iot_ 白名单表运行时插件再注入同值条件，双保险且语义自洽。
++     * fail-closed 边界：tenantId 为 null 或批内 null/空串编码一律判 NOT_REGISTERED
++     * （无法确认登记即拒绝），不抛异常。
++     *
++     * @param tenantId 租户 ID（显式入参，跨租户编码不可见）
++     * @param dataCodes 待核对的数据编码集合（模板数据项选码），可空
++     * @return 每个编码的核对状态；入参为 null/空集合时返回空 Map
++     */
++    Map<String, DictCodeStatus> validateForTemplateRef(Long tenantId, Collection<String> dataCodes);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+index 28bda6c..2875332 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImpl.java
+@@ -10,6 +10,7 @@ import net.otlab.admin.module.iot.entity.dto.DictImportRejectException;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRow;
+ import net.otlab.admin.module.iot.entity.dto.DictImportRowResult;
+ import net.otlab.admin.module.iot.mapper.IotDataDictMapper;
++import net.otlab.admin.module.iot.service.DictCodeStatus;
+ import net.otlab.admin.module.iot.service.IotDataDictService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+@@ -20,8 +21,11 @@ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+@@ -46,6 +50,11 @@ import java.util.regex.Pattern;
+  * 单批上限 5000 行；库内已有判定与单接口同口径（活跃行预检，@TableLogic 过滤已删行、
+  * 租户条件由插件追加）。
+  *
++ * <p>模板引用公共校验器（TASK-0010）：{@link #validateForTemplateRef} 纯查询语义——
++ * 只按 (tenant_id, data_code) 批量返回三态 {@link DictCodeStatus}，不抛异常，异常
++ * 转换与 4002 映射由调用方（TASK-0011 模板保存流程）决定；批量入口一次 IN 预检；
++ * 报错文案区分「未登记/已停用」（{@link DictCodeStatus} 常量）。
++ *
+  * @author dowei
+  * @date 2026-11-21
+  */
+@@ -355,6 +364,65 @@ public class IotDataDictServiceImpl extends ServiceImpl<IotDataDictMapper, IotDa
+         return entity;
+     }
+ 
++    // ---------- 模板引用公共校验器（TASK-0010） ----------
++
++    @Override
++    public Map<String, DictCodeStatus> validateForTemplateRef(Long tenantId, Collection<String> dataCodes) {
++        // 纯查询语义（brief 裁决 2）：只返回状态不抛异常——异常与 4002 映射由调用方
++        // （TASK-0011 模板保存流程）决定。返回 Map 保序（LinkedHashMap），调用方可按
++        // 模板数据项顺序取首个失败项报错。
++        Map<String, DictCodeStatus> result = new LinkedHashMap<>();
++        if (dataCodes == null || dataCodes.isEmpty()) {
++            return result;
++        }
++        // fail-closed 边界：tenantId 为 null 时无法确认登记，一律判未登记且不查库
++        // （校验器不做会话假设——若此处放开条件改为依赖插件注入，则违背纯查询语义，
++        // 且 standalone/异步上下文无会话时会跨租户漏判）；批内 null/空串编码同口径
++        // 直判未登记，不进 IN 条件。
++        if (tenantId == null) {
++            for (String code : dataCodes) {
++                result.put(code, DictCodeStatus.NOT_REGISTERED);
++            }
++            return result;
++        }
++        // 批量入口一次 IN 预检（brief 裁决 1）：模板一次保存 N 个数据项，去重后单查
++        // 回填，不逐个 count。
++        Set<String> codes = new LinkedHashSet<>();
++        for (String code : dataCodes) {
++            if (code == null || code.isEmpty()) {
++                result.put(code, DictCodeStatus.NOT_REGISTERED);
++                continue;
++            }
++            codes.add(code);
++        }
++        if (!codes.isEmpty()) {
++            // 显式 tenant_id 条件进查询（与 0002 旁路方法同款显式条件风格）：校验器不做
++            // 会话假设，跨租户编码不可见由本条件保证；运行时 iot_ 白名单表插件再注入
++            // 同值会话条件，双保险且语义自洽。@TableLogic 自动过滤 deleted 行（按未登记
++            // 口径），status=0 即已停用。
++            LambdaQueryWrapper<IotDataDict> wrapper = new LambdaQueryWrapper<>();
++            wrapper.select(IotDataDict::getDataCode, IotDataDict::getStatus)
++                    .eq(IotDataDict::getTenantId, tenantId)
++                    .in(IotDataDict::getDataCode, codes);
++            Map<String, Integer> statusByCode = new HashMap<>();
++            for (IotDataDict item : this.list(wrapper)) {
++                // uk_tenant_data_code 保证 (tenant_id, data_code) 至多一行；status 理论
++                // 非空（服务层白名单恒写 1），null 防御性兜底按不可用（DISABLED）处理
++                Integer status = item.getStatus();
++                statusByCode.put(item.getDataCode(), status != null ? status : 0);
++            }
++            for (String code : codes) {
++                Integer status = statusByCode.get(code);
++                if (status == null) {
++                    result.put(code, DictCodeStatus.NOT_REGISTERED);
++                } else {
++                    result.put(code, status == 1 ? DictCodeStatus.OK : DictCodeStatus.DISABLED);
++                }
++            }
++        }
++        return result;
++    }
++
+     private BusinessException duplicateDataCode(String dataCode) {
+         return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "数据编码已存在: " + dataCode);
+     }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplValidateForTemplateRefTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplValidateForTemplateRefTest.java
+new file mode 100644
+index 0000000..0e40417
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/IotDataDictServiceImplValidateForTemplateRefTest.java
+@@ -0,0 +1,288 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.entity.IotDataDict;
++import net.otlab.admin.module.iot.mapper.IotDataDictMapper;
++import net.otlab.admin.module.iot.service.DictCodeStatus;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++/**
++ * 业务数据字典「模板引用校验」公共校验器单元测试（TASK-0010）
++ *
++ * <p>校验器纯查询语义（brief 裁决 2）：只按 (tenant_id, data_code) 返回三态
++ * OK / NOT_REGISTERED / DISABLED，不抛异常——异常与 4002 映射由调用方（TASK-0011 模板
++ * 保存流程）决定；批量入口一次 IN 预检（模板一次保存 N 个数据项，不逐个 count）；
++ * 文案常量区分「未登记/已停用」供调用方直接复用。
++ *
++ * <p>测试口径（brief 裁决 4）：空集合返回空；三态各断言；批内混合；deleted 行按
++ * 未登记口径（@TableLogic 运行时自动过滤——单测以「查不到该行」模拟 DB 侧过滤后的
++ * 结果）；跨租户编码不可见以实现为准断言（显式 tenant_id 入参进查询条件）；文案
++ * 常量与三态枚举存在性。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataDictServiceImplValidateForTemplateRefTest {
++
++    @Mock
++    private IotDataDictMapper baseMapper;
++
++    private IotDataDictServiceImpl dictService;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), IotDataDict.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        dictService = new IotDataDictServiceImpl();
++        ReflectionTestUtils.setField(dictService, "baseMapper", baseMapper);
++    }
++
++    /** 模拟查询结果行：只关心 data_code 与 status 两列（select 投影即此两列） */
++    private IotDataDict row(String dataCode, Integer status) {
++        IotDataDict dict = new IotDataDict();
++        dict.setDataCode(dataCode);
++        dict.setStatus(status);
++        return dict;
++    }
++
++    // ---------- 空集合 ----------
++
++    @Test
++    @DisplayName("模板引用校验 - 空集合返回空 Map，不触达数据库")
++    void testValidateForTemplateRef_EmptyCollectionReturnsEmpty() {
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, Collections.emptyList());
++
++        assertNotNull(result);
++        assertTrue(result.isEmpty(), "空集合应返回空 Map（无编码可核对）");
++        verifyNoInteractions(baseMapper);
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - null 集合同样返回空 Map（纯查询语义不抛异常）")
++    void testValidateForTemplateRef_NullCollectionReturnsEmpty() {
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, null);
++
++        assertNotNull(result);
++        assertTrue(result.isEmpty());
++        verifyNoInteractions(baseMapper);
++    }
++
++    // ---------- 三态 ----------
++
++    @Test
++    @DisplayName("模板引用校验 - 启用行（status=1）返回 OK")
++    void testValidateForTemplateRef_EnabledRowIsOk() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ELEC_CONS", 1)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, Collections.singletonList("ELEC_CONS"));
++
++        assertEquals(DictCodeStatus.OK, result.get("ELEC_CONS"));
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 编码不在字典（未登记）返回 NOT_REGISTERED")
++    void testValidateForTemplateRef_MissingCodeIsNotRegistered() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, Collections.singletonList("NO_SUCH_CODE"));
++
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get("NO_SUCH_CODE"));
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 已停用行（status=0）返回 DISABLED")
++    void testValidateForTemplateRef_DisabledRowIsDisabled() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ELEC_CONS", 0)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, Collections.singletonList("ELEC_CONS"));
++
++        assertEquals(DictCodeStatus.DISABLED, result.get("ELEC_CONS"));
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - deleted 行按未登记口径（@TableLogic 运行时自动过滤，查不到即 NOT_REGISTERED）")
++    void testValidateForTemplateRef_DeletedRowIsNotRegistered() {
++        // @TableLogic 使逻辑删行在真实 DB 查询中永不出现——以「查不到该行」模拟过滤后结果：
++        // deleted 行对校验器而言等价于从未登记过（NOT_REGISTERED），编码语义不漂移
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, Collections.singletonList("DELETED_CODE"));
++
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get("DELETED_CODE"),
++                "deleted 行按未登记口径（brief 裁决 1：@TableLogic 自动过滤）");
++    }
++
++    // ---------- 批量入口 ----------
++
++    @Test
++    @DisplayName("模板引用校验 - 批内混合（1 OK + 1 NOT_REGISTERED + 1 DISABLED）且一次 IN 预检不逐个 count")
++    void testValidateForTemplateRef_BatchMixedWithSingleInQuery() {
++        when(baseMapper.selectList(any()))
++                .thenReturn(Arrays.asList(row("ELEC_CONS", 1), row("WATER_CONS", 0)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(
++                1L, Arrays.asList("ELEC_CONS", "GAS_CONS", "WATER_CONS"));
++
++        assertEquals(3, result.size(), "批内每个编码都有核对结果");
++        assertEquals(DictCodeStatus.OK, result.get("ELEC_CONS"));
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get("GAS_CONS"));
++        assertEquals(DictCodeStatus.DISABLED, result.get("WATER_CONS"));
++        // 一次 IN 预检：模板保存 N 个数据项只查一次库，不逐个 count
++        verify(baseMapper, times(1)).selectList(any());
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 批量入口条件为 tenant_id 显式入参 + data_code IN（双保险口径）")
++    void testValidateForTemplateRef_ExplicitTenantConditionAndInClause() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++
++        dictService.validateForTemplateRef(2L, Collections.singletonList("ELEC_CONS"));
++
++        ArgumentCaptor<LambdaQueryWrapper<IotDataDict>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectList(captor.capture());
++        String seg = captor.getValue().getSqlSegment();
++        assertTrue(seg.contains("tenant_id"), "租户隔离必须显式入参并体现在查询条件中（校验器不做会话假设）");
++        assertTrue(seg.contains("data_code"), "应按 data_code 过滤");
++        assertTrue(seg.contains("IN"), "批量入口一次 IN 预检");
++        assertTrue(captor.getValue().getParamNameValuePairs().containsValue(2L),
++                "tenant_id 条件参数值=显式入参（iot_ 白名单表运行时插件再注入同值条件，双保险）");
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 跨租户编码不可见：他租户已登记同码亦按显式租户条件判 NOT_REGISTERED")
++    void testValidateForTemplateRef_CrossTenantCodeNotVisible() {
++        // 显式 tenant_id 条件使 DB 只返回本租户行——模拟该语义：查询结果不含他租户的同码行
++        when(baseMapper.selectList(any())).thenReturn(Collections.emptyList());
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(
++                2L, Collections.singletonList("ELEC_CONS"));
++
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get("ELEC_CONS"),
++                "他租户已登记的编码对本租户不可见（租户内校验口径）");
++    }
++
++    // ---------- 边界（fail-closed） ----------
++
++    @Test
++    @DisplayName("模板引用校验 - 批内 null/空串编码 fail-closed 判 NOT_REGISTERED，不进 IN 条件")
++    void testValidateForTemplateRef_BlankCodeFailsClosed() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ELEC_CONS", 1)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(
++                1L, Arrays.asList("ELEC_CONS", null, ""));
++
++        assertEquals(3, result.size(), "每个入参编码都有核对结果（含空值）");
++        assertEquals(DictCodeStatus.OK, result.get("ELEC_CONS"));
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get(null), "null 编码 fail-closed");
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get(""), "空串编码 fail-closed");
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - tenantId 为 null fail-closed 全判 NOT_REGISTERED 且不查库（不做会话假设）")
++    void testValidateForTemplateRef_NullTenantIdFailsClosed() {
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(
++                null, Collections.singletonList("ELEC_CONS"));
++
++        assertEquals(DictCodeStatus.NOT_REGISTERED, result.get("ELEC_CONS"),
++                "无租户入参无法确认登记，fail-closed 拒绝（纯查询语义不抛异常）");
++        verifyNoInteractions(baseMapper);
++    }
++
++    // ---------- 文案常量与三态枚举 ----------
++
++    @Test
++    @DisplayName("文案常量 - 「未登记/已停用」两份文案存在且逐字与任务正文一致")
++    void testMessageConstants_ExistWithExactText() {
++        assertEquals("数据编码未在字典登记: ", DictCodeStatus.MSG_NOT_REGISTERED,
++                "未登记文案前缀（任务正文硬要求，供 0011 模板保存报错直接复用）");
++        assertEquals("数据编码已停用: ", DictCodeStatus.MSG_DISABLED,
++                "已停用文案前缀（任务正文硬要求）");
++    }
++
++    @Test
++    @DisplayName("文案常量 - messageFor 按状态拼接完整报错文案，OK 无文案")
++    void testMessageFor_ComposesFullMessage() {
++        assertEquals("数据编码未在字典登记: NO_SUCH_CODE", DictCodeStatus.NOT_REGISTERED.messageFor("NO_SUCH_CODE"));
++        assertEquals("数据编码已停用: ELEC_CONS", DictCodeStatus.DISABLED.messageFor("ELEC_CONS"));
++        assertNull(DictCodeStatus.OK.messageFor("ELEC_CONS"), "OK 无报错文案");
++    }
++
++    @Test
++    @DisplayName("三态枚举 - OK/NOT_REGISTERED/DISABLED 三值存在")
++    void testDictCodeStatus_ThreeValuesExist() {
++        assertEquals(3, DictCodeStatus.values().length);
++        assertNotNull(DictCodeStatus.valueOf("OK"));
++        assertNotNull(DictCodeStatus.valueOf("NOT_REGISTERED"));
++        assertNotNull(DictCodeStatus.valueOf("DISABLED"));
++    }
++
++    // ---------- 结果形态 ----------
++
++    @Test
++    @DisplayName("模板引用校验 - 重复入参编码去重后回填同一状态，返回 Map 键与入参一致")
++    void testValidateForTemplateRef_DuplicateInputCodesDeduped() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ELEC_CONS", 1)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(
++                1L, Arrays.asList("ELEC_CONS", "ELEC_CONS"));
++
++        assertEquals(1, result.size(), "重复编码去重（一次 IN 预检口径）");
++        assertEquals(DictCodeStatus.OK, result.get("ELEC_CONS"));
++        verify(baseMapper, times(1)).selectList(any());
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 库行 status 为 null 时 fail-closed 判 DISABLED（不存在可用歧义）")
++    void testValidateForTemplateRef_NullStatusRowFailsClosed() {
++        // DDL status tinyint DEFAULT '1' 且服务层白名单恒写 1，null 理论不可达——防御性兜底按不可用处理
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ODD_CODE", null)));
++
++        Map<String, DictCodeStatus> result = dictService.validateForTemplateRef(1L, List.of("ODD_CODE"));
++
++        assertEquals(DictCodeStatus.DISABLED, result.get("ODD_CODE"));
++    }
++
++    @Test
++    @DisplayName("模板引用校验 - 校验器纯查询语义：三态判定全程不抛异常、不写库")
++    void testValidateForTemplateRef_NeverWrites() {
++        when(baseMapper.selectList(any())).thenReturn(Collections.singletonList(row("ELEC_CONS", 0)));
++
++        dictService.validateForTemplateRef(1L, Arrays.asList("ELEC_CONS", "GAS_CONS"));
++
++        verify(baseMapper, never()).insert(any(IotDataDict.class));
++        verify(baseMapper, never()).updateById(any(IotDataDict.class));
++        verify(baseMapper, never()).deleteById(any());
++        verify(baseMapper, times(1)).selectList(any());
++    }
++}

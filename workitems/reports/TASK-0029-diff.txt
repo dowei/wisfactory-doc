@@ -1,0 +1,3530 @@
+diff --git a/ingest/README.md b/ingest/README.md
+index f856712..71d40f2 100644
+--- a/ingest/README.md
++++ b/ingest/README.md
+@@ -8,18 +8,23 @@
+ 
+ ```
+ ingest/
+-├── cmd/ingestd/       # 服务入口（TASK-0027 接线：mux+httpapi+pipeline+consumer+对账）
++├── cmd/ingestd/       # 服务入口（0027 接线；0029 真执行器/Redis 缓存/事件发射/停机排空接线）
+ ├── internal/
+ │   ├── message/       # 统一消息模型 v1.1.0 §3.2 解析器（信封纪律：空 points 4001、单消息 ≤500）
+ │   ├── quality/       # CONV-02 质量码 0-10 枚举、文本码映射 + 量程二次判定合并规则（TASK-0028）
+ │   ├── snapshot/      # 配置快照 Schema v1.0.1 类型/校验、真客户端（哈希校验）、对账循环、缓存原子替换
+-│   ├── mqttsource/    # MQTT 消费源（§3.2 主题矩阵路由；Port 薄接口隔离 paho，TASK-0027）
+-│   ├── tdengine/      # 超级表契约 v1.0.0 写入侧：kind/表映射、附录 B DDL、INSERT 构造、假执行器
+-│   ├── cache/         # Redis 点位缓存抽象（值形态 v/q/ts，§3.5）+ 内存假实现
++│   ├── mqttsource/    # MQTT 消费源（§3.2 主题矩阵路由；Port 薄接口隔离 paho，TASK-0027；
++│   │                  #  LWT/status 事件化出口 EventStatusSink——ADR-0010，TASK-0029）
++│   ├── tdengine/      # 超级表契约 v1.0.0 写入侧：kind/表映射、附录 B DDL、INSERT 构造、
++│   │                  #  REST 执行器（taosAdapter Basic 认证）+ 最近值查询回源（TASK-0029）
++│   ├── cache/         # Redis 点位缓存（键 iot:pt:{tenant}:{code}、值 v/q/ts §3.5；RESP2 客户端、
++│   │                  #  写穿透/失败不阻塞/未命中回源——TASK-0029）+ 内存假实现（降级形态）
++│   ├── event/         # 新值事件发射侧（Redis Pub/Sub，channel iot:newvalue:{tenant}）+
++│   │                  #  网关状态事件（iot:gwstatus:{tenant}，ADR-0010 LWT——TASK-0029）
+ │   ├── gwtoken/       # 网关令牌链（凭据拉取/TTL 缓存/fail-closed 校验 + gatewayStatus，TASK-0076/0027）
+ │   ├── httpapi/       # HTTP 接入面（/ingest/v1/report、/ingest/v1/auth/mqtt，TASK-0076）
+-│   └── pipeline/      # 内核流水线组装：Consumer→Parser→四步校验→Batcher→Writer→Cache
+-│                      # （幂等 TTL 真实现 0027；量程判定/时间三分裁决/死信统一通道 0028）
++│   └── pipeline/      # 内核流水线组装：Consumer→Parser→四步校验→Batcher→Writer→Cache→Events
++│                      # （幂等 TTL 0027；量程/时间/死信 0028；事件发射/批量缓存/停机排空 Drain 0029）
+ └── go.mod
+ ```
+ 
+@@ -44,6 +49,32 @@ ingest/
+   QoS1 至少一次语义下安全）+ 单 flusher；攒批水位（默认 500，FEAT-0009 口径 100-500）
+   或定时（默认 200ms）触发；攒批缓冲有界，满时丢最旧并计数（ADR-0014 FIFO 口径），
+   写失败整批重排重试且受同上限约束。
++
++## 写库/缓存/事件（TASK-0029）
++
++- 攒批写 TDengine（禁止逐条写）：Writer 按（租户，子表）分组，单条 INSERT 多 VALUES
++  （`INSERT INTO db.child USING db.stable TAGS(...) VALUES ...`——子表首写自动创建，
++  标签取自配置快照含 tenant_id/kind）；真执行器=RESTClient 走 taosAdapter
++  （`INGEST_TDENGINE_BASE_URL/USER/PASSWORD`，Basic 认证，全限定名——9750 教训）；
++  写失败整批重排重试，同一行重排 >3 次转死信计数告警（受攒批缓冲同上限约束）。
++- Redis 点位缓存（键 `iot:pt:{tenant}:{code}`，值 JSON 恰 v/q/ts——§3.5）：真实现
++  RESP2 客户端（零新增第三方依赖）；写穿透（落库成功后更新）；失败不阻塞落库
++  （fail-soft 计 CacheFailures）；未命中回源（读路径懒回源 TDengine 最近值
++  `SELECT ts, value, quality FROM <db>.<child> ORDER BY ts DESC LIMIT 1`，不预热）；
++  选库口径：生产 ingest db0（键前缀与 backend 键空间隔离），测试 db1+；
++  `INGEST_REDIS_ADDR/DB` 配置（未配置降级内存假实现）。
++- 新值事件（发射侧，消费对接归 0040s）：写库成功后经 Redis Pub/Sub 发射
++  channel `iot:newvalue:{tenant}`、payload {tenant,pointCode,ts,value,quality} JSON；
++  发射失败 fail-soft 计 EventFailures。计算引擎按事件驱动触发下游计算/状态判定。
++- ADR-0010 兑现（LWT 离线）：LWT/status 消息照既有分发进 EventStatusSink——
++  只发网关状态事件（channel `iot:gwstatus:{tenant}`，payload {tenant,gateway,graceful,
++  status,ts}），不直写状态 Redis（「按写入方划分」——最终状态由计算引擎按优先级链裁决）。
++- 停机排空（承接 0027 遗留分流①）：SIGTERM → HTTP 排空 → 流水线/消费源停 →
++  `Pipeline.Drain`（INGEST_DRAIN_TIMEOUT 默认 10s）：攒批缓冲内合法数据写完再退；
++  超时兜底强制退出，排空失败 WARN 不阻塞停机。
++- 口径固化（0028 契约留白三项，协调者 2026-11-23 裁决，无代码变更）：①纠偏显式标记
++  形态=结构化 WARN+计数器（不改 CONV-02 码域）；②被拒点重发计数=每次到达都计入对应
++  原因码（拒绝计数=到达次数视角，不去重）；③纠偏计数语义=纠偏动作次数（按点采样 WARN）。
+ - 契约符合性测试以 `Contract` 命名（`go test ./... -run 'Contract' -v`），
+   样例逐字段取自三份冻结契约（CONV-03）。
+ 
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index 1b671ba..1764a30 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -12,7 +12,15 @@
+ //	INGEST_MQTT_USERNAME        broker 账号（空 = 匿名）
+ //	INGEST_MQTT_PASSWORD        broker 口令
+ //	INGEST_MQTT_CLIENT_ID       broker 客户端 ID（空 = ingestd-<pid>）
+-//	INGEST_REDIS_ADDR           Redis 地址（0029 键位预留——本任务不消费）
++//	INGEST_REDIS_ADDR           Redis 地址（TASK-0029：真点位缓存 + 事件发射；空 = 内存缓存降级形态）
++//	INGEST_REDIS_DB             Redis 逻辑库（默认 0——生产 ingest db0，key 前缀 iot:pt: 与
++//	                            backend 键空间天然隔离；测试用 db1+）
++//	INGEST_TDENGINE_BASE_URL    TDengine taosAdapter REST 基址（TASK-0029 真执行器；
++//	                            如 http://192.168.31.145:6041；空 = 记录式假执行器）
++//	INGEST_TDENGINE_USER        REST 账号（默认 root）
++//	INGEST_TDENGINE_PASSWORD    REST 口令（默认 taosdata）
++//	INGEST_DRAIN_TIMEOUT        停机排空预算（TASK-0029 承接 0027 遗留①：SIGTERM 后缓冲
++//	                            内合法数据写完再退；默认 10s，超时兜底强制退出并 WARN）
+ //	INGEST_SNAPSHOT_SCOPE       快照对账范围（"scopeType:scopeId"，如 "1:9111"；空 = 不对账）
+ //	INGEST_SNAPSHOT_TENANT      快照消歧租户编码（可选——跨租户同名 scope）
+ //	INGEST_SNAPSHOT_INTERVAL    对账周期（默认 30s）
+@@ -24,17 +32,24 @@
+ //	                            原始 ts 落库不纠偏）
+ //	INGEST_DEADLETTER_WARN_EVERY 死信告警采样周期（首次 + 每 N 条各告警一次；默认 100）
+ //
+-// 组件口径（决策 3/4/6 + TASK-0028）：幂等=TTL 真实现（单实例形态）；快照=InternalSnapshotClient
+-// 真客户端（哈希校验 + 0073 缓存原子替换）+ Reconciler 拉取对账（config.changed 通知
+-// 本期不消费）；质量判定挂点=RangeQualityJudge 真实现（网关先填 + min/max 量程二次
+-// 判定覆盖写，CONV-02 口径）；死信出口=DeadLetterCounter 统一死信通道（租户隔离计数 +
+-// 采样 WARN + 环形缓冲明细）；纠偏打标=CorrectionTagger（独立计数器 + 采样 WARN；
+-// 不改 CONV-02 码域——枚举冻结）；writer=记录式假执行器（0029 换真写）；
+-// 点位缓存=内存假实现（0029 Redis 化）。
++// 组件口径（决策 3/4/6 + TASK-0028 + TASK-0029）：幂等=TTL 真实现（单实例形态）；
++// 快照=InternalSnapshotClient 真客户端（哈希校验 + 0073 缓存原子替换）+ Reconciler 拉取
++// 对账（config.changed 通知本期不消费）；质量判定挂点=RangeQualityJudge 真实现（网关
++// 先填 + min/max 量程二次判定覆盖写，CONV-02 口径）；死信出口=DeadLetterCounter 统一
++// 死信通道（租户隔离计数 + 采样 WARN + 环形缓冲明细）；纠偏打标=CorrectionTagger
++// （独立计数器 + 采样 WARN；不改 CONV-02 码域——枚举冻结）；
++// writer=TDengine REST 真执行器（INGEST_TDENGINE_BASE_URL 配置时；攒批写——Writer 按
++// 子表分组单条 INSERT 多 VALUES，子表首写经 USING ... TAGS 自动创建；未配置降级为
++// 记录式假执行器）；点位缓存=RedisPointCache 真实现（INGEST_REDIS_ADDR 配置时；键
++// iot:pt:{tenant}:{code}、写穿透、失败不阻塞落库、未命中回源 TDengine 最近值；未配置
++// 降级为内存假实现）；新值事件=Redis Pub/Sub 发射侧（channel iot:newvalue:{tenant}，
++// 写成功后发射——消费对接归 0040s）；网关状态（LWT）=EventStatusSink（ADR-0010 兑现：
++// 只发 iot:gwstatus:{tenant} 事件，不直写状态 Redis）。
+ // 边界注记（ADR-0009 TD-0048）：人工补录/修正走管理面接口，ingest 不提供人工补录入口。
+ //
+ // 优雅停机：SIGTERM/SIGINT → HTTP Server 排空（Shutdown）→ 取消流水线/消费源/对账
+-// 语境 → broker 连接释放 → 退出。
++// 语境 → 攒批缓冲排空（Drain：缓冲内合法数据写完再退，超时兜底强制退出——排空失败
++// WARN 不阻塞退出）→ broker 连接释放 → 退出。
+ package main
+ 
+ import (
+@@ -52,6 +67,7 @@ import (
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/event"
+ 	"net.otlab/ingest/internal/gwtoken"
+ 	"net.otlab/ingest/internal/httpapi"
+ 	"net.otlab/ingest/internal/message"
+@@ -71,7 +87,12 @@ type Config struct {
+ 	MQTTUsername        string
+ 	MQTTPassword        string
+ 	MQTTClientID        string
+-	RedisAddr           string // 0029 键位预留（本任务不消费）
++	RedisAddr           string        // TASK-0029 真点位缓存 + 事件发射（空 = 内存缓存降级）
++	RedisDB             int           // INGEST_REDIS_DB（默认 0——生产 ingest db0；测试 db1+）
++	TDengineBaseURL     string        // TASK-0029 真执行器（空 = 记录式假执行器）
++	TDengineUser        string        // 默认 root
++	TDenginePassword    string        // 默认 taosdata
++	DrainTimeout        time.Duration // INGEST_DRAIN_TIMEOUT（默认 10s——停机排空预算）
+ 	SnapshotScopeType   int
+ 	SnapshotScopeID     int64
+ 	SnapshotTenant      string
+@@ -95,6 +116,10 @@ func loadConfig(getenv func(string) string) Config {
+ 		MQTTPassword:        getenv("INGEST_MQTT_PASSWORD"),
+ 		MQTTClientID:        getenv("INGEST_MQTT_CLIENT_ID"),
+ 		RedisAddr:           getenv("INGEST_REDIS_ADDR"),
++		TDengineBaseURL:     getenv("INGEST_TDENGINE_BASE_URL"),
++		TDengineUser:        tdengine.DefaultRESTUser,
++		TDenginePassword:    tdengine.DefaultRESTPassword,
++		DrainTimeout:        10 * time.Second,
+ 		SnapshotTenant:      getenv("INGEST_SNAPSHOT_TENANT"),
+ 		SnapshotInterval:    30 * time.Second,
+ 		DedupTTL:            time.Hour,
+@@ -136,6 +161,22 @@ func loadConfig(getenv func(string) string) Config {
+ 			cfg.DeadLetterWarnEvery = n
+ 		}
+ 	}
++	if v := getenv("INGEST_REDIS_DB"); v != "" {
++		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
++			cfg.RedisDB = n
++		}
++	}
++	if v := getenv("INGEST_TDENGINE_USER"); v != "" {
++		cfg.TDengineUser = strings.TrimSpace(v)
++	}
++	if v := getenv("INGEST_TDENGINE_PASSWORD"); v != "" {
++		cfg.TDenginePassword = strings.TrimSpace(v)
++	}
++	if v := getenv("INGEST_DRAIN_TIMEOUT"); v != "" {
++		if d, err := time.ParseDuration(v); err == nil && d > 0 {
++			cfg.DrainTimeout = d
++		}
++	}
+ 	for _, entry := range strings.Split(getenv("INGEST_GATEWAY_MAP"), ";") {
+ 		entry = strings.TrimSpace(entry)
+ 		if entry == "" {
+@@ -185,9 +226,38 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 
+ 	batchDedup := pipeline.NewTTLBatchDeduper(0, cfg.DedupTTL) // 幂等真实现（单实例形态）
+ 	pointDedup := pipeline.NewTTLPointDeduper(0, cfg.DedupTTL) // 多实例演进位=Redis 化（0028 定版）
+-	exec := tdengine.NewFakeExecutor(0)                        // 记录式假执行器（0029 换真写）
+-	ptCache := cache.NewMemoryPointCache()                     // 内存假实现（0029 Redis 化）
+-	snapCache := snapshot.NewCache()                           // 0073 原子替换缓存
++
++	// ---- 写库/缓存/事件组件（TASK-0029 真实现接线：env 配置驱动，缺省降级形态）----
++	var exec tdengine.Executor
++	if cfg.TDengineBaseURL != "" {
++		// 真 TDengine 执行器：taosAdapter REST（Basic 认证；攒批写——Writer 按子表分组
++		// 单条 INSERT 多 VALUES，子表首写经 USING ... TAGS 自动创建；写失败整批重排重试）。
++		exec = tdengine.NewRESTClient(tdengine.RESTConfig{
++			Endpoint: cfg.TDengineBaseURL,
++			User:     cfg.TDengineUser,
++			Password: cfg.TDenginePassword,
++		})
++		logger.Printf("ingestd: TDengine REST 执行器已装配 endpoint=%s user=%s", cfg.TDengineBaseURL, cfg.TDengineUser)
++	} else {
++		exec = tdengine.NewFakeExecutor(0) // 记录式假执行器（真执行器未配置的降级形态）
++		logger.Print("ingestd: INGEST_TDENGINE_BASE_URL 未配置——记录式假执行器（写库仅记录不落库）")
++	}
++	var evPub event.Publisher // 新值事件/网关状态事件发射侧（Redis 未配置 = nil 接口，不发射）
++	var ptCache cache.PointCache
++	if cfg.RedisAddr != "" {
++		redisOpts := cache.RedisOptions{Addr: cfg.RedisAddr, DB: cfg.RedisDB}
++		var backfill cache.Backfill // 未命中回源（读-through 懒回源，不预热）
++		if rest, ok := exec.(*tdengine.RESTClient); ok {
++			backfill = cache.BackfillFunc(rest.LatestPointValue)
++		}
++		ptCache = cache.NewRedisPointCache(redisOpts, backfill)
++		evPub = event.NewRedisPublisher(redisOpts)
++		logger.Printf("ingestd: Redis 点位缓存已装配 addr=%s db=%d（键 iot:pt:{tenant}:{code}，写穿透/失败不阻塞落库/未命中回源）+ 新值事件发射侧", cfg.RedisAddr, cfg.RedisDB)
++	} else {
++		ptCache = cache.NewMemoryPointCache() // 内存假实现（Redis 未配置的降级形态）
++		logger.Print("ingestd: INGEST_REDIS_ADDR 未配置——内存点位缓存（回源/事件发射不可用，可选装配面）")
++	}
++	snapCache := snapshot.NewCache() // 0073 原子替换缓存
+ 	deadCounter := pipeline.NewDeadLetterCounter(pipeline.DeadLetterCounterOptions{
+ 		WarnEvery: cfg.DeadLetterWarnEvery, // 统一死信通道：租户隔离计数 + 采样 WARN（brief 裁决 2）
+ 	})
+@@ -203,6 +273,7 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 		TimeTag:   correctionTagger.Tag,
+ 		Writer:    &tdengine.Writer{Ex: exec},
+ 		Cache:     ptCache,
++		Events:    evPub, // nil 安全：不发射（计算引擎消费对接归 0040s）
+ 	}
+ 	pipeCfg := pipeline.Config{
+ 		TSFutureReject: cfg.TSFutureReject, // 时间三分裁决阈值（env 配置化，brief 裁决 3）
+@@ -210,7 +281,13 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	}
+ 	var pipe *pipeline.Pipeline
+ 	if cfg.MQTTBroker != "" {
+-		consumer := mqttsource.NewConsumer(port, mqttsource.Options{})
++		// 状态/LWT 出口（ADR-0010 兑现：Redis 配置时事件化——只发 iot:gwstatus:{tenant}
++		// 事件、不直写状态 Redis；未配置保持 0027 默认计数+日志形态）。
++		var statusSink mqttsource.StatusSink
++		if rp, ok := evPub.(*event.RedisPublisher); ok && rp != nil {
++			statusSink = &mqttsource.EventStatusSink{Pub: rp, Logger: logger}
++		}
++		consumer := mqttsource.NewConsumer(port, mqttsource.Options{StatusSink: statusSink})
+ 		deps.Consumer = consumer
+ 		p, err := pipeline.Assemble(pipeCfg, deps)
+ 		if err != nil {
+@@ -292,7 +369,18 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	if err := srv.Shutdown(shutCtx); err != nil {
+ 		logger.Printf("ingestd: HTTP 排空超时（强制返回）: %v", err)
+ 	}
+-	pcancel()                         // 排空流水线/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
++	pcancel() // 停流水线消费循环/flusher/消费源/对账（MQTT 消费循环退出时释放 broker 连接）
++
++	// 停机排空（TASK-0029 承接 0027 遗留分流①）：攒批缓冲内合法数据写完再退；
++	// 超时兜底强制退出——排空失败 WARN 不阻塞停机（brief 决策 4①）。
++	drainCtx, dcancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)
++	written, remaining := pipe.Drain(drainCtx)
++	dcancel()
++	if remaining > 0 {
++		logger.Printf("ingestd: 排空超时兜底退出（不阻塞停机）：缓冲滞留 %d 行（本次已落库 %d 行）", remaining, written)
++	} else {
++		logger.Printf("ingestd: 停机排空完成（缓冲清零，本次落库 %d 行）", written)
++	}
+ 	time.Sleep(50 * time.Millisecond) // 给消费源 goroutine 一拍退出（连接释放可观测）
+ 	logger.Print("ingestd: 已停机")
+ 	return nil
+diff --git a/ingest/cmd/ingestd/wiring29_test.go b/ingest/cmd/ingestd/wiring29_test.go
+new file mode 100644
+index 0000000..aac0cd3
+--- /dev/null
++++ b/ingest/cmd/ingestd/wiring29_test.go
+@@ -0,0 +1,454 @@
++package main
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// TASK-0029 接线契约测试（brief 决策 1/2/3/4）：真 TDengine REST 执行器 + Redis 点位缓存
++// + 新值事件发射侧 + 停机排空——run() 真装配端到端（假 taosAdapter / 假 Redis / 假 backend）。
++
++// ---- 配置默认值与 env（TASK-0029 新键位）----
++
++func TestIngestdConfigDefaults0029(t *testing.T) {
++	cfg := loadConfig(getenvOf(nil))
++	if cfg.TDengineBaseURL != "" {
++		t.Errorf("TDengineBaseURL = %q, want 空（降级假执行器形态）", cfg.TDengineBaseURL)
++	}
++	if cfg.TDengineUser != "root" || cfg.TDenginePassword != "taosdata" {
++		t.Errorf("TDengine 账号默认 = %s/%s, want root/taosdata", cfg.TDengineUser, cfg.TDenginePassword)
++	}
++	if cfg.RedisDB != 0 {
++		t.Errorf("RedisDB = %d, want 0（生产 ingest db0 口径）", cfg.RedisDB)
++	}
++	if cfg.DrainTimeout != 10*time.Second {
++		t.Errorf("DrainTimeout = %v, want 10s（停机排空预算默认）", cfg.DrainTimeout)
++	}
++}
++
++func TestIngestdConfigFromEnv0029(t *testing.T) {
++	cfg := loadConfig(getenvOf(map[string]string{
++		"INGEST_TDENGINE_BASE_URL": "http://192.168.31.145:6041",
++		"INGEST_TDENGINE_USER":     "svc",
++		"INGEST_TDENGINE_PASSWORD": "pw",
++		"INGEST_REDIS_ADDR":        "127.0.0.1:6379",
++		"INGEST_REDIS_DB":          "3",
++		"INGEST_DRAIN_TIMEOUT":     "2s",
++	}))
++	if cfg.TDengineBaseURL != "http://192.168.31.145:6041" {
++		t.Errorf("TDengineBaseURL = %q", cfg.TDengineBaseURL)
++	}
++	if cfg.TDengineUser != "svc" || cfg.TDenginePassword != "pw" {
++		t.Errorf("TDengine 账号 = %s/%s, want svc/pw", cfg.TDengineUser, cfg.TDenginePassword)
++	}
++	if cfg.RedisAddr != "127.0.0.1:6379" || cfg.RedisDB != 3 {
++		t.Errorf("Redis = %s db=%d, want 127.0.0.1:6379 db=3", cfg.RedisAddr, cfg.RedisDB)
++	}
++	if cfg.DrainTimeout != 2*time.Second {
++		t.Errorf("DrainTimeout = %v, want 2s", cfg.DrainTimeout)
++	}
++}
++
++// ---- 假 taosAdapter（记录 SQL；延迟注入——排空时序控制）----
++
++type fakeTaos29 struct {
++	mu     sync.Mutex
++	sqls   []string
++	sleep  time.Duration
++	status int
++}
++
++func (f *fakeTaos29) handle(w http.ResponseWriter, r *http.Request) {
++	b, _ := io.ReadAll(r.Body)
++	d := func() string {
++		f.mu.Lock()
++		defer f.mu.Unlock()
++		f.sqls = append(f.sqls, string(b))
++		return ""
++	}()
++	_ = d
++	if f.sleep > 0 {
++		time.Sleep(f.sleep)
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "desc": "succ", "affected_rows": 1})
++}
++
++func (f *fakeTaos29) captured() []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return append([]string(nil), f.sqls...)
++}
++
++// ---- 假 Redis（记录命令；SET/PUBLISH 断言）----
++
++type fakeRedis29 struct {
++	addr string
++	ln   net.Listener
++
++	mu       sync.Mutex
++	commands [][]string
++}
++
++func newFakeRedis29(t *testing.T) *fakeRedis29 {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("假 Redis 监听失败: %v", err)
++	}
++	s := &fakeRedis29{addr: ln.Addr().String(), ln: ln}
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go s.handle(conn)
++		}
++	}()
++	t.Cleanup(func() { _ = ln.Close() })
++	return s
++}
++
++func (s *fakeRedis29) handle(conn net.Conn) {
++	defer conn.Close()
++	br := bufio.NewReader(conn)
++	for {
++		args, err := readRESPCmd29(br)
++		if err != nil {
++			return
++		}
++		s.mu.Lock()
++		s.commands = append(s.commands, args)
++		s.mu.Unlock()
++		switch strings.ToUpper(args[0]) {
++		case "AUTH", "SELECT":
++			_, _ = io.WriteString(conn, "+OK\r\n")
++		case "GET":
++			_, _ = io.WriteString(conn, "$-1\r\n")
++		default:
++			_, _ = io.WriteString(conn, ":1\r\n")
++		}
++	}
++}
++
++func (s *fakeRedis29) captured() [][]string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([][]string, len(s.commands))
++	copy(out, s.commands)
++	return out
++}
++
++func readRESPCmd29(br *bufio.Reader) ([]string, error) {
++	line, err := br.ReadString('\n')
++	if err != nil {
++		return nil, err
++	}
++	line = strings.TrimRight(line, "\r\n")
++	if len(line) == 0 || line[0] != '*' {
++		return nil, fmt.Errorf("非法命令行 %q", line)
++	}
++	var n int
++	if _, err := fmt.Sscanf(line[1:], "%d", &n); err != nil {
++		return nil, err
++	}
++	args := make([]string, 0, n)
++	for i := 0; i < n; i++ {
++		hdr, err := br.ReadString('\n')
++		if err != nil {
++			return nil, err
++		}
++		hdr = strings.TrimRight(hdr, "\r\n")
++		var l int
++		if _, err := fmt.Sscanf(hdr[1:], "%d", &l); err != nil {
++			return nil, err
++		}
++		buf := make([]byte, l+2)
++		if _, err := io.ReadFull(br, buf); err != nil {
++			return nil, err
++		}
++		args = append(args, string(buf[:l]))
++	}
++	return args, nil
++}
++
++func filterHandshake29(cmds [][]string) [][]string {
++	out := make([][]string, 0, len(cmds))
++	for _, cmd := range cmds {
++		switch strings.ToUpper(cmd[0]) {
++		case "AUTH", "SELECT":
++		default:
++			out = append(out, cmd)
++		}
++	}
++	return out
++}
++
++// ---- 端到端接线：report → 真执行器 INSERT + 缓存 SET + 事件 PUBLISH → 停机排空 ----
++
++func TestIngestdRealExecutorCacheEventsWiring(t *testing.T) {
++	taos := &fakeTaos29{}
++	taosSrv := httptest.NewServer(http.HandlerFunc(taos.handle))
++	t.Cleanup(taosSrv.Close)
++	redis := newFakeRedis29(t)
++	backend := wireFakeBackend(t)
++
++	cfg := Config{
++		HTTPAddr:          "127.0.0.1:0",
++		BackendBaseURL:    backend.URL,
++		InternalToken:     "tok-wire29",
++		GatewayMap:        map[string]gwtoken.ResolvedChannel{"GW_WIRE": {ChannelID: 7, TenantCode: "group_a"}},
++		SnapshotScopeType: 1,
++		SnapshotScopeID:   88,
++		SnapshotInterval:  time.Hour,
++		DedupTTL:          time.Hour,
++		TDengineBaseURL:   taosSrv.URL,
++		TDengineUser:      "root",
++		TDenginePassword:  "taosdata",
++		RedisAddr:         redis.addr,
++		RedisDB:           7,
++		DrainTimeout:      5 * time.Second,
++		bound:             make(chan string, 1),
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- run(ctx, cfg, nopPort{}) }()
++
++	var base string
++	select {
++	case addr := <-cfg.bound:
++		base = "http://" + addr
++	case err := <-done:
++		t.Fatalf("run 提前退出: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("绑定地址未上报")
++	}
++
++	// 探针：等快照装载（受理即装载完成）。
++	var probe map[string]any
++	deadline := time.Now().Add(3 * time.Second)
++	for i := 0; ; i++ {
++		probe = wireReport(t, base, fmt.Sprintf("WIRE29-PROBE-%d", i),
++			fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":1,"quality":0}`, time.Now().UnixMilli()-2000))
++		if num(probe, "accepted") == 1 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("快照未装载（探针超时）: %v", probe)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	// 合法点上报后立即取消 ctx（未到 200ms flush 定时）→ run 走停机排空路径落库。
++	out := wireReport(t, base, "WIRE29-B1",
++		fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":42.5,"quality":0}`, time.Now().UnixMilli()-1000),
++		fmt.Sprintf(`{"pointCode":"W_M02","ts":%d,"value":7,"quality":0}`, time.Now().UnixMilli()-1000))
++	if num(out, "accepted") != 2 {
++		t.Fatalf("report = %v, want accepted=2", out)
++	}
++	cancel()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("run error: %v", err)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("优雅停机（含排空）超时")
++	}
++
++	// 断言 1：TDengine 攒批形态 INSERT（全限定 USING ... TAGS ... VALUES 多行）。
++	sqls := taos.captured()
++	inserts := make([]string, 0, len(sqls))
++	for _, s := range sqls {
++		if strings.HasPrefix(s, "INSERT INTO") {
++			inserts = append(inserts, s)
++		}
++	}
++	if len(inserts) == 0 {
++		t.Fatalf("无 INSERT 到达 taosAdapter（sqls=%v）", sqls)
++	}
++	joined := strings.Join(inserts, "\n")
++	for _, want := range []string{
++		"INSERT INTO iot_group_5fa.W_5fM01 USING iot_group_5fa.st_point_num TAGS (1, 'W_M01', 'INSTANT', '', 3) VALUES (",
++		"INSERT INTO iot_group_5fa.W_5fM02 USING iot_group_5fa.st_point_num TAGS (1, 'W_M02', 'INSTANT', '', 3) VALUES (",
++	} {
++		if !strings.Contains(joined, want) {
++			t.Errorf("INSERT 形态缺失 %q\nreceived:\n%s", want, joined)
++		}
++	}
++	for _, s := range inserts {
++		if strings.Count(s, "VALUES (") != strings.Count(s, ") VALUES (")+1 && strings.Count(s, "(") < 2 {
++			t.Errorf("INSERT 非多 VALUES 攒批形态: %s", s)
++		}
++	}
++
++	// 断言 2：Redis 点位缓存键在位（iot:pt:{tenant}:{code} + v/q/ts JSON）。
++	cmds := filterHandshake29(redis.captured())
++	var setKeys []string
++	for _, cmd := range cmds {
++		if strings.EqualFold(cmd[0], "SET") && strings.HasPrefix(cmd[1], "iot:pt:group_a:") {
++			setKeys = append(setKeys, cmd[1])
++			var m map[string]any
++			if err := json.Unmarshal([]byte(cmd[2]), &m); err != nil {
++				t.Errorf("SET 值非 JSON: %v", err)
++			} else if len(m) != 3 {
++				t.Errorf("SET 值键数 = %d, want 3（v/q/ts）", len(m))
++			}
++		}
++	}
++	if len(setKeys) < 2 {
++		t.Errorf("缓存 SET 键 = %v, want 覆盖 iot:pt:group_a:W_M01 与 W_M02", setKeys)
++	}
++
++	// 断言 3：新值事件发射（PUBLISH iot:newvalue:{tenant} payload 五键）。
++	var pubOK int
++	for _, cmd := range cmds {
++		if strings.EqualFold(cmd[0], "PUBLISH") && strings.HasPrefix(cmd[1], "iot:newvalue:group_a") {
++			pubOK++
++			var m map[string]any
++			if err := json.Unmarshal([]byte(cmd[2]), &m); err != nil {
++				t.Errorf("事件 payload 非 JSON: %v", err)
++			} else if len(m) != 5 {
++				t.Errorf("事件 payload 键数 = %d (%v), want 5", len(m), m)
++			}
++		}
++	}
++	if pubOK < 2 {
++		t.Errorf("新值事件 PUBLISH = %d 条, want ≥2（每写入行一条）", pubOK)
++	}
++}
++
++// ---- 真 Redis db15 集成（env 门控；冒烟口径补充）----
++
++func TestIngestdWiringLiveRedisOptional(t *testing.T) {
++	addr := os.Getenv("INGEST_REDIS_TEST_ADDR")
++	if addr == "" {
++		t.Skip("INGEST_REDIS_TEST_ADDR 未设置——跳过")
++	}
++	taos := &fakeTaos29{}
++	taosSrv := httptest.NewServer(http.HandlerFunc(taos.handle))
++	t.Cleanup(taosSrv.Close)
++	backend := wireFakeBackend(t)
++	// 测后清理（Go 道纪律：测试不污染业务键空间）。
++	const cleanupKey = "iot:pt:group_a:W_M01"
++	t.Cleanup(func() {
++		if c, err := net.DialTimeout("tcp", addr, 3*time.Second); err == nil {
++			cmd := fmt.Sprintf("*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n*3\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(cleanupKey), cleanupKey)
++			_, _ = c.Write([]byte(cmd))
++			_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
++			buf := make([]byte, 256)
++			_, _ = c.Read(buf)
++			_ = c.Close()
++		}
++	})
++
++	cfg := Config{
++		HTTPAddr:          "127.0.0.1:0",
++		BackendBaseURL:    backend.URL,
++		InternalToken:     "tok-wire29",
++		GatewayMap:        map[string]gwtoken.ResolvedChannel{"GW_WIRE": {ChannelID: 7, TenantCode: "group_a"}},
++		SnapshotScopeType: 1,
++		SnapshotScopeID:   88,
++		SnapshotInterval:  time.Hour,
++		DedupTTL:          time.Hour,
++		TDengineBaseURL:   taosSrv.URL,
++		RedisAddr:         addr,
++		RedisDB:           15,
++		DrainTimeout:      5 * time.Second,
++		bound:             make(chan string, 1),
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- run(ctx, cfg, nopPort{}) }()
++	var base string
++	select {
++	case a := <-cfg.bound:
++		base = "http://" + a
++	case err := <-done:
++		t.Fatalf("run 提前退出: %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("绑定地址未上报")
++	}
++	deadline := time.Now().Add(3 * time.Second)
++	var probe map[string]any
++	for i := 0; ; i++ {
++		probe = wireReport(t, base, fmt.Sprintf("WIRE29L-PROBE-%d", i),
++			fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":1,"quality":0}`, time.Now().UnixMilli()-2000))
++		if num(probe, "accepted") == 1 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("快照未装载: %v", probe)
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	out := wireReport(t, base, "WIRE29L-B1",
++		fmt.Sprintf(`{"pointCode":"W_M01","ts":%d,"value":42.5,"quality":0}`, time.Now().UnixMilli()-1000))
++	if num(out, "accepted") != 1 {
++		t.Fatalf("report = %v, want accepted=1", out)
++	}
++	cancel()
++	if err := <-done; err != nil {
++		t.Fatalf("run error: %v", err)
++	}
++	// 真 Redis 侧核对：键在位（v/q/ts）。
++	rc := newLiveChecker(t, addr)
++	defer rc.close()
++	v, ok := rc.get("iot:pt:group_a:W_M01")
++	if !ok {
++		t.Fatal("真 Redis 中键 iot:pt:group_a:W_M01 不在位")
++	}
++	var m map[string]any
++	if err := json.Unmarshal([]byte(v), &m); err != nil || len(m) != 3 {
++		t.Errorf("缓存值 = %q, want v/q/ts 三键 JSON", v)
++	}
++}
++
++// liveChecker 真 Redis 读核（极简 GET 直连）。
++type liveChecker struct{ c net.Conn }
++
++func newLiveChecker(t *testing.T, addr string) *liveChecker {
++	t.Helper()
++	c, err := net.DialTimeout("tcp", addr, 3*time.Second)
++	if err != nil {
++		t.Fatalf("连真 Redis 失败: %v", err)
++	}
++	_, _ = c.Write([]byte("*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n"))
++	br := bufio.NewReader(c)
++	_, _ = br.ReadString('\n') // +OK
++	return &liveChecker{c: c}
++}
++
++func (l *liveChecker) get(key string) (string, bool) {
++	_, _ = l.c.Write([]byte(fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)))
++	br := bufio.NewReader(l.c)
++	hdr, err := br.ReadString('\n')
++	if err != nil {
++		return "", false
++	}
++	hdr = strings.TrimRight(hdr, "\r\n")
++	if hdr == "$-1" {
++		return "", false
++	}
++	var n int
++	_, _ = fmt.Sscanf(hdr[1:], "%d", &n)
++	buf := make([]byte, n+2)
++	_, _ = io.ReadFull(br, buf)
++	return string(buf[:n]), true
++}
++
++func (l *liveChecker) close() { _ = l.c.Close() }
+diff --git a/ingest/internal/cache/cache.go b/ingest/internal/cache/cache.go
+index 5831dd6..dcf9111 100644
+--- a/ingest/internal/cache/cache.go
++++ b/ingest/internal/cache/cache.go
+@@ -3,11 +3,11 @@
+ // 值形态契约：统一消息模型 v1.1.0 §3.5「GET /openapi/v1/items/realtime —— 优先读 Redis，
+ // 返回 v / q / ts」，缓存 JSON 恰为 {"v","q","ts"} 三键。
+ //
+-// 留白与口径：
+-//   - 缓存键 scheme 上游未定版，本实现拟定 iot:{tenant}:point:{pointCode}（TASK-0029 接线
+-//     真 Redis 时如需调整只改 Key 函数与对应读取方）；
+-//   - 本包只提供抽象与内存假实现；真 Redis 客户端实现归 TASK-0029，接口零改动替换。
+-//     测试环境不连真实 Redis（后端占用 db0，隔离口径见 TASK-0073 报告）。
++// 留白与口径（TASK-0029 定版）：
++//   - 缓存键 scheme 定版 iot:pt:{tenant}:{pointCode}（brief 决策 2，§3.5 口径）；
++//   - 真 Redis 客户端与读-through 见 redis.go（TASK-0029）：生产 ingest 用 db0
++//     （key 前缀 iot:pt: 与 backend 键空间天然隔离），测试用 db1+（Go 道纪律）；
++//   - 内存假实现保留（Redis 未配置时的降级形态 + 单测载体）。
+ package cache
+ 
+ import (
+@@ -36,9 +36,9 @@ type PointCache interface {
+ 	GetPoint(ctx context.Context, tenant, pointCode string) (Value, error)
+ }
+ 
+-// Key 点位缓存键（拟定 scheme：iot:{tenant}:point:{pointCode}；见包注释留白声明）。
++// Key 点位缓存键（TASK-0029 定版：iot:pt:{tenant}:{pointCode}，§3.5 口径——brief 决策 2）。
+ func Key(tenant, pointCode string) string {
+-	return fmt.Sprintf("iot:%s:point:%s", tenant, pointCode)
++	return fmt.Sprintf("iot:pt:%s:%s", tenant, pointCode)
+ }
+ 
+ // MemoryPointCache 内存假实现：内部以 JSON 字节存储（与真 Redis 的字符串语义一致），
+diff --git a/ingest/internal/cache/redis.go b/ingest/internal/cache/redis.go
+new file mode 100644
+index 0000000..19576b5
+--- /dev/null
++++ b/ingest/internal/cache/redis.go
+@@ -0,0 +1,393 @@
++// Redis 点位缓存真实现（TASK-0029 决策 2）：极简 RESP2 客户端（纯标准库，零新增第三方
++// 依赖——0073/0028 依赖纪律延续）+ 读-through 点位缓存。
++//
++// 契约口径（brief 决策 2）：
++//   - 键 iot:pt:{tenant}:{code}（§3.5；生产 ingest 用 db0——key 前缀 iot:pt: 与 backend
++//     键空间天然隔离；测试用 db1+，见 redis_live_test.go）；
++//   - 值 JSON 恰 v/q/ts 三键（§3.5 realtime 返回口径）；
++//   - 写穿透（落库成功后更新缓存——由流水线 flush 成功后调用，本包只保证 SET 命令形态）；
++//   - 缓存失败不阻塞落库（fail-soft：错误上返，流水线计 CacheFailures 继续——缓存是
++//     加速面不是权威面，权威值在 TDengine）；
++//   - 未命中回源：读路径懒回源（Backfill = TDengine 最近值 SELECT ... ORDER BY ts DESC
++//     LIMIT 1，由 ingestd 装配注入），命中后写穿缓存，不预热。
++//
++// 实现口径：单连接互斥串行（点位缓存写频度受攒批节流，单连接足够；并发面由流水线
++// 单 flusher 保证）+ 失败即断连、下次调用重连自愈；SET 幂等覆盖写——重试安全。
++package cache
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net"
++	"strconv"
++	"sync"
++	"time"
++)
++
++// RedisOptions Redis 连接配置。
++type RedisOptions struct {
++	// Addr host:port（INGEST_REDIS_ADDR）。
++	Addr string
++	// Password 空 = 匿名（无 AUTH）。
++	Password string
++	// DB 逻辑库编号（SELECT db）。生产 ingest db0；测试 db1+（Go 道纪律）。
++	DB int
++	// DialTimeout 建连超时；<=0 取 3s。
++	DialTimeout time.Duration
++	// CmdTimeout 单命令超时；<=0 取 3s。
++	CmdTimeout time.Duration
++}
++
++const (
++	defaultRedisDialTimeout = 3 * time.Second
++	defaultRedisCmdTimeout  = 3 * time.Second
++)
++
++// RedisClient 极简 RESP2 客户端（string 命令面：SET/GET/PUBLISH/PING/AUTH/SELECT）。
++// 与真 Redis 的 RESP2 协议兼容（RESP3 服务器对 RESP2 客户端保持兼容）。
++type RedisClient struct {
++	opts RedisOptions
++
++	mu   sync.Mutex
++	conn net.Conn
++	br   *bufio.Reader
++}
++
++// NewRedisClient 构造客户端（惰性建连：首次命令时拨号 + AUTH + SELECT）。
++func NewRedisClient(opts RedisOptions) *RedisClient {
++	if opts.DialTimeout <= 0 {
++		opts.DialTimeout = defaultRedisDialTimeout
++	}
++	if opts.CmdTimeout <= 0 {
++		opts.CmdTimeout = defaultRedisCmdTimeout
++	}
++	return &RedisClient{opts: opts}
++}
++
++// Close 关闭底层连接（幂等）。
++func (c *RedisClient) Close() error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.conn != nil {
++		err := c.conn.Close()
++		c.conn = nil
++		c.br = nil
++		return err
++	}
++	return nil
++}
++
++// Ping 健康探测（PING → PONG）。
++func (c *RedisClient) Ping(ctx context.Context) error {
++	_, err := c.Do(ctx, "PING")
++	return err
++}
++
++// Do 执行单条命令（互斥串行；连接故障时断连、下次调用重连自愈）。
++// 返回值形态：简单串 string / 整数 int64 / bulk []byte（nil=缺失）/ 数组 []any。
++func (c *RedisClient) Do(ctx context.Context, args ...string) (any, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if err := c.ensureConnLocked(ctx); err != nil {
++		return nil, err
++	}
++	reply, err := c.execLocked(ctx, [][]string{args})
++	if err != nil {
++		c.dropConnLocked()
++		return nil, err
++	}
++	if len(reply) == 1 {
++		return reply[0], nil
++	}
++	return nil, errors.New("cache: redis 响应数不符")
++}
++
++// Pipelined 管线化执行一批命令（一次写入、逐条读回——批量 SET/PUBLISH 的队头约束
++// 批量化落点，0027 遗留 ②）。任一命令失败即断连并返回错误（SET 幂等覆盖写，重试安全）。
++func (c *RedisClient) Pipelined(ctx context.Context, cmds [][]string) ([]any, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if err := c.ensureConnLocked(ctx); err != nil {
++		return nil, err
++	}
++	reply, err := c.execLocked(ctx, cmds)
++	if err != nil {
++		c.dropConnLocked()
++		return nil, err
++	}
++	return reply, nil
++}
++
++// ensureConnLocked 惰性建连 +（可选）AUTH + SELECT（连接建立序列）。
++func (c *RedisClient) ensureConnLocked(ctx context.Context) error {
++	if c.conn != nil {
++		return nil
++	}
++	d := c.opts.DialTimeout
++	if dl, ok := ctx.Deadline(); ok {
++		if remain := time.Until(dl); remain < d {
++			d = remain
++		}
++	}
++	conn, err := net.DialTimeout("tcp", c.opts.Addr, d)
++	if err != nil {
++		return fmt.Errorf("cache: redis 连接失败 %s: %w", c.opts.Addr, err)
++	}
++	c.conn = conn
++	c.br = bufio.NewReader(conn)
++	handshake := make([][]string, 0, 2)
++	if c.opts.Password != "" {
++		handshake = append(handshake, []string{"AUTH", c.opts.Password})
++	}
++	handshake = append(handshake, []string{"SELECT", strconv.Itoa(c.opts.DB)})
++	if _, err := c.execLocked(ctx, handshake); err != nil {
++		c.dropConnLocked()
++		return fmt.Errorf("cache: redis 建连握手失败: %w", err)
++	}
++	return nil
++}
++
++// execLocked 写入命令（管线：一次写全部）并逐条读回。失败时断连（下次重连自愈）。
++func (c *RedisClient) execLocked(ctx context.Context, cmds [][]string) ([]any, error) {
++	var buf []byte
++	for _, args := range cmds {
++		buf = appendRESPCommand(buf, args)
++	}
++	if dl, ok := ctx.Deadline(); ok {
++		_ = c.conn.SetDeadline(dl)
++	} else {
++		_ = c.conn.SetDeadline(time.Now().Add(c.opts.CmdTimeout))
++	}
++	if _, err := c.conn.Write(buf); err != nil {
++		return nil, fmt.Errorf("cache: redis 写命令失败: %w", err)
++	}
++	replies := make([]any, 0, len(cmds))
++	for range cmds {
++		r, err := readRESPReply(c.br)
++		if err != nil {
++			return nil, fmt.Errorf("cache: redis 读响应失败: %w", err)
++		}
++		if e, ok := r.(redisError); ok {
++			return nil, fmt.Errorf("cache: redis 错误回执: %s", string(e))
++		}
++		replies = append(replies, r)
++	}
++	return replies, nil
++}
++
++// dropConnLocked 断连（下次调用重连自愈）。
++func (c *RedisClient) dropConnLocked() {
++	if c.conn != nil {
++		_ = c.conn.Close()
++	}
++	c.conn = nil
++	c.br = nil
++}
++
++// redisError RESP2 错误回执（-ERR ...）。
++type redisError string
++
++// appendRESPCommand 编码一条 RESP2 命令数组。
++func appendRESPCommand(buf []byte, args []string) []byte {
++	buf = append(buf, '*')
++	buf = append(buf, strconv.Itoa(len(args))...)
++	buf = append(buf, '\r', '\n')
++	for _, a := range args {
++		buf = append(buf, '$')
++		buf = append(buf, strconv.Itoa(len(a))...)
++		buf = append(buf, '\r', '\n')
++		buf = append(buf, a...)
++		buf = append(buf, '\r', '\n')
++	}
++	return buf
++}
++
++// readRESPReply 读取一条 RESP2 回复。
++func readRESPReply(br *bufio.Reader) (any, error) {
++	line, err := readReplyLine(br)
++	if err != nil {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, errors.New("cache: redis 空回复行")
++	}
++	switch line[0] {
++	case '+': // 简单串
++		return string(line[1:]), nil
++	case '-': // 错误
++		return redisError(string(line[1:])), nil
++	case ':': // 整数
++		n, err := strconv.ParseInt(string(line[1:]), 10, 64)
++		if err != nil {
++			return nil, fmt.Errorf("cache: redis 整数回执非法 %q: %w", line, err)
++		}
++		return n, nil
++	case '$': // bulk string（$-1 = nil 缺失）
++		n, err := strconv.Atoi(string(line[1:]))
++		if err != nil || n < -1 {
++			return nil, fmt.Errorf("cache: redis bulk 长度非法 %q", line)
++		}
++		if n == -1 {
++			return nil, nil
++		}
++		body := make([]byte, n+2)
++		if _, err := ioReadFull(br, body); err != nil {
++			return nil, err
++		}
++		return body[:n], nil
++	case '*': // 数组
++		n, err := strconv.Atoi(string(line[1:]))
++		if err != nil || n < -1 {
++			return nil, fmt.Errorf("cache: redis 数组长度非法 %q", line)
++		}
++		out := make([]any, 0, max(n, 0))
++		for i := 0; i < n; i++ {
++			r, err := readRESPReply(br)
++			if err != nil {
++				return nil, err
++			}
++			out = append(out, r)
++		}
++		return out, nil
++	default:
++		return nil, fmt.Errorf("cache: redis 回复类型未知 %q", line)
++	}
++}
++
++func readReplyLine(br *bufio.Reader) ([]byte, error) {
++	line, err := br.ReadString('\n')
++	if err != nil {
++		return nil, fmt.Errorf("cache: redis 读行失败: %w", err)
++	}
++	// 去掉 \r\n（容忍只有 \n 的非规范服务端）。
++	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
++		line = line[:len(line)-1]
++	}
++	return []byte(line), nil
++}
++
++func ioReadFull(br *bufio.Reader, buf []byte) (int, error) {
++	total := 0
++	for total < len(buf) {
++		n, err := br.Read(buf[total:])
++		total += n
++		if err != nil {
++			return total, fmt.Errorf("cache: redis 读体失败: %w", err)
++		}
++	}
++	return total, nil
++}
++
++// ---- RedisPointCache（PointCache 真实现，零改动替换内存假实现）----
++
++// PointSet 批量写的单点条目（同租户）。
++type PointSet struct {
++	PointCode string
++	Value     Value
++}
++
++// BatchPointSetter 可选批量写接口（RESP 管线一次往返写整批）。流水线按租户分组调用；
++// 未实现该接口的缓存实现退回逐点 SetPoint（接口零改动替换原则——可选能力面）。
++type BatchPointSetter interface {
++	// SetPoints 同租户一批点位覆盖写（管线化）。任一条失败返回错误（调用方 fail-soft）。
++	SetPoints(ctx context.Context, tenant string, items []PointSet) error
++}
++
++// Backfill 未命中回源源（读-through 懒回源；ingestd 装配注入 TDengine 最近值查询）。
++type Backfill interface {
++	// LatestPointValue 查点位最近落库值；found=false 表示源无数据。
++	LatestPointValue(ctx context.Context, tenant, pointCode string) (Value, bool, error)
++}
++
++// BackfillFunc 函数适配器。
++type BackfillFunc func(ctx context.Context, tenant, pointCode string) (Value, bool, error)
++
++// LatestPointValue 实现 Backfill。
++func (f BackfillFunc) LatestPointValue(ctx context.Context, tenant, pointCode string) (Value, bool, error) {
++	return f(ctx, tenant, pointCode)
++}
++
++// RedisPointCache Redis 点位缓存真实现：SET/GET JSON（v/q/ts 三键）+ 未命中读-through。
++type RedisPointCache struct {
++	rc  *RedisClient
++	src Backfill // 可选：nil → 未命中直接 ErrCacheMiss
++}
++
++// NewRedisPointCache 构造（src 可 nil——不回源）。
++func NewRedisPointCache(opts RedisOptions, src Backfill) *RedisPointCache {
++	return &RedisPointCache{rc: NewRedisClient(opts), src: src}
++}
++
++// SetPoint 覆盖写入（SET iot:pt:{tenant}:{code} {"v","q","ts"}）。错误上返——
++// 落库成功后的缓存失败不阻塞（fail-soft 归流水线计数）。
++func (c *RedisPointCache) SetPoint(ctx context.Context, tenant, pointCode string, v Value) error {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return fmt.Errorf("cache: 编码点位值失败: %w", err)
++	}
++	_, err = c.rc.Do(ctx, "SET", Key(tenant, pointCode), string(b))
++	return err
++}
++
++// GetPoint 读取并解码；未命中回源（读-through：源命中 → SET 写穿 → 返回）；
++// 源无数据或无源 → ErrCacheMiss。读路径错误上返（不静默给零值）。
++func (c *RedisPointCache) GetPoint(ctx context.Context, tenant, pointCode string) (Value, error) {
++	reply, err := c.rc.Do(ctx, "GET", Key(tenant, pointCode))
++	if err != nil {
++		return Value{}, err
++	}
++	b, ok := reply.([]byte)
++	if !ok || b == nil {
++		return c.backfill(ctx, tenant, pointCode)
++	}
++	var v Value
++	if err := json.Unmarshal(b, &v); err != nil {
++		return Value{}, fmt.Errorf("cache: 解码点位值失败: %w", err)
++	}
++	return v, nil
++}
++
++// SetPoints 实现 BatchPointSetter：RESP 管线一次往返写整批（同租户）。
++func (c *RedisPointCache) SetPoints(ctx context.Context, tenant string, items []PointSet) error {
++	if len(items) == 0 {
++		return nil
++	}
++	cmds := make([][]string, 0, len(items))
++	for _, it := range items {
++		b, err := json.Marshal(it.Value)
++		if err != nil {
++			return fmt.Errorf("cache: 编码点位值失败: %w", err)
++		}
++		cmds = append(cmds, []string{"SET", Key(tenant, it.PointCode), string(b)})
++	}
++	_, err := c.rc.Pipelined(ctx, cmds)
++	return err
++}
++
++// Delete 清理键（测试/运维用；lint：live 集成测试测后清理）。
++func (c *RedisPointCache) Delete(ctx context.Context, tenant, pointCode string) error {
++	_, err := c.rc.Do(ctx, "DEL", Key(tenant, pointCode))
++	return err
++}
++
++// backfill 未命中回源：源命中 → 写穿缓存 → 返回；源无数据/无源 → ErrCacheMiss。
++func (c *RedisPointCache) backfill(ctx context.Context, tenant, pointCode string) (Value, error) {
++	if c.src == nil {
++		return Value{}, ErrCacheMiss
++	}
++	v, found, err := c.src.LatestPointValue(ctx, tenant, pointCode)
++	if err != nil {
++		return Value{}, fmt.Errorf("cache: 回源失败: %w", err)
++	}
++	if !found {
++		return Value{}, ErrCacheMiss
++	}
++	if err := c.SetPoint(ctx, tenant, pointCode, v); err != nil {
++		// 回源写穿失败：值已到手，仍返回值（读路径优先服务读方；缓存下次再补）。
++		return v, nil
++	}
++	return v, nil
++}
+diff --git a/ingest/internal/cache/redis_backfill_live_test.go b/ingest/internal/cache/redis_backfill_live_test.go
+new file mode 100644
+index 0000000..edce1f7
+--- /dev/null
++++ b/ingest/internal/cache/redis_backfill_live_test.go
+@@ -0,0 +1,87 @@
++package cache_test
++
++import (
++	"context"
++	"os"
++	"strconv"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// 真 Redis + 真 TDengine 未命中回源集成（TASK-0029 live 冒烟口径，env 门控——CI/无环境跳过）。
++// 门控：INGEST_REDIS_TEST_ADDR + INGEST_LIVE_TDENGINE_URL 同时设置。
++// 前置：冒烟已向真库写入点位（iot_verify29.V29_5fNUM_5f01，scratch 库测后即清——
++// 本测试仅在冒烟窗口内可跑；键空间 db15，测后清理）。
++// lenRows 查询结果行数（skip 消息用）。
++func lenRows(r *tdengine.QueryResult) int {
++	if r == nil {
++		return 0
++	}
++	return len(r.Rows)
++}
++
++func TestLiveRedisPointCacheMissBackfillFromTDengine(t *testing.T) {
++	redisAddr := os.Getenv("INGEST_REDIS_TEST_ADDR")
++	taosURL := os.Getenv("INGEST_LIVE_TDENGINE_URL")
++	if redisAddr == "" || taosURL == "" {
++		t.Skip("INGEST_REDIS_TEST_ADDR / INGEST_LIVE_TDENGINE_URL 未同时设置——跳过")
++	}
++	rest := tdengine.NewRESTClient(tdengine.RESTConfig{Endpoint: taosURL, User: "root", Password: "taosdata"})
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	const tenant, code = "verify29", "V29_NUM_01"
++
++	// 真库侧独立读证（回源期望值的基准）；scratch 库已清理（冒烟窗口外）→ 跳过不判 FAIL。
++	res, err := rest.Query(ctx, "SELECT ts, value, quality FROM iot_verify29.V29_5fNUM_5f01 ORDER BY ts DESC LIMIT 1")
++	if err != nil || len(res.Rows) == 0 {
++		t.Skipf("冒烟 scratch 数据不在位（err=%v rows=%d）——窗口外跳过（测后清理证明口径）", err, lenRows(res))
++	}
++	row := res.Rows[0]
++	wantV, err := strconv.ParseFloat(row[1], 64)
++	if err != nil {
++		t.Fatalf("真库 value 解析失败: %v", err)
++	}
++	wantQ, err := strconv.Atoi(row[2])
++	if err != nil {
++		t.Fatalf("真库 quality 解析失败: %v", err)
++	}
++
++	// 未命中回源（读-through）：清键 → GetPoint → 懒回源 TDengine 最近行。
++	src := cache.BackfillFunc(rest.LatestPointValue)
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: redisAddr, DB: 15}, src)
++	if err := c.Delete(ctx, tenant, code); err != nil {
++		t.Fatalf("Delete error: %v", err)
++	}
++	got, err := c.GetPoint(ctx, tenant, code)
++	if err != nil {
++		t.Fatalf("回源 GetPoint error: %v", err)
++	}
++	if got.V != wantV {
++		t.Errorf("回源 v = %v, want 真库最近值 %v", got.V, wantV)
++	}
++	if got.Q != wantQ {
++		t.Errorf("回源 q = %d, want 真库 %d", got.Q, wantQ)
++	}
++	if got.Ts == 0 {
++		t.Errorf("回源 ts = 0（真库行 ts=%s 未解析）", row[0])
++	}
++
++	// 写穿断言：无源缓存实例读同键应命中（键已由回源写入 db15，不再依赖回源）。
++	plain := cache.NewRedisPointCache(cache.RedisOptions{Addr: redisAddr, DB: 15}, nil)
++	again, err := plain.GetPoint(ctx, tenant, code)
++	if err != nil {
++		t.Fatalf("写穿核验 GetPoint error: %v", err)
++	}
++	if again != got {
++		t.Errorf("写穿值 = %+v, want 与回源值一致 %+v", again, got)
++	}
++
++	// 测后清理（Go 道纪律）。
++	if err := c.Delete(ctx, tenant, code); err != nil {
++		t.Fatalf("测后清理 Delete error: %v", err)
++	}
++}
+diff --git a/ingest/internal/cache/redis_contract_test.go b/ingest/internal/cache/redis_contract_test.go
+new file mode 100644
+index 0000000..a05f8ea
+--- /dev/null
++++ b/ingest/internal/cache/redis_contract_test.go
+@@ -0,0 +1,514 @@
++package cache_test
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++)
++
++// TASK-0029 Redis 点位缓存真实现契约测试（brief 决策 2）：
++//   - 键形态 iot:pt:{tenant}:{code}（§3.5 口径，协调者裁决）；
++//   - 值形态 JSON 恰 v/q/ts 三键（§3.5 realtime 返回口径）；
++//   - 写穿透（落库成功后更新缓存——流水线侧保证，本包锁 SET 命令形态）；
++//   - 未命中回源（读路径懒回源 TDengine 最近值——SELECT ... ORDER BY ts DESC LIMIT 1，
++//     按需实现不预热）；
++//   - 缓存失败不阻塞落库（fail-soft：错误上返由流水线计数，不 panic 不阻塞）；
++//   - Redis 选库口径：生产 ingest db0（key 前缀 iot:pt: 与 backend 键空间隔离），
++//     测试用 db1+（Go 道纪律）；真 Redis db1 集成测试 env 门控（见 redis_live_test.go）。
++
++// ---- fakeRedisServer 极简 RESP2 假服务（解析命令数组、记录、按内存字典回放）----
++
++type fakeRedisServer struct {
++	addr string
++	ln   net.Listener
++
++	mu         sync.Mutex
++	commands   [][]string // 收到的命令（跨连接按到达序）
++	segments   []string   // 每次收到的原始字节段（管线化断言：一次写入含多条命令）
++	data       map[string]string
++	failNextN  int // 前 N 条命令注入 -ERR
++	afterConnN int // 每条连接收到的前 n 条命令注入 -ERR（连接级失败注入）
++}
++
++func newFakeRedisServer(t *testing.T) *fakeRedisServer {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("假 Redis 监听失败: %v", err)
++	}
++	s := &fakeRedisServer{addr: ln.Addr().String(), ln: ln, data: map[string]string{}}
++	go s.serve()
++	t.Cleanup(func() { _ = ln.Close() })
++	return s
++}
++
++func (s *fakeRedisServer) serve() {
++	for {
++		conn, err := s.ln.Accept()
++		if err != nil {
++			return
++		}
++		go s.handle(conn)
++	}
++}
++
++func (s *fakeRedisServer) handle(conn net.Conn) {
++	defer conn.Close()
++	var pend []byte
++	buf := make([]byte, 64*1024)
++	for {
++		n, err := conn.Read(buf)
++		if err != nil {
++			return
++		}
++		s.mu.Lock()
++		s.segments = append(s.segments, string(buf[:n])) // 原始 TCP 读段（管线化断言依据）
++		s.mu.Unlock()
++		pend = append(pend, buf[:n]...)
++		for {
++			args, consumed, perr := parseRESPCommand(pend)
++			if perr != nil {
++				return
++			}
++			if consumed == 0 {
++				break // 不完整命令，等下一个读段
++			}
++			pend = pend[consumed:]
++			s.mu.Lock()
++			s.commands = append(s.commands, args)
++			fail := s.failNextN > 0
++			if fail {
++				s.failNextN--
++			}
++			s.mu.Unlock()
++			if fail {
++				_, _ = io.WriteString(conn, "-ERR injected failure\r\n")
++				continue
++			}
++			_, _ = io.WriteString(conn, s.reply(args))
++		}
++	}
++}
++
++// reply 按命令语义回放（SET/GET/PUBLISH/PING/AUTH/SELECT/DEL）。
++func (s *fakeRedisServer) reply(args []string) string {
++	switch strings.ToUpper(args[0]) {
++	case "PING":
++		return "+PONG\r\n"
++	case "AUTH", "SELECT":
++		if len(args) >= 2 && args[1] == "BAD" {
++			return "-ERR invalid password\r\n"
++		}
++		return "+OK\r\n"
++	case "SET":
++		if len(args) < 3 {
++			return "-ERR wrong number of arguments\r\n"
++		}
++		s.mu.Lock()
++		s.data[args[1]] = args[2]
++		s.mu.Unlock()
++		return "+OK\r\n"
++	case "GET":
++		if len(args) < 2 {
++			return "-ERR wrong number of arguments\r\n"
++		}
++		s.mu.Lock()
++		v, ok := s.data[args[1]]
++		s.mu.Unlock()
++		if !ok {
++			return "$-1\r\n"
++		}
++		return fmt.Sprintf("$%d\r\n%s\r\n", len(v), v)
++	case "PUBLISH":
++		return ":1\r\n"
++	case "DEL":
++		s.mu.Lock()
++		delete(s.data, args[1])
++		s.mu.Unlock()
++		return ":1\r\n"
++	default:
++		return "-ERR unknown command '" + args[0] + "'\r\n"
++	}
++}
++
++func (s *fakeRedisServer) snapshotCommands() [][]string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([][]string, len(s.commands))
++	copy(out, s.commands)
++	return out
++}
++
++func (s *fakeRedisServer) snapshotSegments() []string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([]string, len(s.segments))
++	copy(out, s.segments)
++	return out
++}
++
++func (s *fakeRedisServer) injectFailures(n int) {
++	s.mu.Lock()
++	s.failNextN = n
++	s.mu.Unlock()
++}
++
++func (s *fakeRedisServer) stored(key string) (string, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	v, ok := s.data[key]
++	return v, ok
++}
++
++// parseRESPCommand 从缓冲解析一条完整 RESP2 命令：返回 (args, 消费字节数, 错误)；
++// consumed=0 表示命令不完整（等更多字节）。
++func parseRESPCommand(b []byte) ([]string, int, error) {
++	pos := 0
++	line, n, err := readBufLine(b, pos)
++	if err != nil {
++		return nil, 0, err
++	}
++	if n == 0 {
++		return nil, 0, nil
++	}
++	pos += n
++	if len(line) == 0 || line[0] != '*' {
++		return nil, 0, fmt.Errorf("fakeRedis: 期望命令数组，收到 %q", line)
++	}
++	var count int
++	if _, err := fmt.Sscanf(string(line[1:]), "%d", &count); err != nil {
++		return nil, 0, fmt.Errorf("fakeRedis: 数组长度非法 %q", line)
++	}
++	args := make([]string, 0, count)
++	for i := 0; i < count; i++ {
++		hdr, n, err := readBufLine(b, pos)
++		if err != nil {
++			return nil, 0, err
++		}
++		if n == 0 {
++			return nil, 0, nil
++		}
++		pos += n
++		if len(hdr) == 0 || hdr[0] != '$' {
++			return nil, 0, fmt.Errorf("fakeRedis: 期望 bulk 头，收到 %q", hdr)
++		}
++		var l int
++		if _, err := fmt.Sscanf(string(hdr[1:]), "%d", &l); err != nil {
++			return nil, 0, fmt.Errorf("fakeRedis: bulk 长度非法 %q", hdr)
++		}
++		if l < 0 {
++			args = append(args, "")
++			continue
++		}
++		if len(b)-pos < l+2 {
++			return nil, 0, nil // 体不完整
++		}
++		args = append(args, string(b[pos:pos+l]))
++		pos += l + 2 // 数据 + \r\n
++	}
++	return args, pos, nil
++}
++
++// readBufLine 从 b[pos:] 读取一行（到 \n 为止，含去 \r）；行不完整返回 n=0。
++func readBufLine(b []byte, pos int) (line []byte, n int, err error) {
++	i := pos
++	for i < len(b) && b[i] != '\n' {
++		i++
++	}
++	if i >= len(b) {
++		return nil, 0, nil // 不完整
++	}
++	line = b[pos:i]
++	for len(line) > 0 && line[len(line)-1] == '\r' {
++		line = line[:len(line)-1]
++	}
++	return line, i - pos + 1, nil
++}
++
++// ---- 键形态（§3.5 口径：iot:pt:{tenant}:{code}，TASK-0029 定版）----
++
++func TestContractPointCacheKeySchemeIotPT(t *testing.T) {
++	if got := cache.Key("default", "SMOKE0026_P1"); got != "iot:pt:default:SMOKE0026_P1" {
++		t.Errorf("Key = %q, want iot:pt:default:SMOKE0026_P1（brief 决策 2 键形态）", got)
++	}
++}
++
++// ---- RedisPointCache：SET 写形态（写穿透的缓存侧命令形态）----
++
++func TestContractRedisPointCacheSetWriteThroughShape(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, nil)
++	ctx := context.Background()
++
++	want := cache.Value{V: 98231.4, Q: 2, Ts: 1795211995000}
++	if err := c.SetPoint(ctx, "default", "SMOKE0026_P1", want); err != nil {
++		t.Fatalf("SetPoint error: %v", err)
++	}
++
++	cmds := filterDataCommands(srv.snapshotCommands())
++	if len(cmds) != 1 || strings.ToUpper(cmds[0][0]) != "SET" {
++		t.Fatalf("commands = %v, want 单条 SET", cmds)
++	}
++	if cmds[0][1] != "iot:pt:default:SMOKE0026_P1" {
++		t.Errorf("SET key = %q, want iot:pt:default:SMOKE0026_P1", cmds[0][1])
++	}
++	var m map[string]any
++	if err := json.Unmarshal([]byte(cmds[0][2]), &m); err != nil {
++		t.Fatalf("SET value 非 JSON: %v", err)
++	}
++	if len(m) != 3 {
++		t.Errorf("缓存 JSON 键数 = %d (%v), want 恰 3 键 v/q/ts", len(m), m)
++	}
++	for _, k := range []string{"v", "q", "ts"} {
++		if _, ok := m[k]; !ok {
++			t.Errorf("缓存 JSON 缺键 %q", k)
++		}
++	}
++	if m["v"].(float64) != 98231.4 || m["q"].(float64) != 2 || m["ts"].(float64) != 1795211995000 {
++		t.Errorf("缓存值 = %v, want v=98231.4 q=2 ts=1795211995000", m)
++	}
++}
++
++// ---- RedisPointCache：GET 读 + 未命中 ----
++
++func TestContractRedisPointCacheGetHitAndMiss(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, nil)
++	ctx := context.Background()
++
++	want := cache.Value{V: 132.5, Q: 0, Ts: 1795211995000}
++	if err := c.SetPoint(ctx, "t1", "P1", want); err != nil {
++		t.Fatalf("SetPoint error: %v", err)
++	}
++	got, err := c.GetPoint(ctx, "t1", "P1")
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if got != want {
++		t.Errorf("GetPoint = %+v, want %+v", got, want)
++	}
++
++	// 未命中显式 ErrCacheMiss，不静默给零值（既有契约口径）。
++	if _, err := c.GetPoint(ctx, "t1", "X99"); err != cache.ErrCacheMiss {
++		t.Errorf("未命中 GetPoint err = %v, want ErrCacheMiss", err)
++	}
++}
++
++// ---- RedisPointCache：未命中回源（读-through，按需不预热）----
++
++type fakeBackfill struct {
++	mu     sync.Mutex
++	calls  int
++	tenant string
++	code   string
++	val    cache.Value
++	found  bool
++	err    error
++}
++
++func (f *fakeBackfill) LatestPointValue(_ context.Context, tenant, pointCode string) (cache.Value, bool, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.calls++
++	f.tenant, f.code = tenant, pointCode
++	return f.val, f.found, f.err
++}
++
++func TestContractRedisPointCacheMissBackfillFromSource(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	src := &fakeBackfill{val: cache.Value{V: 55.5, Q: 1, Ts: 1795211990000}, found: true}
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, src)
++	ctx := context.Background()
++
++	got, err := c.GetPoint(ctx, "default", "SMOKE0026_P1")
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if got != src.val {
++		t.Errorf("GetPoint = %+v, want 回源值 %+v", got, src.val)
++	}
++	if src.tenant != "default" || src.code != "SMOKE0026_P1" {
++		t.Errorf("回源调用参数 = %s/%s, want default/SMOKE0026_P1", src.tenant, src.code)
++	}
++	// 回源后写穿缓存（读-through）：缓存键在位，第二次读不再回源。
++	if _, ok := srv.stored("iot:pt:default:SMOKE0026_P1"); !ok {
++		t.Error("回源后缓存键未写入（读-through 未落缓存）")
++	}
++	if src.calls != 1 {
++		t.Errorf("回源调用次数 = %d, want 1（命中后不再回源）", src.calls)
++	}
++	if _, err := c.GetPoint(ctx, "default", "SMOKE0026_P1"); err != nil {
++		t.Errorf("二次 GetPoint error: %v", err)
++	}
++	if src.calls != 1 {
++		t.Errorf("命中后回源调用次数 = %d, want 仍 1", src.calls)
++	}
++}
++
++func TestContractRedisPointCacheBackfillNotFoundAndError(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	// 源也无数据 → ErrCacheMiss（不静默给零值）。
++	src := &fakeBackfill{}
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, src)
++	if _, err := c.GetPoint(context.Background(), "t1", "P1"); err != cache.ErrCacheMiss {
++		t.Errorf("源无数据 err = %v, want ErrCacheMiss", err)
++	}
++	// 源错误 → 上返错误（读路径 fail-soft 归调用方口径）。
++	srcErr := &fakeBackfill{err: fmt.Errorf("tdengine down")}
++	c2 := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, srcErr)
++	if _, err := c2.GetPoint(context.Background(), "t1", "P1"); err == nil {
++		t.Error("回源错误未上返")
++	}
++}
++
++// ---- RedisPointCache：失败上返（fail-soft 上游：流水线计数不阻塞——不 panic 不丢锁）----
++
++func TestContractRedisPointCacheErrorPropagates(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	srv.injectFailures(1)
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, nil)
++	err := c.SetPoint(context.Background(), "t1", "P1", cache.Value{V: 1})
++	if err == nil {
++		t.Fatal("注入失败后 SetPoint error = nil, want 错误上返（流水线据此计 CacheFailures）")
++	}
++	// 失败后连接自愈：下一条命令重连成功。
++	if err := c.SetPoint(context.Background(), "t1", "P1", cache.Value{V: 2}); err != nil {
++		t.Fatalf("失败后重试 SetPoint error: %v", err)
++	}
++	if v, ok := srv.stored("iot:pt:t1:P1"); !ok || jsonValue(t, v).V != 2 {
++		t.Errorf("重试后缓存值 = %q ok=%v, want v=2", v, ok)
++	}
++}
++
++type jsonShape struct {
++	V  float64 `json:"v"`
++	Q  int     `json:"q"`
++	Ts int64   `json:"ts"`
++}
++
++func jsonValue(t *testing.T, raw string) jsonShape {
++	t.Helper()
++	var v jsonShape
++	if err := json.Unmarshal([]byte(raw), &v); err != nil {
++		t.Fatalf("JSON 解码失败: %v", err)
++	}
++	return v
++}
++
++// ---- 批量写（RESP 管线一次往返——0027 遗留 ② sink 队头约束复核的批量化落点）----
++
++func TestContractRedisPointCacheSetPointsPipelined(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: srv.addr, DB: 1}, nil)
++	ctx := context.Background()
++
++	items := []cache.PointSet{
++		{PointCode: "P1", Value: cache.Value{V: 1, Q: 0, Ts: 100}},
++		{PointCode: "P2", Value: cache.Value{V: 2, Q: 1, Ts: 200}},
++		{PointCode: "P3", Value: cache.Value{V: 3, Q: 2, Ts: 300}},
++	}
++	if err := c.SetPoints(ctx, "t1", items); err != nil {
++		t.Fatalf("SetPoints error: %v", err)
++	}
++	cmds := filterDataCommands(srv.snapshotCommands())
++	if len(cmds) != 3 {
++		t.Fatalf("commands = %d 条, want 3 条 SET", len(cmds))
++	}
++	for i, want := range []string{"P1", "P2", "P3"} {
++		if cmds[i][0] != "SET" || cmds[i][1] != "iot:pt:t1:"+want {
++			t.Errorf("commands[%d] = %v, want SET iot:pt:t1:%s", i, cmds[i], want)
++		}
++	}
++	// 管线化：3 条命令一次写入（单段）——非逐条往返。
++	segs := srv.snapshotSegments()
++	setSegs := 0
++	for _, seg := range segs {
++		if n := strings.Count(seg, "SET"); n > 0 {
++			setSegs++
++			if n != 3 {
++				t.Errorf("含 SET 的段内命令数 = %d, want 3（管线化一次写入）", n)
++			}
++		}
++	}
++	if setSegs != 1 {
++		t.Errorf("含 SET 的写入段数 = %d, want 1（3 条 SET 管线化单次写入，非逐条往返）", setSegs)
++	}
++	for i, it := range items {
++		if v, ok := srv.stored("iot:pt:t1:" + it.PointCode); !ok || jsonValue(t, v).V != it.Value.V {
++			t.Errorf("items[%d] 缓存值缺失或不符", i)
++		}
++	}
++}
++
++func firstOr(ss []string) string {
++	if len(ss) == 0 {
++		return ""
++	}
++	return ss[0]
++}
++
++// filterDataCommands 过滤建连握手（AUTH/SELECT），只留数据命令（断言口径）。
++func filterDataCommands(cmds [][]string) [][]string {
++	out := make([][]string, 0, len(cmds))
++	for _, cmd := range cmds {
++		switch strings.ToUpper(cmd[0]) {
++		case "AUTH", "SELECT":
++		default:
++			out = append(out, cmd)
++		}
++	}
++	return out
++}
++
++// ---- RedisClient 基础（RESP2 信封 + 选库 + 失败注入）----
++
++func TestContractRedisClientPingAndSelectDB(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: srv.addr, Password: "", DB: 3})
++	defer c.Close()
++	ctx := context.Background()
++	if err := c.Ping(ctx); err != nil {
++		t.Fatalf("Ping error: %v", err)
++	}
++	cmds := srv.snapshotCommands()
++	// 建连序列含 SELECT 3（选库口径：测试 db1+ / 生产 db0）。
++	foundSelect := false
++	for _, cmd := range cmds {
++		if strings.EqualFold(cmd[0], "SELECT") && cmd[1] == "3" {
++			foundSelect = true
++		}
++	}
++	if !foundSelect {
++		t.Errorf("建连命令序列缺 SELECT 3: %v", cmds)
++	}
++}
++
++func TestContractRedisClientErrorReplyAndReconnect(t *testing.T) {
++	srv := newFakeRedisServer(t)
++	srv.injectFailures(1)
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: srv.addr, DB: 1})
++	defer c.Close()
++	ctx := context.Background()
++	if err := c.Ping(ctx); err == nil {
++		t.Fatal("注入 -ERR 后 Ping error = nil")
++	}
++	if err := c.Ping(ctx); err != nil {
++		t.Fatalf("重连后 Ping error: %v", err)
++	}
++}
++
++func TestContractRedisClientBadAddrFailsFast(t *testing.T) {
++	c := cache.NewRedisClient(cache.RedisOptions{Addr: "127.0.0.1:1", DB: 1, DialTimeout: 300 * time.Millisecond})
++	defer c.Close()
++	if err := c.Ping(context.Background()); err == nil {
++		t.Fatal("不可达地址 Ping error = nil, want 快速失败")
++	}
++}
+diff --git a/ingest/internal/cache/redis_live_test.go b/ingest/internal/cache/redis_live_test.go
+new file mode 100644
+index 0000000..5654cd6
+--- /dev/null
++++ b/ingest/internal/cache/redis_live_test.go
+@@ -0,0 +1,75 @@
++package cache_test
++
++import (
++	"context"
++	"os"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++)
++
++// 真 Redis db1 集成测试（brief 测试口径：可选 env 门控）。
++// 门控：INGEST_REDIS_TEST_ADDR 非空（如 127.0.0.1:6379）；测试固定 db15（Go 道纪律：
++// 生产 ingest db0、测试 db1+——db15 远离业务键空间，测后清理）。
++// 未设置 env 时跳过（CI/无 Redis 环境零影响）。
++func TestLiveRedisPointCacheDB1Integration(t *testing.T) {
++	addr := os.Getenv("INGEST_REDIS_TEST_ADDR")
++	if addr == "" {
++		t.Skip("INGEST_REDIS_TEST_ADDR 未设置——跳过真 Redis 集成测试")
++	}
++	c := cache.NewRedisPointCache(cache.RedisOptions{Addr: addr, DB: 15}, nil)
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	const tenant, code = "live29", "LIVE_P1"
++	defer func() {
++		_ = c.Delete(ctx, tenant, code)
++	}()
++
++	// 写穿透形态：SET + 读回同形态。
++	want := cache.Value{V: 98231.4, Q: 2, Ts: time.Now().UnixMilli()}
++	if err := c.SetPoint(ctx, tenant, code, want); err != nil {
++		t.Fatalf("SetPoint error: %v", err)
++	}
++	got, err := c.GetPoint(ctx, tenant, code)
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if got != want {
++		t.Errorf("GetPoint = %+v, want %+v", got, want)
++	}
++
++	// 覆盖写（最新值语义）。
++	want2 := cache.Value{V: 99.5, Q: 0, Ts: time.Now().UnixMilli()}
++	if err := c.SetPoint(ctx, tenant, code, want2); err != nil {
++		t.Fatalf("SetPoint(overwrite) error: %v", err)
++	}
++	if got, _ := c.GetPoint(ctx, tenant, code); got != want2 {
++		t.Errorf("覆盖写后 GetPoint = %+v, want %+v", got, want2)
++	}
++
++	// 批量管线写 + 读回。
++	items := []cache.PointSet{
++		{PointCode: "LIVE_P2", Value: cache.Value{V: 1, Q: 0, Ts: 1}},
++		{PointCode: "LIVE_P3", Value: cache.Value{V: 2, Q: 1, Ts: 2}},
++	}
++	if err := c.SetPoints(ctx, tenant, items); err != nil {
++		t.Fatalf("SetPoints error: %v", err)
++	}
++	for _, it := range items {
++		got, err := c.GetPoint(ctx, tenant, it.PointCode)
++		if err != nil {
++			t.Fatalf("GetPoint(%s) error: %v", it.PointCode, err)
++		}
++		if got != it.Value {
++			t.Errorf("GetPoint(%s) = %+v, want %+v", it.PointCode, got, it.Value)
++		}
++		defer func(pc string) { _ = c.Delete(ctx, tenant, pc) }(it.PointCode)
++	}
++
++	// 未命中（db15 无该键）→ ErrCacheMiss。
++	if _, err := c.GetPoint(ctx, tenant, "LIVE_NO_SUCH"); err != cache.ErrCacheMiss {
++		t.Errorf("未命中 err = %v, want ErrCacheMiss", err)
++	}
++}
+diff --git a/ingest/internal/event/event.go b/ingest/internal/event/event.go
+new file mode 100644
+index 0000000..8846985
+--- /dev/null
++++ b/ingest/internal/event/event.go
+@@ -0,0 +1,62 @@
++// Package event 承载新值事件与网关状态事件的发射侧（TASK-0029 决策 3 + ADR-0010 兑现）。
++//
++// 新值事件：写库成功后经 Redis Pub/Sub 发射（channel iot:newvalue:{tenant}，
++// payload {tenant,pointCode,ts,value,quality} JSON）——计算引擎（0040s）按事件驱动
++// 消费触发下游计算/状态判定；消费方未建，本包交付发射侧，消费对接登记演进位。
++//
++// 网关状态事件（ADR-0010 TD-0049 兑现）：LWT/status 离线语义只发事件、不直写状态
++// Redis（「按写入方划分」纪律——接入服务不成为状态的第二写入方，最终状态由计算引擎
++// 按状态判定优先级链裁决落 Redis）。channel iot:gwstatus:{tenant}（发射侧拟定形态，
++// 消费对接归 0040s 定版），payload {tenant,gateway,graceful,status,ts} JSON——
++// graceful=false 含 LWT 异常断开（告警语义由消费方承担）。
++//
++// 实现口径：Redis Pub/Sub 发射为 fire-and-forget（无订阅者不失败——PUBLISH 回执
++// 接收者计数只作观测）；发射失败错误上返，流水线计 EventFailures（fail-soft 不阻塞
++// 落库）；批量发射走 RESP 管线（一次往返整批）。
++package event
++
++import "context"
++
++// NewValueEvent 新值事件载荷（brief 决策 3 逐字五键）。
++type NewValueEvent struct {
++	Tenant    string  `json:"tenant"`
++	PointCode string  `json:"pointCode"`
++	Ts        int64   `json:"ts"`
++	Value     float64 `json:"value"`
++	Quality   int     `json:"quality"`
++}
++
++// NewValueChannel 新值事件频道（brief 决策 3 逐字：iot:newvalue:{tenant}）。
++func NewValueChannel(tenant string) string {
++	return "iot:newvalue:" + tenant
++}
++
++// Publisher 新值事件薄接口（发射侧最小面；流水线写成功后调用）。
++type Publisher interface {
++	PublishNewValue(ctx context.Context, ev NewValueEvent) error
++}
++
++// BatchPublisher 批量发射可选接口（RESP 管线一次往返整批——队头约束批量化落点，
++// 0027 遗留 ②）。流水线优先取用；未实现退回逐条 PublishNewValue。
++type BatchPublisher interface {
++	PublishNewValues(ctx context.Context, evs []NewValueEvent) error
++}
++
++// GatewayStatusEvent 网关状态事件载荷（ADR-0010 发射侧拟定，消费对接归 0040s）。
++type GatewayStatusEvent struct {
++	Tenant   string `json:"tenant"`
++	Gateway  string `json:"gateway"`
++	Graceful bool   `json:"graceful"` // true=正常下线（graceful 标记）；false=心跳/LWT 异常断开
++	Status   string `json:"status"`
++	Ts       int64  `json:"ts"` // 接收时刻（毫秒）——状态载荷契约未冻结 ts 键，发射侧取接收时刻
++}
++
++// GatewayStatusChannel 网关状态事件频道（发射侧拟定：iot:gwstatus:{tenant}）。
++func GatewayStatusChannel(tenant string) string {
++	return "iot:gwstatus:" + tenant
++}
++
++// GatewayStatusPublisher 网关状态事件薄接口。
++type GatewayStatusPublisher interface {
++	PublishGatewayStatus(ctx context.Context, ev GatewayStatusEvent) error
++}
+diff --git a/ingest/internal/event/event_contract_test.go b/ingest/internal/event/event_contract_test.go
+new file mode 100644
+index 0000000..3b204f6
+--- /dev/null
++++ b/ingest/internal/event/event_contract_test.go
+@@ -0,0 +1,94 @@
++package event_test
++
++import (
++	"encoding/json"
++	"testing"
++
++	"net.otlab/ingest/internal/event"
++)
++
++// TASK-0029 新值事件契约测试（brief 决策 3）：薄接口 ValueEventPublisher + Redis Pub/Sub
++// 实现——channel iot:newvalue:{tenant}，payload {tenant,pointCode,ts,value,quality} JSON。
++// 计算引擎消费方未建（0040s），本批交付发射侧 + 契约测试，消费对接登记演进位。
++
++// 契约依据：payload 恰 {tenant,pointCode,ts,value,quality} 五键（brief 决策 3 逐字）。
++func TestContractNewValueEventPayloadKeys(t *testing.T) {
++	b, err := json.Marshal(event.NewValueEvent{
++		Tenant: "default", PointCode: "SMOKE0026_P1",
++		Ts: 1795211995000, Value: 98231.4, Quality: 0,
++	})
++	if err != nil {
++		t.Fatalf("Marshal error: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("Unmarshal error: %v", err)
++	}
++	if len(m) != 5 {
++		t.Errorf("payload 键数 = %d (%v), want 恰 5 键", len(m), m)
++	}
++	for _, k := range []string{"tenant", "pointCode", "ts", "value", "quality"} {
++		if _, ok := m[k]; !ok {
++			t.Errorf("payload 缺键 %q（brief 决策 3）", k)
++		}
++	}
++	for k := range m {
++		switch k {
++		case "tenant", "pointCode", "ts", "value", "quality":
++		default:
++			t.Errorf("payload 出现契约外键 %q", k)
++		}
++	}
++}
++
++func TestContractNewValueEventPayloadValues(t *testing.T) {
++	b, _ := json.Marshal(event.NewValueEvent{Tenant: "t1", PointCode: "P1", Ts: 7, Value: 98231.4, Quality: 2})
++	var m map[string]any
++	_ = json.Unmarshal(b, &m)
++	if m["tenant"] != "t1" || m["pointCode"] != "P1" || m["ts"].(float64) != 7 || m["value"].(float64) != 98231.4 || m["quality"].(float64) != 2 {
++		t.Errorf("payload 值不符: %v", m)
++	}
++}
++
++func TestContractNewValueChannelNaming(t *testing.T) {
++	if got := event.NewValueChannel("default"); got != "iot:newvalue:default" {
++		t.Errorf("NewValueChannel = %q, want iot:newvalue:default（brief 决策 3）", got)
++	}
++}
++
++// 契约依据：ADR-0010 兑现（LWT 离线走事件链）——网关状态事件发射侧（发射侧拟定形态，
++// 消费对接归 0040s 定版）：channel iot:gwstatus:{tenant}，payload {tenant,gateway,
++// graceful,status,ts}。接入服务不直写状态 Redis——只发事件。
++func TestContractGatewayStatusEventPayloadKeys(t *testing.T) {
++	b, err := json.Marshal(event.GatewayStatusEvent{
++		Tenant: "default", Gateway: "GW_01", Graceful: false, Status: "offline", Ts: 1795211995000,
++	})
++	if err != nil {
++		t.Fatalf("Marshal error: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("Unmarshal error: %v", err)
++	}
++	if len(m) != 5 {
++		t.Errorf("payload 键数 = %d (%v), want 恰 5 键", len(m), m)
++	}
++	for _, k := range []string{"tenant", "gateway", "graceful", "status", "ts"} {
++		if _, ok := m[k]; !ok {
++			t.Errorf("payload 缺键 %q", k)
++		}
++	}
++}
++
++func TestContractGatewayStatusChannelNaming(t *testing.T) {
++	if got := event.GatewayStatusChannel("default"); got != "iot:gwstatus:default" {
++		t.Errorf("GatewayStatusChannel = %q, want iot:gwstatus:default", got)
++	}
++}
++
++// 编译期接口面锁定：薄接口（发射侧最小面）。
++var (
++	_ event.Publisher              = (*event.RedisPublisher)(nil)
++	_ event.BatchPublisher         = (*event.RedisPublisher)(nil)
++	_ event.GatewayStatusPublisher = (*event.RedisPublisher)(nil)
++)
+diff --git a/ingest/internal/event/redis.go b/ingest/internal/event/redis.go
+new file mode 100644
+index 0000000..9df92a5
+--- /dev/null
++++ b/ingest/internal/event/redis.go
+@@ -0,0 +1,63 @@
++// Redis Pub/Sub 发射侧实现（TASK-0029 决策 3）：复用 cache.RedisClient（RESP2 极简
++// 客户端，零新增第三方依赖）。PUBLISH 无订阅者不失败（回执 :0 为合法观测值）；
++// 发射失败断连自愈（连接故障下次调用重连）。
++package event
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++
++	"net.otlab/ingest/internal/cache"
++)
++
++// RedisPublisher Redis Pub/Sub 发射器：新值事件（单条/批量管线）+ 网关状态事件，
++// 同一连接承载（三类发射互不依赖）。
++type RedisPublisher struct {
++	rc *cache.RedisClient
++}
++
++// NewRedisPublisher 构造（惰性建连）。
++func NewRedisPublisher(opts cache.RedisOptions) *RedisPublisher {
++	return &RedisPublisher{rc: cache.NewRedisClient(opts)}
++}
++
++// Close 关闭底层连接（幂等）。
++func (p *RedisPublisher) Close() error { return p.rc.Close() }
++
++// PublishNewValue 实现 Publisher：PUBLISH iot:newvalue:{tenant} <payload>。
++func (p *RedisPublisher) PublishNewValue(ctx context.Context, ev NewValueEvent) error {
++	b, err := json.Marshal(ev)
++	if err != nil {
++		return fmt.Errorf("event: 编码新值事件失败: %w", err)
++	}
++	_, err = p.rc.Do(ctx, "PUBLISH", NewValueChannel(ev.Tenant), string(b))
++	return err
++}
++
++// PublishNewValues 实现 BatchPublisher：RESP 管线一次往返发射整批。
++func (p *RedisPublisher) PublishNewValues(ctx context.Context, evs []NewValueEvent) error {
++	if len(evs) == 0 {
++		return nil
++	}
++	cmds := make([][]string, 0, len(evs))
++	for _, ev := range evs {
++		b, err := json.Marshal(ev)
++		if err != nil {
++			return fmt.Errorf("event: 编码新值事件失败: %w", err)
++		}
++		cmds = append(cmds, []string{"PUBLISH", NewValueChannel(ev.Tenant), string(b)})
++	}
++	_, err := p.rc.Pipelined(ctx, cmds)
++	return err
++}
++
++// PublishGatewayStatus 实现 GatewayStatusPublisher：PUBLISH iot:gwstatus:{tenant} <payload>。
++func (p *RedisPublisher) PublishGatewayStatus(ctx context.Context, ev GatewayStatusEvent) error {
++	b, err := json.Marshal(ev)
++	if err != nil {
++		return fmt.Errorf("event: 编码网关状态事件失败: %w", err)
++	}
++	_, err = p.rc.Do(ctx, "PUBLISH", GatewayStatusChannel(ev.Tenant), string(b))
++	return err
++}
+diff --git a/ingest/internal/event/redis_publisher_contract_test.go b/ingest/internal/event/redis_publisher_contract_test.go
+new file mode 100644
+index 0000000..2d6051f
+--- /dev/null
++++ b/ingest/internal/event/redis_publisher_contract_test.go
+@@ -0,0 +1,288 @@
++package event_test
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/event"
++)
++
++// TASK-0029 Redis Pub/Sub 发射侧契约测试：PUBLISH 命令形态（channel + payload 逐字）
++// 与管线化批量发射。假服务记录原始 TCP 读段（管线化断言依据）。
++
++type fakePubServer struct {
++	addr string
++	ln   net.Listener
++
++	mu       sync.Mutex
++	segments []string
++	commands [][]string
++	failNext int
++}
++
++func newFakePubServer(t *testing.T) *fakePubServer {
++	t.Helper()
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatalf("假 Redis 监听失败: %v", err)
++	}
++	s := &fakePubServer{addr: ln.Addr().String(), ln: ln}
++	go func() {
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			go s.handle(conn)
++		}
++	}()
++	t.Cleanup(func() { _ = ln.Close() })
++	return s
++}
++
++func (s *fakePubServer) handle(conn net.Conn) {
++	defer conn.Close()
++	var pend []byte
++	buf := make([]byte, 64*1024)
++	for {
++		n, err := conn.Read(buf)
++		if err != nil {
++			return
++		}
++		s.mu.Lock()
++		s.segments = append(s.segments, string(buf[:n]))
++		s.mu.Unlock()
++		pend = append(pend, buf[:n]...)
++		for {
++			args, consumed, perr := parseResp(pend)
++			if perr != nil {
++				return
++			}
++			if consumed == 0 {
++				break
++			}
++			pend = pend[consumed:]
++			s.mu.Lock()
++			s.commands = append(s.commands, args)
++			fail := s.failNext > 0
++			if fail {
++				s.failNext--
++			}
++			s.mu.Unlock()
++			if fail {
++				_, _ = io.WriteString(conn, "-ERR injected\r\n")
++				continue
++			}
++			if strings.EqualFold(args[0], "AUTH") || strings.EqualFold(args[0], "SELECT") {
++				_, _ = io.WriteString(conn, "+OK\r\n")
++				continue
++			}
++			_, _ = io.WriteString(conn, ":1\r\n")
++		}
++	}
++}
++
++func parseResp(b []byte) ([]string, int, error) {
++	pos := 0
++	line, n, err := bufLine(b, pos)
++	if err != nil {
++		return nil, 0, err
++	}
++	if n == 0 {
++		return nil, 0, nil
++	}
++	pos += n
++	if len(line) == 0 || line[0] != '*' {
++		return nil, 0, fmt.Errorf("fakePub: 非法 RESP 命令形态")
++	}
++	var count int
++	if _, err := fmt.Sscanf(string(line[1:]), "%d", &count); err != nil {
++		return nil, 0, fmt.Errorf("fakePub: 非法 RESP 命令形态")
++	}
++	args := make([]string, 0, count)
++	for i := 0; i < count; i++ {
++		hdr, n, err := bufLine(b, pos)
++		if err != nil {
++			return nil, 0, err
++		}
++		if n == 0 {
++			return nil, 0, nil
++		}
++		pos += n
++		if len(hdr) == 0 || hdr[0] != '$' {
++			return nil, 0, fmt.Errorf("fakePub: 非法 RESP 命令形态")
++		}
++		var l int
++		if _, err := fmt.Sscanf(string(hdr[1:]), "%d", &l); err != nil {
++			return nil, 0, fmt.Errorf("fakePub: 非法 RESP 命令形态")
++		}
++		if len(b)-pos < l+2 {
++			return nil, 0, nil
++		}
++		args = append(args, string(b[pos:pos+l]))
++		pos += l + 2
++	}
++	return args, pos, nil
++}
++
++func bufLine(b []byte, pos int) (line []byte, n int, err error) {
++	i := pos
++	for i < len(b) && b[i] != '\n' {
++		i++
++	}
++	if i >= len(b) {
++		return nil, 0, nil
++	}
++	line = b[pos:i]
++	for len(line) > 0 && line[len(line)-1] == '\r' {
++		line = line[:len(line)-1]
++	}
++	return line, i - pos + 1, nil
++}
++
++func (s *fakePubServer) snapshot() (segments []string, commands [][]string) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	segments = append([]string(nil), s.segments...)
++	commands = append([][]string(nil), s.commands...)
++	return segments, commands
++}
++
++func (s *fakePubServer) injectFailures(n int) {
++	s.mu.Lock()
++	s.failNext = n
++	s.mu.Unlock()
++}
++
++func pubPublisher(s *fakePubServer) *event.RedisPublisher {
++	return event.NewRedisPublisher(cache.RedisOptions{Addr: s.addr, DB: 1})
++}
++
++// 契约依据：发射形态——PUBLISH iot:newvalue:{tenant} <payload JSON>（channel 逐字）。
++func TestContractRedisPublisherPublishShape(t *testing.T) {
++	srv := newFakePubServer(t)
++	pub := pubPublisher(srv)
++
++	ev := event.NewValueEvent{Tenant: "default", PointCode: "SMOKE0026_P1", Ts: 1795211995000, Value: 98231.4, Quality: 2}
++	if err := pub.PublishNewValue(context.Background(), ev); err != nil {
++		t.Fatalf("PublishNewValue error: %v", err)
++	}
++	_, cmds := srv.snapshot()
++	data := filterHandshake(cmds)
++	if len(data) != 1 || !strings.EqualFold(data[0][0], "PUBLISH") {
++		t.Fatalf("commands = %v, want 单条 PUBLISH", data)
++	}
++	if data[0][1] != "iot:newvalue:default" {
++		t.Errorf("channel = %q, want iot:newvalue:default", data[0][1])
++	}
++	var m map[string]any
++	if err := json.Unmarshal([]byte(data[0][2]), &m); err != nil {
++		t.Fatalf("payload 非 JSON: %v", err)
++	}
++	if len(m) != 5 {
++		t.Errorf("payload 键数 = %d (%v), want 5", len(m), m)
++	}
++	if m["tenant"] != "default" || m["pointCode"] != "SMOKE0026_P1" {
++		t.Errorf("payload 值不符: %v", m)
++	}
++}
++
++// 契约依据：批量发射管线化——一次往返 PUBLISH 整批（flush 后逐行发射的队头约束批量化）。
++func TestContractRedisPublisherBatchPipelined(t *testing.T) {
++	srv := newFakePubServer(t)
++	pub := pubPublisher(srv)
++
++	evs := []event.NewValueEvent{
++		{Tenant: "t1", PointCode: "P1", Ts: 1, Value: 1, Quality: 0},
++		{Tenant: "t1", PointCode: "P2", Ts: 2, Value: 2, Quality: 1},
++		{Tenant: "t1", PointCode: "P3", Ts: 3, Value: 3, Quality: 2},
++	}
++	if err := pub.PublishNewValues(context.Background(), evs); err != nil {
++		t.Fatalf("PublishNewValues error: %v", err)
++	}
++	segs, cmds := srv.snapshot()
++	data := filterHandshake(cmds)
++	if len(data) != 3 {
++		t.Fatalf("commands = %d, want 3 条 PUBLISH", len(data))
++	}
++	pubSegs := 0
++	for _, seg := range segs {
++		if n := strings.Count(seg, "PUBLISH"); n > 0 {
++			pubSegs++
++			if n != 3 {
++				t.Errorf("段内 PUBLISH 数 = %d, want 3（管线化一次写入）", n)
++			}
++		}
++	}
++	if pubSegs != 1 {
++		t.Errorf("含 PUBLISH 段数 = %d, want 1（非逐条往返）", pubSegs)
++	}
++}
++
++// 契约依据：网关状态事件（ADR-0010 LWT 路径）——channel iot:gwstatus:{tenant}。
++func TestContractRedisPublisherGatewayStatusShape(t *testing.T) {
++	srv := newFakePubServer(t)
++	pub := pubPublisher(srv)
++
++	ev := event.GatewayStatusEvent{Tenant: "default", Gateway: "GW_01", Graceful: false, Status: "offline", Ts: 1795211995000}
++	if err := pub.PublishGatewayStatus(context.Background(), ev); err != nil {
++		t.Fatalf("PublishGatewayStatus error: %v", err)
++	}
++	_, cmds := srv.snapshot()
++	data := filterHandshake(cmds)
++	if len(data) != 1 || !strings.EqualFold(data[0][0], "PUBLISH") {
++		t.Fatalf("commands = %v, want 单条 PUBLISH", data)
++	}
++	if data[0][1] != "iot:gwstatus:default" {
++		t.Errorf("channel = %q, want iot:gwstatus:default", data[0][1])
++	}
++	var m map[string]any
++	_ = json.Unmarshal([]byte(data[0][2]), &m)
++	if m["gateway"] != "GW_01" || m["graceful"] != false {
++		t.Errorf("payload 值不符: %v", m)
++	}
++}
++
++// 契约依据：发射失败错误上返（流水线计 EventFailures fail-soft，不 panic 不阻塞）。
++func TestContractRedisPublisherErrorPropagates(t *testing.T) {
++	srv := newFakePubServer(t)
++	srv.injectFailures(1)
++	pub := pubPublisher(srv)
++	err := pub.PublishNewValue(context.Background(), event.NewValueEvent{Tenant: "t1", PointCode: "P1"})
++	if err == nil {
++		t.Fatal("注入失败后 PublishNewValue error = nil, want 错误上返")
++	}
++	// 失败后重连自愈。
++	if err := pub.PublishNewValue(context.Background(), event.NewValueEvent{Tenant: "t1", PointCode: "P1"}); err != nil {
++		t.Fatalf("重试 PublishNewValue error: %v", err)
++	}
++}
++
++// 契约依据：不可达地址快速失败（不挂死发射侧）。
++func TestContractRedisPublisherBadAddrFailsFast(t *testing.T) {
++	pub := event.NewRedisPublisher(cache.RedisOptions{Addr: "127.0.0.1:1", DB: 1, DialTimeout: 300 * time.Millisecond})
++	defer pub.Close()
++	if err := pub.PublishNewValue(context.Background(), event.NewValueEvent{Tenant: "t1", PointCode: "P1"}); err == nil {
++		t.Fatal("不可达地址 PublishNewValue error = nil, want 快速失败")
++	}
++}
++
++func filterHandshake(cmds [][]string) [][]string {
++	out := make([][]string, 0, len(cmds))
++	for _, cmd := range cmds {
++		switch strings.ToUpper(cmd[0]) {
++		case "AUTH", "SELECT":
++		default:
++			out = append(out, cmd)
++		}
++	}
++	return out
++}
+diff --git a/ingest/internal/mqttsource/status_event.go b/ingest/internal/mqttsource/status_event.go
+new file mode 100644
+index 0000000..d882ec1
+--- /dev/null
++++ b/ingest/internal/mqttsource/status_event.go
+@@ -0,0 +1,61 @@
++// ADR-0010 兑现（TASK-0029 决策 3）：LWT/status 消息按流水线既有分发照旧——data 信封
++// 进数据流水线、status 信封进本出口（0027 分发形态零改动）；离线语义只发网关状态事件、
++// 不直写状态 Redis（「按写入方划分」纪律——接入服务不成为状态的第二写入方，最终状态由
++// 计算引擎按状态判定优先级链裁决落 Redis，消费对接归 0040s）。
++// channel iot:gwstatus:{tenant}、payload {tenant,gateway,graceful,status,ts}（发射侧
++// 拟定形态，见 internal/event）。
++package mqttsource
++
++import (
++	"context"
++	"log"
++	"time"
++
++	"net.otlab/ingest/internal/event"
++)
++
++// EventStatusSink 状态信封出口的事件化实现（StatusSink 零改动替换——0027 默认计数+日志
++// 形态的发射侧升级）：每个 status/LWT 报文发射一条网关状态事件（心跳/LWT/正常下线同为
++// 状态判定输入），保留计数与日志语义。发射失败 fail-soft WARN（不 panic、不阻塞路由）。
++type EventStatusSink struct {
++	// Pub 网关状态事件发射器（Redis 未配置时不得装配本出口——用默认计数+日志形态）。
++	Pub event.GatewayStatusPublisher
++	// Logger 日志；nil → log.Default()。
++	Logger *log.Logger
++	// Now 接收时刻（事件 ts）；nil → time.Now。测试注入冻结时钟。
++	Now func() time.Time
++}
++
++// OnStatus 实现 StatusSink：计数 + 日志 + 网关状态事件发射（ADR-0010——只发事件，
++// 不直写状态 Redis）。
++func (s *EventStatusSink) OnStatus(env StatusEnvelope) {
++	nowFn := s.Now
++	if nowFn == nil {
++		nowFn = time.Now
++	}
++	ev := event.GatewayStatusEvent{
++		Tenant:   env.Tenant,
++		Gateway:  env.Gateway,
++		Graceful: env.Graceful,
++		Status:   env.Status,
++		Ts:       nowFn().UnixMilli(),
++	}
++	if err := s.Pub.PublishGatewayStatus(context.Background(), ev); err != nil {
++		s.logger().Printf("mqttsource: 网关状态事件发射失败（fail-soft，不阻塞路由）tenant=%s gateway=%s: %v",
++			env.Tenant, env.Gateway, err)
++	}
++	// 计数与日志语义照 0027 默认出口（路由计数由 Consumer.route 承担，此处只记语义行）。
++	if env.Graceful {
++		s.logger().Printf("mqttsource: 网关正常下线（graceful——事件已发射）tenant=%s gateway=%s", env.Tenant, env.Gateway)
++		return
++	}
++	s.logger().Printf("mqttsource: 网关状态上报（心跳/LWT——ADR-0010 只发事件不直写状态 Redis）tenant=%s gateway=%s status=%q",
++		env.Tenant, env.Gateway, env.Status)
++}
++
++func (s *EventStatusSink) logger() *log.Logger {
++	if s.Logger != nil {
++		return s.Logger
++	}
++	return log.Default()
++}
+diff --git a/ingest/internal/mqttsource/status_event_contract_test.go b/ingest/internal/mqttsource/status_event_contract_test.go
+new file mode 100644
+index 0000000..38f93ce
+--- /dev/null
++++ b/ingest/internal/mqttsource/status_event_contract_test.go
+@@ -0,0 +1,107 @@
++package mqttsource
++
++import (
++	"context"
++	"errors"
++	"log"
++	"strings"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/event"
++)
++
++// TASK-0029 ADR-0010 兑现契约测试（brief 决策 3）：LWT/status 消息按流水线既有分发
++// （data→数据流水线、status→StatusSink——0027 形态不变）；离线语义只发网关状态事件、
++// 不直写状态 Redis（「按写入方划分」——接入服务不成为状态的第二写入方，最终状态由
++// 计算引擎按状态判定优先级链裁决，消费对接归 0040s）。
++
++type fakeGatewayStatusPub struct {
++	calls []event.GatewayStatusEvent
++	err   error
++}
++
++func (f *fakeGatewayStatusPub) PublishGatewayStatus(_ context.Context, ev event.GatewayStatusEvent) error {
++	if f.err != nil {
++		return f.err
++	}
++	f.calls = append(f.calls, ev)
++	return nil
++}
++
++func statusSinkHarness(pub event.GatewayStatusPublisher) *EventStatusSink {
++	return &EventStatusSink{
++		Pub:    pub,
++		Logger: log.New(&strings.Builder{}, "", 0),                        // 测试静音
++		Now:    func() time.Time { return time.UnixMilli(1795212000000) }, // 冻结时钟
++	}
++}
++
++// 契约依据：LWT（异常断开——graceful=false）→ 网关状态事件发射，graceful=false 逐字承载。
++func TestContractStatusSinkLWTEmitsGatewayStatusEvent(t *testing.T) {
++	pub := &fakeGatewayStatusPub{}
++	sink := statusSinkHarness(pub)
++
++	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"offline"}`))
++	sink.OnStatus(env)
++
++	if len(pub.calls) != 1 {
++		t.Fatalf("状态事件发射数 = %d, want 1", len(pub.calls))
++	}
++	ev := pub.calls[0]
++	if ev.Tenant != "default" || ev.Gateway != "GW_01" {
++		t.Errorf("事件租户/网关 = %s/%s, want default/GW_01", ev.Tenant, ev.Gateway)
++	}
++	if ev.Graceful {
++		t.Error("LWT 事件 graceful = true, want false（异常断开语义）")
++	}
++	if ev.Ts != 1795212000000 {
++		t.Errorf("事件 ts = %d, want 接收时刻 1795212000000", ev.Ts)
++	}
++}
++
++// 契约依据：正常下线（graceful:true）同样只发事件（状态判定输入面统一走事件链）。
++func TestContractStatusSinkGracefulEmitsEventWithFlag(t *testing.T) {
++	pub := &fakeGatewayStatusPub{}
++	sink := statusSinkHarness(pub)
++
++	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"graceful":true,"status":"offline"}`))
++	sink.OnStatus(env)
++
++	if len(pub.calls) != 1 || !pub.calls[0].Graceful {
++		t.Fatalf("事件 = %+v, want 恰 1 条且 graceful=true", pub.calls)
++	}
++}
++
++// 契约依据：心跳（status 主题非下线报文）同为状态判定输入——照发事件（graceful=false
++// 由消费方结合 status 键区分语义；发射侧不臆造状态语义）。
++func TestContractStatusSinkHeartbeatEmitsEvent(t *testing.T) {
++	pub := &fakeGatewayStatusPub{}
++	sink := statusSinkHarness(pub)
++
++	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"online"}`))
++	sink.OnStatus(env)
++
++	if len(pub.calls) != 1 {
++		t.Fatalf("事件发射数 = %d, want 1（心跳同入事件链）", len(pub.calls))
++	}
++	if pub.calls[0].Status != "online" {
++		t.Errorf("status = %q, want online（载荷原样承载）", pub.calls[0].Status)
++	}
++}
++
++// 契约依据：ADR-0010 结构性断言——发射失败 fail-soft WARN，不直写任何状态存储
++// （EventStatusSink 无 PointCache/状态写依赖；发射失败不 panic、不阻塞路由）。
++func TestContractStatusSinkPublishFailureFailSoft(t *testing.T) {
++	pub := &fakeGatewayStatusPub{err: errors.New("redis down")}
++	sink := statusSinkHarness(pub)
++
++	env := parseStatus("iot/default/GW_01/status", "default", "GW_01", []byte(`{"status":"offline"}`))
++	sink.OnStatus(env) // 不得 panic
++	if len(pub.calls) != 0 {
++		t.Errorf("失败发射被计入成功 = %d, want 0", len(pub.calls))
++	}
++}
++
++// 编译期锁定：EventStatusSink 是既有 StatusSink 出口的零改动替换实现（0027 分发形态不变）。
++var _ StatusSink = (*EventStatusSink)(nil)
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+index 0b9f658..49c7dfd 100644
+--- a/ingest/internal/pipeline/pipeline.go
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -47,11 +47,13 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"math"
++	"sort"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/event"
+ 	"net.otlab/ingest/internal/message"
+ 	"net.otlab/ingest/internal/quality"
+ 	"net.otlab/ingest/internal/snapshot"
+@@ -202,6 +204,10 @@ type Deps struct {
+ 	// nil → 不回调。ingestd 装配 CorrectionTagger.Tag）。
+ 	// 参数：tenant、pointCode、消息原始 ts、纠偏后接收时间（毫秒）。
+ 	TimeTag func(tenant, pointCode string, origTs, correctedTs int64)
++	// Events 新值事件发射出口（TASK-0029 决策 3：写库成功后经 iot:newvalue:{tenant}
++	// 发射 {tenant,pointCode,ts,value,quality}——计算引擎事件驱动消费挂点）。
++	// nil → 不发射（事件为可选装配面；Redis 未配置时 ingestd 不装配）。
++	Events event.Publisher
+ 	// Now 消息接收时钟（时间三分裁决基准——纠偏目标=接收时间、越界窗基准）。
+ 	// nil → time.Now。测试注入冻结时钟。
+ 	Now func() time.Time
+@@ -599,6 +605,7 @@ func (p *Pipeline) flush(ctx context.Context) {
+ 	p.stats.WrittenBatches.Add(1)
+ 	p.stats.WrittenPoints.Add(int64(len(batch)))
+ 	p.updateCache(ctx, batch)
++	p.publishEvents(ctx, batch)
+ }
+ 
+ // requeueFront 失败重排：整批放回缓冲头部重试（单行重排次数超 maxWriteRequeues 时
+@@ -629,8 +636,31 @@ func (p *Pipeline) requeueFront(items []bufItem) {
+ 	p.stats.RequeuedRows.Add(int64(len(retry)))
+ }
+ 
+-// updateCache 第 5 步后半：写库成功后更新 Redis 点位缓存（v/q/ts）。
++// updateCache 第 5 步后半：写库成功后更新 Redis 点位缓存（v/q/ts；写穿透——brief 决策 2）。
++// 缓存失败 fail-soft：计数不阻塞（缓存是加速面，权威值在 TDengine）。
++// 支持可选批量接口 BatchPointSetter（按租户分组 RESP 管线一次往返——0027 遗留 ②
++// sink 队头约束复核的批量化落点）；未实现退回逐点 SetPoint（0073 形态零改动）。
+ func (p *Pipeline) updateCache(ctx context.Context, batch []tdengine.PointRow) {
++	if bs, ok := p.deps.Cache.(cache.BatchPointSetter); ok {
++		byTenant := make(map[string][]cache.PointSet)
++		order := make([]string, 0, 1)
++		for _, r := range batch {
++			if _, seen := byTenant[r.TenantCode]; !seen {
++				order = append(order, r.TenantCode)
++			}
++			byTenant[r.TenantCode] = append(byTenant[r.TenantCode], cache.PointSet{
++				PointCode: r.PointCode,
++				Value:     cache.Value{V: r.Value, Q: r.Quality, Ts: r.Ts},
++			})
++		}
++		sort.Strings(order) // 稳定序（与 Writer 分组同口径）
++		for _, tenant := range order {
++			if err := bs.SetPoints(ctx, tenant, byTenant[tenant]); err != nil {
++				p.stats.CacheFailures.Add(int64(len(byTenant[tenant])))
++			}
++		}
++		return
++	}
+ 	for _, r := range batch {
+ 		if err := p.deps.Cache.SetPoint(ctx, r.TenantCode, r.PointCode, cache.Value{V: r.Value, Q: r.Quality, Ts: r.Ts}); err != nil {
+ 			p.stats.CacheFailures.Add(1)
+@@ -638,6 +668,66 @@ func (p *Pipeline) updateCache(ctx context.Context, batch []tdengine.PointRow) {
+ 	}
+ }
+ 
++// publishEvents 新值事件发射（TASK-0029 决策 3）：写库成功后逐行构造事件
++// {tenant,pointCode,ts,value,quality}，优先批量管线发射（BatchPublisher 可选接口），
++// 未实现退回逐条。发射失败 fail-soft 计数（EventFailures），不影响落库事实。
++func (p *Pipeline) publishEvents(ctx context.Context, batch []tdengine.PointRow) {
++	if p.deps.Events == nil || len(batch) == 0 {
++		return
++	}
++	evs := make([]event.NewValueEvent, 0, len(batch))
++	for _, r := range batch {
++		evs = append(evs, event.NewValueEvent{
++			Tenant:    r.TenantCode,
++			PointCode: r.PointCode,
++			Ts:        r.Ts,
++			Value:     r.Value,
++			Quality:   r.Quality,
++		})
++	}
++	if bp, ok := p.deps.Events.(event.BatchPublisher); ok {
++		if err := bp.PublishNewValues(ctx, evs); err != nil {
++			p.stats.EventFailures.Add(int64(len(evs)))
++			return
++		}
++		p.stats.EventsPublished.Add(int64(len(evs)))
++		return
++	}
++	for _, ev := range evs {
++		if err := p.deps.Events.PublishNewValue(ctx, ev); err != nil {
++			p.stats.EventFailures.Add(1)
++			continue
++		}
++		p.stats.EventsPublished.Add(1)
++	}
++}
++
++// ---- 停机排空（TASK-0029 承接 0027 遗留分流①）----
++
++// Drain 停机排空：同步冲刷攒批缓冲直到空或 ctx 超时/取消（SIGTERM 后进程退出前，
++// 把缓冲内合法数据写完再退）。返回（本次排空成功写出行数, 排空后仍滞留缓冲的行数）；
++// remaining>0 交调用方 WARN（排空失败不阻塞退出——超时兜底强制退出口径）。
++// 与 flusher 并发安全（bufMu 串行化）；写失败重排语义与运行期一致（重排上限内重试，
++// 超限死信不回灌——持续失败在排空内收敛退出）。written 按本函数调用期间的
++// WrittenPoints 增量计（排空期调用方已停止新提交，无并发混淆面）。
++func (p *Pipeline) Drain(ctx context.Context) (written, remaining int64) {
++	var writtenTotal int64
++	for {
++		before := p.stats.WrittenPoints.Load()
++		p.flush(ctx)
++		writtenTotal += p.stats.WrittenPoints.Load() - before
++		p.bufMu.Lock()
++		left := int64(len(p.buf))
++		p.bufMu.Unlock()
++		if left == 0 {
++			return writtenTotal, 0
++		}
++		if ctx.Err() != nil {
++			return writtenTotal, left
++		}
++	}
++}
++
+ // ---- 观测 ----
+ 
+ // Stats 流水线计数快照（运维监控 FEAT-0020 的数据源挂点）。
+@@ -656,7 +746,9 @@ type Stats struct {
+ 	WriteRetriesExhausted int64 // 写失败重排超限（>3 次）转死信行数（修订轮 I2）
+ 	WrittenBatches        int64 // 成功下发攒批次数
+ 	WrittenPoints         int64 // 成功写入行数
+-	CacheFailures         int64 // 缓存更新失败次数
++	CacheFailures         int64 // 缓存更新失败次数（fail-soft 计数）
++	EventsPublished       int64 // 新值事件发射成功数（TASK-0029 决策 3）
++	EventFailures         int64 // 新值事件发射失败数（fail-soft 计数）
+ }
+ 
+ type statsCounters struct {
+@@ -675,6 +767,8 @@ type statsCounters struct {
+ 	WrittenBatches        atomic.Int64
+ 	WrittenPoints         atomic.Int64
+ 	CacheFailures         atomic.Int64
++	EventsPublished       atomic.Int64
++	EventFailures         atomic.Int64
+ }
+ 
+ // Stats 返回计数快照。
+@@ -695,6 +789,8 @@ func (p *Pipeline) Stats() Stats {
+ 		WrittenBatches:        p.stats.WrittenBatches.Load(),
+ 		WrittenPoints:         p.stats.WrittenPoints.Load(),
+ 		CacheFailures:         p.stats.CacheFailures.Load(),
++		EventsPublished:       p.stats.EventsPublished.Load(),
++		EventFailures:         p.stats.EventFailures.Load(),
+ 	}
+ }
+ 
+diff --git a/ingest/internal/pipeline/pipeline_event_drain_contract_test.go b/ingest/internal/pipeline/pipeline_event_drain_contract_test.go
+new file mode 100644
+index 0000000..db2b103
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_event_drain_contract_test.go
+@@ -0,0 +1,347 @@
++package pipeline_test
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/event"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0029 流水线接线契约测试：新值事件（写成功后发射）、缓存批量写（可选接口）、
++// 停机排空（Drain——0027 遗留分流①）。
++
++// ---- 假实现 ----
++
++// fakeEvents 事件发射记录（Publisher + BatchPublisher 双实现）。
++type fakeEvents struct {
++	mu         sync.Mutex
++	single     []event.NewValueEvent
++	batch      []event.NewValueEvent
++	batchCalls int
++	fail       bool
++}
++
++func (f *fakeEvents) PublishNewValue(_ context.Context, ev event.NewValueEvent) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.fail {
++		return errors.New("fakeEvents: 注入失败")
++	}
++	f.single = append(f.single, ev)
++	return nil
++}
++
++func (f *fakeEvents) PublishNewValues(_ context.Context, evs []event.NewValueEvent) error {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if f.fail {
++		return errors.New("fakeEvents: 注入失败")
++	}
++	f.batchCalls++
++	f.batch = append(f.batch, evs...)
++	return nil
++}
++
++func (f *fakeEvents) batchSnapshot() (batch []event.NewValueEvent, batchCalls int) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.batch, f.batchCalls
++}
++
++func (f *fakeEvents) singleSnapshot() []event.NewValueEvent {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.single
++}
++
++// singleOnlyPublisher 仅实现 Publisher（批量回退路径用）。
++type singleOnlyPublisher struct{ inner *fakeEvents }
++
++func (s *singleOnlyPublisher) PublishNewValue(ctx context.Context, ev event.NewValueEvent) error {
++	return s.inner.PublishNewValue(ctx, ev)
++}
++
++// fakeBatchCache Memory 缓存 + 批量写记录（BatchPointSetter 可选能力面）。
++type fakeBatchCache struct {
++	*cache.MemoryPointCache
++	mu         sync.Mutex
++	batchCalls int
++}
++
++func (c *fakeBatchCache) SetPoints(_ context.Context, tenant string, items []cache.PointSet) error {
++	c.mu.Lock()
++	c.batchCalls++
++	c.mu.Unlock()
++	for _, it := range items {
++		if err := c.MemoryPointCache.SetPoint(context.Background(), tenant, it.PointCode, it.Value); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (c *fakeBatchCache) batchCallCount() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.batchCalls
++}
++
++// blockingWriter 阻塞写入器（ctx 取消/超时后返回错误——排空超时兜底测试用）。
++type blockingWriter struct{ released chan struct{} }
++
++func (w *blockingWriter) WritePoints(ctx context.Context, _ []tdengine.PointRow) error {
++	select {
++	case <-w.released:
++		return errors.New("blockingWriter: 释放后注入失败")
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// failWriter 永远失败（排空重试耗尽测试用）。
++type failWriter struct{}
++
++func (failWriter) WritePoints(context.Context, []tdengine.PointRow) error {
++	return errors.New("failWriter: 持续写失败")
++}
++
++// submitPoints 经 Submit 同步面提交 n 个合法点位（不依赖消费循环）。
++func submitPoints(t *testing.T, p *pipeline.Pipeline, batchID string, n int) pipeline.SubmitResult {
++	t.Helper()
++	var sb strings.Builder
++	fmt.Fprintf(&sb, `{"tenant":"group_a","gateway":"GW_F01_01","batchId":%q,"sentAt":1795212000000,"points":[`, batchID)
++	for i := 0; i < n; i++ {
++		if i > 0 {
++			sb.WriteByte(',')
++		}
++		fmt.Fprintf(&sb, `{"pointCode":"F01_WS01_EQ001_M01","ts":%d,"value":%v,"quality":0}`, int64(1795211995000+i), float64(100+i))
++	}
++	sb.WriteString("]}")
++	return p.Submit(context.Background(), pipeline.Inbound{Tenant: "group_a", Payload: []byte(sb.String())})
++}
++
++// edHarness 本文件专用组装器：显式注入 Writer/Events/Cache（可选项均无默认依赖）。
++func edHarness(t *testing.T, cfg pipeline.Config, w pipeline.Writer, ev event.Publisher, c cache.PointCache) *pipeline.Pipeline {
++	t.Helper()
++	p, err := pipeline.Assemble(cfg, pipeline.Deps{
++		Consumer:  newFakeConsumer(64),
++		Parser:    message.Parser{},
++		Snapshots: preloadSnapshotJSON(t, defaultSnapshotJSON),
++		Batches:   pipeline.NewMemoryBatchDeduper(65536),
++		Points:    pipeline.NewMemoryPointDeduper(65536),
++		Judge:     passthroughJudge,
++		Dead:      &recordingSink{},
++		Writer:    w,
++		Cache:     c,
++		Events:    ev,
++		Now:       clockAt(1795212000000),
++	})
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	return p
++}
++
++func edCfg() pipeline.Config {
++	// 长定时窗口 + 高水位：Submit 后行滞留缓冲，由 Drain 显式冲刷（时序确定）。
++	return pipeline.Config{BatchSize: 500, FlushInterval: time.Hour}
++}
++
++// ---- 新值事件（brief 决策 3：写库成功后发射 iot:newvalue:{tenant}）----
++
++func TestContractPipelineEventsPublishedAfterWrite(t *testing.T) {
++	ev := &fakeEvents{}
++	ex := tdengine.NewFakeExecutor(0)
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, ev, cache.NewMemoryPointCache())
++	res := submitPoints(t, p, "B-EV1", 2)
++	if res.Accepted != 2 {
++		t.Fatalf("Accepted = %d, want 2", res.Accepted)
++	}
++	written, remaining := p.Drain(context.Background())
++	if written != 2 || remaining != 0 {
++		t.Fatalf("Drain = (%d,%d), want (2,0)", written, remaining)
++	}
++	if single := ev.singleSnapshot(); len(single) != 0 {
++		t.Errorf("单条发射 = %d, want 0（批量接口优先）", len(single))
++	}
++	batch, batchCalls := ev.batchSnapshot()
++	if batchCalls != 1 || len(batch) != 2 {
++		t.Fatalf("批量发射 = calls %d events %d, want 1 次 2 条（管线化）", batchCalls, len(batch))
++	}
++	if batch[0].Tenant != "group_a" || batch[0].PointCode != "F01_WS01_EQ001_M01" {
++		t.Errorf("events[0] = %+v, want tenant=group_a pointCode=F01_WS01_EQ001_M01", batch[0])
++	}
++	if batch[0].Ts != 1795211995000 || batch[0].Value != 100 || batch[0].Quality != 0 {
++		t.Errorf("events[0] 值不符: %+v（应与写入行逐字段一致）", batch[0])
++	}
++	if batch[1].Ts != 1795211995001 || batch[1].Value != 101 {
++		t.Errorf("events[1] 值不符: %+v", batch[1])
++	}
++	if st := p.Stats(); st.EventsPublished != 2 {
++		t.Errorf("EventsPublished = %d, want 2", st.EventsPublished)
++	}
++}
++
++// 契约依据：写失败不发射事件（事件只描述已落库事实——失败行随重排重试，成功后才发射，
++// 不产生幻影事件、不重复发射）。
++func TestContractPipelineNoEventsOnWriteFailure(t *testing.T) {
++	ev := &fakeEvents{}
++	ex := tdengine.NewFakeExecutor(1) // 注入首写失败 → 重排 → 重试成功
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, ev, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-EV2", 2)
++	written, remaining := p.Drain(context.Background())
++	if written != 2 || remaining != 0 {
++		t.Fatalf("Drain = (%d,%d), want (2,0)", written, remaining)
++	}
++	batch, batchCalls := ev.batchSnapshot()
++	if batchCalls != 1 || len(batch) != 2 {
++		t.Errorf("发射 = calls %d events %d, want 1 次 2 条（失败轮零发射、成功轮恰一次）", batchCalls, len(batch))
++	}
++	if st := p.Stats(); st.WriteFailures != 1 {
++		t.Errorf("WriteFailures = %d, want 1（首写失败留痕）", st.WriteFailures)
++	}
++}
++
++// 契约依据：发射失败 fail-soft（缓存/事件为加速面——失败计数不阻塞落库事实）。
++func TestContractPipelineEventFailureFailSoft(t *testing.T) {
++	ev := &fakeEvents{fail: true}
++	ex := tdengine.NewFakeExecutor(0)
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, ev, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-EV3", 2)
++	written, remaining := p.Drain(context.Background())
++	if written != 2 || remaining != 0 {
++		t.Fatalf("Drain = (%d,%d), want (2,0)（事件失败不得影响落库排空）", written, remaining)
++	}
++	st := p.Stats()
++	if st.WrittenPoints != 2 || st.EventFailures != 2 {
++		t.Errorf("Stats = written %d eventFailures %d, want 2/2", st.WrittenPoints, st.EventFailures)
++	}
++}
++
++// 契约依据：仅实现 Publisher 的发射器退回逐条发射（接口零改动替换——可选批量能力面）。
++func TestContractPipelineEventsPerRowFallback(t *testing.T) {
++	ev := &fakeEvents{}
++	ex := tdengine.NewFakeExecutor(0)
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, &singleOnlyPublisher{inner: ev}, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-EV4", 3)
++	written, _ := p.Drain(context.Background())
++	if written != 3 {
++		t.Fatalf("Drain written = %d, want 3", written)
++	}
++	if _, batchCalls := ev.batchSnapshot(); batchCalls != 0 {
++		t.Errorf("批量调用 = %d, want 0（未实现 BatchPublisher）", batchCalls)
++	}
++	if single := ev.singleSnapshot(); len(single) != 3 {
++		t.Errorf("单条发射 = %d, want 3（逐条回退）", len(single))
++	}
++}
++
++// ---- 缓存批量写（可选接口；0027 遗留 ② 批量化落点）----
++
++func TestContractPipelineCacheBatchSetterPipelined(t *testing.T) {
++	ev := &fakeEvents{}
++	ex := tdengine.NewFakeExecutor(0)
++	bc := &fakeBatchCache{MemoryPointCache: cache.NewMemoryPointCache()}
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, ev, bc)
++	submitPoints(t, p, "B-BC1", 3)
++	written, _ := p.Drain(context.Background())
++	if written != 3 {
++		t.Fatalf("Drain written = %d, want 3", written)
++	}
++	if bc.batchCallCount() != 1 {
++		t.Errorf("批量缓存调用 = %d, want 1（按租户管线化一次）", bc.batchCallCount())
++	}
++	got, err := bc.GetPoint(context.Background(), "group_a", "F01_WS01_EQ001_M01")
++	if err != nil || got.V != 102 { // 同点位 3 行——最新覆盖（ts 最大 value=102）
++		t.Errorf("缓存读回 = %+v err=%v, want 最新覆盖 v=102", got, err)
++	}
++}
++
++// 契约依据：未实现批量接口的缓存实现退回逐点 SetPoint（既有 0073 形态零改动）。
++func TestContractPipelineCachePerRowFallback(t *testing.T) {
++	ev := &fakeEvents{}
++	ex := tdengine.NewFakeExecutor(0)
++	mc := cache.NewMemoryPointCache()
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, ev, mc)
++	submitPoints(t, p, "B-BC2", 2)
++	written, _ := p.Drain(context.Background())
++	if written != 2 {
++		t.Fatalf("Drain written = %d, want 2", written)
++	}
++	if got, err := mc.GetPoint(context.Background(), "group_a", "F01_WS01_EQ001_M01"); err != nil || got.V != 101 {
++		t.Errorf("逐点回退缓存读回 = %+v err=%v, want v=101", got, err)
++	}
++}
++
++// ---- 停机排空（0027 遗留分流①：SIGTERM 后缓冲内合法数据写完再退，超时兜底）----
++
++func TestContractPipelineDrainFlushesBufferOnShutdown(t *testing.T) {
++	ex := tdengine.NewFakeExecutor(0)
++	p := edHarness(t, edCfg(), &tdengine.Writer{Ex: ex}, &fakeEvents{}, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-DR1", 3)
++	// 未启动 flusher（模拟停机后 flusher 已随 ctx 退出）——排空独自冲刷。
++	written, remaining := p.Drain(context.Background())
++	if written != 3 || remaining != 0 {
++		t.Fatalf("Drain = (%d,%d), want (3,0)", written, remaining)
++	}
++	if st := p.Stats(); st.WrittenPoints != 3 {
++		t.Errorf("WrittenPoints = %d, want 3", st.WrittenPoints)
++	}
++	calls := ex.Calls()
++	if len(calls) == 0 {
++		t.Fatal("执行器零调用（缓冲未落库）")
++	}
++	for _, c := range calls {
++		if !strings.Contains(c.SQL, "VALUES") {
++			t.Errorf("非攒批形态语句: %s", c.SQL)
++		}
++	}
++}
++
++func TestContractPipelineDrainTimeoutBounded(t *testing.T) {
++	w := &blockingWriter{released: make(chan struct{})}
++	p := edHarness(t, edCfg(), w, &fakeEvents{}, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-DR2", 3)
++	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
++	defer cancel()
++	start := time.Now()
++	written, remaining := p.Drain(ctx)
++	elapsed := time.Since(start)
++	if remaining != 3 {
++		t.Fatalf("Drain remaining = %d, want 3（写阻塞超时兜底，行保留缓冲）", remaining)
++	}
++	if written != 0 {
++		t.Errorf("Drain written = %d, want 0", written)
++	}
++	if elapsed > 2*time.Second {
++		t.Errorf("Drain elapsed = %v, want 受 ctx 超时约束（约 80ms）", elapsed)
++	}
++	close(w.released)
++}
++
++// 契约依据：持续写失败——排空期间重试走既有重排上限（>3 次死信不回灌），排空收敛退出
++// 不阻塞（written=0、remaining=0——行已转死信计数）。
++func TestContractPipelineDrainExhaustsRetriesToDeadLetter(t *testing.T) {
++	p := edHarness(t, edCfg(), failWriter{}, &fakeEvents{}, cache.NewMemoryPointCache())
++	submitPoints(t, p, "B-DR3", 3)
++	written, remaining := p.Drain(context.Background())
++	if written != 0 || remaining != 0 {
++		t.Fatalf("Drain = (%d,%d), want (0,0)（重试耗尽转死信，缓冲排空）", written, remaining)
++	}
++	st := p.Stats()
++	if st.WriteRetriesExhausted != 3 {
++		t.Errorf("WriteRetriesExhausted = %d, want 3", st.WriteRetriesExhausted)
++	}
++	if st.WriteFailures != 4 { // 3 行同批一次下发：初始 + 3 次重排 = 4 次 flush 失败（按批计）
++		t.Errorf("WriteFailures = %d, want 4（失败按下发批计——整批重排语义）", st.WriteFailures)
++	}
++}
+diff --git a/ingest/internal/tdengine/rest.go b/ingest/internal/tdengine/rest.go
+index 024cc18..f21d0ec 100644
+--- a/ingest/internal/tdengine/rest.go
++++ b/ingest/internal/tdengine/rest.go
+@@ -8,8 +8,11 @@ import (
+ 	"io"
+ 	"log"
+ 	"net/http"
++	"strconv"
+ 	"strings"
+ 	"time"
++
++	"net.otlab/ingest/internal/cache"
+ )
+ 
+ // TDengine REST 写客户端（TASK-0076 brief 决策 4）——真库写入归 0068 联调（fd 待修复），
+@@ -164,10 +167,168 @@ func (c *RESTClient) Exec(ctx context.Context, sql string) error {
+ 	return &SQLError{Code: env.Code, Desc: env.Desc}
+ }
+ 
+-// EnsureSchema 附录 B 建库建表（每租户一库）：单请求多语句下发——CREATE DATABASE +
+-// USE + CREATE STABLE 串接（9750 教训第二路径「SQL 内 USE 多语句」，不用
+-// /rest/sql/<db> 库上下文）；语句复用 0073 DDL 构造器逐字。
++// QualifiedCreateStableSQLs 附录 B 四张超级表 DDL 的库名全限定形态（REST 逐语句下发用）：
++// REST 无状态连接，USE 语境不可跨请求（9750 教训同族），建表语句须全限定表名。
++// 语句主体复用 0073 附录 B 构造器逐字（库名限定是唯一变换）。
++func QualifiedCreateStableSQLs(tenantCode string) []string {
++	db := DBName(tenantCode)
++	out := make([]string, 0, 4)
++	for _, stmt := range CreateStableSQL(tenantCode) {
++		out = append(out, strings.Replace(stmt, "CREATE STABLE IF NOT EXISTS ", "CREATE STABLE IF NOT EXISTS "+db+".", 1))
++	}
++	return out
++}
++
++// EnsureSchema 附录 B 建库建表（每租户一库）——逐语句独立下发。
++// TASK-0029 live 发现修正（2026-11-23 真库 3.4.3.9 实测）：taosAdapter REST 一次一 SQL，
++// 旧「单请求多语句（CREATE DATABASE + USE + CREATE STABLE）」信封被**静默忽略**
++// （code=0 affected=0、SHOW STABLES 零建表）——多语句形态在产品路径上是静默空操作。
++// 修正后：CREATE DATABASE 一请求；CREATE STABLE 一表一请求（QualifiedCreateStableSQLs
++// 全限定，复用附录 B 构造器逐字）。任一语句失败即中止并上返（调用方 fail-soft 处理）。
+ func (c *RESTClient) EnsureSchema(ctx context.Context, tenantCode string) error {
+-	stmts := append([]string{CreateDatabaseSQL(tenantCode), UseSQL(tenantCode)}, CreateStableSQL(tenantCode)...)
+-	return c.Exec(ctx, strings.Join(stmts, "\n"))
++	if err := c.Exec(ctx, CreateDatabaseSQL(tenantCode)); err != nil {
++		return err
++	}
++	for _, stmt := range QualifiedCreateStableSQLs(tenantCode) {
++		if err := c.Exec(ctx, stmt); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// QueryResult 查询结果集：列名与数据行（REST JSON 的 data 全为字符串形态）。
++type QueryResult struct {
++	Columns []string
++	Rows    [][]string
++}
++
++// queryEnvelope 查询响应信封（taosadapter：code/desc/column_meta/data/rows）。
++type queryEnvelope struct {
++	Code int
++	Desc string
++	Data [][]any
++}
++
++// Query 执行只读 SQL（SELECT/SHOW——回源最近值等），走同一 REST 通道（POST /rest/sql，
++// Basic 认证，全限定名——9750 教训同口径）。code=0 成功；24/918 环境级失败同 Exec 口径。
++func (c *RESTClient) Query(ctx context.Context, sql string) (*QueryResult, error) {
++	endpoint := strings.TrimRight(c.cfg.Endpoint, "/") + RESTPath
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(sql))
++	if err != nil {
++		return nil, fmt.Errorf("tdengine: 构造 REST 请求失败: %w", err)
++	}
++	req.SetBasicAuth(c.cfg.User, c.cfg.Password)
++	req.Header.Set("Content-Type", "text/plain")
++
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("tdengine: REST 请求失败: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
++	if err != nil {
++		return nil, fmt.Errorf("tdengine: 读取 REST 响应失败: %w", err)
++	}
++
++	var env queryEnvelope
++	if err := json.Unmarshal(body, &env); err != nil {
++		return nil, fmt.Errorf("tdengine: 查询响应解析失败 status=%d body=%s: %w", resp.StatusCode, truncateSQL(string(body)), err)
++	}
++	if env.Code != 0 {
++		if envErrorCodes[env.Code] {
++			c.logger.Printf("tdengine: 环境级失败（fail-soft 重试计数）code=%d desc=%q sql=%s", env.Code, env.Desc, truncateSQL(sql))
++			return nil, &EnvError{Code: env.Code, Desc: env.Desc}
++		}
++		return nil, &SQLError{Code: env.Code, Desc: env.Desc}
++	}
++	out := &QueryResult{Columns: resultColumns(body)}
++	for _, row := range env.Data {
++		r := make([]string, 0, len(row))
++		for _, cell := range row {
++			r = append(r, fmt.Sprintf("%v", cell))
++		}
++		out.Rows = append(out.Rows, r)
++	}
++	return out, nil
++}
++
++// resultColumns 从响应原文提取列名（column_meta[0] 为列名数组；解析失败容忍为空——
++// 列名对按位取值足够）。
++func resultColumns(body []byte) []string {
++	var raw struct {
++		ColumnMeta [][]json.RawMessage `json:"column_meta"`
++	}
++	if err := json.Unmarshal(body, &raw); err != nil {
++		return nil
++	}
++	out := make([]string, 0, len(raw.ColumnMeta))
++	for _, col := range raw.ColumnMeta {
++		if len(col) == 0 {
++			out = append(out, "")
++			continue
++		}
++		var name string
++		_ = json.Unmarshal(col[0], &name)
++		out = append(out, name)
++	}
++	return out
++}
++
++// LatestPointValue 点位最近落库值（缓存未命中回源源——TASK-0029 读-through 口径）：
++// SELECT ts, value, quality FROM iot_<tenant>.<child> ORDER BY ts DESC LIMIT 1。
++// 子表名走 ChildTableName 确定性映射、库名走 DBName 唯一入口（LOG-0011：建库建表
++// 不手拼）；全限定表名不落库上下文路径（9750 教训）。
++// 返回 found=false 表示源无数据（子表尚不存在/无行——缓存侧转 ErrCacheMiss，不静默给零值）。
++func (c *RESTClient) LatestPointValue(ctx context.Context, tenantCode, pointCode string) (cache.Value, bool, error) {
++	child, err := ChildTableName(pointCode)
++	if err != nil {
++		return cache.Value{}, false, err
++	}
++	sql := fmt.Sprintf("SELECT ts, value, quality FROM %s.%s ORDER BY ts DESC LIMIT 1", DBName(tenantCode), child)
++	res, err := c.Query(ctx, sql)
++	if err != nil {
++		return cache.Value{}, false, err
++	}
++	if len(res.Rows) == 0 || len(res.Rows[0]) < 3 {
++		return cache.Value{}, false, nil
++	}
++	row := res.Rows[0]
++	ts, err := parseTsCell(row[0])
++	if err != nil {
++		return cache.Value{}, false, fmt.Errorf("tdengine: 最近值 ts 解析失败 %q: %w", row[0], err)
++	}
++	v, err := strconv.ParseFloat(row[1], 64)
++	if err != nil {
++		return cache.Value{}, false, fmt.Errorf("tdengine: 最近值 value 解析失败 %q: %w", row[1], err)
++	}
++	q, err := strconv.Atoi(row[2])
++	if err != nil {
++		return cache.Value{}, false, fmt.Errorf("tdengine: 最近值 quality 解析失败 %q: %w", row[2], err)
++	}
++	return cache.Value{V: v, Q: q, Ts: ts}, true, nil
++}
++
++// parseTsCell 时间戳单元格解析（taosadapter 形态二选一）：
++//   - 毫秒整数字符串（"1795211995000"）；
++//   - ISO 字符串（"2026-11-20 22:00:00.500"——无时区标记按 UTC 解析；带时区 RFC3339
++//     直接解析）。live 真库口径以冒烟核对为准。
++func parseTsCell(s string) (int64, error) {
++	if s == "" {
++		return 0, fmt.Errorf("tdengine: 空 ts 单元格")
++	}
++	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
++		return n, nil
++	}
++	layouts := []string{
++		"2006-01-02 15:04:05.999999999",
++		"2006-01-02 15:04:05",
++		time.RFC3339Nano,
++	}
++	for _, layout := range layouts {
++		if t, err := time.Parse(layout, s); err == nil {
++			return t.UnixMilli(), nil
++		}
++	}
++	return 0, fmt.Errorf("tdengine: 不可识别的 ts 形态 %q", s)
+ }
+diff --git a/ingest/internal/tdengine/rest_contract_test.go b/ingest/internal/tdengine/rest_contract_test.go
+index f0a226f..c833bc9 100644
+--- a/ingest/internal/tdengine/rest_contract_test.go
++++ b/ingest/internal/tdengine/rest_contract_test.go
+@@ -39,6 +39,7 @@ type fakeTaosAdapter struct {
+ 	auth       string
+ 	contType   string
+ 	body       string
++	bodies     []string // 全部请求体（EnsureSchema 逐语句断言用，TASK-0029 live 发现后扩）
+ 	sleep      time.Duration
+ 	respCode   int
+ 	respDesc   string
+@@ -53,6 +54,7 @@ func (f *fakeTaosAdapter) handle(w http.ResponseWriter, r *http.Request) {
+ 	f.auth = r.Header.Get("Authorization")
+ 	f.contType = r.Header.Get("Content-Type")
+ 	f.body = string(b)
++	f.bodies = append(f.bodies, string(b))
+ 	f.reqCount++
+ 	sleep := f.sleep
+ 	code, desc := f.respCode, f.respDesc
+@@ -71,6 +73,12 @@ func (f *fakeTaosAdapter) snapshot() (path, auth, body string, count int) {
+ 	return f.path, f.auth, f.body, f.reqCount
+ }
+ 
++func (f *fakeTaosAdapter) allBodies() []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return append([]string(nil), f.bodies...)
++}
++
+ func newClient(srvURL string, cfgOverride func(*tdengine.RESTConfig), logger *log.Logger) *tdengine.RESTClient {
+ 	cfg := tdengine.RESTConfig{Endpoint: srvURL, User: "root", Password: "taosdata"}
+ 	if cfgOverride != nil {
+@@ -121,10 +129,13 @@ func TestContractRESTWriteFullyQualifiedNamesAndBasicAuth(t *testing.T) {
+ 	}
+ }
+ 
+-// 契约依据：9750 教训「必须全限定表名（db.stable）或 SQL 内 USE 多语句」——附录 B DDL
+-// 经 EnsureSchema 以单请求多语句（CREATE DATABASE + USE + CREATE STABLE）下发，
+-// 复用 0073 DDL 构造器逐字语句。
+-func TestContractRESTEnsureSchemaUsesUseMultiStatement(t *testing.T) {
++// 契约依据（TASK-0029 live 发现修正——红转绿）：taosAdapter REST 一次一 SQL——多语句
++// 信封（USE 多语句）在真库 3.4.3.9 上被**静默忽略**（2026-11-23 实测：code=0 affected=0，
++// SHOW STABLES 零建表），EnsureSchema 旧「单请求多语句」形态在产品路径上是静默空操作。
++// 修正语义：逐语句独立下发——CREATE DATABASE 一请求；CREATE STABLE 一表一请求，
++// 表名库名全限定（REST 无状态连接，USE 语境不可跨请求——9750 教训同族）；DDL 语句
++// 仍复用 0073 附录 B 构造器逐字（库名限定为唯一变换）。
++func TestContractRESTEnsureSchemaSplitsPerStatementQualified(t *testing.T) {
+ 	fake := &fakeTaosAdapter{}
+ 	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
+ 	defer srv.Close()
+@@ -134,19 +145,35 @@ func TestContractRESTEnsureSchemaUsesUseMultiStatement(t *testing.T) {
+ 		t.Fatalf("EnsureSchema error: %v", err)
+ 	}
+ 
+-	path, _, body, _ := fake.snapshot()
++	path, _, _, count := fake.snapshot()
+ 	if path != "/rest/sql" {
+ 		t.Errorf("path = %q, want /rest/sql（不用 /rest/sql/<db>）", path)
+ 	}
+-	for _, want := range []string{
+-		"CREATE DATABASE IF NOT EXISTS iot_group_5fa KEEP 1825d DURATION 10d BUFFER 256;",
+-		"USE iot_group_5fa;",
+-		"CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT)",
+-		"CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT)",
+-	} {
+-		if !strings.Contains(body, want) {
+-			t.Errorf("body 缺附录 B 语句: %q\nbody = %s", want, body)
++	if count != 5 { // 建库 1 + 四张超级表各 1
++		t.Fatalf("请求次数 = %d, want 5（逐语句独立下发——多语句信封真库静默空操作）", count)
++	}
++	bodies := fake.allBodies()
++	want0 := "CREATE DATABASE IF NOT EXISTS iot_group_5fa KEEP 1825d DURATION 10d BUFFER 256;"
++	if bodies[0] != want0 {
++		t.Errorf("请求 0 = %q, want 建库语句 %q", bodies[0], want0)
++	}
++	qualifiedWant := []string{
++		"CREATE STABLE IF NOT EXISTS iot_group_5fa.st_point_num (ts TIMESTAMP, value DOUBLE, quality INT)",
++		"CREATE STABLE IF NOT EXISTS iot_group_5fa.st_point_state (ts TIMESTAMP, value INT, quality INT)",
++		"CREATE STABLE IF NOT EXISTS iot_group_5fa.st_item_value (ts TIMESTAMP, value DOUBLE, quality INT)",
++		"CREATE STABLE IF NOT EXISTS iot_group_5fa.st_metric_value (ts TIMESTAMP, value DOUBLE, yoy DOUBLE, mom DOUBLE)",
++	}
++	for i, want := range qualifiedWant {
++		if !strings.HasPrefix(bodies[i+1], want) {
++			t.Errorf("请求 %d = %q\nwant 前缀 %q（附录 B 语句逐字 + 库名全限定）", i+1, bodies[i+1], want)
+ 		}
++		if strings.Contains(bodies[i+1], "USE ") {
++			t.Errorf("请求 %d 含 USE 多语句形态（真库静默空操作——已废弃）: %s", i+1, bodies[i+1])
++		}
++	}
++	// 附录 B 语句逐字核对（TAGS 行与原文一致——库名限定是唯一变换）。
++	if !strings.Contains(bodies[1], "TAGS (tenant_id BIGINT, point_code BINARY(96), kind BINARY(16), instance_key BINARY(96), dept_id BIGINT);") {
++		t.Errorf("TAGS 行偏离附录 B 逐字: %s", bodies[1])
+ 	}
+ }
+ 
+diff --git a/ingest/internal/tdengine/rest_query_contract_test.go b/ingest/internal/tdengine/rest_query_contract_test.go
+new file mode 100644
+index 0000000..36ee362
+--- /dev/null
++++ b/ingest/internal/tdengine/rest_query_contract_test.go
+@@ -0,0 +1,160 @@
++package tdengine_test
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0029 最近值查询契约测试（缓存未命中回源源——brief 决策 2「SELECT ... ORDER BY
++// ts DESC LIMIT 1，按需实现不预热的读-through」）。查询走同一 REST 通道（POST /rest/sql，
++// Basic 认证，全限定表名——9750 教训同口径）。
++
++// fakeQueryAdapter 假 taosAdapter：记录查询 SQL，回放注入结果集。
++type fakeQueryAdapter struct {
++	mu     sync.Mutex
++	sqls   []string
++	resp   map[string]any
++	status int
++}
++
++func (f *fakeQueryAdapter) handle(w http.ResponseWriter, r *http.Request) {
++	body := make([]byte, 8192)
++	n, _ := r.Body.Read(body)
++	f.mu.Lock()
++	f.sqls = append(f.sqls, string(body[:n]))
++	resp := f.resp
++	status := f.status
++	f.mu.Unlock()
++	if status != 0 {
++		w.WriteHeader(status)
++	}
++	_ = json.NewEncoder(w).Encode(resp)
++}
++
++func (f *fakeQueryAdapter) captured() []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	out := make([]string, len(f.sqls))
++	copy(out, f.sqls)
++	return out
++}
++
++func queryClient(t *testing.T, srvURL string) *tdengine.RESTClient {
++	t.Helper()
++	return tdengine.NewRESTClient(tdengine.RESTConfig{Endpoint: srvURL, User: "root", Password: "taosdata"})
++}
++
++func queryResult(columns [][]string, rows [][]string) map[string]any {
++	meta := make([][]any, 0, len(columns))
++	for _, c := range columns {
++		meta = append(meta, []any{c[0], c[1], c[2]})
++	}
++	return map[string]any{"code": 0, "desc": "succ", "column_meta": meta, "data": rows, "rows": len(rows)}
++}
++
++// 契约依据：回源 SQL 形态——SELECT ts, value, quality FROM iot_<tenant>.<child>
++// ORDER BY ts DESC LIMIT 1（最近一行；子表名走 0073 ChildTableName 确定性映射，
++// 库名走 DBName 唯一入口，全限定不落 /rest/sql/<db> 库上下文）。
++func TestContractRESTLatestPointValueSQLShape(t *testing.T) {
++	fake := &fakeQueryAdapter{
++		resp: queryResult(
++			[][]string{{"ts", "TIMESTAMP", "8"}, {"value", "DOUBLE", "6"}, {"quality", "INT", "4"}},
++			[][]string{{"1795211995000", "98231.4", "0"}},
++		),
++	}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	got, found, err := queryClient(t, srv.URL).LatestPointValue(context.Background(), "group_a", "F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("LatestPointValue error: %v", err)
++	}
++	if !found {
++		t.Fatal("found = false, want true")
++	}
++	want := cache.Value{V: 98231.4, Q: 0, Ts: 1795211995000}
++	if got != want {
++		t.Errorf("LatestPointValue = %+v, want %+v", got, want)
++	}
++
++	sqls := fake.captured()
++	if len(sqls) != 1 {
++		t.Fatalf("SQL 次数 = %d, want 1", len(sqls))
++	}
++	const wantSQL = "SELECT ts, value, quality FROM iot_group_5fa.F01_5fWS01_5fEQ001_5fM01 ORDER BY ts DESC LIMIT 1"
++	if sqls[0] != wantSQL {
++		t.Errorf("SQL = %q\nwant     %q（全限定 + 确定性映射子表名）", sqls[0], wantSQL)
++	}
++}
++
++// 契约依据：state 表 value 为 INT——同一查询形态，值按浮点承载（cache.Value v 语义）。
++func TestContractRESTLatestPointValueStateKind(t *testing.T) {
++	fake := &fakeQueryAdapter{
++		resp: queryResult(
++			[][]string{{"ts", "TIMESTAMP", "8"}, {"value", "INT", "4"}, {"quality", "INT", "4"}},
++			[][]string{{"2026-11-20 22:00:00.500", "2", "3"}},
++		),
++	}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	got, found, err := queryClient(t, srv.URL).LatestPointValue(context.Background(), "group_a", "ST01_SW01")
++	if err != nil {
++		t.Fatalf("LatestPointValue error: %v", err)
++	}
++	if !found {
++		t.Fatal("found = false, want true")
++	}
++	if got.V != 2 || got.Q != 3 {
++		t.Errorf("LatestPointValue = %+v, want v=2 q=3", got)
++	}
++	// ts 为 ISO 形态（taosadapter 回放口径之一）——毫秒解析（无时区标记按 UTC；
++	// 真库口径以 live 冒烟核对为准）。
++	if got.Ts != 1795212000500 { // 2026-11-20 22:00:00.500 UTC
++		t.Errorf("ts = %d, want 1795212000500（ISO 字符串解析）", got.Ts)
++	}
++}
++
++// 契约依据：源无数据（子表尚不存在/无行）→ found=false（缓存侧转 ErrCacheMiss，
++// 不静默给零值）。
++func TestContractRESTLatestPointValueNotFound(t *testing.T) {
++	fake := &fakeQueryAdapter{
++		resp: queryResult(
++			[][]string{{"ts", "TIMESTAMP", "8"}, {"value", "DOUBLE", "6"}, {"quality", "INT", "4"}},
++			[][]string{},
++		),
++	}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	_, found, err := queryClient(t, srv.URL).LatestPointValue(context.Background(), "group_a", "P1")
++	if err != nil {
++		t.Fatalf("LatestPointValue error: %v", err)
++	}
++	if found {
++		t.Error("found = true, want false（空结果集）")
++	}
++}
++
++// 契约依据：SQL 执行失败（非 0 码）→ 错误上返（读路径 fail-soft 归缓存侧）。
++func TestContractRESTLatestPointValueSQLError(t *testing.T) {
++	fake := &fakeQueryAdapter{resp: map[string]any{"code": 9730, "desc": "Table does not exist"}}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	_, _, err := queryClient(t, srv.URL).LatestPointValue(context.Background(), "group_a", "P1")
++	if err == nil {
++		t.Fatal("LatestPointValue error = nil, want SQL 失败上返")
++	}
++	if !strings.Contains(err.Error(), "9730") {
++		t.Errorf("err = %v, want 含码 9730", err)
++	}
++}

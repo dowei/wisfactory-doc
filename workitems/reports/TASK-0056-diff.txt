@@ -1,0 +1,4677 @@
+diff --git a/frontend/src/api/iot/channel-api.ts b/frontend/src/api/iot/channel-api.ts
+new file mode 100644
+index 0000000..95b9c11
+--- /dev/null
++++ b/frontend/src/api/iot/channel-api.ts
+@@ -0,0 +1,50 @@
++/*
++ * 采集通道（智慧工厂）
++ *
++ * 对接后端 IotChannelController（TASK-0018 交付，路径前缀 /iot/channel；
++ * 权限位 iot:channel:* 与 sys_menu 4046-4050 五行一一对应）。
++ * list 按 gatewayId 必传查通道列表（通道列表按网关查，§3.1 口径）；
++ * conn_config 以 JSON 对象承载（后端 JsonNode 直收，无需预字符串化），按协议
++ * Schema 校验且不含凭据（ADR-0006）；MODBUS/OPCUA 可建不可启用（status 强制 0）；
++ * channel_code/gateway_id 创建后不可改；保存≠生效（生效走配置快照发布链路）。
++ */
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const channelApi = {
++  /**
++   * 通道分页列表（gatewayId 必传——按网关查；channelCode 模糊，protocolType/status 精确）
++   */
++  queryChannelList: (params?) => {
++    return getRequest('/iot/channel/list', params);
++  },
++
++  /**
++   * 通道详情（含 conn_config JSON 原文——不含凭据，ADR-0006）
++   */
++  queryChannelById: (id) => {
++    return getRequest(`/iot/channel/${id}`, undefined);
++  },
++
++  /**
++   * 新增通道（channel_code 网关内唯一；conn_config 按协议 Schema 后端校验；
++   * MODBUS/OPCUA 请求携带 status=1 也落库 0）
++   */
++  addChannel: (data) => {
++    return postRequest('/iot/channel', data);
++  },
++
++  /**
++   * 修改通道（channel_code/gateway_id 不可改——携带不一致后端拒；
++   * conn_config 或 protocolType 任一携带即重新校验 conn_config）
++   */
++  updateChannel: (data) => {
++    return putRequest('/iot/channel', data);
++  },
++
++  /**
++   * 删除通道（软删除；其下有点位时后端拒绝）
++   */
++  deleteChannel: (id) => {
++    return deleteRequest(`/iot/channel/${id}`);
++  },
++};
+diff --git a/frontend/src/api/iot/dict-api.ts b/frontend/src/api/iot/dict-api.ts
+new file mode 100644
+index 0000000..3137cc4
+--- /dev/null
++++ b/frontend/src/api/iot/dict-api.ts
+@@ -0,0 +1,72 @@
++/*
++ * 业务数据字典（智慧工厂）
++ *
++ * 对接后端 IotDataDictController（TASK-0008/0009 交付，路径前缀 /iot/dict，
++ * 权限位 iot:dict:* 与 sys_menu 4018-4023 六个按钮行一一对应）。
++ * CONV-01：本页是业务数据字典（模板选码唯一来源），与框架系统枚举字典
++ * sys_dict 两类不混用；data_code/data_type 创建后锁定；DELETE 语义=置禁用。
++ */
++import { deleteRequest, getDownload, getRequest, postDownload, postRequest, putRequest } from '/@/lib/axios';
++
++export const dictApi = {
++  /**
++   * 分页查询字典条目（dataCode/dataName 模糊，category/status 精确）
++   */
++  queryDictList: (params?) => {
++    return getRequest('/iot/dict/list', params);
++  },
++
++  /**
++   * 根据ID查询字典条目
++   */
++  queryDictById: (id) => {
++    return getRequest(`/iot/dict/${id}`, undefined);
++  },
++
++  /**
++   * 新增字典条目（data_code 租户内唯一，重复后端报 4002）
++   */
++  addDict: (data) => {
++    return postRequest('/iot/dict', data);
++  },
++
++  /**
++   * 修改字典条目（data_code/data_type 创建后锁定，编辑表单禁输）
++   */
++  updateDict: (data) => {
++    return putRequest('/iot/dict', data);
++  },
++
++  /**
++   * 禁用字典条目（DELETE 语义=置禁用 status=0，不物理删除，编码不复用）
++   */
++  disableDict: (id) => {
++    return deleteRequest(`/iot/dict/${id}`);
++  },
++
++  /**
++   * 批量导入（multipart Excel，单批≤5000 行，整批原子；失败整批拒绝并返回逐行回执）。
++   * silentError：拒绝时 body code=400 且 data 携带回执清单，由弹窗自行渲染
++   */
++  importDict: (formData) => {
++    return postRequest('/iot/dict/import', formData, {
++      headers: { 'Content-Type': 'multipart/form-data' },
++      timeout: 120000,
++      silentError: true,
++    });
++  },
++
++  /**
++   * 下载字典导入模板（表头+示例行+说明行）
++   */
++  downloadImportTemplate: () => {
++    return getDownload('/iot/dict/import/template');
++  },
++
++  /**
++   * 下载导入错误行清单（回执失败行渲染 xlsx，无失败行仅表头）
++   */
++  downloadImportErrorReport: (receipt) => {
++    return postDownload('/iot/dict/import/error-report', receipt);
++  },
++};
+diff --git a/frontend/src/api/iot/gateway-api.ts b/frontend/src/api/iot/gateway-api.ts
+new file mode 100644
+index 0000000..7e0b5b3
+--- /dev/null
++++ b/frontend/src/api/iot/gateway-api.ts
+@@ -0,0 +1,42 @@
++/*
++ * 采集网关（智慧工厂）
++ *
++ * 对接后端 IotGatewayController（TASK-0017 交付，路径前缀 /iot/gateway；
++ * 权限位 iot:gateway:* 与 sys_menu 4041-4045 五行对应——后端不设 detail 端点
++ * （iot:gateway:query 4042 预登记供前端详情弹层预留，本封装不提供 GET /{id}）。
++ * gateway_code 创建后不可改；在线状态五字段组由接入服务心跳回写，管理面只读。
++ */
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const gatewayApi = {
++  /**
++   * 网关分页列表（gatewayCode/gatewayName 模糊，status/onlineStatus 精确；
++   * 含在线状态与心跳时间列）
++   */
++  queryGatewayList: (params?) => {
++    return getRequest('/iot/gateway/list', params);
++  },
++
++  /**
++   * 新增网关（编码租户内唯一，[A-Za-z0-9_] ≤64，创建后不可改；新建一律启用，
++   * 启停走编辑接口）
++   */
++  addGateway: (data) => {
++    return postRequest('/iot/gateway', data);
++  },
++
++  /**
++   * 修改网关（gateway_code 不可改，仅作一致性核对；可变白名单
++   * gatewayName/instanceId/deptId/heartbeatPeriod/status）
++   */
++  updateGateway: (data) => {
++    return putRequest('/iot/gateway', data);
++  },
++
++  /**
++   * 删除网关（软删除；名下有通道/点位时后端拒绝并提示）
++   */
++  deleteGateway: (id) => {
++    return deleteRequest(`/iot/gateway/${id}`);
++  },
++};
+diff --git a/frontend/src/api/iot/instance-api.ts b/frontend/src/api/iot/instance-api.ts
+new file mode 100644
+index 0000000..47189d3
+--- /dev/null
++++ b/frontend/src/api/iot/instance-api.ts
+@@ -0,0 +1,54 @@
++/*
++ * 模型实例（智慧工厂）
++ *
++ * 对接后端 IotModelInstanceController（TASK-0012 交付，路径前缀 /iot/instance；
++ * 权限位 iot:instance:* 与 sys_menu 4030-4035 六行一一对应，树接口单设 iot:instance:tree）。
++ * 路径式编码：创建只传本级短码（服务层拼父全码）；编辑五字段不可变（编码/父/祖级/
++ * 类型/模板，仅作一致性核对）；删除为逻辑删（有子实例时后端拒绝）。
++ */
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const instanceApi = {
++  /**
++   * 实例树查询（按数据权限裁剪：无权节点不返回，路径节点仅骨架）
++   */
++  queryInstanceTree: () => {
++    return getRequest('/iot/instance/tree', undefined);
++  },
++
++  /**
++   * 分页查询实例（instanceCode/instanceName 模糊，nodeType/status/deptId 精确）
++   */
++  queryInstanceList: (params?) => {
++    return getRequest('/iot/instance/list', params);
++  },
++
++  /**
++   * 实例详情（数据权限不命中后端 403）
++   */
++  queryInstanceById: (id) => {
++    return getRequest(`/iot/instance/${id}`, undefined);
++  },
++
++  /**
++   * 新增实例（只传本级短码 shortCode；设备/组件级 template_id 必填 TD-0008，
++   * 工厂/车间级 dept_id 必填——后端服务层校验）
++   */
++  addInstance: (data) => {
++    return postRequest('/iot/instance', data);
++  },
++
++  /**
++   * 修改实例（编码/父/祖级/类型/模板五字段不可改；locked=1 时后端仅接受 status 变更）
++   */
++  updateInstance: (data) => {
++    return putRequest('/iot/instance', data);
++  },
++
++  /**
++   * 批量删除实例（逻辑删；有子实例时后端拒绝并提示子实例编码）
++   */
++  deleteInstances: (ids) => {
++    return deleteRequest(`/iot/instance/${ids}`);
++  },
++};
+diff --git a/frontend/src/api/iot/item-api.ts b/frontend/src/api/iot/item-api.ts
+new file mode 100644
+index 0000000..5af5cab
+--- /dev/null
++++ b/frontend/src/api/iot/item-api.ts
+@@ -0,0 +1,40 @@
++/*
++ * 实例数据项（智慧工厂）
++ *
++ * 对接后端 IotDataItemController（TASK-0013 清单/重生成 + TASK-0014 参数覆盖与继承链；
++ * 清单挂 /iot/item/list，重生成/参数覆盖/有效值挂实例子资源
++ * /iot/instance/{instanceId}/items/**。权限位 iot:item:*（sys_menu 4036-4040）：
++ * 清单 list(4036) / 有效值 query(4037) / 重生成 add(4038) / 参数覆盖 edit(4039)。
++ * 参数覆盖四字段逐字段生效：null=清除覆盖回归模板继承。
++ */
++import { getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const itemApi = {
++  /**
++   * 按实例查数据项清单（数据权限裁剪：不可见实例后端返回空清单）
++   */
++  queryItemList: (instanceId) => {
++    return getRequest('/iot/item/list', { instanceId });
++  },
++
++  /**
++   * 重生成实例数据项（按模板清单对齐：新增缺失项；已存在跳过；模板已删项保留）
++   */
++  regenerateItems: (instanceId) => {
++    return postRequest(`/iot/instance/${instanceId}/items/regenerate`, undefined);
++  },
++
++  /**
++   * 覆盖实例参数阈值（valid/alarm 四字段逐字段生效，null=清除覆盖回归继承）
++   */
++  overrideItemParams: (instanceId, itemId, data) => {
++    return putRequest(`/iot/instance/${instanceId}/items/${itemId}/params`, data);
++  },
++
++  /**
++   * 实例参数有效值与继承来源（逐字段三态 INSTANCE/TEMPLATE/NONE）
++   */
++  queryEffectiveParams: (instanceId, itemId) => {
++    return getRequest(`/iot/instance/${instanceId}/items/${itemId}/effective-params`, undefined);
++  },
++};
+diff --git a/frontend/src/api/iot/template-api.ts b/frontend/src/api/iot/template-api.ts
+new file mode 100644
+index 0000000..9f2b2d6
+--- /dev/null
++++ b/frontend/src/api/iot/template-api.ts
+@@ -0,0 +1,74 @@
++/*
++ * 模型模板 + 模板数据项（智慧工厂）
++ *
++ * 对接后端 IotModelTemplateController / IotDataItemTemplateController（TASK-0011 交付，
++ * 路径前缀 /iot/template 与子资源 /iot/template/item；权限位 iot:template:*（4024-4028）
++ * 与 iot:template:item:edit（4029，三个写接口共用；查询共用 iot:template:list））。
++ * template_code 创建后不可改；模板删除为真实逻辑删（有实例/数据项引用时后端拒绝）。
++ */
++import { deleteRequest, getRequest, postRequest, putRequest } from '/@/lib/axios';
++
++export const templateApi = {
++  /**
++   * 分页查询模型模板（templateCode/templateName 模糊，nodeType/status 精确）
++   */
++  queryTemplateList: (params?) => {
++    return getRequest('/iot/template/list', params);
++  },
++
++  /**
++   * 模板详情（withItems=true 聚合模板数据项清单，items 字段仅该模式返回）
++   */
++  queryTemplateById: (id, withItems?) => {
++    return getRequest(`/iot/template/${id}`, { withItems: withItems === true ? true : undefined });
++  },
++
++  /**
++   * 新增模板（template_code 租户内唯一，重复后端报 4002；tenant_id 会话覆盖）
++   */
++  addTemplate: (data) => {
++    return postRequest('/iot/template', data);
++  },
++
++  /**
++   * 修改模板（template_code 创建后不可改，编辑表单禁输；node_type 1-5）
++   */
++  updateTemplate: (data) => {
++    return putRequest('/iot/template', data);
++  },
++
++  /**
++   * 批量删除模板（逻辑删；有实例引用或模板数据项时后端拒绝并提示引用来源）
++   */
++  deleteTemplates: (ids) => {
++    return deleteRequest(`/iot/template/${ids}`);
++  },
++
++  /**
++   * 按模板查数据项清单（查询共用 iot:template:list）
++   */
++  queryTemplateItems: (templateId) => {
++    return getRequest('/iot/template/item/list', { templateId });
++  },
++
++  /**
++   * 批量保存数据项（一次 ≤500 项；data_code 必须取自字典，未登记/已停用后端拒整批）
++   */
++  addTemplateItems: (data) => {
++    return postRequest('/iot/template/item', data);
++  },
++
++  /**
++   * 修改数据项（data_code 创建后不可改，编辑表单禁输）
++   */
++  updateTemplateItem: (data) => {
++    return putRequest('/iot/template/item', data);
++  },
++
++  /**
++   * 批量删除数据项（逻辑删；同模板删除后编码不可复用，后端 4002）
++   */
++  deleteTemplateItems: (ids) => {
++    return deleteRequest(`/iot/template/item/${ids}`);
++  },
++};
+diff --git a/frontend/src/api/iot/tenant-api.ts b/frontend/src/api/iot/tenant-api.ts
+index 407f0f6..446434a 100644
+--- a/frontend/src/api/iot/tenant-api.ts
++++ b/frontend/src/api/iot/tenant-api.ts
+@@ -52,4 +52,12 @@ export const tenantApi = {
+   deleteTenant: (ids) => {
+     return deleteRequest(`/iot/tenant/${ids}`);
+   },
++
++  /**
++   * 初始化租户管理员（TASK-0002：POST /iot/tenant/{id}/init-admin，权限 iot:tenant:admin）
++   * password 为前端 SM4 密文（TenantAdminCreateForm 口径，与 /user 创建一致）
++   */
++  initTenantAdmin: (id, data) => {
++    return postRequest(`/iot/tenant/${id}/init-admin`, data);
++  },
+ };
+diff --git a/frontend/src/components/iot/iot-conn-config-editor.vue b/frontend/src/components/iot/iot-conn-config-editor.vue
+new file mode 100644
+index 0000000..fa1b449
+--- /dev/null
++++ b/frontend/src/components/iot/iot-conn-config-editor.vue
+@@ -0,0 +1,156 @@
++<!--
++  * 通道连接配置 JSON 编辑器（TASK-0056，通道页公共组件）
++  *
++  * 协议类型联动 Schema 前置提示：按 ChannelProtocols 四值切换提示文案（后端
++  * classpath schema/channel/<协议>-v1.json 语义的前端镜像），并做基础格式提示
++  * （JSON 可解析、必含键、以 / 开头、凭据关键词扫描——递归对象/数组，镜像
++  * ChannelConnConfigValidator 黑名单）。提示仅供前置纠错，后端 Schema 校验为准
++  * （brief 决策 1：前端做基础格式提示，conn_config 校验以服务层为准）。
++-->
++<template>
++  <div>
++    <a-alert type="info" show-icon class="ot-margin-bottom10" :message="protocolHint" />
++    <a-textarea
++      :value="modelValue"
++      :rows="6"
++      placeholder='请输入 JSON 对象，如 {"broker":"tcp://127.0.0.1:1883","topic":"factory/gw01","qos":0}'
++      @update:value="onInput"
++    />
++    <div class="conn-config-check">
++      <template v-if="checkMessage">
++        <span class="conn-config-check-error">{{ checkMessage }}</span>
++      </template>
++      <template v-else-if="modelValue">
++        <span class="conn-config-check-ok">格式检查通过（最终以后端协议 Schema 校验为准）</span>
++      </template>
++    </div>
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed } from 'vue';
++  import { IOT_CONN_CONFIG_HINTS } from './iot-consts';
++
++  const props = defineProps<{
++    // 协议类型 MQTT/HTTP/MODBUS/OPCUA（ChannelProtocols.ALL）
++    protocolType: string;
++    // JSON 文本（编辑态字符串；提交前 parse 为对象随表单提交）
++    modelValue: string;
++  }>();
++
++  const emit = defineEmits(['update:modelValue']);
++
++  const protocolHint = computed(() => {
++    return IOT_CONN_CONFIG_HINTS[props.protocolType] || '请先选择协议类型';
++  });
++
++  /** 凭据关键词黑名单（镜像 ChannelConnConfigValidator.CREDENTIAL_KEYWORDS，大小写不敏感子串匹配键名） */
++  const CREDENTIAL_KEYWORDS = ['credential', 'password', 'passwd', 'secret', 'token', 'apikey', 'accesskey', 'privatekey'];
++
++  /** 必含键（镜像各协议 -v1.json required；MODBUS/OPCUA 一期宽松骨架无 required） */
++  const REQUIRED_KEYS: Record<string, string[]> = {
++    MQTT: ['broker', 'topic'],
++    HTTP: ['reportPath'],
++    MODBUS: [],
++    OPCUA: [],
++  };
++
++  const checkMessage = computed(() => basicFormatCheck(props.modelValue, props.protocolType));
++
++  function onInput(value: string) {
++    emit('update:modelValue', value);
++  }
++
++  /**
++   * 基础格式检查（非权威）：空串=未配置（宽松骨架协议落 NULL；MQTT/HTTP 后端按空对象
++   * 参与校验、必含字段即拒，前置同口径提示）；非空时要求可解析为 JSON 对象、无凭据键、
++   * 协议必含键齐全；HTTP reportPath 以 / 开头。返回错误文案，''=通过。
++   */
++  function basicFormatCheck(text: string, protocolType: string): string {
++    if (!text || !text.trim()) {
++      const required = REQUIRED_KEYS[protocolType] || [];
++      if (required.length > 0) {
++        return `该协议必含字段 ${required.join('/')}（conn_config 不能为空，后端按空对象校验即拒）`;
++      }
++      return '';
++    }
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(text);
++    } catch (e) {
++      return `不是合法 JSON：${(e as Error).message}`;
++    }
++    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
++      return 'conn_config 必须是 JSON 对象（{...}）';
++    }
++    const credentialPath = findCredentialKeyPath(parsed as Record<string, unknown>, '');
++    if (credentialPath) {
++      return `检测到疑似凭据字段 ${credentialPath}：凭据不入 conn_config（ADR-0006），后端将拒绝保存`;
++    }
++    if (protocolType === 'HTTP') {
++      const reportPath = (parsed as Record<string, unknown>).reportPath;
++      if (typeof reportPath === 'string' && !reportPath.startsWith('/')) {
++        return 'reportPath 必须以 / 开头（如 /api/v1/report）';
++      }
++    }
++    for (const key of REQUIRED_KEYS[protocolType] || []) {
++      const v = (parsed as Record<string, unknown>)[key];
++      if (v === undefined || v === null || (typeof v === 'string' && !v.trim())) {
++        return `该协议必含字段 ${key}`;
++      }
++    }
++    return '';
++  }
++
++  /** 凭据键名深度扫描（镜像后端：对象逐层 + 数组元素逐个递归，返回首个命中路径） */
++  function findCredentialKeyPath(node: unknown, path: string): string {
++    if (Array.isArray(node)) {
++      for (let i = 0; i < node.length; i++) {
++        const hit = findCredentialKeyPath(node[i], `${path}[${i}]`);
++        if (hit) {
++          return hit;
++        }
++      }
++      return '';
++    }
++    if (node && typeof node === 'object') {
++      for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
++        const keyLower = key.toLowerCase();
++        if (CREDENTIAL_KEYWORDS.some((k) => keyLower.includes(k))) {
++          return path ? `${path}.${key}` : key;
++        }
++        const hit = findCredentialKeyPath(value, path ? `${path}.${key}` : key);
++        if (hit) {
++          return hit;
++        }
++      }
++    }
++    return '';
++  }
++
++  /**
++   * 供表单提交前调用：返回 ''=通过（含空串=未配置）；非空=错误文案。
++   */
++  function validate(): string {
++    return basicFormatCheck(props.modelValue, props.protocolType);
++  }
++
++  defineExpose({
++    validate,
++  });
++</script>
++<style scoped lang="less">
++  .conn-config-check {
++    margin-top: 6px;
++    font-size: 12px;
++    line-height: 18px;
++
++    .conn-config-check-error {
++      color: #cf1322;
++      word-break: break-all;
++    }
++
++    .conn-config-check-ok {
++      color: #389e0d;
++    }
++  }
++</style>
+diff --git a/frontend/src/components/iot/iot-consts.ts b/frontend/src/components/iot/iot-consts.ts
+new file mode 100644
+index 0000000..dcab3a3
+--- /dev/null
++++ b/frontend/src/components/iot/iot-consts.ts
+@@ -0,0 +1,80 @@
++/*
++ * 智慧工厂（iot）公共枚举与文案映射（TASK-0056）
++ *
++ * 与后端枚举/DTO 注解一一对照（改动需同步 controller DTO）：
++ * - 节点类型 1-5：IotModelTemplate/IotModelInstance nodeType（@Min(1) @Max(5)）
++ * - 数据类型：IotDataDict.dataType @Pattern（DOUBLE|INT|BOOL|ENUM）
++ * - 类别：IotDataDict.category @Pattern（ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER）
++ * - 值性质/取值方式：IotDataItemTemplate valueKind/defaultSourceType（1-3）
++ * - 缺省聚合：IotDataItemTemplate.aggMethod @Pattern（SUM|AVG|MAX|MIN）
++ * - 协议类型：ChannelProtocols.ALL 四值；RESERVED_NO_ADAPTER = MODBUS/OPCUA（可建不可启用）
++ * - 分页上限：MybatisPlusConfig pagination.setMaxLimit(500)——各页 pageSize 上限 500
++ */
++
++/** 节点类型：1 工厂 2 车间 3 产线 4 设备 5 组件 */
++export const IOT_NODE_TYPE_OPTIONS = [
++  { value: 1, label: '工厂' },
++  { value: 2, label: '车间' },
++  { value: 3, label: '产线' },
++  { value: 4, label: '设备' },
++  { value: 5, label: '组件' },
++];
++
++export function iotNodeTypeLabel(nodeType?: number): string {
++  return IOT_NODE_TYPE_OPTIONS.find((o) => o.value === nodeType)?.label || '-';
++}
++
++/** 数据类型（创建后锁定） */
++export const IOT_DATA_TYPE_OPTIONS = ['DOUBLE', 'INT', 'BOOL', 'ENUM'];
++
++/** 类别（七选一，可空） */
++export const IOT_CATEGORY_OPTIONS = [
++  { value: 'ELEC', label: '电 (ELEC)' },
++  { value: 'WATER', label: '水 (WATER)' },
++  { value: 'GAS', label: '气 (GAS)' },
++  { value: 'STEAM', label: '蒸汽 (STEAM)' },
++  { value: 'MATERIAL', label: '物料 (MATERIAL)' },
++  { value: 'ENV', label: '环境 (ENV)' },
++  { value: 'OTHER', label: '其他 (OTHER)' },
++];
++
++/** 值性质：1 瞬时 2 累计 3 增量（可空） */
++export const IOT_VALUE_KIND_OPTIONS = [
++  { value: 1, label: '瞬时' },
++  { value: 2, label: '累计' },
++  { value: 3, label: '增量' },
++];
++
++/** 默认取值方式：1 绑定 2 公式 3 汇总（可空） */
++export const IOT_SOURCE_TYPE_OPTIONS = [
++  { value: 1, label: '绑定' },
++  { value: 2, label: '公式' },
++  { value: 3, label: '汇总' },
++];
++
++/** 缺省聚合：SUM/AVG/MAX/MIN（可空） */
++export const IOT_AGG_METHOD_OPTIONS = ['SUM', 'AVG', 'MAX', 'MIN'];
++
++/** 协议类型字典四值（ChannelProtocols.ALL） */
++export const IOT_PROTOCOL_OPTIONS = ['MQTT', 'HTTP', 'MODBUS', 'OPCUA'];
++
++/** 一期预留协议（可建不可启用——status 强制 0，无适配器） */
++export const IOT_PROTOCOL_RESERVED = ['MODBUS', 'OPCUA'];
++
++/** 协议 conn_config 前置提示（后端 classpath schema/channel/<协议>-v1.json 语义的前端镜像，校验以后端为准） */
++export const IOT_CONN_CONFIG_HINTS: Record<string, string> = {
++  MQTT: 'JSON 对象；必含 broker（如 tcp://host:1883）与 topic，可选 qos（0/1/2）；不允许额外字段；凭据键名会被后端拒绝（ADR-0006，凭据归 TASK-0019 凭据管理）',
++  HTTP: 'JSON 对象；必含 reportPath（以 / 开头，如 /api/v1/report），可选 authType（none/apiKey，缺省 none；apiKey 实际凭据走凭据管理）；不允许额外字段',
++  MODBUS: '一期宽松骨架（可建不可启用）：仅要求 JSON 对象，结构字段二期随适配器定义；凭据键名会被后端拒绝',
++  OPCUA: '一期宽松骨架（可建不可启用）：仅要求 JSON 对象，结构字段二期随适配器定义；凭据键名会被后端拒绝',
++};
++
++/** 状态文案 */
++export const IOT_STATUS_ENABLE = '启用';
++export const IOT_STATUS_DISABLE = '禁用';
++
++/** 分页上限（后端 MybatisPlusConfig maxLimit=500） */
++export const IOT_PAGE_MAX = 500;
++
++/** 模板数据项单批上限（IotDataItemTemplateService.ITEM_BATCH_MAX） */
++export const IOT_TEMPLATE_ITEM_BATCH_MAX = 500;
+diff --git a/frontend/src/components/iot/iot-optimistic-lock.ts b/frontend/src/components/iot/iot-optimistic-lock.ts
+new file mode 100644
+index 0000000..8513a59
+--- /dev/null
++++ b/frontend/src/components/iot/iot-optimistic-lock.ts
+@@ -0,0 +1,38 @@
++/*
++ * 乐观锁冲突提示（组件化预留，TASK-0056 通用交互范式③）
++ *
++ * 口径（brief 决策 3）：iot 域各实体均无 @Version 字段（MyBatis-Plus 乐观锁插件对
++ * iot 表不生效），本提示逻辑组件化但登记不触发——各写操作 catch 分支统一接入
++ * handleIotConflictError()，当后端响应文案命中乐观锁冲突特征词时弹出「数据已被
++ * 他人修改，请刷新后重试」确认框；命中与否都把错误继续上抛（页面既有 catch 语义不变）。
++ *
++ * 触发条件当前不存在（无 version 列、无 updateVersion 路径），接入零成本的意义：
++ * 后续任一 iot 实体引入 @Version 后无需改页面代码，提示即自动生效。
++ */
++import { Modal } from 'ant-design-vue';
++
++/** 乐观锁冲突特征词（与框架 GlobalException/MybatisPlus 乐观锁异常文案对齐的宽松匹配） */
++const CONFLICT_KEYWORDS = ['乐观锁', '已被修改', '已被他人', '记录版本', 'version conflict', 'Data changed'];
++
++/** 乐观锁冲突提示开关（iot 域无 @Version 字段——登记不触发，brief 决策 3） */
++export const IOT_OPTIMISTIC_LOCK_ENABLED = false;
++
++/**
++ * 写操作 catch 分支统一接入：命中乐观锁特征词时弹出刷新提示；始终原样上抛。
++ * @param error 响应拦截器 reject 的 AxiosResponse（body 在 error.data）或任意错误
++ */
++export function handleIotConflictError(error: unknown): unknown {
++  if (!IOT_OPTIMISTIC_LOCK_ENABLED) {
++    return error;
++  }
++  const body = (error as { data?: { message?: string; msg?: string } })?.data;
++  const text = `${body?.message || ''}${body?.msg || ''}`.toLowerCase();
++  if (CONFLICT_KEYWORDS.some((k) => text.includes(k.toLowerCase()))) {
++    Modal.warning({
++      title: '数据已变更',
++      content: '该记录已被他人修改（乐观锁冲突），请刷新列表后基于最新数据重试。',
++      okText: '知道了',
++    });
++  }
++  return error;
++}
+diff --git a/frontend/src/views/iot/channel/components/channel-detail-modal.vue b/frontend/src/views/iot/channel/components/channel-detail-modal.vue
+new file mode 100644
+index 0000000..428cd74
+--- /dev/null
++++ b/frontend/src/views/iot/channel/components/channel-detail-modal.vue
+@@ -0,0 +1,78 @@
++<!--
++  * 通道详情 弹窗（TASK-0056）
++  *
++  * 对接 GET /iot/channel/{id}（iot:channel:query 4047）：含 conn_config JSON 原文
++  * （不含凭据，ADR-0006）与网关内归属展示。
++-->
++<template>
++  <a-modal :open="visible" title="通道详情" :width="640" :footer="null" @cancel="onClose">
++    <a-descriptions bordered size="small" :column="2" :loading="detailLoading">
++      <a-descriptions-item label="ID" :span="1">{{ detail.id }}</a-descriptions-item>
++      <a-descriptions-item label="通道编码" :span="1">{{ detail.channelCode }}</a-descriptions-item>
++      <a-descriptions-item label="通道名称" :span="1">{{ detail.channelName }}</a-descriptions-item>
++      <a-descriptions-item label="所属网关ID" :span="1">{{ detail.gatewayId }}</a-descriptions-item>
++      <a-descriptions-item label="协议类型" :span="1">{{ detail.protocolType }}</a-descriptions-item>
++      <a-descriptions-item label="状态" :span="1">
++        <a-tag v-if="detail.status === 1" color="green">启用</a-tag>
++        <a-tag v-else color="red">禁用</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="创建时间" :span="1">{{ detail.createTime }}</a-descriptions-item>
++      <a-descriptions-item label="更新时间" :span="1">{{ detail.updateTime }}</a-descriptions-item>
++      <a-descriptions-item label="连接配置 (conn_config)" :span="2">
++        <pre class="conn-config-raw">{{ prettyConnConfig || '（未配置）' }}</pre>
++      </a-descriptions-item>
++    </a-descriptions>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref } from 'vue';
++  import { channelApi } from '/@/api/iot/channel-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++
++  const visible = ref(false);
++  const detailLoading = ref(false);
++  const detail = reactive<Record<string, unknown>>({});
++
++  const prettyConnConfig = computed(() => {
++    if (!detail.connConfig) {
++      return '';
++    }
++    try {
++      return JSON.stringify(JSON.parse(detail.connConfig as string), null, 2);
++    } catch (e) {
++      return detail.connConfig as string;
++    }
++  });
++
++  async function showModal(id) {
++    visible.value = true;
++    detailLoading.value = true;
++    try {
++      const responseData = await channelApi.queryChannelById(id);
++      Object.assign(detail, responseData.data);
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      detailLoading.value = false;
++    }
++  }
++
++  function onClose() {
++    visible.value = false;
++    Object.keys(detail).forEach((key) => delete detail[key]);
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
++<style scoped lang="less">
++  .conn-config-raw {
++    max-height: 200px;
++    margin: 0;
++    overflow: auto;
++    font-size: 12px;
++    white-space: pre-wrap;
++    word-break: break-all;
++  }
++</style>
+diff --git a/frontend/src/views/iot/channel/components/channel-form-modal.vue b/frontend/src/views/iot/channel/components/channel-form-modal.vue
+new file mode 100644
+index 0000000..fa40264
+--- /dev/null
++++ b/frontend/src/views/iot/channel/components/channel-form-modal.vue
+@@ -0,0 +1,202 @@
++<!--
++  * 通道表单 弹窗（TASK-0056）
++  *
++  * 表单校验与 IotChannelCreateForm / IotChannelUpdateForm DTO 注解对齐：
++  * channel_code 必填 ≤64（创建后不可改——编辑禁输）、channel_name 必填 ≤100、
++  * protocol_type 必填 ≤16（四值字典）、gateway_id 新增必传（创建后不可改——编辑禁输）。
++  * conn_config 走公共编辑器（协议联动前置提示，后端 Schema 校验为准，brief 决策 1）；
++  * MODBUS/OPCUA 可建不可启用：status 选择禁用并强制 0（请求携带 1 后端也落库 0，
++  * 保存成功文案含「未启用适配器」标注——此处前置提示）；协议变更时旧 conn_config
++  * 必须能过新协议 Schema（后端口径，前端编辑器实时重检提示）。
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑通道' : '添加通道'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-alert
++      v-if="isReservedProtocol(form.protocolType)"
++      type="warning"
++      show-icon
++      class="ot-margin-bottom10"
++      message="该协议一期未启用适配器：可建不可启用，状态强制禁用（不产生接入行为，二期适配器上线后可启用）"
++    />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 6 }" :wrapper-col="{ span: 18 }">
++      <a-form-item label="所属网关" name="gatewayId">
++        <a-select
++          v-model:value="form.gatewayId"
++          show-search
++          option-filter-prop="label"
++          :options="gatewayOptions"
++          :disabled="!!form.id"
++          placeholder="通道属网关固定（创建后不可改）"
++        />
++      </a-form-item>
++      <a-form-item label="通道编码" name="channelCode">
++        <a-input v-model:value="form.channelCode" :disabled="!!form.id" :maxlength="64" placeholder="网关内唯一（创建后不可改）" />
++      </a-form-item>
++      <a-form-item label="通道名称" name="channelName">
++        <a-input v-model:value="form.channelName" :maxlength="100" placeholder="请输入通道名称" />
++      </a-form-item>
++      <a-form-item label="协议类型" name="protocolType">
++        <a-select v-model:value="form.protocolType" placeholder="MQTT/HTTP/MODBUS/OPCUA（MODBUS/OPCUA 可建不可启用）">
++          <a-select-option v-for="p in IOT_PROTOCOL_OPTIONS" :key="p" :value="p">
++            {{ p }}{{ isReservedProtocol(p) ? '（未启用适配器）' : '' }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="连接配置" name="connConfigText">
++        <IotConnConfigEditor ref="connConfigEditorRef" v-model:modelValue="form.connConfigText" :protocol-type="form.protocolType || ''" />
++      </a-form-item>
++      <a-form-item label="状态" name="status" v-if="form.id || !isReservedProtocol(form.protocolType)">
++        <a-radio-group v-model:value="form.status" button-style="solid" :disabled="isReservedProtocol(form.protocolType)">
++          <a-radio-button :value="1">启用</a-radio-button>
++          <a-radio-button :value="0">禁用</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { channelApi } from '/@/api/iot/channel-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_PROTOCOL_OPTIONS, IOT_PROTOCOL_RESERVED } from '/@/components/iot/iot-consts';
++  import IotConnConfigEditor from '/@/components/iot/iot-conn-config-editor.vue';
++
++  const emit = defineEmits(['reloadList']);
++
++  // 页面传入的网关下拉（避免重复加载网关列表）
++  const props = defineProps<{
++    gatewayOptions: { label: string; value: number }[];
++  }>();
++
++  const formRef = ref();
++  const connConfigEditorRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    gatewayId: undefined,
++    channelCode: '',
++    channelName: '',
++    protocolType: undefined,
++    connConfigText: '',
++    status: undefined,
++  };
++  const form = reactive({ ...formDefault });
++  // 编辑态的 conn_config 原文快照（协议变更重检提示与提交用）
++  const rules = {
++    gatewayId: [{ required: true, message: '请选择所属网关' }],
++    channelCode: [
++      { required: true, message: '请输入通道编码' },
++      { max: 64, message: '通道编码长度不能超过 64' },
++    ],
++    channelName: [
++      { required: true, message: '请输入通道名称' },
++      { max: 100, message: '通道名称长度不能超过 100' },
++    ],
++    protocolType: [
++      { required: true, message: '请选择协议类型' },
++      { max: 16, message: '协议类型长度不能超过 16' },
++    ],
++  };
++
++  const visible = ref(false);
++  const originalConnConfigText = ref('');
++
++  const isReservedProtocol = (protocolType) => IOT_PROTOCOL_RESERVED.includes(protocolType);
++
++  async function showModal(rowData?, gatewayId?) {
++    Object.assign(form, formDefault);
++    originalConnConfigText.value = '';
++    if (rowData) {
++      // 编辑：详情接口取 conn_config JSON 原文（不含凭据，ADR-0006）
++      try {
++        const responseData = await channelApi.queryChannelById(rowData.id);
++        const detail = responseData.data;
++        Object.assign(form, detail);
++        form.connConfigText = detail.connConfig || '';
++        originalConnConfigText.value = detail.connConfig || '';
++      } catch (e) {
++        otSentry.captureError(e);
++        Object.assign(form, rowData);
++      }
++    } else if (gatewayId) {
++      form.gatewayId = gatewayId;
++    }
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    originalConnConfigText.value = '';
++    visible.value = false;
++  }
++
++  /**
++   * 提交：connConfig 以 JSON 对象承载（后端 JsonNode 直收）——文本可解析时随表单提交；
++   * 空/未变更的 conn_config 不携带（编辑 null 字段不进更新集保持库内原值；新增交后端
++   * 按空对象校验——MQTT/HTTP 必含字段即拒，前端编辑器已前置同口径提示）。
++   */
++  async function onSubmit() {
++    try {
++      await formRef.value.validate();
++    } catch (e) {
++      message.error('参数验证错误，请仔细填写表单数据!');
++      return;
++    }
++    const formatError = connConfigEditorRef.value?.validate?.() || '';
++    if (formatError) {
++      message.error(`连接配置格式问题：${formatError}`);
++      return;
++    }
++    OtLoading.show();
++    try {
++      if (form.id) {
++        const updateData: Record<string, unknown> = {
++          id: form.id,
++          gatewayId: form.gatewayId,
++          channelCode: form.channelCode,
++          channelName: form.channelName,
++          protocolType: form.protocolType,
++          status: form.status,
++        };
++        // conn_config 变更（含协议变更联动重检）才携带；未变更不携带（后端保持原值）
++        if (form.connConfigText && form.connConfigText.trim() && form.connConfigText !== originalConnConfigText.value) {
++          updateData.connConfig = JSON.parse(form.connConfigText);
++        }
++        await channelApi.updateChannel(updateData);
++      } else {
++        const createData: Record<string, unknown> = {
++          gatewayId: form.gatewayId,
++          channelCode: form.channelCode,
++          channelName: form.channelName,
++          protocolType: form.protocolType,
++        };
++        if (form.connConfigText && form.connConfigText.trim()) {
++          createData.connConfig = JSON.parse(form.connConfigText);
++        }
++        if (!isReservedProtocol(form.protocolType)) {
++          createData.status = form.status;
++        }
++        await channelApi.addChannel(createData);
++      }
++      message.success(`${form.id ? '修改' : '添加'}成功`);
++      emit('reloadList');
++      onClose();
++    } catch (error) {
++      // JSON.parse 失败兜底（编辑器 validate 已前置拦截，此处防御）
++      if (error instanceof SyntaxError) {
++        message.error('连接配置不是合法 JSON');
++      } else {
++        otSentry.captureError(handleIotConflictError(error));
++      }
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/channel/index.vue b/frontend/src/views/iot/channel/index.vue
+index 43dcc81..c514174 100644
+--- a/frontend/src/views/iot/channel/index.vue
++++ b/frontend/src/views/iot/channel/index.vue
+@@ -1,11 +1,277 @@
+ <!--
+-  * 通道管理（占位骨架，TASK-0055）
++  * 采集通道管理（TASK-0056 完整页）
+   *
+-  * 菜单挂载点：sys_menu 4013（/iot/channel）。采集通道配置归 TASK-0056/0070。
++  * 对接 IotChannelController（/iot/channel，权限位 iot:channel:* 4046-4050）。
++  * list 按 gatewayId 必传查通道列表（§3.1 口径：通道列表按网关查）——页首网关下拉
++  * 必选后才加载列表。conn_config 以 JSON 对象承载（后端 JsonNode 直收），编辑器做
++  * 协议联动 Schema 前置提示（后端校验为准，brief 决策 1）；MODBUS/OPCUA 可建不可
++  * 启用（status 强制 0，请求携带 1 也落库 0，保存成功文案含「未启用适配器」标注）；
++  * channel_code/gateway_id 创建后不可改；保存≠生效（生效走配置快照发布链路）。
+ -->
+ <template>
+-  <IotPlaceholder title="通道管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="所属网关" class="ot-query-form-item" required>
++        <a-select
++          style="width: 260px"
++          v-model:value="queryForm.gatewayId"
++          show-search
++          option-filter-prop="label"
++          :options="gatewayOptions"
++          placeholder="请选择网关（通道列表按网关查）"
++          @change="onGatewayChange"
++        />
++      </a-form-item>
++      <a-form-item label="通道编码" class="ot-query-form-item">
++        <a-input style="width: 160px" v-model:value="queryForm.channelCode" placeholder="通道编码" :disabled="!queryForm.gatewayId" />
++      </a-form-item>
++      <a-form-item label="协议类型" class="ot-query-form-item">
++        <a-select
++          style="width: 110px"
++          v-model:value="queryForm.protocolType"
++          :allowClear="true"
++          placeholder="请选择"
++          :disabled="!queryForm.gatewayId"
++        >
++          <a-select-option v-for="p in IOT_PROTOCOL_OPTIONS" :key="p" :value="p">
++            {{ p }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 100px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择" :disabled="!queryForm.gatewayId">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:channel:list'" type="primary" :disabled="!queryForm.gatewayId" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:channel:add'" type="primary" :disabled="!queryForm.gatewayId" @click="addOrUpdateChannel()">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          新建
++        </a-button>
++        <span v-if="!queryForm.gatewayId" class="channel-gateway-tip">请先选择所属网关（gatewayId 必传，按网关查通道）</span>
++      </div>
++    </a-row>
++
++    <a-table size="small" :dataSource="tableData" :columns="columns" :loading="tableLoading" rowKey="id" :pagination="false" bordered>
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'protocolType'">
++          <a-tag v-if="isReservedProtocol(record.protocolType)" color="orange">{{ record.protocolType }}（未启用适配器）</a-tag>
++          <span v-else>{{ record.protocolType }}</span>
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:channel:query'" type="link" @click="showDetail(record)">详情</a-button>
++            <a-button v-privilege="'iot:channel:edit'" type="link" @click="addOrUpdateChannel(record)">编辑</a-button>
++            <a-button v-privilege="'iot:channel:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <ChannelFormModal ref="channelFormModalRef" :gateway-options="gatewayOptions" @reloadList="ajaxQuery" />
++    <ChannelDetailModal ref="channelDetailModalRef" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import ChannelFormModal from './components/channel-form-modal.vue';
++  import ChannelDetailModal from './components/channel-detail-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { PlusOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { channelApi } from '/@/api/iot/channel-api';
++  import { gatewayApi } from '/@/api/iot/gateway-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_PROTOCOL_OPTIONS, IOT_PROTOCOL_RESERVED } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '通道编码',
++      dataIndex: 'channelCode',
++    },
++    {
++      title: '通道名称',
++      dataIndex: 'channelName',
++    },
++    {
++      title: '协议类型',
++      width: 140,
++      dataIndex: 'protocolType',
++    },
++    {
++      title: '状态',
++      width: 70,
++      dataIndex: 'status',
++    },
++    {
++      title: '更新时间',
++      width: 160,
++      dataIndex: 'updateTime',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 130,
++    },
++  ]);
++
++  // ---------------- 网关下拉（gatewayId 必传前置） -----------------
++
++  const gatewayOptions = ref<{ label: string; value: number }[]>([]);
++
++  async function loadGatewayOptions() {
++    try {
++      // pageSize 上限 500 对齐后端 maxLimit（MybatisPlusConfig）
++      const responseData = await gatewayApi.queryGatewayList({ pageNum: 1, pageSize: 500 });
++      gatewayOptions.value = (responseData.data.records || []).map((g) => ({
++        label: `${g.gatewayCode}（${g.gatewayName}）`,
++        value: g.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  function isReservedProtocol(protocolType) {
++    return IOT_PROTOCOL_RESERVED.includes(protocolType);
++  }
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    gatewayId: undefined,
++    channelCode: '',
++    protocolType: undefined,
++    status: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const channelFormModalRef = ref();
++  const channelDetailModalRef = ref();
++
++  function onGatewayChange() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++  async function ajaxQuery() {
++    if (!queryForm.gatewayId) {
++      // gatewayId 必传（后端 PARAM_ERROR）——未选网关不发请求
++      tableData.value = [];
++      total.value = 0;
++      return;
++    }
++    try {
++      tableLoading.value = true;
++      const responseData = await channelApi.queryChannelList(queryForm);
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 删除（软删，二次确认） -----------------
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除通道【${rowData.channelCode} ${rowData.channelName}】吗?（其下有点位时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteChannel(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteChannel(rowData) {
++    try {
++      OtLoading.show();
++      await channelApi.deleteChannel(rowData.id);
++      message.success('删除成功');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 详情 / 添加/更新 -----------------
++
++  function showDetail(rowData) {
++    channelDetailModalRef.value.showModal(rowData.id);
++  }
++
++  function addOrUpdateChannel(rowData?) {
++    channelFormModalRef.value.showModal(rowData, queryForm.gatewayId);
++  }
++
++  onMounted(() => {
++    loadGatewayOptions();
++  });
+ </script>
++<style scoped lang="less">
++  .channel-gateway-tip {
++    color: #999;
++    font-size: 12px;
++  }
++</style>
+diff --git a/frontend/src/views/iot/dict/components/dict-form-modal.vue b/frontend/src/views/iot/dict/components/dict-form-modal.vue
+new file mode 100644
+index 0000000..b5553d8
+--- /dev/null
++++ b/frontend/src/views/iot/dict/components/dict-form-modal.vue
+@@ -0,0 +1,129 @@
++<!--
++  * 字典条目表单 弹窗（TASK-0056）
++  *
++  * 表单校验与 IotDataDict DTO 校验注解对齐：data_code 必填 ≤64（创建后不可改——
++  * 编辑禁输且必携带原值，服务层「携带不一致（含未携带）即拒」）、data_name 必填 ≤100、
++  * category 七选一可空 ≤32、data_type 四值必填（创建后锁定——编辑禁输且必携带原值）、
++  * default_unit ≤32。新增 status 后端强制 1；status 不进更新集（禁用走 DELETE 语义）。
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑字典条目' : '添加字典条目'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-alert v-if="form.id" type="info" show-icon class="ot-margin-bottom10" message="数据编码与数据类型创建后锁定，仅名称/类别/默认单位可修改" />
++    <br v-if="form.id" />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 5 }" :wrapper-col="{ span: 19 }">
++      <a-form-item label="数据编码" name="dataCode">
++        <a-input v-model:value="form.dataCode" :disabled="!!form.id" :maxlength="64" placeholder="请输入数据编码（租户内唯一，创建后不可改）" />
++      </a-form-item>
++      <a-form-item label="数据名称" name="dataName">
++        <a-input v-model:value="form.dataName" :maxlength="100" placeholder="请输入数据名称（全厂统一）" />
++      </a-form-item>
++      <a-form-item label="数据类型" name="dataType">
++        <a-select v-model:value="form.dataType" :disabled="!!form.id" placeholder="请选择数据类型（创建后锁定）">
++          <a-select-option v-for="t in IOT_DATA_TYPE_OPTIONS" :key="t" :value="t">
++            {{ t }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="类别" name="category">
++        <a-select v-model:value="form.category" :allowClear="true" placeholder="请选择类别（可空）">
++          <a-select-option v-for="opt in IOT_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="默认单位" name="defaultUnit">
++        <a-input v-model:value="form.defaultUnit" :maxlength="32" placeholder="请输入默认单位（引用单位字典 sys_dict，可空）" />
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { dictApi } from '/@/api/iot/dict-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_CATEGORY_OPTIONS, IOT_DATA_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++
++  // emit
++  const emit = defineEmits(['reloadList']);
++
++  //  组件
++  const formRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    dataCode: '',
++    dataName: '',
++    dataType: undefined,
++    category: undefined,
++    defaultUnit: '',
++  };
++  const form = reactive({ ...formDefault });
++  // 与 IotDataDict 校验注解逐条对齐（brief 决策 3：表单校验与后端一致前置提示）
++  const rules = {
++    dataCode: [
++      { required: true, message: '请输入数据编码' },
++      { max: 64, message: '数据编码长度不能超过 64' },
++    ],
++    dataName: [
++      { required: true, message: '请输入数据名称' },
++      { max: 100, message: '数据名称长度不能超过 100' },
++    ],
++    dataType: [
++      { required: true, message: '请选择数据类型' },
++      { pattern: /^(DOUBLE|INT|BOOL|ENUM)$/, message: '数据类型仅允许 DOUBLE/INT/BOOL/ENUM' },
++    ],
++    category: [
++      { max: 32, message: '类别长度不能超过 32' },
++      { pattern: /^(ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER)$/, message: '类别仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER' },
++    ],
++    defaultUnit: [{ max: 32, message: '默认单位长度不能超过 32' }],
++  };
++  // 是否展示
++  const visible = ref(false);
++
++  function showModal(rowData?) {
++    Object.assign(form, formDefault);
++    if (rowData) {
++      Object.assign(form, rowData);
++    }
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        try {
++          if (form.id) {
++            await dictApi.updateDict(form);
++          } else {
++            await dictApi.addDict(form);
++          }
++          message.success(`${form.id ? '修改' : '添加'}成功`);
++          emit('reloadList');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  // ----------------------- 以下是暴露的方法内容 ------------------------
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/dict/components/dict-import-modal.vue b/frontend/src/views/iot/dict/components/dict-import-modal.vue
+new file mode 100644
+index 0000000..fc4f17a
+--- /dev/null
++++ b/frontend/src/views/iot/dict/components/dict-import-modal.vue
+@@ -0,0 +1,183 @@
++<!--
++  * 字典批量导入 弹窗（TASK-0056，TASK-0009 交付接口的前端闭环）
++  *
++  * 对接三接口（共用 iot:dict:import 4023）：GET /iot/dict/import/template（模板下载）、
++  * POST /iot/dict/import（multipart Excel，单批≤5000 行，整批原子）、
++  * POST /iot/dict/import/error-report（回执失败行渲染 xlsx 下载）。
++  * 整批拒绝口径：全部成功 body code=200；任一行校验失败整批拒绝 body code=400
++  * 且 data 携带完整逐行回执清单（DictImportReceipt）——silentError 静默全局提示，
++  * 回执在弹窗内渲染并可下载错误行清单。
++-->
++<template>
++  <a-modal :open="visible" title="批量导入数据字典" :width="640" :maskClosable="false" @cancel="close">
++    <a-alert
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      message="单批上限 5000 行，整批原子：任一行校验失败整批拒绝不落库；data_code 租户内唯一且不复用；data_type 仅 DOUBLE/INT/BOOL/ENUM"
++    />
++
++    <a-space class="ot-margin-bottom10">
++      <a-button @click="downloadTemplate">
++        <template #icon>
++          <DownloadOutlined />
++        </template>
++        下载导入模板
++      </a-button>
++    </a-space>
++
++    <a-upload-dragger name="file" accept=".xlsx,.xls" :maxCount="1" :fileList="fileList" :beforeUpload="beforeUpload" @remove="removeFile">
++      <p class="ant-upload-drag-icon">
++        <InboxOutlined />
++      </p>
++      <p class="ant-upload-text">点击或拖拽选择导入文件（.xlsx）</p>
++    </a-upload-dragger>
++
++    <div v-if="receipt" class="ot-margin-top10">
++      <a-alert :type="receipt.failCount === 0 ? 'success' : 'error'" show-icon :message="receiptMessage" />
++      <a-table
++        v-if="failRows.length > 0"
++        class="ot-margin-top10"
++        size="small"
++        bordered
++        rowKey="rowIndex"
++        :dataSource="failRows"
++        :columns="receiptColumns"
++        :pagination="false"
++        :scroll="{ y: 220 }"
++      />
++      <a-button v-if="failRows.length > 0" class="ot-margin-top10" @click="downloadErrorReport">
++        <template #icon>
++          <DownloadOutlined />
++        </template>
++        下载错误行清单
++      </a-button>
++    </div>
++
++    <template #footer>
++      <a-button @click="close">关闭</a-button>
++      <a-button type="primary" :loading="importing" :disabled="!file" @click="doImport">开始导入</a-button>
++    </template>
++  </a-modal>
++</template>
++
++<script setup lang="ts">
++  import { computed, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { DownloadOutlined, InboxOutlined } from '@ant-design/icons-vue';
++  import { dictApi } from '/@/api/iot/dict-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++
++  // DictImportReceipt（后端 DictImportRowResult 字段：rowIndex/dataCode/reasonCode/message/success）
++  interface DictImportRowResult {
++    rowIndex?: number;
++    dataCode?: string;
++    reasonCode?: string;
++    message?: string;
++    success?: boolean;
++    [key: string]: unknown;
++  }
++  interface DictImportReceipt {
++    totalCount?: number;
++    successCount?: number;
++    failCount?: number;
++    rows?: DictImportRowResult[];
++    [key: string]: unknown;
++  }
++
++  const emit = defineEmits(['reload']);
++
++  const visible = ref(false);
++  const file = ref<File | null>(null);
++  const fileList = ref<Record<string, unknown>[]>([]);
++  const importing = ref(false);
++  const receipt = ref<DictImportReceipt | null>(null);
++
++  const receiptColumns = [
++    { title: '行号', dataIndex: 'rowIndex', width: 70 },
++    { title: '数据编码', dataIndex: 'dataCode', width: 160 },
++    { title: '原因码', dataIndex: 'reasonCode', width: 150 },
++    { title: '说明', dataIndex: 'message' },
++  ];
++
++  const failRows = computed(() => (receipt.value?.rows || []).filter((row) => !row.success));
++  const receiptMessage = computed(() => {
++    if (!receipt.value) {
++      return '';
++    }
++    if (receipt.value.failCount === 0) {
++      return `导入成功：共 ${receipt.value.totalCount ?? receipt.value.successCount} 条全部落库`;
++    }
++    return '导入被整批拒绝（任一行校验失败整批不落库），回执明细如下';
++  });
++
++  function show() {
++    visible.value = true;
++    file.value = null;
++    fileList.value = [];
++    receipt.value = null;
++  }
++
++  function close() {
++    visible.value = false;
++    if (receipt.value && receipt.value.failCount === 0) {
++      emit('reload');
++    }
++  }
++
++  function downloadTemplate() {
++    dictApi.downloadImportTemplate();
++  }
++
++  // 阻止 antd 自动上传，仅收集文件
++  function beforeUpload(uploadFile) {
++    file.value = uploadFile;
++    fileList.value = [uploadFile];
++    receipt.value = null;
++    return false;
++  }
++
++  function removeFile() {
++    file.value = null;
++    fileList.value = [];
++    return true;
++  }
++
++  async function doImport() {
++    const formData = new FormData();
++    formData.append('file', file.value as File);
++    importing.value = true;
++    OtLoading.show();
++    try {
++      const res = await dictApi.importDict(formData);
++      // 全部成功：body code=200，data=回执
++      receipt.value = res.data;
++      message.success(`导入成功，共 ${res.data.successCount ?? res.data.totalCount} 条`);
++      file.value = null;
++      fileList.value = [];
++      emit('reload');
++    } catch (e) {
++      // 整批拒绝：body code=400（PARAM_ERROR）且 data 携带逐行回执（silentError 已静默全局提示）
++      const body = (e as { data?: { data?: DictImportReceipt } })?.data;
++      if (body?.data) {
++        receipt.value = body.data;
++        message.error('导入被整批拒绝：任一行校验失败整批不落库');
++      }
++      otSentry.captureError(e);
++    } finally {
++      importing.value = false;
++      OtLoading.hide();
++    }
++  }
++
++  function downloadErrorReport() {
++    if (receipt.value) {
++      dictApi.downloadImportErrorReport(receipt.value);
++    }
++  }
++
++  defineExpose({
++    show,
++  });
++</script>
+diff --git a/frontend/src/views/iot/dict/index.vue b/frontend/src/views/iot/dict/index.vue
+index 633dee8..80cf008 100644
+--- a/frontend/src/views/iot/dict/index.vue
++++ b/frontend/src/views/iot/dict/index.vue
+@@ -1,11 +1,248 @@
+ <!--
+-  * 字典管理（占位骨架，TASK-0055）
++  * 业务数据字典管理（TASK-0056 完整页）
+   *
+-  * 菜单挂载点：sys_menu 4008（/iot/dict）。采集字典/单位清单管理归 TASK-0056/0070。
++  * 对接 IotDataDictController（/iot/dict，权限位 iot:dict:* 4018-4023）。
++  * CONV-01：本页是业务数据字典（模板选码唯一来源），与框架系统枚举字典 sys_dict
++  * 两类不混用。语义对齐后端：data_code/data_type 创建后锁定（编辑禁输）；DELETE
++  * =置禁用（只增不删，编码永不复用，无「启用」路径——status 仅禁用接口可置 0）；
++  * 导入三接口共用 iot:dict:import（4023）。
+ -->
+ <template>
+-  <IotPlaceholder title="字典管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="数据编码" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.dataCode" placeholder="数据编码" />
++      </a-form-item>
++      <a-form-item label="数据名称" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.dataName" placeholder="数据名称" />
++      </a-form-item>
++      <a-form-item label="类别" class="ot-query-form-item">
++        <a-select style="width: 140px" v-model:value="queryForm.category" :allowClear="true" placeholder="请选择">
++          <a-select-option v-for="opt in IOT_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 120px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:dict:list'" type="primary" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:dict:list'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:dict:add'" type="primary" @click="addOrUpdateDict()">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          新建
++        </a-button>
++        <a-button v-privilege="'iot:dict:import'" @click="openImport">
++          <template #icon>
++            <UploadOutlined />
++          </template>
++          批量导入
++        </a-button>
++      </div>
++    </a-row>
++
++    <a-table size="small" :dataSource="tableData" :columns="columns" :loading="tableLoading" rowKey="id" :pagination="false" bordered>
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'category'">
++          {{ categoryLabel(record.category) }}
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:dict:edit'" type="link" @click="addOrUpdateDict(record)">编辑</a-button>
++            <a-button v-if="record.status === 1" v-privilege="'iot:dict:remove'" type="link" danger @click="confirmDisable(record)"> 禁用 </a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <DictFormModal ref="dictFormModalRef" @reloadList="ajaxQuery" />
++    <DictImportModal ref="dictImportModalRef" @reloadList="ajaxQuery" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import DictFormModal from './components/dict-form-modal.vue';
++  import DictImportModal from './components/dict-import-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { PlusOutlined, ReloadOutlined, SearchOutlined, UploadOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { dictApi } from '/@/api/iot/dict-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_CATEGORY_OPTIONS } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '数据编码',
++      dataIndex: 'dataCode',
++    },
++    {
++      title: '数据名称',
++      dataIndex: 'dataName',
++    },
++    {
++      title: '类别',
++      width: 110,
++      dataIndex: 'category',
++    },
++    {
++      title: '数据类型',
++      width: 90,
++      dataIndex: 'dataType',
++    },
++    {
++      title: '默认单位',
++      width: 90,
++      dataIndex: 'defaultUnit',
++    },
++    {
++      title: '状态',
++      width: 70,
++      dataIndex: 'status',
++    },
++    {
++      title: '更新时间',
++      width: 160,
++      dataIndex: 'updateTime',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 110,
++    },
++  ]);
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    dataCode: '',
++    dataName: '',
++    category: undefined,
++    status: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const dictFormModalRef = ref();
++  const dictImportModalRef = ref();
++
++  function categoryLabel(category) {
++    return IOT_CATEGORY_OPTIONS.find((o) => o.value === category)?.label || '-';
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    ajaxQuery();
++  }
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await dictApi.queryDictList(queryForm);
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 禁用（DELETE 语义=置禁用，二次确认） -----------------
++
++  function confirmDisable(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要禁用字典条目【${rowData.dataCode} ${rowData.dataName}】吗?（禁用后不可恢复启用，编码永不复用）`,
++      okText: '禁用',
++      okType: 'danger',
++      onOk() {
++        disableDict(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function disableDict(rowData) {
++    try {
++      OtLoading.show();
++      await dictApi.disableDict(rowData.id);
++      message.success('禁用成功');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 添加/更新 / 导入 -----------------
++
++  function addOrUpdateDict(rowData?) {
++    dictFormModalRef.value.showModal(rowData);
++  }
++
++  function openImport() {
++    dictImportModalRef.value.show();
++  }
++
++  onMounted(ajaxQuery);
+ </script>
+diff --git a/frontend/src/views/iot/gateway/components/gateway-detail-modal.vue b/frontend/src/views/iot/gateway/components/gateway-detail-modal.vue
+new file mode 100644
+index 0000000..fc3ed20
+--- /dev/null
++++ b/frontend/src/views/iot/gateway/components/gateway-detail-modal.vue
+@@ -0,0 +1,53 @@
++<!--
++  * 网关详情 弹窗（TASK-0056）
++  *
++  * 后端不设 detail 端点（iot:gateway:query 4042 预登记供详情弹层预留）——
++  * 数据直接来自列表行（含在线状态五字段组只读展示：onlineStatus/lastHeartbeatTime/
++  * ipAddr/version/configVersion，REQ-0009 验收 4 运维监控数据源）。
++-->
++<template>
++  <a-modal :open="visible" title="网关详情" :width="640" :footer="null" @cancel="onClose">
++    <a-descriptions bordered size="small" :column="2">
++      <a-descriptions-item label="ID" :span="1">{{ detail.id }}</a-descriptions-item>
++      <a-descriptions-item label="网关编码" :span="1">{{ detail.gatewayCode }}</a-descriptions-item>
++      <a-descriptions-item label="网关名称" :span="1">{{ detail.gatewayName }}</a-descriptions-item>
++      <a-descriptions-item label="状态" :span="1">
++        <a-tag v-if="detail.status === 1" color="green">启用</a-tag>
++        <a-tag v-else color="red">禁用</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="在线状态" :span="1">
++        <a-tag v-if="detail.onlineStatus === 1" color="green">在线</a-tag>
++        <a-tag v-else color="default">离线</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="最后心跳时间" :span="1">{{ detail.lastHeartbeatTime || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="心跳周期(秒)" :span="1">{{ detail.heartbeatPeriod }}</a-descriptions-item>
++      <a-descriptions-item label="程序版本" :span="1">{{ detail.version || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="配置版本" :span="1">{{ detail.configVersion ?? '-' }}</a-descriptions-item>
++      <a-descriptions-item label="来源IP" :span="1">{{ detail.ipAddr || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="所属实例ID" :span="1">{{ detail.instanceId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="绑定部门ID" :span="1">{{ detail.deptId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="创建时间" :span="1">{{ detail.createTime }}</a-descriptions-item>
++      <a-descriptions-item label="更新时间" :span="1">{{ detail.updateTime }}</a-descriptions-item>
++    </a-descriptions>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++
++  const visible = ref(false);
++  const detail = reactive<Record<string, unknown>>({});
++
++  function showModal(rowData) {
++    Object.keys(detail).forEach((key) => delete detail[key]);
++    Object.assign(detail, rowData);
++    visible.value = true;
++  }
++
++  function onClose() {
++    visible.value = false;
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/gateway/components/gateway-form-modal.vue b/frontend/src/views/iot/gateway/components/gateway-form-modal.vue
+new file mode 100644
+index 0000000..1920d23
+--- /dev/null
++++ b/frontend/src/views/iot/gateway/components/gateway-form-modal.vue
+@@ -0,0 +1,168 @@
++<!--
++  * 网关表单 弹窗（TASK-0056）
++  *
++  * 表单校验与 IotGatewayCreateForm / IotGatewayUpdateForm DTO 注解对齐：
++  * gateway_code 必填 ≤64 且 [A-Za-z0-9_]（作 MQTT 主题与设备身份段，创建后不可改——
++  * 编辑禁输、仅作一致性核对回传）、gateway_name 必填 ≤100；可变白名单
++  * gatewayName/instanceId/deptId/heartbeatPeriod/status（回写字段组五字段不进表单）。
++  * 新建不携带 status（一律启用，启停走编辑接口）；心跳周期 1-86400（后端校验口径）。
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑网关' : '添加网关'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 6 }" :wrapper-col="{ span: 18 }">
++      <a-form-item label="网关编码" name="gatewayCode">
++        <a-input
++          v-model:value="form.gatewayCode"
++          :disabled="!!form.id"
++          :maxlength="64"
++          placeholder="字母/数字/下划线（MQTT 主题与设备身份段，创建后不可改）"
++        />
++      </a-form-item>
++      <a-form-item label="网关名称" name="gatewayName">
++        <a-input v-model:value="form.gatewayName" :maxlength="100" placeholder="请输入网关名称" />
++      </a-form-item>
++      <a-form-item label="所属实例" name="instanceId">
++        <a-tree-select
++          v-model:value="form.instanceId"
++          style="width: 100%"
++          :tree-data="instanceTreeData"
++          :field-names="{ label: 'title', value: 'key', children: 'children' }"
++          tree-default-expand-all
++          allow-clear
++          placeholder="所属模型实例（决定点位数据归属工厂/车间，可空）"
++        />
++      </a-form-item>
++      <a-form-item label="绑定部门" name="deptId">
++        <a-tree-select
++          v-model:value="form.deptId"
++          style="width: 100%"
++          :tree-data="deptTreeData"
++          :field-names="{ label: 'deptName', value: 'id', children: 'children' }"
++          tree-default-expand-all
++          allow-clear
++          placeholder="绑定部门（运维分工与数据权限锚点，可空）"
++        />
++      </a-form-item>
++      <a-form-item label="心跳周期(秒)" name="heartbeatPeriod">
++        <a-input-number
++          v-model:value="form.heartbeatPeriod"
++          :min="1"
++          :max="86400"
++          :precision="0"
++          style="width: 100%"
++          placeholder="未携带落库默认 30"
++        />
++      </a-form-item>
++      <a-form-item label="状态" name="status" v-if="form.id">
++        <a-radio-group v-model:value="form.status" button-style="solid">
++          <a-radio-button :value="1">启用</a-radio-button>
++          <a-radio-button :value="0">禁用</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { gatewayApi } from '/@/api/iot/gateway-api';
++  import { instanceApi } from '/@/api/iot/instance-api';
++  import { deptApi } from '/@/api/system/dept-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  const emit = defineEmits(['reloadList']);
++
++  const formRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    gatewayCode: '',
++    gatewayName: '',
++    instanceId: undefined,
++    deptId: undefined,
++    heartbeatPeriod: undefined,
++    status: undefined,
++  };
++  const form = reactive({ ...formDefault });
++  // 与 IotGatewayCreateForm/UpdateForm 校验注解逐条对齐
++  const rules = {
++    gatewayCode: [
++      { required: true, message: '请输入网关编码' },
++      { max: 64, message: '网关编码长度不能超过 64' },
++      { pattern: /^[A-Za-z0-9_]+$/, message: '网关编码仅允许字母/数字/下划线（作 MQTT 主题与设备身份段）' },
++    ],
++    gatewayName: [
++      { required: true, message: '请输入网关名称' },
++      { max: 100, message: '网关名称长度不能超过 100' },
++    ],
++  };
++
++  const visible = ref(false);
++  const instanceTreeData = ref([]);
++  const deptTreeData = ref([]);
++
++  async function showModal(rowData?) {
++    Object.assign(form, formDefault);
++    if (rowData) {
++      Object.assign(form, rowData);
++    }
++    await Promise.all([loadInstanceTree(), loadDeptTree()]);
++    visible.value = true;
++  }
++
++  async function loadInstanceTree() {
++    try {
++      const responseData = await instanceApi.queryInstanceTree();
++      instanceTreeData.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  async function loadDeptTree() {
++    try {
++      const responseData = await deptApi.queryDeptTree();
++      deptTreeData.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        try {
++          if (form.id) {
++            await gatewayApi.updateGateway(form);
++          } else {
++            // 新建不携带 status（后端一律启用）与 id/回写字段组
++            const { id, status, ...createData } = form;
++            await gatewayApi.addGateway(createData);
++          }
++          message.success(`${form.id ? '修改' : '添加'}成功`);
++          emit('reloadList');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/gateway/index.vue b/frontend/src/views/iot/gateway/index.vue
+index 8686b01..88adc31 100644
+--- a/frontend/src/views/iot/gateway/index.vue
++++ b/frontend/src/views/iot/gateway/index.vue
+@@ -1,11 +1,253 @@
+ <!--
+-  * 网关管理（占位骨架，TASK-0055）
++  * 采集网关管理（TASK-0056 完整页）
+   *
+-  * 菜单挂载点：sys_menu 4012（/iot/gateway）。网关建档归 TASK-0056/0070。
++  * 对接 IotGatewayController（/iot/gateway，权限位 iot:gateway:* 4041-4045）。
++  * 后端无 detail 端点（iot:gateway:query 4042 预登记）——详情弹层用列表行数据渲染，
++  * 不调 GET /{id}（不存在该接口）。gateway_code 创建后不可改（编辑禁输，仅作一致性
++  * 核对回传）；在线状态/最后心跳/IP/版本/配置版本五字段组由接入服务心跳回写，
++  * 管理面只读（REQ-0009 验收 4）；删除软删（名下有通道/点位时后端拒绝）。
+ -->
+ <template>
+-  <IotPlaceholder title="网关管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="网关编码" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.gatewayCode" placeholder="网关编码" />
++      </a-form-item>
++      <a-form-item label="网关名称" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.gatewayName" placeholder="网关名称" />
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 100px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="在线状态" class="ot-query-form-item">
++        <a-select style="width: 100px" v-model:value="queryForm.onlineStatus" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">在线</a-select-option>
++          <a-select-option :value="0">离线</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:gateway:list'" type="primary" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:gateway:list'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:gateway:add'" type="primary" @click="addOrUpdateGateway()">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          新建
++        </a-button>
++      </div>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="id"
++      :pagination="false"
++      bordered
++      :scroll="{ x: 1000 }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'onlineStatus'">
++          <a-tag v-if="record.onlineStatus === 1" color="green">在线</a-tag>
++          <a-tag v-else color="default">离线</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:gateway:query'" type="link" @click="showDetail(record)">详情</a-button>
++            <a-button v-privilege="'iot:gateway:edit'" type="link" @click="addOrUpdateGateway(record)">编辑</a-button>
++            <a-button v-privilege="'iot:gateway:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <GatewayFormModal ref="gatewayFormModalRef" @reloadList="ajaxQuery" />
++    <GatewayDetailModal ref="gatewayDetailModalRef" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import GatewayFormModal from './components/gateway-form-modal.vue';
++  import GatewayDetailModal from './components/gateway-detail-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { gatewayApi } from '/@/api/iot/gateway-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '网关编码',
++      dataIndex: 'gatewayCode',
++    },
++    {
++      title: '网关名称',
++      dataIndex: 'gatewayName',
++    },
++    {
++      title: '状态',
++      width: 70,
++      dataIndex: 'status',
++    },
++    {
++      title: '在线状态',
++      width: 90,
++      dataIndex: 'onlineStatus',
++    },
++    {
++      title: '最后心跳时间',
++      width: 160,
++      dataIndex: 'lastHeartbeatTime',
++    },
++    {
++      title: '心跳周期(秒)',
++      width: 110,
++      dataIndex: 'heartbeatPeriod',
++    },
++    {
++      title: '程序版本',
++      width: 90,
++      dataIndex: 'version',
++    },
++    {
++      title: '配置版本',
++      width: 90,
++      dataIndex: 'configVersion',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 130,
++    },
++  ]);
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    gatewayCode: '',
++    gatewayName: '',
++    status: undefined,
++    onlineStatus: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const gatewayFormModalRef = ref();
++  const gatewayDetailModalRef = ref();
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    ajaxQuery();
++  }
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await gatewayApi.queryGatewayList(queryForm);
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 删除（软删，二次确认） -----------------
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除网关【${rowData.gatewayCode} ${rowData.gatewayName}】吗?（名下有通道/点位时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteGateway(rowData);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteGateway(rowData) {
++    try {
++      OtLoading.show();
++      await gatewayApi.deleteGateway(rowData.id);
++      message.success('删除成功');
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 详情 / 添加/更新 -----------------
++
++  function showDetail(rowData) {
++    // 后端不设 detail 端点（0017 口径）：详情弹层用列表行数据渲染
++    gatewayDetailModalRef.value.showModal(rowData);
++  }
++
++  function addOrUpdateGateway(rowData?) {
++    gatewayFormModalRef.value.showModal(rowData);
++  }
++
++  onMounted(ajaxQuery);
+ </script>
+diff --git a/frontend/src/views/iot/instance/components/instance-detail-modal.vue b/frontend/src/views/iot/instance/components/instance-detail-modal.vue
+new file mode 100644
+index 0000000..3b73e66
+--- /dev/null
++++ b/frontend/src/views/iot/instance/components/instance-detail-modal.vue
+@@ -0,0 +1,65 @@
++<!--
++  * 实例详情 弹窗（TASK-0056）
++  *
++  * 对接 GET /iot/instance/{id}（iot:instance:query，数据权限不命中后端 403）。
++  * 展示全字段含不可变五字段（编码/父/祖级/类型/模板）与锁定/模板版本，供
++  * 编辑前核对一致性快照。
++-->
++<template>
++  <a-modal :open="visible" title="实例详情" :width="640" :footer="null" @cancel="onClose">
++    <a-descriptions bordered size="small" :column="2" :loading="detailLoading">
++      <a-descriptions-item label="ID" :span="1">{{ detail.id }}</a-descriptions-item>
++      <a-descriptions-item label="实例编码" :span="1">{{ detail.instanceCode }}</a-descriptions-item>
++      <a-descriptions-item label="实例名称" :span="1">{{ detail.instanceName }}</a-descriptions-item>
++      <a-descriptions-item label="节点类型" :span="1">{{ iotNodeTypeLabel(detail.nodeType as number) }}</a-descriptions-item>
++      <a-descriptions-item label="父实例ID" :span="1">{{ detail.parentId === 0 ? '顶级' : detail.parentId }}</a-descriptions-item>
++      <a-descriptions-item label="祖级路径" :span="1">{{ detail.ancestors || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="来源模板ID" :span="1">{{ detail.templateId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="已应用模板版本" :span="1">{{ detail.appliedTemplateVersion || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="绑定部门ID" :span="1">{{ detail.deptId || '-' }}</a-descriptions-item>
++      <a-descriptions-item label="同级排序" :span="1">{{ detail.sort }}</a-descriptions-item>
++      <a-descriptions-item label="状态" :span="1">
++        <a-tag v-if="detail.status === 1" color="green">启用</a-tag>
++        <a-tag v-else color="red">禁用</a-tag>
++      </a-descriptions-item>
++      <a-descriptions-item label="锁定" :span="1">
++        <a-tag v-if="detail.locked === 1" color="orange">已锁定</a-tag>
++        <span v-else>未锁定</span>
++      </a-descriptions-item>
++      <a-descriptions-item label="创建时间" :span="1">{{ detail.createTime }}</a-descriptions-item>
++      <a-descriptions-item label="更新时间" :span="1">{{ detail.updateTime }}</a-descriptions-item>
++    </a-descriptions>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { instanceApi } from '/@/api/iot/instance-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { iotNodeTypeLabel } from '/@/components/iot/iot-consts';
++
++  const visible = ref(false);
++  const detailLoading = ref(false);
++  const detail = reactive<Record<string, unknown>>({});
++
++  async function showModal(id) {
++    visible.value = true;
++    detailLoading.value = true;
++    try {
++      const responseData = await instanceApi.queryInstanceById(id);
++      Object.assign(detail, responseData.data);
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      detailLoading.value = false;
++    }
++  }
++
++  function onClose() {
++    visible.value = false;
++    Object.keys(detail).forEach((key) => delete detail[key]);
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/instance/components/instance-form-modal.vue b/frontend/src/views/iot/instance/components/instance-form-modal.vue
+new file mode 100644
+index 0000000..4ddd467
+--- /dev/null
++++ b/frontend/src/views/iot/instance/components/instance-form-modal.vue
+@@ -0,0 +1,268 @@
++<!--
++  * 实例表单 弹窗（TASK-0056）
++  *
++  * 表单校验与 IotInstanceCreateForm / IotInstanceUpdateForm DTO 注解对齐：
++  * 新增只传本级短码 shortCode（[A-Za-z0-9_]，服务层拼父全码）、instanceName ≤100、
++  * node_type 1-5；选模板 TD-0008：设备/组件级 template_id 必填，工厂/车间级可空、
++  * 绑部门：工厂/车间级 dept_id 必填（数据权限锚点）——必填联动按节点类型前置提示，
++  * 最终以后端服务层校验为准。编辑五字段不可变（编码/父/祖级/类型/模板，仅作一致性
++  * 核对随表单回传）；locked=1 仅允许改 status（REQ-0005，其余字段禁输）。
++  * 表单无 remark 字段（iot_model_instance DDL 无该列，后端 0012 口径）。
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑实例' : '添加实例'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-alert
++      v-if="form.id"
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      :message="lockedEdit ? '该实例已锁定：仅允许修改状态（REQ-0005）' : '编码/父实例/节点类型/来源模板创建后不可改，仅名称/部门/排序/状态可修改'"
++    />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 6 }" :wrapper-col="{ span: 18 }">
++      <a-form-item label="父实例" name="parentId">
++        <a-tree-select
++          v-model:value="form.parentId"
++          style="width: 100%"
++          :tree-data="parentTreeData"
++          :field-names="{ label: 'title', value: 'key', children: 'children' }"
++          tree-default-expand-all
++          :allow-clear="!form.id"
++          :disabled="!!form.id"
++          placeholder="不选 = 顶级实例"
++        />
++      </a-form-item>
++      <a-form-item label="本级短码" name="shortCode">
++        <a-input v-model:value="form.shortCode" :disabled="!!form.id" :maxlength="96" placeholder="字母/数字/下划线；服务层拼「父码.短码」为全码" />
++      </a-form-item>
++      <a-form-item label="实例编码" name="instanceCode" v-if="form.id">
++        <a-input :value="form.instanceCode" disabled />
++      </a-form-item>
++      <a-form-item label="实例名称" name="instanceName">
++        <a-input v-model:value="form.instanceName" :maxlength="100" :disabled="lockedEdit" placeholder="请输入实例名称" />
++      </a-form-item>
++      <a-form-item label="节点类型" name="nodeType">
++        <a-select v-model:value="form.nodeType" :disabled="!!form.id" placeholder="1 工厂 2 车间 3 产线 4 设备 5 组件">
++          <a-select-option v-for="opt in IOT_NODE_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="来源模板" name="templateId">
++        <a-select
++          v-model:value="form.templateId"
++          :allow-clear="!isDeviceLike"
++          :disabled="!!form.id"
++          placeholder="设备/组件级必填（TD-0008）；工厂/车间级可空；产线可选"
++          :options="templateOptions"
++          option-filter-prop="label"
++        />
++      </a-form-item>
++      <a-form-item label="绑定部门" name="deptId">
++        <a-tree-select
++          v-model:value="form.deptId"
++          style="width: 100%"
++          :tree-data="deptTreeData"
++          :field-names="{ label: 'deptName', value: 'id', children: 'children' }"
++          tree-default-expand-all
++          :allow-clear="!isOrgNode"
++          :disabled="lockedEdit"
++          placeholder="工厂/车间级必填（数据权限锚点）；设备/组件级可空"
++        />
++      </a-form-item>
++      <a-form-item label="同级排序" name="sort">
++        <a-input-number v-model:value="form.sort" :precision="0" :disabled="lockedEdit" style="width: 100%" placeholder="未携带落库默认 0" />
++      </a-form-item>
++      <a-form-item label="状态" name="status" v-if="form.id">
++        <a-radio-group v-model:value="form.status" button-style="solid">
++          <a-radio-button :value="1">启用</a-radio-button>
++          <a-radio-button :value="0">禁用</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref, watch } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { instanceApi } from '/@/api/iot/instance-api';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { deptApi } from '/@/api/system/dept-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_NODE_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++
++  const emit = defineEmits(['reloadList']);
++
++  const formRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    parentId: undefined,
++    shortCode: '',
++    instanceCode: '',
++    instanceName: '',
++    nodeType: undefined,
++    templateId: undefined,
++    deptId: undefined,
++    sort: undefined,
++    status: undefined,
++    locked: undefined,
++    ancestors: undefined,
++  };
++  const form = reactive({ ...formDefault });
++  const visible = ref(false);
++  const submitLoading = ref(false);
++
++  // 一致性核对字段（编辑时原样回传，服务层校验与库中一致）
++  const immutableSnapshot = ref<{ instanceCode?: string; parentId?: number; nodeType?: number; templateId?: number; ancestors?: string }>({});
++
++  // 树数据（页面传入：实例树供父实例选择、部门树供绑部门选择）
++  const parentTreeData = ref([]);
++  const deptTreeData = ref([]);
++
++  const isDeviceLike = computed(() => form.nodeType === 4 || form.nodeType === 5);
++  const isOrgNode = computed(() => form.nodeType === 1 || form.nodeType === 2);
++  const lockedEdit = computed(() => form.locked === 1);
++
++  // 设备/组件级选模板必填（TD-0008）；工厂/车间级绑部门必填（ADR-0016 开放点 10）——
++  // 条件必填用自定义 validator（校验与后端服务层口径一致，前置提示）
++  const rules = {
++    shortCode: [
++      { required: true, message: '请输入本级短码' },
++      { pattern: /^[A-Za-z0-9_]+$/, message: '本级短码仅允许字母/数字/下划线' },
++    ],
++    instanceName: [
++      { required: true, message: '请输入实例名称' },
++      { max: 100, message: '实例名称长度不能超过 100' },
++    ],
++    nodeType: [
++      { required: true, message: '请选择节点类型' },
++      { type: 'number', min: 1, max: 5, message: '节点类型仅允许 1-5' },
++    ],
++    templateId: [
++      {
++        validator: async (_rule, value) => {
++          if (isDeviceLike.value && !value) {
++            return Promise.reject('设备/组件级必须选择来源模板（TD-0008）');
++          }
++          return Promise.resolve();
++        },
++      },
++    ],
++    deptId: [
++      {
++        validator: async (_rule, value) => {
++          if (isOrgNode.value && !value) {
++            return Promise.reject('工厂/车间级必须绑定部门（数据权限锚点）');
++          }
++          return Promise.resolve();
++        },
++      },
++    ],
++  };
++
++  // 模板下拉：按节点类型联动加载（status=1 的租户/预置模板；pageSize 上限 500 对齐 maxLimit）
++  const templateOptions = ref<{ label: string; value: number }[]>([]);
++  watch(
++    () => form.nodeType,
++    (nodeType) => {
++      // 编辑回显时保留原模板（仅新增切换类型才清空重选）
++      if (!form.id) {
++        form.templateId = undefined;
++      }
++      if (nodeType) {
++        loadTemplateOptions(nodeType);
++      } else {
++        templateOptions.value = [];
++      }
++    }
++  );
++
++  async function loadTemplateOptions(nodeType) {
++    try {
++      // 编辑回显场景不过滤 status（历史模板可能已停用仍需展示编码）
++      const statusFilter = form.id ? undefined : 1;
++      const responseData = await templateApi.queryTemplateList({ pageNum: 1, pageSize: 500, nodeType, status: statusFilter });
++      templateOptions.value = (responseData.data.records || []).map((t) => ({
++        label: `${t.templateCode}（${t.templateName}）`,
++        value: t.id,
++      }));
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  async function showModal(rowData?, instanceTree?) {
++    Object.assign(form, formDefault);
++    immutableSnapshot.value = {};
++    parentTreeData.value = instanceTree || [];
++    await loadDeptTree();
++    if (rowData) {
++      Object.assign(form, rowData);
++      immutableSnapshot.value = {
++        instanceCode: rowData.instanceCode,
++        parentId: rowData.parentId,
++        nodeType: rowData.nodeType,
++        templateId: rowData.templateId,
++        ancestors: rowData.ancestors,
++      };
++    }
++    visible.value = true;
++  }
++
++  async function loadDeptTree() {
++    try {
++      const responseData = await deptApi.queryDeptTree();
++      deptTreeData.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        submitLoading.value = true;
++        try {
++          if (form.id) {
++            const updateData: Record<string, unknown> = { id: form.id, ...immutableSnapshot.value };
++            // locked=1：仅允许改 status（REQ-0005——其余可变字段不携带）
++            if (!lockedEdit.value) {
++              updateData.instanceName = form.instanceName;
++              updateData.deptId = form.deptId;
++              updateData.sort = form.sort;
++            }
++            updateData.status = form.status;
++            await instanceApi.updateInstance(updateData);
++          } else {
++            const { id, instanceCode, status, locked, ancestors, ...createData } = form;
++            // 新增只传本级短码（服务层拼父全码）；parentId 空=顶级
++            await instanceApi.addInstance({ ...createData, parentId: createData.parentId || 0 });
++          }
++          message.success(`${form.id ? '修改' : '添加'}成功`);
++          emit('reloadList');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++          submitLoading.value = false;
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/instance/components/instance-item-drawer.vue b/frontend/src/views/iot/instance/components/instance-item-drawer.vue
+new file mode 100644
+index 0000000..d2dd58a
+--- /dev/null
++++ b/frontend/src/views/iot/instance/components/instance-item-drawer.vue
+@@ -0,0 +1,146 @@
++<!--
++  * 实例数据项抽屉（TASK-0056：清单 + 参数覆盖 + 重生成）
++  *
++  * 对接 IotDataItemController：GET /iot/item/list（iot:item:list 4036，数据权限裁剪）、
++  * POST /iot/instance/{id}/items/regenerate（iot:item:add 4038，按模板清单对齐）、
++  * 参数覆盖入口开弹窗（iot:item:edit 4039 + iot:item:query 4037，见 instance-params-modal）。
++  * 实例数据项只能由模板生成（TD-0008：不设手动新增口子），故无「新增」按钮。
++-->
++<template>
++  <a-drawer :open="visible" :title="`实例数据项 - ${instance.instanceCode || ''} ${instance.instanceName || ''}`" :width="1020" @close="onClose">
++    <a-space class="ot-margin-bottom10">
++      <a-button v-privilege="'iot:item:add'" @click="confirmRegenerate">
++        <template #icon>
++          <SyncOutlined />
++        </template>
++        按模板重生成
++      </a-button>
++      <span class="item-drawer-tip">数据项由来源模板清单批量生成（TD-0008），参数阈值可逐项覆盖</span>
++    </a-space>
++
++    <a-table
++      size="small"
++      bordered
++      rowKey="id"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      :pagination="false"
++      :scroll="{ x: 960 }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'sourceType'">
++          {{ sourceTypeLabel(record.sourceType) }}
++        </template>
++        <template v-if="column.dataIndex === 'enabled'">
++          <a-tag v-if="record.enabled === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">停算</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:item:query'" type="link" @click="openParams(record, 'view')">有效值</a-button>
++            <a-button v-privilege="'iot:item:edit'" type="link" @click="openParams(record, 'edit')">参数覆盖</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <InstanceParamsModal ref="instanceParamsModalRef" @reload="ajaxQueryItems" />
++  </a-drawer>
++</template>
++<script setup lang="ts">
++  import { ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { SyncOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { itemApi } from '/@/api/iot/item-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_SOURCE_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++  import InstanceParamsModal from './instance-params-modal.vue';
++
++  const columns = [
++    { title: '数据编码', dataIndex: 'dataCode', width: 140, fixed: 'left' },
++    { title: '全键', dataIndex: 'fullKey', width: 200, ellipsis: true },
++    { title: '数据名称', dataIndex: 'dataName', width: 120 },
++    { title: '单位', dataIndex: 'unit', width: 60 },
++    { title: '取值方式', dataIndex: 'sourceType', width: 80 },
++    { title: '有效下限', dataIndex: 'validMin', width: 90 },
++    { title: '有效上限', dataIndex: 'validMax', width: 90 },
++    { title: '告警低阈', dataIndex: 'alarmLow', width: 90 },
++    { title: '告警高阈', dataIndex: 'alarmHigh', width: 90 },
++    { title: '计算周期(秒)', dataIndex: 'calcPeriod', width: 100 },
++    { title: '计算', dataIndex: 'enabled', width: 70 },
++    { title: '操作', dataIndex: 'action', width: 150, fixed: 'right' },
++  ];
++
++  const visible = ref(false);
++  const instance = ref<Record<string, unknown>>({});
++  const tableLoading = ref(false);
++  const tableData = ref<Record<string, unknown>[]>([]);
++  const instanceParamsModalRef = ref();
++
++  function sourceTypeLabel(sourceType) {
++    return IOT_SOURCE_TYPE_OPTIONS.find((o) => o.value === sourceType)?.label || '-';
++  }
++
++  async function showDrawer(rowData) {
++    instance.value = rowData;
++    visible.value = true;
++    await ajaxQueryItems();
++  }
++
++  function onClose() {
++    visible.value = false;
++    instance.value = {};
++    tableData.value = [];
++  }
++
++  async function ajaxQueryItems() {
++    try {
++      tableLoading.value = true;
++      const responseData = await itemApi.queryItemList(instance.value.id);
++      tableData.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  function confirmRegenerate() {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要按来源模板重生成实例【${instance.value.instanceCode}】的数据项吗?（新增缺失项；已存在跳过；模板已删项保留）`,
++      okText: '重生成',
++      onOk() {
++        regenerate();
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function regenerate() {
++    try {
++      OtLoading.show();
++      const responseData = await itemApi.regenerateItems(instance.value.id);
++      message.success(`重生成完成：新增 ${responseData.data} 项`);
++      await ajaxQueryItems();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  function openParams(record, mode) {
++    instanceParamsModalRef.value.showModal(instance.value, record, mode);
++  }
++</script>
++<style scoped lang="less">
++  .item-drawer-tip {
++    color: #999;
++    font-size: 12px;
++  }
++</style>
+diff --git a/frontend/src/views/iot/instance/components/instance-params-modal.vue b/frontend/src/views/iot/instance/components/instance-params-modal.vue
+new file mode 100644
+index 0000000..2c83594
+--- /dev/null
++++ b/frontend/src/views/iot/instance/components/instance-params-modal.vue
+@@ -0,0 +1,160 @@
++<!--
++  * 实例参数覆盖 弹窗（TASK-0056，TASK-0014 继承链前端）
++  *
++  * 对接 GET /iot/instance/{instanceId}/items/{itemId}/effective-params
++  * （iot:item:query 4037：逐字段三态 INSTANCE/TEMPLATE/NONE 来源标注）与
++  * PUT /iot/instance/{instanceId}/items/{itemId}/params（iot:item:edit 4039）。
++  * 覆盖语义：四字段逐字段生效，null=清除覆盖回归模板继承（输入留空=清除）；
++  * min<=max 等范围校验在后端服务层 fail-closed（PARAM_ERROR），前端仅做基础提示。
++-->
++<template>
++  <a-modal
++    :open="visible"
++    :title="`参数覆盖 - ${effective.fullKey || item.dataCode || ''}`"
++    ok-text="保存"
++    cancel-text="取消"
++    @ok="onSubmit"
++    @cancel="onClose"
++  >
++    <a-alert
++      type="info"
++      show-icon
++      class="ot-margin-bottom10"
++      message="留空 = 清除覆盖回归模板继承（null 语义）；「来源」列标注当前有效值继承链（实例覆盖 / 模板默认 / 不判定）"
++    />
++    <a-form ref="formRef" :model="form" :label-col="{ span: 6 }" :wrapper-col="{ span: 16 }">
++      <a-form-item label="有效下限" name="validMin" extra="留空清除覆盖">
++        <a-input-number v-model:value="form.validMin" style="width: 100%" placeholder="留空 = 清除覆盖" />
++      </a-form-item>
++      <a-form-item label="有效上限" name="validMax" extra="留空清除覆盖">
++        <a-input-number v-model:value="form.validMax" style="width: 100%" placeholder="留空 = 清除覆盖" />
++      </a-form-item>
++      <a-form-item label="告警低阈值" name="alarmLow" extra="留空清除覆盖">
++        <a-input-number v-model:value="form.alarmLow" style="width: 100%" placeholder="留空 = 清除覆盖" />
++      </a-form-item>
++      <a-form-item label="告警高阈值" name="alarmHigh" extra="留空清除覆盖">
++        <a-input-number v-model:value="form.alarmHigh" style="width: 100%" placeholder="留空 = 清除覆盖" />
++      </a-form-item>
++    </a-form>
++
++    <a-divider class="ot-margin-bottom10">当前有效值与继承来源</a-divider>
++    <a-descriptions bordered size="small" :column="1" :loading="effectiveLoading">
++      <a-descriptions-item v-for="field in PARAM_FIELDS" :key="field.key" :label="field.label">
++        {{ effective[field.key] ?? '（不判定）' }}
++        <a-tag :color="sourceColor(effective[`${field.key}Source`])" class="ot-margin-left10">{{
++          sourceLabel(effective[`${field.key}Source`])
++        }}</a-tag>
++      </a-descriptions-item>
++    </a-descriptions>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { itemApi } from '/@/api/iot/item-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  const PARAM_FIELDS = [
++    { key: 'validMin', label: '有效下限' },
++    { key: 'validMax', label: '有效上限' },
++    { key: 'alarmLow', label: '告警低阈值' },
++    { key: 'alarmHigh', label: '告警高阈值' },
++  ];
++
++  const visible = ref(false);
++  const instanceId = ref<number>();
++  const item = ref<Record<string, unknown>>({});
++  const mode = ref<'view' | 'edit'>('edit');
++  const effectiveLoading = ref(false);
++  // IotItemEffectiveParamsVO：值 + *Source（INSTANCE/TEMPLATE/NONE）
++  const effective = reactive<Record<string, unknown>>({});
++  const formRef = ref();
++
++  const form = reactive({
++    validMin: undefined,
++    validMax: undefined,
++    alarmLow: undefined,
++    alarmHigh: undefined,
++  });
++
++  function sourceLabel(source) {
++    if (source === 'INSTANCE') {
++      return '实例覆盖';
++    }
++    if (source === 'TEMPLATE') {
++      return '模板默认';
++    }
++    return '不判定';
++  }
++  function sourceColor(source) {
++    if (source === 'INSTANCE') {
++      return 'orange';
++    }
++    if (source === 'TEMPLATE') {
++      return 'blue';
++    }
++    return 'default';
++  }
++
++  async function showModal(instanceRow, itemRow, openMode) {
++    instanceId.value = instanceRow.id;
++    item.value = itemRow;
++    mode.value = openMode || 'edit';
++    visible.value = true;
++    // 预填实例行当前覆盖值（null=继承中）
++    form.validMin = itemRow.validMin ?? undefined;
++    form.validMax = itemRow.validMax ?? undefined;
++    form.alarmLow = itemRow.alarmLow ?? undefined;
++    form.alarmHigh = itemRow.alarmHigh ?? undefined;
++    await loadEffective();
++  }
++
++  async function loadEffective() {
++    try {
++      effectiveLoading.value = true;
++      const responseData = await itemApi.queryEffectiveParams(instanceId.value, item.value.id);
++      Object.keys(effective).forEach((key) => delete effective[key]);
++      Object.assign(effective, responseData.data);
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      effectiveLoading.value = false;
++    }
++  }
++
++  function onClose() {
++    visible.value = false;
++    item.value = {};
++    Object.keys(effective).forEach((key) => delete effective[key]);
++  }
++
++  async function onSubmit() {
++    if (mode.value !== 'edit') {
++      onClose();
++      return;
++    }
++    // a-input-number 清空后可能落 undefined：提交前归一 null（null=清除覆盖，后端口径）
++    const payload = {
++      validMin: form.validMin ?? null,
++      validMax: form.validMax ?? null,
++      alarmLow: form.alarmLow ?? null,
++      alarmHigh: form.alarmHigh ?? null,
++    };
++    OtLoading.show();
++    try {
++      await itemApi.overrideItemParams(instanceId.value, item.value.id, payload);
++      message.success('参数覆盖已保存（逐字段生效）');
++      onClose();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/instance/index.vue b/frontend/src/views/iot/instance/index.vue
+index 3a9db1d..3a84611 100644
+--- a/frontend/src/views/iot/instance/index.vue
++++ b/frontend/src/views/iot/instance/index.vue
+@@ -1,11 +1,405 @@
+ <!--
+-  * 实例管理（占位骨架，TASK-0055）
++  * 模型实例管理（TASK-0056 完整页）
+   *
+-  * 菜单挂载点：sys_menu 4010（/iot/instance）。模型实例（采集对象实例）管理归 TASK-0056/0070。
++  * 对接 IotModelInstanceController（/iot/instance，权限位 iot:instance:* 4030-4035）：
++  * 左侧实例树（iot:instance:tree，数据权限裁剪）+ 右侧列表/表单/详情（iot:instance:list/
++  * add/edit/remove/query）+ 每行「数据项」入口开抽屉（iot:item:*，见 instance-item-drawer）。
++  * 树节点点击 = 按编码前缀检索子树（list 的 instanceCode like 语义：全码路径式
++  * F01.WS01.EQ001 含父码前缀）；编辑五字段不可变；删除逻辑删（有子实例后端拒绝）。
+ -->
+ <template>
+-  <IotPlaceholder title="实例管理" task="TASK-0056 / TASK-0070" />
++  <a-row :gutter="8">
++    <a-col :span="6">
++      <a-card size="small" :bordered="false" :hoverable="true" class="instance-tree-card">
++        <template #title>
++          <span>实例树</span>
++        </template>
++        <template #extra>
++          <a-button v-privilege="'iot:instance:tree'" type="link" size="small" @click="queryTree">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            刷新
++          </a-button>
++        </template>
++        <div v-privilege="'iot:instance:tree'">
++          <a-input-search class="ot-margin-bottom10" v-model:value="treeKeywords" placeholder="过滤实例名称/编码" allow-clear />
++          <a-tree
++            v-if="treeData.length > 0"
++            :tree-data="filteredTreeData"
++            :field-names="{ title: 'title', key: 'key', children: 'children' }"
++            :default-expand-all="false"
++            :expanded-keys="expandedKeys"
++            @expand="onExpandTree"
++            @select="onSelectTree"
++          />
++          <a-empty v-else :description="treeLoading ? '加载中...' : '暂无实例（空数据=列表空态）'" />
++        </div>
++      </a-card>
++    </a-col>
++    <a-col :span="18">
++      <a-form class="ot-query-form">
++        <a-row class="ot-query-form-row">
++          <a-form-item label="实例编码" class="ot-query-form-item">
++            <a-input style="width: 180px" v-model:value="queryForm.instanceCode" placeholder="实例编码（含前缀检索子树）" />
++          </a-form-item>
++          <a-form-item label="实例名称" class="ot-query-form-item">
++            <a-input style="width: 160px" v-model:value="queryForm.instanceName" placeholder="实例名称" />
++          </a-form-item>
++          <a-form-item label="节点类型" class="ot-query-form-item">
++            <a-select style="width: 110px" v-model:value="queryForm.nodeType" :allowClear="true" placeholder="请选择">
++              <a-select-option v-for="opt in IOT_NODE_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++                {{ opt.label }}
++              </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="状态" class="ot-query-form-item">
++            <a-select style="width: 100px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++              <a-select-option :value="1">启用</a-select-option>
++              <a-select-option :value="0">禁用</a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item class="ot-query-form-item ot-margin-left10">
++            <a-button-group>
++              <a-button v-privilege="'iot:instance:list'" type="primary" @click="onSearch">
++                <template #icon>
++                  <SearchOutlined />
++                </template>
++                查询
++              </a-button>
++              <a-button v-privilege="'iot:instance:list'" @click="resetQuery">
++                <template #icon>
++                  <ReloadOutlined />
++                </template>
++                重置
++              </a-button>
++            </a-button-group>
++          </a-form-item>
++        </a-row>
++      </a-form>
++
++      <a-card size="small" :bordered="false" :hoverable="true">
++        <a-row class="ot-table-btn-block">
++          <div class="ot-table-operate-block">
++            <a-button v-privilege="'iot:instance:add'" type="primary" @click="addInstance()">
++              <template #icon>
++                <PlusOutlined />
++              </template>
++              新建
++            </a-button>
++            <a-button
++              v-privilege="'iot:instance:remove'"
++              type="primary"
++              danger
++              :disabled="selectedRowKeyList.length === 0"
++              @click="confirmBatchDelete"
++            >
++              <template #icon>
++                <DeleteOutlined />
++              </template>
++              批量删除
++            </a-button>
++          </div>
++        </a-row>
++
++        <a-table
++          size="small"
++          :dataSource="tableData"
++          :columns="columns"
++          :loading="tableLoading"
++          rowKey="id"
++          :pagination="false"
++          bordered
++          :row-selection="{ selectedRowKeys: selectedRowKeyList, onChange: onSelectChange }"
++        >
++          <template #bodyCell="{ record, column }">
++            <template v-if="column.dataIndex === 'nodeType'">
++              {{ iotNodeTypeLabel(record.nodeType) }}
++            </template>
++            <template v-if="column.dataIndex === 'status'">
++              <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++              <a-tag v-else color="red">禁用</a-tag>
++            </template>
++            <template v-if="column.dataIndex === 'locked'">
++              <a-tag v-if="record.locked === 1" color="orange">已锁定</a-tag>
++              <span v-else>-</span>
++            </template>
++            <template v-if="column.dataIndex === 'action'">
++              <div class="ot-table-operate">
++                <a-button v-privilege="'iot:instance:query'" type="link" @click="showDetail(record)">详情</a-button>
++                <a-button v-privilege="'iot:item:list'" type="link" @click="openItems(record)">数据项</a-button>
++                <a-button v-privilege="'iot:instance:edit'" type="link" @click="addInstance(record)">编辑</a-button>
++                <a-button v-privilege="'iot:instance:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++              </div>
++            </template>
++          </template>
++        </a-table>
++
++        <div class="ot-query-table-page">
++          <a-pagination
++            showSizeChanger
++            showQuickJumper
++            show-less-items
++            :pageSizeOptions="PAGE_SIZE_OPTIONS"
++            :defaultPageSize="queryForm.pageSize"
++            v-model:current="queryForm.pageNum"
++            v-model:pageSize="queryForm.pageSize"
++            :total="total"
++            @change="ajaxQuery"
++            :show-total="(total) => `共${total}条`"
++          />
++        </div>
++      </a-card>
++    </a-col>
++  </a-row>
++
++  <InstanceFormModal ref="instanceFormModalRef" @reloadList="reloadAll" />
++  <InstanceDetailModal ref="instanceDetailModalRef" />
++  <InstanceItemDrawer ref="instanceItemDrawerRef" />
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import InstanceFormModal from './components/instance-form-modal.vue';
++  import InstanceDetailModal from './components/instance-detail-modal.vue';
++  import InstanceItemDrawer from './components/instance-item-drawer.vue';
++  import { computed, onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { DeleteOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { instanceApi } from '/@/api/iot/instance-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_NODE_TYPE_OPTIONS, iotNodeTypeLabel } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '实例编码',
++      dataIndex: 'instanceCode',
++    },
++    {
++      title: '实例名称',
++      dataIndex: 'instanceName',
++    },
++    {
++      title: '节点类型',
++      width: 90,
++      dataIndex: 'nodeType',
++    },
++    {
++      title: '状态',
++      width: 70,
++      dataIndex: 'status',
++    },
++    {
++      title: '锁定',
++      width: 80,
++      dataIndex: 'locked',
++    },
++    {
++      title: '模板版本',
++      width: 90,
++      dataIndex: 'appliedTemplateVersion',
++    },
++    {
++      title: '更新时间',
++      width: 160,
++      dataIndex: 'updateTime',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 210,
++    },
++  ]);
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    instanceCode: '',
++    instanceName: '',
++    nodeType: undefined,
++    status: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const instanceFormModalRef = ref();
++  const instanceDetailModalRef = ref();
++  const instanceItemDrawerRef = ref();
++
++  // 批量选择（批量删除）
++  const selectedRowKeyList = ref<number[]>([]);
++  function onSelectChange(selectedRowKeys) {
++    selectedRowKeyList.value = selectedRowKeys;
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    ajaxQuery();
++  }
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await instanceApi.queryInstanceList(queryForm);
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 实例树（iot:instance:tree） -----------------
++
++  const treeLoading = ref(false);
++  const treeData = ref<TreeNode[]>([]);
++  const expandedKeys = ref<number[]>([]);
++  const treeKeywords = ref('');
++
++  interface TreeNode {
++    title: string;
++    key: number;
++    instanceCode: string;
++    status: number;
++    children: TreeNode[];
++  }
++
++  function mapTreeNodes(nodes): TreeNode[] {
++    return (nodes || []).map((node) => ({
++      title: `${node.instanceName}（${node.instanceCode}）${node.status === 0 ? '【禁用】' : ''}`,
++      key: node.id,
++      instanceCode: node.instanceCode,
++      status: node.status,
++      children: mapTreeNodes(node.children),
++    }));
++  }
++
++  async function queryTree() {
++    try {
++      treeLoading.value = true;
++      const responseData = await instanceApi.queryInstanceTree();
++      treeData.value = mapTreeNodes(responseData.data);
++      // 默认展开一级节点
++      expandedKeys.value = treeData.value.map((node) => node.key);
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      treeLoading.value = false;
++    }
++  }
++
++  // 树名称/编码过滤（保留命中节点及其祖先路径）
++  const filteredTreeData = computed(() => filterTree(treeData.value, treeKeywords.value?.trim() || ''));
++  function filterTree(nodes, keywords): TreeNode[] {
++    if (!keywords) {
++      return nodes;
++    }
++    const result: TreeNode[] = [];
++    for (const node of nodes) {
++      const children = filterTree(node.children || [], keywords);
++      if (node.title.includes(keywords) || children.length > 0) {
++        result.push({ ...node, children });
++      }
++    }
++    return result;
++  }
++
++  function onExpandTree(keys) {
++    expandedKeys.value = keys;
++  }
++
++  function onSelectTree(selectedKeys, { node }) {
++    if (!selectedKeys.length) {
++      return;
++    }
++    // 按编码前缀检索子树：like %父码% 命中该节点与全部子孙（路径式编码语义）
++    queryForm.instanceCode = node.instanceCode;
++    onSearch();
++  }
++
++  async function reloadAll() {
++    await Promise.all([queryTree(), ajaxQuery()]);
++  }
++
++  // ---------------- 删除（逻辑删，二次确认） -----------------
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除实例【${rowData.instanceCode} ${rowData.instanceName}】吗?（有子实例时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteInstances(String(rowData.id));
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  function confirmBatchDelete() {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除选中的 ${selectedRowKeyList.value.length} 个实例吗?（有子实例时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteInstances(selectedRowKeyList.value.join(','));
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteInstances(ids) {
++    try {
++      OtLoading.show();
++      await instanceApi.deleteInstances(ids);
++      message.success('删除成功');
++      selectedRowKeyList.value = [];
++      await reloadAll();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 详情 / 表单 / 数据项 -----------------
++
++  function addInstance(rowData?) {
++    instanceFormModalRef.value.showModal(rowData, treeData.value);
++  }
++
++  function showDetail(rowData) {
++    instanceDetailModalRef.value.showModal(rowData.id);
++  }
++
++  function openItems(rowData) {
++    instanceItemDrawerRef.value.showDrawer(rowData);
++  }
++
++  onMounted(() => {
++    ajaxQuery();
++    queryTree();
++  });
+ </script>
++<style scoped lang="less">
++  .instance-tree-card {
++    min-height: 400px;
++  }
++</style>
+diff --git a/frontend/src/views/iot/template/components/template-form-modal.vue b/frontend/src/views/iot/template/components/template-form-modal.vue
+new file mode 100644
+index 0000000..ff26cdb
+--- /dev/null
++++ b/frontend/src/views/iot/template/components/template-form-modal.vue
+@@ -0,0 +1,134 @@
++<!--
++  * 模板表单 弹窗（TASK-0056）
++  *
++  * 表单校验与 IotModelTemplate DTO 校验注解对齐：template_code 必填 ≤64（创建后
++  * 不可改——编辑禁输）、template_name 必填 ≤100、node_type 必填 1-5、version ≥1
++  * （未携带后端落库默认 1）、remark ≤500。新增 status 后端强制 1，编辑可启停。
++-->
++<template>
++  <a-modal :open="visible" :title="form.id ? '编辑模板' : '添加模板'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 5 }" :wrapper-col="{ span: 19 }">
++      <a-form-item label="模板编码" name="templateCode">
++        <a-input v-model:value="form.templateCode" :disabled="!!form.id" :maxlength="64" placeholder="请输入编码（租户内唯一，创建后不可改）" />
++      </a-form-item>
++      <a-form-item label="模板名称" name="templateName">
++        <a-input v-model:value="form.templateName" :maxlength="100" placeholder="请输入名称" />
++      </a-form-item>
++      <a-form-item label="节点类型" name="nodeType">
++        <a-select v-model:value="form.nodeType" placeholder="请选择节点类型（约束实例可建层级）">
++          <a-select-option v-for="opt in IOT_NODE_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="版本号" name="version">
++        <a-input-number
++          v-model:value="form.version"
++          :min="1"
++          :precision="0"
++          style="width: 100%"
++          placeholder="不填默认 1；模板变更升版，已建实例不自动跟随"
++        />
++      </a-form-item>
++      <a-form-item label="状态" name="status">
++        <a-radio-group v-model:value="form.status" button-style="solid" :disabled="!form.id">
++          <a-radio-button :value="1">启用</a-radio-button>
++          <a-radio-button :value="0">禁用</a-radio-button>
++        </a-radio-group>
++      </a-form-item>
++      <a-form-item label="备注" name="remark">
++        <a-textarea v-model:value="form.remark" :maxlength="500" style="width: 100%; height: 100px; outline: none" />
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_NODE_TYPE_OPTIONS } from '/@/components/iot/iot-consts';
++
++  // emit
++  const emit = defineEmits(['reloadList']);
++
++  //  组件
++  const formRef = ref();
++
++  const formDefault = {
++    id: undefined,
++    templateCode: '',
++    templateName: '',
++    nodeType: undefined,
++    version: undefined,
++    status: 1,
++    remark: '',
++  };
++  const form = reactive({ ...formDefault });
++  // 与 IotModelTemplate 校验注解逐条对齐
++  const rules = {
++    templateCode: [
++      { required: true, message: '请输入模板编码' },
++      { max: 64, message: '模板编码长度不能超过 64' },
++    ],
++    templateName: [
++      { required: true, message: '请输入模板名称' },
++      { max: 100, message: '模板名称长度不能超过 100' },
++    ],
++    nodeType: [
++      { required: true, message: '请选择节点类型' },
++      { type: 'number', min: 1, max: 5, message: '节点类型仅允许 1-5' },
++    ],
++    version: [{ type: 'number', min: 1, message: '模板版本号必须为正整数' }],
++    remark: [{ max: 500, message: '备注长度不能超过 500' }],
++  };
++  // 是否展示
++  const visible = ref(false);
++
++  function showModal(rowData?) {
++    Object.assign(form, formDefault);
++    if (rowData) {
++      Object.assign(form, rowData);
++    }
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        try {
++          if (form.id) {
++            await templateApi.updateTemplate(form);
++          } else {
++            // 新增不携带 status（后端强制 1）；version 未填交后端默认 1
++            const { status, ...createData } = form;
++            await templateApi.addTemplate(createData);
++          }
++          message.success(`${form.id ? '修改' : '添加'}成功`);
++          emit('reloadList');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  // ----------------------- 以下是暴露的方法内容 ------------------------
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/template/components/template-item-modal.vue b/frontend/src/views/iot/template/components/template-item-modal.vue
+new file mode 100644
+index 0000000..90afaca
+--- /dev/null
++++ b/frontend/src/views/iot/template/components/template-item-modal.vue
+@@ -0,0 +1,411 @@
++<!--
++  * 模板数据项管理 弹窗（TASK-0056，模板子表）
++  *
++  * 对接 /iot/template/item 三接口：GET list（查询共用 iot:template:list）、
++  * POST 批量保存（iot:template:item:edit 4029，一次 ≤500 项）、PUT 修改、
++  * DELETE 批量删除（均 4029）。语义对齐后端：data_code 必须取自业务数据字典
++  * （下拉仅列启用字典，后端三态核对未登记/已停用拒整批）；data_code 创建后不可改
++  * （编辑禁输）；同模板删除后编码不可复用（后端 4002）。
++  * 批量口径：新增行先进「待保存清单」，一次 POST 批量提交。
++-->
++<template>
++  <a-modal
++    :open="visible"
++    :title="`模板数据项 - ${template.templateCode || ''} ${template.templateName || ''}`"
++    :width="960"
++    :footer="null"
++    :maskClosable="false"
++    @cancel="onClose"
++  >
++    <a-table
++      class="ot-margin-bottom10"
++      size="small"
++      bordered
++      :row-key="rowKeyFunc"
++      :dataSource="displayRows"
++      :columns="columns"
++      :loading="tableLoading"
++      :pagination="false"
++      :scroll="{ y: 320 }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'category'">
++          {{ categoryLabel(record.category) }}
++        </template>
++        <template v-if="column.dataIndex === 'valueKind'">
++          {{ valueKindLabel(record.valueKind) }}
++        </template>
++        <template v-if="column.dataIndex === 'defaultSourceType'">
++          {{ sourceTypeLabel(record.defaultSourceType) }}
++        </template>
++        <template v-if="column.dataIndex === 'pending'">
++          <a-tag v-if="record.pending" color="orange">待保存</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:template:item:edit'" type="link" @click="editItem(record)">编辑</a-button>
++            <a-button v-privilege="'iot:template:item:edit'" type="link" danger @click="confirmDeleteItem(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <a-divider class="ot-margin-bottom10">{{ editingId ? '编辑数据项' : '新增数据项（加入待保存清单后批量提交）' }}</a-divider>
++
++    <a-form ref="itemFormRef" :model="itemForm" :rules="itemRules" :label-col="{ span: 4 }" :wrapper-col="{ span: 20 }">
++      <a-row>
++        <a-col :span="12">
++          <a-form-item label="数据编码" name="dataCode">
++            <a-select
++              v-model:value="itemForm.dataCode"
++              show-search
++              :disabled="!!editingId"
++              :filter-option="filterDictOption"
++              placeholder="从业务数据字典选择（创建后不可改）"
++            >
++              <a-select-option v-for="d in dictOptions" :key="d.dataCode" :value="d.dataCode"> {{ d.dataCode }}（{{ d.dataName }}） </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="数据名称" name="dataName">
++            <a-input v-model:value="itemForm.dataName" :maxlength="100" placeholder="请输入数据名称" />
++          </a-form-item>
++          <a-form-item label="类别" name="category">
++            <a-select v-model:value="itemForm.category" :allowClear="true" placeholder="可空">
++              <a-select-option v-for="opt in IOT_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
++                {{ opt.label }}
++              </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="值性质" name="valueKind">
++            <a-select v-model:value="itemForm.valueKind" :allowClear="true" placeholder="可空">
++              <a-select-option v-for="opt in IOT_VALUE_KIND_OPTIONS" :key="opt.value" :value="opt.value">
++                {{ opt.label }}
++              </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="单位" name="unit">
++            <a-input v-model:value="itemForm.unit" :maxlength="32" placeholder="可空（引用单位字典 sys_dict）" />
++          </a-form-item>
++        </a-col>
++        <a-col :span="12">
++          <a-form-item label="取值方式" name="defaultSourceType">
++            <a-select v-model:value="itemForm.defaultSourceType" :allowClear="true" placeholder="可空">
++              <a-select-option v-for="opt in IOT_SOURCE_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++                {{ opt.label }}
++              </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="缺省聚合" name="aggMethod">
++            <a-select v-model:value="itemForm.aggMethod" :allowClear="true" placeholder="可空">
++              <a-select-option v-for="m in IOT_AGG_METHOD_OPTIONS" :key="m" :value="m">
++                {{ m }}
++              </a-select-option>
++            </a-select>
++          </a-form-item>
++          <a-form-item label="计算周期" name="defaultCalcPeriod">
++            <a-input v-model:value="itemForm.defaultCalcPeriod" :maxlength="16" placeholder="如 MINUTE/HOUR/DAY（可空）" />
++          </a-form-item>
++          <a-form-item label="默认公式" name="defaultFormula">
++            <a-textarea
++              v-model:value="itemForm.defaultFormula"
++              :maxlength="2000"
++              :rows="2"
++              placeholder="Aviator 相对引用，一期后端仅做长度与基础格式校验（可空）"
++            />
++          </a-form-item>
++        </a-col>
++      </a-row>
++      <a-row>
++        <a-col :span="12">
++          <a-form-item label="有效下限" name="defaultValidMin">
++            <a-input-number v-model:value="itemForm.defaultValidMin" style="width: 100%" placeholder="可空（不判定）" />
++          </a-form-item>
++          <a-form-item label="告警低阈" name="defaultAlarmLow">
++            <a-input-number v-model:value="itemForm.defaultAlarmLow" style="width: 100%" placeholder="可空" />
++          </a-form-item>
++        </a-col>
++        <a-col :span="12">
++          <a-form-item label="有效上限" name="defaultValidMax">
++            <a-input-number v-model:value="itemForm.defaultValidMax" style="width: 100%" placeholder="可空" />
++          </a-form-item>
++          <a-form-item label="告警高阈" name="defaultAlarmHigh">
++            <a-input-number v-model:value="itemForm.defaultAlarmHigh" style="width: 100%" placeholder="可空" />
++          </a-form-item>
++        </a-col>
++      </a-row>
++      <a-form-item :wrapper-col="{ span: 20, offset: 4 }">
++        <a-space>
++          <a-button v-privilege="'iot:template:item:edit'" type="primary" @click="saveItem">
++            {{ editingId ? '保存修改' : '加入待保存清单' }}
++          </a-button>
++          <a-button v-if="editingId" @click="resetItemForm">取消编辑</a-button>
++          <a-button v-if="pendingRows.length > 0" v-privilege="'iot:template:item:edit'" type="primary" ghost @click="batchSavePending">
++            批量保存（{{ pendingRows.length }} 项）
++          </a-button>
++          <a-button v-if="pendingRows.length > 0" v-privilege="'iot:template:item:edit'" danger ghost @click="pendingRows = []"
++            >清空待保存清单</a-button
++          >
++        </a-space>
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { computed, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { dictApi } from '/@/api/iot/dict-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import {
++    IOT_AGG_METHOD_OPTIONS,
++    IOT_CATEGORY_OPTIONS,
++    IOT_SOURCE_TYPE_OPTIONS,
++    IOT_TEMPLATE_ITEM_BATCH_MAX,
++    IOT_VALUE_KIND_OPTIONS,
++  } from '/@/components/iot/iot-consts';
++
++  // emit
++  const emit = defineEmits(['reloadList']);
++
++  const columns = [
++    { title: '数据编码', dataIndex: 'dataCode', width: 150 },
++    { title: '数据名称', dataIndex: 'dataName', width: 130 },
++    { title: '类别', dataIndex: 'category', width: 90 },
++    { title: '值性质', dataIndex: 'valueKind', width: 70 },
++    { title: '单位', dataIndex: 'unit', width: 70 },
++    { title: '取值方式', dataIndex: 'defaultSourceType', width: 80 },
++    { title: '缺省聚合', dataIndex: 'aggMethod', width: 80 },
++    { title: '计算周期', dataIndex: 'defaultCalcPeriod', width: 90 },
++    { title: '状态', dataIndex: 'pending', width: 80 },
++    { title: '操作', dataIndex: 'action', width: 120 },
++  ];
++
++  const visible = ref(false);
++  const template = ref<{ id?: number; templateCode?: string; templateName?: string }>({});
++  const tableLoading = ref(false);
++  const persistedRows = ref<Record<string, unknown>[]>([]);
++  const pendingRows = ref<Record<string, unknown>[]>([]);
++  const editingId = ref<number>();
++  const dictOptions = ref<{ dataCode: string; dataName: string }[]>([]);
++  const itemFormRef = ref();
++
++  // 展示行：已落库行（rowKey=id）+ 待保存行（rowKey=pending-{n}）
++  const displayRows = computed(() => [...persistedRows.value, ...pendingRows.value]);
++
++  const itemFormDefault = {
++    dataCode: undefined,
++    dataName: '',
++    category: undefined,
++    valueKind: undefined,
++    unit: '',
++    defaultSourceType: undefined,
++    defaultFormula: '',
++    aggMethod: undefined,
++    defaultCalcPeriod: '',
++    defaultValidMin: undefined,
++    defaultValidMax: undefined,
++    defaultAlarmLow: undefined,
++    defaultAlarmHigh: undefined,
++  };
++  const itemForm = reactive({ ...itemFormDefault });
++  // 与 IotDataItemTemplate 校验注解逐条对齐
++  const itemRules = {
++    dataCode: [
++      { required: true, message: '请从业务数据字典选择数据编码' },
++      { max: 64, message: '数据编码长度不能超过 64' },
++    ],
++    dataName: [
++      { required: true, message: '请输入数据名称' },
++      { max: 100, message: '数据名称长度不能超过 100' },
++    ],
++    category: [
++      { max: 32, message: '类别长度不能超过 32' },
++      { pattern: /^(ELEC|WATER|GAS|STEAM|MATERIAL|ENV|OTHER)$/, message: '类别仅允许 ELEC/WATER/GAS/STEAM/MATERIAL/ENV/OTHER' },
++    ],
++    valueKind: [{ type: 'number', min: 1, max: 3, message: '值性质仅允许 1-3' }],
++    unit: [{ max: 32, message: '单位长度不能超过 32' }],
++    defaultSourceType: [{ type: 'number', min: 1, max: 3, message: '默认取值方式仅允许 1-3' }],
++    defaultFormula: [{ max: 2000, message: '默认公式长度不能超过 2000' }],
++    aggMethod: [{ pattern: /^(SUM|AVG|MAX|MIN)$/, message: '缺省聚合仅允许 SUM/AVG/MAX/MIN' }],
++    defaultCalcPeriod: [{ max: 16, message: '默认计算周期长度不能超过 16' }],
++  };
++
++  function categoryLabel(category) {
++    return IOT_CATEGORY_OPTIONS.find((o) => o.value === category)?.label || '-';
++  }
++  function valueKindLabel(valueKind) {
++    return IOT_VALUE_KIND_OPTIONS.find((o) => o.value === valueKind)?.label || '-';
++  }
++  function sourceTypeLabel(sourceType) {
++    return IOT_SOURCE_TYPE_OPTIONS.find((o) => o.value === sourceType)?.label || '-';
++  }
++  function filterDictOption(input, option) {
++    return (option.value as string)?.toLowerCase().includes(input.toLowerCase());
++  }
++
++  // 已落库行用 id、待保存行用临时 rowKey
++  function rowKeyFunc(record) {
++    return record.rowKey ?? record.id;
++  }
++
++  async function showModal(rowData) {
++    template.value = rowData;
++    visible.value = true;
++    resetItemForm();
++    await Promise.all([ajaxQueryItems(), loadDictOptions()]);
++  }
++
++  function onClose() {
++    visible.value = false;
++    template.value = {};
++    persistedRows.value = [];
++    pendingRows.value = [];
++    resetItemForm();
++  }
++
++  async function ajaxQueryItems() {
++    try {
++      tableLoading.value = true;
++      const responseData = await templateApi.queryTemplateItems(template.value.id);
++      persistedRows.value = responseData.data || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  /**
++   * 字典选码下拉：仅启用字典（status=1），pageSize 上限 500 对齐后端
++   * maxLimit=500（MybatisPlusConfig）；data_code 取自字典为后端三态校验的
++   * 前置提示，最终以后端校验为准
++   */
++  async function loadDictOptions() {
++    try {
++      const responseData = await dictApi.queryDictList({ pageNum: 1, pageSize: 500, status: 1 });
++      dictOptions.value = responseData.data.records || [];
++    } catch (e) {
++      otSentry.captureError(e);
++    }
++  }
++
++  function resetItemForm() {
++    Object.assign(itemForm, itemFormDefault);
++    editingId.value = undefined;
++    itemFormRef.value?.clearValidate?.();
++  }
++
++  // ---------------- 新增（待保存清单 + 批量提交）/ 编辑 -----------------
++
++  function addItemToPending() {
++    if (pendingRows.value.length >= IOT_TEMPLATE_ITEM_BATCH_MAX) {
++      message.warning(`单批上限 ${IOT_TEMPLATE_ITEM_BATCH_MAX} 项（后端 IotTemplateItemBatchForm 校验口径）`);
++      return;
++    }
++    pendingRows.value.push({
++      ...itemForm,
++      rowKey: `pending-${Date.now()}-${pendingRows.value.length}`,
++      pending: true,
++    });
++    message.success('已加入待保存清单，点击「批量保存」一次提交');
++    resetItemForm();
++  }
++
++  function editItem(record) {
++    // 只回填表单字段，剔除 rowKey/pending 等展示用附加键
++    const { rowKey, pending, ...item } = record;
++    if (pending) {
++      // 待保存行回填编辑（从清单移除后重填表单）
++      pendingRows.value = pendingRows.value.filter((row) => row.rowKey !== rowKey);
++      Object.assign(itemForm, itemFormDefault, item);
++      return;
++    }
++    editingId.value = record.id;
++    Object.assign(itemForm, itemFormDefault, item);
++  }
++
++  function saveItem() {
++    itemFormRef.value
++      .validate()
++      .then(async () => {
++        if (editingId.value) {
++          await updateItem();
++        } else {
++          addItemToPending();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  async function updateItem() {
++    try {
++      OtLoading.show();
++      await templateApi.updateTemplateItem({ ...itemForm, id: editingId.value, templateId: template.value.id });
++      message.success('修改成功');
++      resetItemForm();
++      await ajaxQueryItems();
++      emit('reloadList');
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  async function batchSavePending() {
++    try {
++      OtLoading.show();
++      await templateApi.addTemplateItems({
++        templateId: template.value.id,
++        items: pendingRows.value.map(({ rowKey, pending, ...item }) => item),
++      });
++      message.success(`批量保存成功，共 ${pendingRows.value.length} 项`);
++      pendingRows.value = [];
++      resetItemForm();
++      await ajaxQueryItems();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  function confirmDeleteItem(record) {
++    if (record.pending) {
++      pendingRows.value = pendingRows.value.filter((row) => row.rowKey !== record.rowKey);
++      return;
++    }
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除数据项【${record.dataCode}】吗?（逻辑删除；同模板删除后该编码不可复用）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteItem(record);
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteItem(record) {
++    try {
++      OtLoading.show();
++      await templateApi.deleteTemplateItems(String(record.id));
++      message.success('删除成功');
++      await ajaxQueryItems();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/template/index.vue b/frontend/src/views/iot/template/index.vue
+index 169bffa..9e5c285 100644
+--- a/frontend/src/views/iot/template/index.vue
++++ b/frontend/src/views/iot/template/index.vue
+@@ -1,11 +1,291 @@
+ <!--
+-  * 模板管理（占位骨架，TASK-0055）
++  * 模型模板管理（TASK-0056 完整页）
+   *
+-  * 菜单挂载点：sys_menu 4009（/iot/template）。采集模板 CRUD 归 TASK-0056/0070。
++  * 对接 IotModelTemplateController + IotDataItemTemplateController（/iot/template[，
++  * /item]，权限位 iot:template:* 4024-4029）。模板数据项子表管理入口挂每行
++  * 「数据项」按钮（iot:template:item:edit 4029 控制编辑按钮显隐，查询共用
++  * iot:template:list）；状态规则配置入口为占位按钮（iot_status_rule 后端未交付，
++  * 点击提示待 TASK-0048）。template_code 创建后不可改；删除为真实逻辑删
++  * （有实例引用或模板数据项时后端拒绝并提示引用来源）。
+ -->
+ <template>
+-  <IotPlaceholder title="模板管理" task="TASK-0056 / TASK-0070" />
++  <a-form class="ot-query-form">
++    <a-row class="ot-query-form-row">
++      <a-form-item label="模板编码" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.templateCode" placeholder="模板编码" />
++      </a-form-item>
++      <a-form-item label="模板名称" class="ot-query-form-item">
++        <a-input style="width: 200px" v-model:value="queryForm.templateName" placeholder="模板名称" />
++      </a-form-item>
++      <a-form-item label="节点类型" class="ot-query-form-item">
++        <a-select style="width: 120px" v-model:value="queryForm.nodeType" :allowClear="true" placeholder="请选择">
++          <a-select-option v-for="opt in IOT_NODE_TYPE_OPTIONS" :key="opt.value" :value="opt.value">
++            {{ opt.label }}
++          </a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item label="状态" class="ot-query-form-item">
++        <a-select style="width: 120px" v-model:value="queryForm.status" :allowClear="true" placeholder="请选择">
++          <a-select-option :value="1">启用</a-select-option>
++          <a-select-option :value="0">禁用</a-select-option>
++        </a-select>
++      </a-form-item>
++      <a-form-item class="ot-query-form-item ot-margin-left10">
++        <a-button-group>
++          <a-button v-privilege="'iot:template:list'" type="primary" @click="onSearch">
++            <template #icon>
++              <SearchOutlined />
++            </template>
++            查询
++          </a-button>
++          <a-button v-privilege="'iot:template:list'" @click="resetQuery">
++            <template #icon>
++              <ReloadOutlined />
++            </template>
++            重置
++          </a-button>
++        </a-button-group>
++      </a-form-item>
++    </a-row>
++  </a-form>
++
++  <a-card size="small" :bordered="false" :hoverable="true">
++    <a-row class="ot-table-btn-block">
++      <div class="ot-table-operate-block">
++        <a-button v-privilege="'iot:template:add'" type="primary" @click="addOrUpdateTemplate()">
++          <template #icon>
++            <PlusOutlined />
++          </template>
++          新建
++        </a-button>
++        <a-button v-privilege="'iot:template:remove'" type="primary" danger :disabled="selectedRowKeyList.length === 0" @click="confirmBatchDelete">
++          <template #icon>
++            <DeleteOutlined />
++          </template>
++          批量删除
++        </a-button>
++        <a-button v-privilege="'iot:template:edit'" @click="onStatusRuleEntry">
++          <template #icon>
++            <ApartmentOutlined />
++          </template>
++          状态规则
++        </a-button>
++      </div>
++    </a-row>
++
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="id"
++      :pagination="false"
++      bordered
++      :row-selection="{ selectedRowKeys: selectedRowKeyList, onChange: onSelectChange }"
++    >
++      <template #bodyCell="{ record, column }">
++        <template v-if="column.dataIndex === 'nodeType'">
++          {{ iotNodeTypeLabel(record.nodeType) }}
++        </template>
++        <template v-if="column.dataIndex === 'status'">
++          <a-tag v-if="record.status === 1" color="green">启用</a-tag>
++          <a-tag v-else color="red">禁用</a-tag>
++        </template>
++        <template v-if="column.dataIndex === 'action'">
++          <div class="ot-table-operate">
++            <a-button v-privilege="'iot:template:list'" type="link" @click="openItems(record)">数据项</a-button>
++            <a-button v-privilege="'iot:template:edit'" type="link" @click="addOrUpdateTemplate(record)">编辑</a-button>
++            <a-button v-privilege="'iot:template:remove'" type="link" danger @click="confirmDelete(record)">删除</a-button>
++          </div>
++        </template>
++      </template>
++    </a-table>
++
++    <div class="ot-query-table-page">
++      <a-pagination
++        showSizeChanger
++        showQuickJumper
++        show-less-items
++        :pageSizeOptions="PAGE_SIZE_OPTIONS"
++        :defaultPageSize="queryForm.pageSize"
++        v-model:current="queryForm.pageNum"
++        v-model:pageSize="queryForm.pageSize"
++        :total="total"
++        @change="ajaxQuery"
++        :show-total="(total) => `共${total}条`"
++      />
++    </div>
++
++    <TemplateFormModal ref="templateFormModalRef" @reloadList="ajaxQuery" />
++    <TemplateItemModal ref="templateItemModalRef" />
++  </a-card>
+ </template>
+ <script setup lang="ts">
+-  import IotPlaceholder from '../components/iot-placeholder.vue';
++  import TemplateFormModal from './components/template-form-modal.vue';
++  import TemplateItemModal from './components/template-item-modal.vue';
++  import { onMounted, reactive, ref } from 'vue';
++  import { message, Modal } from 'ant-design-vue';
++  import { ApartmentOutlined, DeleteOutlined, PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { templateApi } from '/@/api/iot/template-api';
++  import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++  import { IOT_NODE_TYPE_OPTIONS, iotNodeTypeLabel } from '/@/components/iot/iot-consts';
++
++  const columns = ref([
++    {
++      title: 'ID',
++      width: 70,
++      dataIndex: 'id',
++    },
++    {
++      title: '模板编码',
++      dataIndex: 'templateCode',
++    },
++    {
++      title: '模板名称',
++      dataIndex: 'templateName',
++    },
++    {
++      title: '节点类型',
++      width: 90,
++      dataIndex: 'nodeType',
++    },
++    {
++      title: '版本',
++      width: 70,
++      dataIndex: 'version',
++    },
++    {
++      title: '状态',
++      width: 70,
++      dataIndex: 'status',
++    },
++    {
++      title: '备注',
++      dataIndex: 'remark',
++      ellipsis: true,
++    },
++    {
++      title: '更新时间',
++      width: 160,
++      dataIndex: 'updateTime',
++    },
++    {
++      title: '操作',
++      dataIndex: 'action',
++      fixed: 'right',
++      width: 170,
++    },
++  ]);
++
++  // ---------------- 查询数据 -----------------
++
++  const queryFormState = {
++    templateCode: '',
++    templateName: '',
++    nodeType: undefined,
++    status: undefined,
++    pageNum: 1,
++    pageSize: 10,
++  };
++  const queryForm = reactive({ ...queryFormState });
++  const tableLoading = ref(false);
++  const tableData = ref([]);
++  const total = ref(0);
++  const templateFormModalRef = ref();
++  const templateItemModalRef = ref();
++
++  // 批量选择（批量删除）
++  const selectedRowKeyList = ref<number[]>([]);
++  function onSelectChange(selectedRowKeys) {
++    selectedRowKeyList.value = selectedRowKeys;
++  }
++
++  function resetQuery() {
++    Object.assign(queryForm, queryFormState);
++    ajaxQuery();
++  }
++  function onSearch() {
++    queryForm.pageNum = 1;
++    ajaxQuery();
++  }
++  async function ajaxQuery() {
++    try {
++      tableLoading.value = true;
++      const responseData = await templateApi.queryTemplateList(queryForm);
++      tableData.value = responseData.data.records;
++      total.value = responseData.data.total;
++    } catch (e) {
++      otSentry.captureError(e);
++    } finally {
++      tableLoading.value = false;
++    }
++  }
++
++  // ---------------- 删除（真实逻辑删，二次确认） -----------------
++
++  function confirmDelete(rowData) {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除模板【${rowData.templateCode} ${rowData.templateName}】吗?（有实例引用或模板数据项时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteTemplates(String(rowData.id));
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  function confirmBatchDelete() {
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除选中的 ${selectedRowKeyList.value.length} 个模板吗?（有实例引用或模板数据项时将被拒绝）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteTemplates(selectedRowKeyList.value.join(','));
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteTemplates(ids) {
++    try {
++      OtLoading.show();
++      await templateApi.deleteTemplates(ids);
++      message.success('删除成功');
++      selectedRowKeyList.value = [];
++      await ajaxQuery();
++    } catch (e) {
++      otSentry.captureError(handleIotConflictError(e));
++    } finally {
++      OtLoading.hide();
++    }
++  }
++
++  // ---------------- 添加/更新 / 数据项 / 状态规则占位 -----------------
++
++  function addOrUpdateTemplate(rowData?) {
++    templateFormModalRef.value.showModal(rowData);
++  }
++
++  function openItems(rowData) {
++    templateItemModalRef.value.showModal(rowData);
++  }
++
++  /**
++   * 状态规则配置入口（占位）：iot_status_rule 域后端未交付（TASK-0048），
++   * 点击提示待交付；按钮显隐暂挂 iot:template:edit（规则配置属模板编辑高危域，
++   * REQ-0034——TASK-0048 交付独立权限位后替换绑定）
++   */
++  function onStatusRuleEntry() {
++    message.info('状态规则配置待 TASK-0048 交付（iot_status_rule 接口未上线），届时在此进入规则集配置');
++  }
++
++  onMounted(ajaxQuery);
+ </script>
+diff --git a/frontend/src/views/iot/tenant/components/tenant-admin-modal.vue b/frontend/src/views/iot/tenant/components/tenant-admin-modal.vue
+new file mode 100644
+index 0000000..508933d
+--- /dev/null
++++ b/frontend/src/views/iot/tenant/components/tenant-admin-modal.vue
+@@ -0,0 +1,113 @@
++<!--
++  * 初始化租户管理员 弹窗（TASK-0056，TASK-0002 交付接口的前端入口）
++  *
++  * 对接 POST /iot/tenant/{id}/init-admin（权限 iot:tenant:admin，sys_menu 4017）：
++  * tenant_id 强制取路径租户 id（管理面例外，路径即授权范围）；表单校验与
++  * TenantAdminCreateForm 注解对齐（username/nickname ≤50 必填，password 必填，
++  * 前端 SM4 密文与 /user 创建口径一致）。
++-->
++<template>
++  <a-modal
++    :open="visible"
++    :title="`初始化租户管理员 - ${tenantName}`"
++    ok-text="确认"
++    cancel-text="取消"
++    :maskClosable="false"
++    @ok="onSubmit"
++    @cancel="onClose"
++  >
++    <a-alert
++      type="warning"
++      show-icon
++      class="ot-margin-bottom10"
++      :message="`为租户【${tenantName}】初始化管理员账号；初始化后该管理员可登录且只见本租户数据`"
++    />
++    <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 5 }" :wrapper-col="{ span: 19 }">
++      <a-form-item label="用户名" name="username">
++        <a-input v-model:value="form.username" :maxlength="50" placeholder="请输入管理员用户名（租户内唯一）" />
++      </a-form-item>
++      <a-form-item label="昵称" name="nickname">
++        <a-input v-model:value="form.nickname" :maxlength="50" placeholder="请输入昵称" />
++      </a-form-item>
++      <a-form-item label="初始密码" name="password">
++        <a-input-password v-model:value.trim="form.password" autocomplete="new-password" placeholder="请输入初始密码" />
++      </a-form-item>
++    </a-form>
++  </a-modal>
++</template>
++<script setup lang="ts">
++  import { reactive, ref } from 'vue';
++  import { message } from 'ant-design-vue';
++  import { OtLoading } from '/@/components/framework/ot-loading';
++  import { tenantApi } from '/@/api/iot/tenant-api';
++  import { otSentry } from '/@/lib/ot-sentry';
++  import { encryptData } from '/@/lib/encrypt';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
++
++  const formRef = ref();
++
++  const formDefault = {
++    username: '',
++    nickname: '',
++    password: '',
++  };
++  const form = reactive({ ...formDefault });
++  // 与 TenantAdminCreateForm 校验注解对齐
++  const rules = {
++    username: [
++      { required: true, message: '请输入用户名' },
++      { max: 50, message: '用户名长度不能超过 50' },
++    ],
++    nickname: [
++      { required: true, message: '请输入昵称' },
++      { max: 50, message: '昵称长度不能超过 50' },
++    ],
++    password: [{ required: true, message: '请输入初始密码' }],
++  };
++
++  const visible = ref(false);
++  const tenantId = ref<number>();
++  const tenantName = ref('');
++
++  function showModal(rowData) {
++    Object.assign(form, formDefault);
++    tenantId.value = rowData.id;
++    tenantName.value = rowData.tenantName;
++    visible.value = true;
++  }
++
++  function onClose() {
++    Object.assign(form, formDefault);
++    visible.value = false;
++  }
++
++  function onSubmit() {
++    formRef.value
++      .validate()
++      .then(async () => {
++        OtLoading.show();
++        try {
++          // password 前端 SM4 密文（TenantAdminCreateForm 口径，与 /user 创建一致）
++          const submitData = {
++            username: form.username,
++            nickname: form.nickname,
++            password: encryptData(form.password),
++          };
++          await tenantApi.initTenantAdmin(tenantId.value, submitData);
++          message.success('初始化管理员成功');
++          onClose();
++        } catch (error) {
++          otSentry.captureError(handleIotConflictError(error));
++        } finally {
++          OtLoading.hide();
++        }
++      })
++      .catch(() => {
++        message.error('参数验证错误，请仔细填写表单数据!');
++      });
++  }
++
++  defineExpose({
++    showModal,
++  });
++</script>
+diff --git a/frontend/src/views/iot/tenant/components/tenant-form-modal.vue b/frontend/src/views/iot/tenant/components/tenant-form-modal.vue
+index 3d4b744..69a0976 100644
+--- a/frontend/src/views/iot/tenant/components/tenant-form-modal.vue
++++ b/frontend/src/views/iot/tenant/components/tenant-form-modal.vue
+@@ -1,19 +1,21 @@
+ <!--
+-  * 租户表单 弹窗（TASK-0055 最小骨架）
++  * 租户表单 弹窗（TASK-0056 完整版）
+   *
+-  * tenant_code 全局唯一且创建后不可改（后端 uk_tenant_code + 编辑不进更新集），
+-  * 编辑态编码输入框禁用。完整表单校验（编码字符集/唯一性前置提示）与
+-  * 配额/到期联动归 TASK-0056。
++  * 表单校验与 SysTenant DTO 校验注解对齐（brief 决策 3）：
++  * tenant_code 必填 ≤32 且 [A-Za-z0-9_]（库名派生安全）、全局唯一且创建后不可改
++  * （后端 uk_tenant_code + 编辑不进更新集），编辑态编码输入框禁用；
++  * tenant_name 必填 ≤100；contact_name ≤50；contact_phone ≤32；remark ≤500。
++  * 配额字段随新增/编辑接口下发，不单设权限点（TASK-0001）。
+ -->
+ <template>
+   <a-modal :open="visible" :title="form.id ? '编辑租户' : '添加租户'" ok-text="确认" cancel-text="取消" @ok="onSubmit" @cancel="onClose">
+     <br />
+     <a-form ref="formRef" :model="form" :rules="rules" :label-col="{ span: 5 }" :wrapper-col="{ span: 19 }">
+       <a-form-item label="租户编码" name="tenantCode">
+-        <a-input v-model:value="form.tenantCode" :disabled="!!form.id" placeholder="请输入编码（创建后不可改）" />
++        <a-input v-model:value="form.tenantCode" :disabled="!!form.id" :maxlength="32" placeholder="请输入编码（字母/数字/下划线，创建后不可改）" />
+       </a-form-item>
+       <a-form-item label="租户名称" name="tenantName">
+-        <a-input v-model:value="form.tenantName" placeholder="请输入名称" />
++        <a-input v-model:value="form.tenantName" :maxlength="100" placeholder="请输入名称" />
+       </a-form-item>
+       <a-form-item label="状态" name="status">
+         <a-radio-group v-model:value="form.status" button-style="solid">
+@@ -31,13 +33,13 @@
+         <a-date-picker v-model:value="form.expireTime" style="width: 100%" show-time valueFormat="YYYY-MM-DD HH:mm:ss" placeholder="空为长期" />
+       </a-form-item>
+       <a-form-item label="联系人" name="contactName">
+-        <a-input v-model:value="form.contactName" placeholder="请输入联系人" />
++        <a-input v-model:value="form.contactName" :maxlength="50" placeholder="请输入联系人" />
+       </a-form-item>
+       <a-form-item label="联系电话" name="contactPhone">
+-        <a-input v-model:value="form.contactPhone" placeholder="请输入联系电话" />
++        <a-input v-model:value="form.contactPhone" :maxlength="32" placeholder="请输入联系电话" />
+       </a-form-item>
+       <a-form-item label="备注" name="remark">
+-        <a-textarea v-model:value="form.remark" style="width: 100%; height: 100px; outline: none" />
++        <a-textarea v-model:value="form.remark" :maxlength="500" style="width: 100%; height: 100px; outline: none" />
+       </a-form-item>
+     </a-form>
+   </a-modal>
+@@ -48,6 +50,7 @@
+   import { OtLoading } from '/@/components/framework/ot-loading';
+   import { tenantApi } from '/@/api/iot/tenant-api';
+   import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
+ 
+   // emit
+   const emit = defineEmits(['reloadList']);
+@@ -68,9 +71,20 @@
+     remark: '',
+   };
+   const form = reactive({ ...formDefault });
++  // 与 SysTenant 校验注解逐条对齐（brief 决策 3：表单校验与后端一致前置提示）
+   const rules = {
+-    tenantCode: [{ required: true, message: '请输入租户编码' }],
+-    tenantName: [{ required: true, message: '请输入租户名称' }],
++    tenantCode: [
++      { required: true, message: '请输入租户编码' },
++      { max: 32, message: '租户编码长度不能超过 32' },
++      { pattern: /^[A-Za-z0-9_]+$/, message: '租户编码仅允许字母、数字与下划线' },
++    ],
++    tenantName: [
++      { required: true, message: '请输入租户名称' },
++      { max: 100, message: '租户名称长度不能超过 100' },
++    ],
++    contactName: [{ max: 50, message: '联系人长度不能超过 50' }],
++    contactPhone: [{ max: 32, message: '联系电话长度不能超过 32' }],
++    remark: [{ max: 500, message: '备注长度不能超过 500' }],
+   };
+   // 是否展示
+   const visible = ref(false);
+@@ -103,7 +117,7 @@
+           emit('reloadList');
+           onClose();
+         } catch (error) {
+-          otSentry.captureError(error);
++          otSentry.captureError(handleIotConflictError(error));
+         } finally {
+           OtLoading.hide();
+         }
+diff --git a/frontend/src/views/iot/tenant/index.vue b/frontend/src/views/iot/tenant/index.vue
+index cb71091..bb1f790 100644
+--- a/frontend/src/views/iot/tenant/index.vue
++++ b/frontend/src/views/iot/tenant/index.vue
+@@ -1,10 +1,10 @@
+ <!--
+-  * 租户管理（最小可用骨架，TASK-0055）
++  * 租户管理（TASK-0056 完整页）
+   *
+-  * 权限显隐演示页：列表 + 新增/编辑/启停/删除，按钮全部 v-privilege 绑定 iot:tenant:*
+-  * （sys_menu 4002-4007 六个按钮行，与 SysTenantController @SaCheckPermission 一一对应）。
+-  * 权限由后端下发前端只做显隐（REQ-0034）；越权拦截一律后端 403。
+-  * 完整租户页（配额/到期提醒等）归 TASK-0056。
++  * 列表筛选/批量删除/启停/删除/初始化管理员，按钮全部 v-privilege 绑定 iot:tenant:*
++  * （sys_menu 4002-4007 + 4017 七个按钮行，与 SysTenantController @SaCheckPermission
++  * 一一对应）。权限由后端下发前端只做显隐（REQ-0034）；越权拦截一律后端 403。
++  * 表单校验与 SysTenant DTO 注解对齐（编码字符集/必填/长度，见 tenant-form-modal）。
+ -->
+ <template>
+   <a-form class="ot-query-form">
+@@ -23,13 +23,13 @@
+       </a-form-item>
+       <a-form-item class="ot-query-form-item ot-margin-left10">
+         <a-button-group>
+-          <a-button type="primary" @click="onSearch">
++          <a-button v-privilege="'iot:tenant:list'" type="primary" @click="onSearch">
+             <template #icon>
+               <SearchOutlined />
+             </template>
+             查询
+           </a-button>
+-          <a-button @click="resetQuery">
++          <a-button v-privilege="'iot:tenant:list'" @click="resetQuery">
+             <template #icon>
+               <ReloadOutlined />
+             </template>
+@@ -49,10 +49,31 @@
+           </template>
+           新建
+         </a-button>
++        <a-button v-privilege="'iot:tenant:remove'" type="primary" danger :disabled="selectedRowKeyList.length === 0" @click="confirmBatchDelete">
++          <template #icon>
++            <DeleteOutlined />
++          </template>
++          批量删除
++        </a-button>
++        <a-button v-privilege="'iot:tenant:admin'" :disabled="selectedRowKeyList.length !== 1" @click="openInitAdmin">
++          <template #icon>
++            <UserAddOutlined />
++          </template>
++          初始化管理员
++        </a-button>
+       </div>
+     </a-row>
+ 
+-    <a-table size="small" :dataSource="tableData" :columns="columns" :loading="tableLoading" rowKey="id" :pagination="false" bordered>
++    <a-table
++      size="small"
++      :dataSource="tableData"
++      :columns="columns"
++      :loading="tableLoading"
++      rowKey="id"
++      :pagination="false"
++      bordered
++      :row-selection="{ selectedRowKeys: selectedRowKeyList, onChange: onSelectChange }"
++    >
+       <template #bodyCell="{ record, column }">
+         <template v-if="column.dataIndex === 'status'">
+           <a-tag v-if="record.status === 1" color="green">启用</a-tag>
+@@ -89,17 +110,20 @@
+     </div>
+ 
+     <TenantFormModal ref="tenantFormModalRef" @reloadList="ajaxQuery" />
++    <TenantAdminModal ref="tenantAdminModalRef" />
+   </a-card>
+ </template>
+ <script setup lang="ts">
+   import TenantFormModal from './components/tenant-form-modal.vue';
++  import TenantAdminModal from './components/tenant-admin-modal.vue';
+   import { onMounted, reactive, ref } from 'vue';
+   import { message, Modal } from 'ant-design-vue';
+-  import { PlusOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons-vue';
++  import { DeleteOutlined, PlusOutlined, ReloadOutlined, SearchOutlined, UserAddOutlined } from '@ant-design/icons-vue';
+   import { OtLoading } from '/@/components/framework/ot-loading';
+   import { tenantApi } from '/@/api/iot/tenant-api';
+   import { PAGE_SIZE_OPTIONS } from '/@/constants/common-const';
+   import { otSentry } from '/@/lib/ot-sentry';
++  import { handleIotConflictError } from '/@/components/iot/iot-optimistic-lock';
+ 
+   const columns = ref([
+     {
+@@ -135,6 +159,11 @@
+       width: 100,
+       dataIndex: 'contactName',
+     },
++    {
++      title: '联系电话',
++      width: 120,
++      dataIndex: 'contactPhone',
++    },
+     {
+       title: '到期时间',
+       width: 160,
+@@ -164,9 +193,25 @@
+   };
+   const queryForm = reactive({ ...queryFormState });
+   const tableLoading = ref(false);
+-  const tableData = ref([]);
++  const tableData = ref<TenantRow[]>([]);
+   const total = ref(0);
+   const tenantFormModalRef = ref();
++  const tenantAdminModalRef = ref();
++
++  // 批量选择（批量删除）
++  const selectedRowKeyList = ref<number[]>([]);
++  function onSelectChange(selectedRowKeys) {
++    selectedRowKeyList.value = selectedRowKeys;
++  }
++
++  // 行类型（列表消费 id/tenantName/tenantCode 等字段；其余列字段宽松透传）
++  interface TenantRow {
++    id: number;
++    tenantCode: string;
++    tenantName: string;
++    status?: number;
++    [key: string]: unknown;
++  }
+ 
+   function resetQuery() {
+     Object.assign(queryForm, queryFormState);
+@@ -213,7 +258,7 @@
+       message.success('操作成功');
+       await ajaxQuery();
+     } catch (e) {
+-      otSentry.captureError(e);
++      otSentry.captureError(handleIotConflictError(e));
+     } finally {
+       OtLoading.hide();
+     }
+@@ -222,25 +267,44 @@
+   function confirmDelete(rowData) {
+     Modal.confirm({
+       title: '提示',
+-      content: `确定要删除租户【${rowData.tenantName}】吗?`,
++      content: `确定要删除租户【${rowData.tenantName}】吗?（逻辑删除，编码不复用）`,
+       okText: '删除',
+       okType: 'danger',
+       onOk() {
+-        deleteTenant(rowData);
++        deleteTenant(String(rowData.id));
+       },
+       cancelText: '取消',
+       onCancel() {},
+     });
+   }
+ 
+-  async function deleteTenant(rowData) {
++  function confirmBatchDelete() {
++    const names = tableData.value
++      .filter((row) => selectedRowKeyList.value.includes(row.id))
++      .map((row) => row.tenantName)
++      .join('、');
++    Modal.confirm({
++      title: '提示',
++      content: `确定要删除选中的 ${selectedRowKeyList.value.length} 个租户【${names}】吗?（逻辑删除，编码不复用）`,
++      okText: '删除',
++      okType: 'danger',
++      onOk() {
++        deleteTenant(selectedRowKeyList.value.join(','));
++      },
++      cancelText: '取消',
++      onCancel() {},
++    });
++  }
++
++  async function deleteTenant(ids) {
+     try {
+       OtLoading.show();
+-      await tenantApi.deleteTenant(String(rowData.id));
++      await tenantApi.deleteTenant(ids);
+       message.success('删除成功');
++      selectedRowKeyList.value = [];
+       await ajaxQuery();
+     } catch (e) {
+-      otSentry.captureError(e);
++      otSentry.captureError(handleIotConflictError(e));
+     } finally {
+       OtLoading.hide();
+     }
+@@ -252,5 +316,14 @@
+     tenantFormModalRef.value.showModal(rowData);
+   }
+ 
++  // ---------------- 初始化租户管理员（TASK-0002，iot:tenant:admin 4017） -----------------
++
++  function openInitAdmin() {
++    const rowData = tableData.value.find((row) => row.id === selectedRowKeyList.value[0]);
++    if (rowData) {
++      tenantAdminModalRef.value.showModal(rowData);
++    }
++  }
++
+   onMounted(ajaxQuery);
+ </script>

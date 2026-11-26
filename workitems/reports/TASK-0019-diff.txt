@@ -1,0 +1,2565 @@
+commit 2ff499bf6a1551626c4a33ed49ef163d894d9af8
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 11:13:03 2026 +0800
+
+    feat(iot): 凭据域——iot_channel_credential 四管理接口（列表掩码/写入轮换/查看明文/吊销）+ /internal/v1/credential/pull 内部拉取（SM4 {v1} 密文、edit/view 双权限、@OperateLog saveParam/saveResponse=false 审计无明文、InternalAuthChecker 统一收口 /internal/v1/**）、升级脚本与菜单 4051-4052（TASK-0019）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialController.java
+new file mode 100644
+index 0000000..807b858
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialController.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.iot.credential.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.credential.dto.CredentialItemVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * 通道凭据控制器（TASK-0019，管理面四接口——详细设计 §3.1 续 p23）
++ *
++ * <p>路径命名空间 /iot/channel/credential（通道资源子资源）；权限双轨（ADR-0006 先例：
++ * 「能配通道的人」与「能看凭据的人」可以是两个角色）：列表复用 iot:channel:list
++ * （sys_menu 4046，TASK-0018 已登记不重复登记），写入/轮换/吊销 iot:credential:edit
++ * （4051）、查看明文 iot:credential:view（4052）单设权限——无 view 权限的角色不可见
++ * 入口且直调 403（越权审计由 PermissionDeniedAuditListener 既有链路留痕，BUG-0044）。
++ *
++ * <p><b>审计无明文</b>（brief 验收硬项）：写入/轮换/查看/吊销四动作全部 @OperateLog——
++ * <ul>
++ * <li>写入（入参含凭据明文）：{@code saveParam=false}——参数列不落库，明文不进
++ *     sys_operate_log；channel/type 上下文由凭据行的 create_by/update_by 审计列与
++ *     url+时间关联恢复；</li>
++ * <li>查看（响应含明文）：{@code saveResponse=false}——响应列不落库，审计只记
++ *     「谁在何时看了哪个凭据」（url 承载凭据 id）；</li>
++ * <li>吊销（入参/响应无敏感面）：默认全落。</li>
++ * </ul>
++ * grep 级断言见 {@code IotCredentialAuditNoPlaintextTest}（真实切面织入 + 全列 grep）。
++ *
++ * <p>列表不挂 @OperateLog（brief：四动作口径——列表只回掩码、非生命周期动作）。
++ * 吊销语义为 status 置禁用（立即生效），审计业务类型记 UPDATE（非物理删除）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "通道凭据")
++@RestController
++@RequestMapping("/iot/channel/credential")
++public class IotCredentialController {
++
++    @Autowired
++    private IotCredentialService credentialService;
++
++    @Operation(summary = "凭据列表（channelId 必传——按通道查；只返回类型/掩码/key_version/状态，"
++            + "永不返回密文/明文——掩码前四****后四）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:channel:list")
++    public Result<List<CredentialItemVO>> list(@RequestParam("channelId") Long channelId) {
++        return Result.success(credentialService.listByChannel(channelId));
++    }
++
++    @OperateLog(title = "通道凭据", businessType = BusinessType.INSERT, saveParam = false)
++    @Operation(summary = "写入/轮换凭据（明文只走 HTTPS 入参，服务端 SM4 加密落 {v1} 密文；"
++            + "同通道同类型重复写入=轮换 key_version 递增不新增行；加密失败 fail-closed 拒保存；"
++            + "审计参数列不落库——入参含明文）")
++    @PostMapping
++    @SaCheckPermission("iot:credential:edit")
++    public Result<Void> write(@Valid @RequestBody CredentialWriteForm form) {
++        credentialService.writeCredential(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "通道凭据", businessType = BusinessType.OTHER, saveResponse = false)
++    @Operation(summary = "查看凭据明文（SM4 解密展示；iot:credential:view 单设权限——无此权限"
++            + "角色不可见入口且直调 403；审计响应列不落库——响应含明文，留痕「谁看了凭据」）")
++    @GetMapping("/view/{id}")
++    @SaCheckPermission("iot:credential:view")
++    public Result<CredentialViewVO> view(@PathVariable("id") Long id) {
++        return Result.success(credentialService.viewCredential(id));
++    }
++
++    @OperateLog(title = "通道凭据", businessType = BusinessType.UPDATE)
++    @Operation(summary = "吊销凭据（status 置禁用，立即生效——内部拉取接口随即 403；"
++            + "非物理删除，行保留审计）")
++    @DeleteMapping("/{id}")
++    @SaCheckPermission("iot:credential:edit")
++    public Result<Void> revoke(@PathVariable("id") Long id) {
++        credentialService.revokeCredential(id);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalController.java
+new file mode 100644
+index 0000000..8035b99
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalController.java
+@@ -0,0 +1,66 @@
++package net.otlab.admin.module.iot.credential.controller;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
++import net.otlab.admin.module.iot.credential.dto.CredentialPullVO;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 凭据内部拉取控制器（TASK-0019，GET /internal/v1/credential/pull——详细设计 §3.1 续 p23）
++ *
++ * <p><b>无 Sa-Token</b>：内部系统间接口（§3 p20「/internal/v1 前缀，与管理面、对外面
++ * 物理隔离（不同网关路由与鉴权）」）——@Anonymous 跳过管理面登录校验，认证由
++ * InternalAuthChecker 承担（TASK-0019 完整化接线：拦截器统一覆盖 /internal/v1/**，
++ * 本控制器先于控制器层的拦截器 + 控制器内显式调用双道生效，照 0017 心跳范式）。
++ * 静态令牌（X-Internal-Token + IP 白名单）即本期准入——<b>网关设备令牌链（校验令牌
++ * 归属通道）归 TASK-0020/0027 接线，brief 明文登记遗留</b>。
++ *
++ * <p><b>返回密文与 key_version，服务端不解密传输</b>（ADR-0006）：调用方（网关/接入
++ * 服务）内存解密使用；凭据缺失/吊销/通道禁用统一 403（吊销立即生效口径）。
++ *
++ * <p><b>不写操作日志</b>：本方法不挂 @OperateLog——内部运行链路高频（网关配置加载/
++ * 通道重连），照 0017 心跳口径；凭据生命周期审计由管理面四动作承担；且响应含密文，
++ * 不入审计列（REQ-0011 验收 4「应用与访问日志无明文」——密文出口为契约本身）。
++ * 凭据不进配置快照与 config.changed 载荷（ADR-0006——快照链路 0024 交付时排除项，
++ * 本期登记口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "凭据内部拉取（服务间）")
++@RestController
++@RequestMapping("/internal/v1/credential")
++public class IotCredentialInternalController {
++
++    @Autowired
++    private IotCredentialService credentialService;
++
++    @Autowired
++    private InternalAuthChecker internalAuthChecker;
++
++    /**
++     * 凭据拉取：channelId/credType 定位（通道存在/启用、凭据存在/启用、租户一致），
++     * 返回密文与 key_version；缺失/吊销/禁用统一 403。
++     */
++    @Anonymous
++    @Operation(summary = "凭据拉取（内部接口：静态令牌 X-Internal-Token；返回密文与 key_version，"
++            + "调用方内存解密；凭据吊销/通道禁用 403 立即生效）")
++    @GetMapping("/pull")
++    public Result<CredentialPullVO> pull(HttpServletRequest request,
++                                         @RequestParam("channelId") Long channelId,
++                                         @RequestParam("credType") String credType) {
++        // 控制器层显式调用认证检查器（拦截器层已先行校验——此处为拦截器缺席场景的纵深
++        // 防御与 standalone 测试可达性；认证先于一切业务处理）
++        internalAuthChecker.check(request);
++        return Result.success(credentialService.pullCredential(channelId, credType));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialMask.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialMask.java
+new file mode 100644
+index 0000000..24db409
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialMask.java
+@@ -0,0 +1,54 @@
++package net.otlab.admin.module.iot.credential.domain;
++
++/**
++ * 凭据掩码器（TASK-0019，列表出口唯一展示形态——ADR-0006/REQ-0011「列表永不返回密文」）
++ *
++ * <p>掩码口径（brief：格式自定如 {@code abcd****wxyz} 前四后四）：
++ * <ul>
++ * <li>长度 ≥ 12：前四 + {@code ****} + 后四（中段至少隐藏 4 字符）；</li>
++ * <li>长度 8-11：前四 + {@code ****}（尾段至少隐藏 4 字符）；</li>
++ * <li>长度 &lt; 8 或空：纯占位 {@code ****}（短凭据隐藏比例不足 4 字符，不露任何字符）。</li>
++ * </ul>
++ *
++ * <p>边界纪律：只要露段，隐藏段恒 ≥ 4 字符；掩码输入为<b>解密后的明文</b>（列表服务层
++ * 解密后取前后四），输出只允许掩码字符串——任何明文/密文子串不得出现在掩码之外；
++ * 解密失败（密钥不匹配/密文损坏）由调用方降级为纯占位，列表不崩、不泄底。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class CredentialMask {
++
++    /** 纯占位符（短凭据/解密失败/空值通用） */
++    public static final String FULL_MASK = "****";
++
++    /** 前后四双露的最小明文长度（≥12：中段至少 4 字符隐藏） */
++    private static final int BOTH_ENDS_MIN_LENGTH = 12;
++
++    /** 单露首四的最小明文长度（8-11：尾段至少 4 字符隐藏） */
++    private static final int HEAD_ONLY_MIN_LENGTH = 8;
++
++    /** 首段长度 */
++    private static final int EDGE_LENGTH = 4;
++
++    private CredentialMask() {
++    }
++
++    /**
++     * 掩码化：明文（或任意待展示敏感串）→ 掩码字符串。null/空安全。
++     */
++    public static String mask(String plaintext) {
++        if (plaintext == null || plaintext.isEmpty()) {
++            return FULL_MASK;
++        }
++        int length = plaintext.length();
++        if (length >= BOTH_ENDS_MIN_LENGTH) {
++            return plaintext.substring(0, EDGE_LENGTH) + FULL_MASK
++                    + plaintext.substring(length - EDGE_LENGTH);
++        }
++        if (length >= HEAD_ONLY_MIN_LENGTH) {
++            return plaintext.substring(0, EDGE_LENGTH) + FULL_MASK;
++        }
++        return FULL_MASK;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialTypes.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialTypes.java
+new file mode 100644
+index 0000000..505b7d5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/domain/CredentialTypes.java
+@@ -0,0 +1,43 @@
++package net.otlab.admin.module.iot.credential.domain;
++
++import java.util.Set;
++
++/**
++ * 凭据类型字典（TASK-0019，详细设计 §1.3A p8）
++ *
++ * <p>cred_type 四值：DEVICE_TOKEN 设备令牌 / MQTT_PASSWORD / HTTP_SECRET / CERT 证书口令。
++ * 与 {@link net.otlab.admin.module.iot.channel.domain.ChannelProtocols} 同款「服务层/控制器
++ * 共用一处防漂移」形态；varchar(32) 限长在表单 @Size 与服务层双保险。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class CredentialTypes {
++
++    /** 设备令牌（网关设备身份令牌） */
++    public static final String DEVICE_TOKEN = "DEVICE_TOKEN";
++
++    /** MQTT 接入密码 */
++    public static final String MQTT_PASSWORD = "MQTT_PASSWORD";
++
++    /** HTTP 上报密钥 */
++    public static final String HTTP_SECRET = "HTTP_SECRET";
++
++    /** 证书口令 */
++    public static final String CERT = "CERT";
++
++    /** 字典全集（大写） */
++    public static final Set<String> ALL =
++            Set.of(DEVICE_TOKEN, MQTT_PASSWORD, HTTP_SECRET, CERT);
++
++    /** varchar(32) 限长口径（与 iot_channel_credential DDL 一致） */
++    public static final int MAX_LEN_CRED_TYPE = 32;
++
++    private CredentialTypes() {
++    }
++
++    /** 字典校验：∈ 四值字典（未知类型拒） */
++    public static boolean isValid(String credType) {
++        return credType != null && ALL.contains(credType);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialItemVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialItemVO.java
+new file mode 100644
+index 0000000..eda6c27
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialItemVO.java
+@@ -0,0 +1,51 @@
++package net.otlab.admin.module.iot.credential.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++
++/**
++ * 凭据列表项 VO（TASK-0019，GET /iot/channel/credential/list）
++ *
++ * <p><b>永不返回密文/明文</b>（详细设计 §3.1 续 p23 / REQ-0011 验收 1）：本 VO 结构上
++ * 不存在密文/明文承载体字段（{@link IotCredentialServiceImplTest} 反射结构断言固化）——
++ * 只返回类型、掩码、key_version 与状态（+id 供 view/revoke 定位）。掩码由服务层解密后
++ * 经 {@link net.otlab.admin.module.iot.credential.domain.CredentialMask} 生成。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "凭据列表项（只含类型/掩码/key_version/状态——永不返回密文/明文）")
++public class CredentialItemVO {
++
++    @Schema(description = "凭据ID（view/revoke 定位用）")
++    private Long id;
++
++    @Schema(description = "所属通道ID")
++    private Long channelId;
++
++    @Schema(description = "凭据类型 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT")
++    private String credType;
++
++    @Schema(description = "凭据掩码（前四****后四口径；短凭据纯占位）——列表唯一可见形态")
++    private String credentialMask;
++
++    @Schema(description = "密钥版本（写入/轮换代次）")
++    private String keyVersion;
++
++    @Schema(description = "状态 0 禁用（已吊销）1 启用")
++    private Integer status;
++
++    /** 从实体构建掩码项（掩码由服务层解密后传入——本 VO 不携带密文） */
++    public static CredentialItemVO of(IotChannelCredential entity, String credentialMask) {
++        CredentialItemVO vo = new CredentialItemVO();
++        vo.setId(entity.getId());
++        vo.setChannelId(entity.getChannelId());
++        vo.setCredType(entity.getCredType());
++        vo.setCredentialMask(credentialMask);
++        vo.setKeyVersion(entity.getKeyVersion());
++        vo.setStatus(entity.getStatus());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialPullVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialPullVO.java
+new file mode 100644
+index 0000000..8fbeffe
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialPullVO.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.credential.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.ToString;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++
++/**
++ * 凭据内部拉取 VO（TASK-0019，GET /internal/v1/credential/pull）
++ *
++ * <p><b>只回密文与 key_version，服务端不解密传输</b>（详细设计 §3.1 续 p23「返回密文与
++ * key_version，调用方内存解密」）：本 VO 结构上无明文字段（单测反射断言固化）；网关/
++ * 接入服务取密文后在内存解密使用，不落本地明文文件（ADR-0006）。密文格式 {@code {v1}}，
++ * 与存储列原文一致。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "凭据拉取（内部接口：密文 + key_version，调用方内存解密）")
++public class CredentialPullVO {
++
++    @Schema(description = "所属通道ID")
++    private Long channelId;
++
++    @Schema(description = "凭据类型 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT")
++    private String credType;
++
++    @ToString.Exclude
++    @Schema(description = "SM4 密文（{v1} 前缀，与存储列原文一致——调用方内存解密）")
++    private String ciphertext;
++    // toString 排除密文（日志卫生——防响应体 DEBUG 日志把密文副本扩散进日志文件；
++    // 密文非明文不违反 REQ-0011 验收 4，但凭据域从源头减少敏感材料 Copies）
++
++    @Schema(description = "密钥版本（调用方按版本选钥的替换位；一期单密钥）")
++    private String keyVersion;
++
++    /** 从实体构建拉取项（原样带出密文，不设明文字段） */
++    public static CredentialPullVO of(IotChannelCredential entity) {
++        CredentialPullVO vo = new CredentialPullVO();
++        vo.setChannelId(entity.getChannelId());
++        vo.setCredType(entity.getCredType());
++        vo.setCiphertext(entity.getCiphertext());
++        vo.setKeyVersion(entity.getKeyVersion());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialViewVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialViewVO.java
+new file mode 100644
+index 0000000..6f90c9a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialViewVO.java
+@@ -0,0 +1,55 @@
++package net.otlab.admin.module.iot.credential.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.ToString;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++
++/**
++ * 凭据明文查看 VO（TASK-0019，GET /iot/channel/credential/view/{id}）
++ *
++ * <p><b>唯一管理面明文出口</b>（详细设计 §3.1 续 p23）：iot:credential:view 单设权限 +
++ * {@code @OperateLog(saveResponse=false)} 审计（响应含明文，响应列不落库——审计只记
++ * 「谁在何时看了哪个凭据」，url 承载凭据 id）。调用方仅限管理面前端（HTTPS 响应体），
++ * 凭据列所在行有 create_by/update_by 审计列。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "凭据明文查看（iot:credential:view 单设权限，审计不落响应列）")
++public class CredentialViewVO {
++
++    @Schema(description = "凭据ID")
++    private Long id;
++
++    @Schema(description = "所属通道ID")
++    private Long channelId;
++
++    @Schema(description = "凭据类型 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT")
++    private String credType;
++
++    @ToString.Exclude
++    @Schema(description = "凭据明文（SM4 解密结果——唯一管理面明文出口，响应不进审计日志）")
++    private String credential;
++    // toString 排除明文（REQ-0011 验收 4「应用与访问日志无明文」——防响应体 DEBUG 日志泄明文，
++    // 源端治理；Jackson 序列化走 getter，不受影响）
++
++    @Schema(description = "密钥版本（写入/轮换代次）")
++    private String keyVersion;
++
++    @Schema(description = "状态 0 禁用（已吊销）1 启用")
++    private Integer status;
++
++    /** 从实体构建明文查看项（明文由服务层解密后传入） */
++    public static CredentialViewVO of(IotChannelCredential entity, String plaintext) {
++        CredentialViewVO vo = new CredentialViewVO();
++        vo.setId(entity.getId());
++        vo.setChannelId(entity.getChannelId());
++        vo.setCredType(entity.getCredType());
++        vo.setCredential(plaintext);
++        vo.setKeyVersion(entity.getKeyVersion());
++        vo.setStatus(entity.getStatus());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialWriteForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialWriteForm.java
+new file mode 100644
+index 0000000..cd338a6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/dto/CredentialWriteForm.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.credential.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++import lombok.ToString;
++
++/**
++ * 凭据写入/轮换请求表单（TASK-0019，POST /iot/channel/credential）
++ *
++ * <p><b>明文只走 HTTPS 入参</b>（ADR-0006/REQ-0011）：credential 为凭据明文，服务端
++ * SM4 加密落 {@code {v1}} 密文后即弃——表单对象不落任何持久面；本表单所在接口的
++ * {@code @OperateLog(saveParam=false)} 明文不进 sys_operate_log 参数列（审计无明文硬项）。
++ *
++ * <p>同 channel 同 cred_type 重复写入=轮换（更新密文与 key_version 递增），不新增行；
++ * 表单不携带 tenantId（服务层会话覆盖）/status（写入即启用）/id/审计字段。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "凭据写入/轮换表单（TASK-0019）")
++public class CredentialWriteForm {
++
++    @NotNull(message = "所属通道不能为空")
++    @Schema(description = "所属通道ID（iot_channel.id；校验存在/同租户/未删）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long channelId;
++
++    @NotBlank(message = "凭据类型不能为空")
++    @Size(max = 32, message = "凭据类型长度不能超过 32")
++    @Schema(description = "凭据类型字典 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT（未知类型拒）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String credType;
++
++    @NotBlank(message = "凭据明文不能为空")
++    @Size(max = 1000, message = "凭据明文长度不能超过 1000")
++    @ToString.Exclude
++    @Schema(description = "凭据明文（只走 HTTPS 入参，服务端 SM4 加密落库后即弃；SM4 密文列 varchar(2000) 安全上限）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String credential;
++    // toString 排除明文（REQ-0011 验收 4「应用与访问日志无明文」）：dev 档 org.springframework.web
++    // 开 DEBUG 时 RequestResponseBodyMethodProcessor 会以 toString 记录请求体绑定结果——源端
++    // 治理避免明文进日志；Jackson/审计切面均走 getter，不受影响
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/entity/IotChannelCredential.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/entity/IotChannelCredential.java
+new file mode 100644
+index 0000000..77355a4
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/entity/IotChannelCredential.java
+@@ -0,0 +1,60 @@
++package net.otlab.admin.module.iot.credential.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 通道凭据实体类（TASK-0019，详细设计 §1.3A p8 / 附录 A p35）
++ *
++ * <p>iot_channel_credential 表随本任务升级脚本（20261122_iot_credential_domain.sql）建立，
++ * DDL 逐字照附录 A p35。一条通道的一类凭据一行（uk_channel_cred_type 物理唯一索引），
++ * 密文列 {@code ciphertext} 为 SM4 密文——沿用框架 {v1} 前缀约定
++ * （{@link net.otlab.core.security.SmDataCrypto}，与 sys_user 敏感字段同一加密口径，
++ * 密钥经 ot.crypto.data-key 环境变量注入、不入库，ADR-0006）；key_version 标识凭据
++ * 写入/轮换代次（一期单密钥部署下按 brief 裁决随轮换递增，多密钥并行选钥为密钥服务
++ * 替换位预留）；status 0 禁用（吊销）1 启用——吊销=置禁用立即生效（拉取接口随即 403），
++ * 非物理删除、不软删（编码/行保留审计）。
++ *
++ * <p>凭据全链路不落明文（ADR-0006）：存储本列只存密文；传输明文只走 HTTPS 入参
++ * （写入接口）；读取明文单设权限（iot:credential:view）+ 全量审计；列表/快照/日志
++ * 一律只允许掩码或占位。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_channel_credential")
++@Schema(description = "通道凭据（TASK-0019）")
++public class IotChannelCredential extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "凭据ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "所属通道ID（iot_channel.id，一条通道一类凭据一行）")
++    private Long channelId;
++
++    @Schema(description = "凭据类型字典 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT")
++    private String credType;
++
++    @Schema(description = "SM4 密文（{v1} 前缀，与 sys_user 敏感字段同口径）——永不经管理面接口回传")
++    private String ciphertext;
++
++    @Schema(description = "密钥版本（写入/轮换代次；一期单密钥，多密钥并行选钥为密钥服务替换位预留）")
++    private String keyVersion;
++
++    @Schema(description = "状态 0 禁用（吊销，立即生效）1 启用")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/mapper/IotChannelCredentialMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/mapper/IotChannelCredentialMapper.java
+new file mode 100644
+index 0000000..5fbd6ea
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/mapper/IotChannelCredentialMapper.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.credential.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 通道凭据 Mapper（TASK-0019）
++ *
++ * <p>空 BaseMapper（iot_ 前缀表多租户插件注入）：管理面链路（有 Sa-Token 会话）由
++ * OtTenantLineHandler 按会话租户注入条件——凭据列表/查看/吊销天然同租户隔离；内部拉取
++ * 链路（无会话）插件跳过注入，服务层显式 (channel_id, cred_type) 条件定位 + 租户一致
++ * 断言（防御纵深，0017 心跳同口径）。tenant_id 服务层从会话覆盖、禁前端传参。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotChannelCredentialMapper extends BaseMapper<IotChannelCredential> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/IotCredentialService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/IotCredentialService.java
+new file mode 100644
+index 0000000..39b81a6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/IotCredentialService.java
+@@ -0,0 +1,52 @@
++package net.otlab.admin.module.iot.credential.service;
++
++import net.otlab.admin.module.iot.credential.dto.CredentialItemVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialPullVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++
++import java.util.List;
++
++/**
++ * 通道凭据服务接口（TASK-0019，凭据全生命周期：写入/轮换/掩码列表/明文查看/吊销/内部拉取）
++ *
++ * <p>接口契约照详细设计 §3.1 续 p23 与 REQ-0011：写入/轮换 iot:credential:edit、查看明文
++ * iot:credential:view（双权限全审计）、列表只回掩码、吊销立即生效、内部拉取回密文与
++ * key_version（调用方内存解密）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotCredentialService {
++
++    /**
++     * 按通道查凭据列表（channelId 必传）：只返回类型/掩码/key_version/状态，永不返回
++     * 密文/明文。通道不存在/已删除拒绝（归属校验）。
++     */
++    List<CredentialItemVO> listByChannel(Long channelId);
++
++    /**
++     * 写入/轮换凭据：明文只走 HTTPS 入参，服务端 SM4 加密落 {v1} 密文；同 channel 同
++     * cred_type 重复写入=轮换（更新密文与 key_version 递增），不新增行；重写即重新启用。
++     * 加密失败 fail-closed 拒保存。
++     */
++    boolean writeCredential(CredentialWriteForm form);
++
++    /**
++     * 查看凭据明文：SM4 解密返回（唯一管理面明文出口；审计由控制器 @OperateLog
++     * saveResponse=false 承担——谁看了凭据留痕、明文不落日志列）。
++     */
++    CredentialViewVO viewCredential(Long id);
++
++    /**
++     * 吊销凭据：status 置禁用（0）立即生效——内部拉取接口随即 403；非物理删除。
++     */
++    boolean revokeCredential(Long id);
++
++    /**
++     * 内部拉取凭据（无 Sa-Token 会话，准入由 InternalAuthChecker 承担）：显式条件定位
++     * （通道存在/启用、凭据存在/启用、租户一致），统一 403 拒绝；返回密文与 key_version
++     * （服务端不解密传输，调用方内存解密）。
++     */
++    CredentialPullVO pullCredential(Long channelId, String credType);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java
+new file mode 100644
+index 0000000..02c7bc5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java
+@@ -0,0 +1,297 @@
++package net.otlab.admin.module.iot.credential.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.domain.CredentialMask;
++import net.otlab.admin.module.iot.credential.domain.CredentialTypes;
++import net.otlab.admin.module.iot.credential.dto.CredentialItemVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialPullVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.security.SmDataCrypto;
++import net.otlab.core.tenant.TenantContext;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.List;
++
++/**
++ * 凭据服务实现类（TASK-0019）
++ *
++ * <p><b>密文口径</b>（ADR-0006/REQ-0011）：SM4 复用框架 {@link SmDataCrypto}（{v1} 前缀、
++ * 密钥经 ot.crypto.data-key 环境变量注入不入库）——<b>加密失败 fail-closed 拒保存</b>：
++ * 明文恰以 {v1} 开头时 encrypt 幂等原样返回（落库的将是未加密明文），此形态直接拒绝
++ * （{@code ciphertext.equals(plaintext)} 判定 + isCiphertext 双条件）；解密失败（密钥不
++ * 匹配/密文损坏）不静默降级为明文。
++ *
++ * <p><b>写入=轮换 upsert</b>（brief 裁决）：同 channel 同 cred_type 由 uk_channel_cred_type
++ * 物理唯一索引保证一行——首写落 key_version=1，重复写入=轮换（更新密文与 key_version
++ * 递增），不新增行；重写即重新启用（吊销后再次写入视为重新配发，status 复活 1）。
++ * 新建并发撞键（DuplicateKeyException）转轮换更新（upsert 语义），预检与落库之间的
++ * 真实并发窗口不向调用方报错。
++ *
++ * <p><b>列表永不回密文/明文</b>（REQ-0011 验收 1）：服务层解密后经 {@link CredentialMask}
++ * 掩码化（前四****后四口径），解密失败降级纯占位（列表不崩、不泄底）；列表 VO 结构上
++ * 无密文/明文字段（单测反射断言固化）。查看明文是唯一管理面出口（iot:credential:view
++ * 单设权限 + 审计），拉取只回密文（调用方内存解密）。
++ *
++ * <p><b>归属校验</b>：管理面链路 channel/credential 经多租户插件注入会话租户条件（同租户
++ * 保证，照 0018 范式）；写入校验所属通道存在/同租户/未删（不校验通道 status——禁用通道
++ * 仍可配凭据，准入拦截在接入链路归 0020，与 0018 通道创建不校验网关 status 同口径）。
++ * cred_type ∈ 字典四值（{@link CredentialTypes}）；tenant_id 服务层从会话覆盖、禁前端传参。
++ *
++ * <p><b>吊销立即生效</b>（REQ-0011 验收 5）：status 置 0（字段白名单更新，不触密文/租户/
++ * 类型）；拉取链路对 status!=1 即拒——已吊销凭据随即 403。对已吊销行重复吊销幂等。
++ *
++ * <p><b>内部拉取（无 Sa-Token 会话）</b>：多租户插件对无会话链路跳过注入（0017 同口径），
++ * 显式条件定位：通道存在/未删/<b>启用</b>（REQ-0011 验收 5「通道禁用时拉取 403」）、凭据
++ * (channel_id, cred_type) 存在/<b>启用</b>、凭据租户与通道租户一致（防御断言）；缺失/吊销/
++ * 禁用/不一致统一 403（FORBIDDEN）——不区分原因，不给探测面（网关设备令牌「校验令牌
++ * 归属通道」链归 0020/0027，本期静态令牌即准入，brief 明文登记遗留）。服务端不解密
++ * 传输：响应只带密文与 key_version。
++ *
++ * <p><b>日志无明文</b>：本服务任何日志调用不携带明文/密文（只记 channelId/credType/
++ * 凭据 id）；审计无明文由控制器 @OperateLog(saveParam/saveResponse=false) + 切面链路
++ * 承担（{@link net.otlab.admin.module.iot.credential.audit.IotCredentialAuditNoPlaintextTest}
++ * grep 级固化）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotCredentialServiceImpl extends ServiceImpl<IotChannelCredentialMapper, IotChannelCredential>
++        implements IotCredentialService {
++
++    /** 凭据明文长度上限（SM4 密文列 varchar(2000)：1000 字符明文 → 密文 ≤ 约 1400 字符，安全余量） */
++    private static final int MAX_LEN_PLAINTEXT = 1000;
++
++    /** 首写 key_version（写入/轮换代次起点） */
++    private static final String INITIAL_KEY_VERSION = "1";
++
++    /** 状态值域（0 禁用 1 启用） */
++    private static final int STATUS_DISABLED = 0;
++    private static final int STATUS_ENABLED = 1;
++
++    @Autowired
++    private IotChannelMapper channelMapper;
++
++    // ---------- 列表（只回掩码） ----------
++
++    @Override
++    public List<CredentialItemVO> listByChannel(Long channelId) {
++        if (channelId == null) {
++            throw paramError("按通道查凭据：channelId 必传");
++        }
++        // 归属校验：通道存在/同租户/未删（selectById 经 @TableLogic 与多租户插件过滤）
++        IotChannel channel = channelMapper.selectById(channelId);
++        if (channel == null) {
++            throw paramError("通道不存在或已删除: " + channelId);
++        }
++        // 多租户条件由插件注入（会话链路）；deleted 由 @TableLogic 运行时过滤；按通道精确过滤
++        List<IotChannelCredential> rows = this.list(new LambdaQueryWrapper<IotChannelCredential>()
++                .eq(IotChannelCredential::getChannelId, channelId)
++                .orderByAsc(IotChannelCredential::getId));
++        return rows.stream().map(this::toMaskItem).toList();
++    }
++
++    /** 实体 → 掩码项：解密后掩码化（唯一持明文瞬间），解密失败降级纯占位（不泄底、不崩） */
++    private CredentialItemVO toMaskItem(IotChannelCredential row) {
++        String mask;
++        try {
++            mask = CredentialMask.mask(SmDataCrypto.decrypt(row.getCiphertext()));
++        } catch (Exception e) {
++            log.warn("[CREDENTIAL] list mask decrypt failed, credentialId={}, keyVersion={}",
++                    row.getId(), row.getKeyVersion());
++            mask = CredentialMask.mask(null);
++        }
++        return CredentialItemVO.of(row, mask);
++    }
++
++    // ---------- 写入 / 轮换 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean writeCredential(CredentialWriteForm form) {
++        String credType = resolveCredType(form.getCredType());
++        String plaintext = form.getCredential();
++        if (plaintext == null || plaintext.isBlank()) {
++            throw paramError("凭据明文不能为空");
++        }
++        if (plaintext.length() > MAX_LEN_PLAINTEXT) {
++            throw paramError("凭据明文长度不能超过 " + MAX_LEN_PLAINTEXT);
++        }
++        if (form.getChannelId() == null) {
++            throw paramError("所属通道不能为空");
++        }
++        // 归属校验：通道存在/同租户/未删（不校验通道 status——禁用通道仍可配凭据，与 0018 同口径）
++        IotChannel channel = channelMapper.selectById(form.getChannelId());
++        if (channel == null) {
++            throw paramError("所属通道不存在或已删除: " + form.getChannelId());
++        }
++
++        // SM4 加密（{v1} 前缀）——fail-closed：明文恰以 {v1} 开头时 encrypt 幂等原样返回
++        // （落库的将是未加密明文），此形态直接拒绝保存
++        String ciphertext = SmDataCrypto.encrypt(plaintext);
++        if (!SmDataCrypto.isCiphertext(ciphertext) || ciphertext.equals(plaintext)) {
++            throw paramError("凭据加密失败，拒绝保存（fail-closed）");
++        }
++
++        // 直接 mapper 调用（0017 tenantMapper.selectOne 同款范式）：uk_channel_cred_type 保证
++        // ≤1 行，selectOne 语义精确且单测桩化确定
++        IotChannelCredential existing = this.getBaseMapper().selectOne(
++                new LambdaQueryWrapper<IotChannelCredential>()
++                        .eq(IotChannelCredential::getChannelId, form.getChannelId())
++                        .eq(IotChannelCredential::getCredType, credType));
++        if (existing == null) {
++            // 字段白名单构建新增实体：tenant_id 会话覆盖、status 启用起步、id/审计字段不复制
++            IotChannelCredential entity = new IotChannelCredential();
++            entity.setTenantId(TenantContext.getTenantId());
++            entity.setChannelId(form.getChannelId());
++            entity.setCredType(credType);
++            entity.setCiphertext(ciphertext);
++            entity.setKeyVersion(INITIAL_KEY_VERSION);
++            entity.setStatus(STATUS_ENABLED);
++            try {
++                return this.save(entity);
++            } catch (DuplicateKeyException e) {
++                // 并发窗口兜底：uk_channel_cred_type 撞键 → 转轮换更新（upsert 语义，不向调用方报错）
++                existing = this.getBaseMapper().selectOne(
++                        new LambdaQueryWrapper<IotChannelCredential>()
++                                .eq(IotChannelCredential::getChannelId, form.getChannelId())
++                                .eq(IotChannelCredential::getCredType, credType));
++                if (existing == null) {
++                    throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "凭据类型已存在: " + credType);
++                }
++                return rotate(existing, ciphertext);
++            }
++        }
++        // 同 channel 同 cred_type 重复写入=轮换：更新密文与 key_version 递增，不新增行
++        return rotate(existing, ciphertext);
++    }
++
++    /** 轮换更新（字段白名单：仅密文/key_version/status 复活——tenantId/credType/审计列不进 SET） */
++    private boolean rotate(IotChannelCredential existing, String ciphertext) {
++        IotChannelCredential upd = new IotChannelCredential();
++        upd.setId(existing.getId());
++        upd.setCiphertext(ciphertext);
++        upd.setKeyVersion(nextKeyVersion(existing.getKeyVersion()));
++        upd.setStatus(STATUS_ENABLED);
++        return this.updateById(upd);
++    }
++
++    /** key_version 递增口径：null/空白/非数值回落 1（legacy 行首次轮换归一），数值继续递增 */
++    static String nextKeyVersion(String current) {
++        if (current == null || current.isBlank()) {
++            return INITIAL_KEY_VERSION;
++        }
++        try {
++            return String.valueOf(Long.parseLong(current.trim()) + 1);
++        } catch (NumberFormatException e) {
++            return INITIAL_KEY_VERSION;
++        }
++    }
++
++    // ---------- 查看明文 ----------
++
++    @Override
++    public CredentialViewVO viewCredential(Long id) {
++        if (id == null) {
++            throw paramError("请选择要查看的凭据");
++        }
++        IotChannelCredential row = this.getById(id);
++        if (row == null) {
++            throw paramError("凭据不存在或已删除");
++        }
++        // 唯一管理面明文出口（iot:credential:view 单设权限 + @OperateLog(saveResponse=false)）
++        return CredentialViewVO.of(row, SmDataCrypto.decrypt(row.getCiphertext()));
++    }
++
++    // ---------- 吊销 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean revokeCredential(Long id) {
++        if (id == null) {
++            throw paramError("请选择要吊销的凭据");
++        }
++        IotChannelCredential row = this.getById(id);
++        if (row == null) {
++            throw paramError("凭据不存在或已删除");
++        }
++        // 吊销=置禁用立即生效（拉取接口随即 403）；字段白名单更新：仅 status——密文/类型/租户不触；
++        // 非物理删除（行保留审计）；对已吊销行幂等
++        IotChannelCredential upd = new IotChannelCredential();
++        upd.setId(row.getId());
++        upd.setStatus(STATUS_DISABLED);
++        return this.updateById(upd);
++    }
++
++    // ---------- 内部拉取 ----------
++
++    @Override
++    public CredentialPullVO pullCredential(Long channelId, String credType) {
++        if (channelId == null) {
++            throw paramError("channelId 必传");
++        }
++        if (credType == null || credType.isBlank()) {
++            throw paramError("credType 必传");
++        }
++        // 无 Sa-Token 会话 → 多租户插件跳过注入（0017 同口径）：显式条件定位（防御纵深，
++        // 异常会话场景插件条件与本显式条件叠加只会更严）。
++        // 通道存在/未删/启用（REQ-0011 验收 5「通道禁用时拉取 403」）
++        IotChannel channel = channelMapper.selectById(channelId);
++        if (channel == null || channel.getStatus() == null || channel.getStatus() != STATUS_ENABLED) {
++            throw forbidden("通道不存在、已删除或已禁用");
++        }
++        // 凭据存在/启用：缺失与吊销统一 403，不区分原因（不给探测面）；未知 credType 走
++        // 同一 403（不枚举校验字典——避免类型枚举探测）；直接 mapper 调用（uk 保证 ≤1 行）
++        IotChannelCredential row = this.getBaseMapper().selectOne(
++                new LambdaQueryWrapper<IotChannelCredential>()
++                        .eq(IotChannelCredential::getChannelId, channelId)
++                        .eq(IotChannelCredential::getCredType, credType));
++        if (row == null || row.getStatus() == null || row.getStatus() != STATUS_ENABLED) {
++            throw forbidden("凭据不存在或已吊销");
++        }
++        // 租户一致防御断言（同库约束下恒成立，防御异常数据/未来直写路径）
++        if (!channel.getTenantId().equals(row.getTenantId())) {
++            throw forbidden("凭据归属校验失败");
++        }
++        // 服务端不解密传输：只回密文与 key_version，调用方内存解密（ADR-0006）
++        return CredentialPullVO.of(row);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** cred_type 字典校验：∈ 四值字典，未知类型拒（写入入口闸） */
++    private String resolveCredType(String credType) {
++        if (credType == null || credType.isBlank()) {
++            throw paramError("凭据类型不能为空");
++        }
++        if (credType.length() > CredentialTypes.MAX_LEN_CRED_TYPE) {
++            throw paramError("凭据类型长度不能超过 " + CredentialTypes.MAX_LEN_CRED_TYPE);
++        }
++        if (!CredentialTypes.isValid(credType)) {
++            throw paramError("凭据类型仅允许 DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT: " + credType);
++        }
++        return credType;
++    }
++
++    private BusinessException forbidden(String message) {
++        return new BusinessException(ResultCode.FORBIDDEN.getCode(), message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java
+index 898c738..3080c01 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/GatewayInternalAuthConfig.java
+@@ -5,13 +5,19 @@ import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+ 
+ /**
+- * 网关内部接口拦截器注册（TASK-0017）。
++ * 内部接口拦截器注册（TASK-0017 引入，TASK-0019 完整化接线）。
+  *
+- * <p>仅拦 /internal/v1/gateway/**（物理隔离原则，详细设计 §3 p20「内部系统间接口用
+- * /internal/v1 前缀，与管理面、对外面物理隔离（不同网关路由与鉴权）」）；管理面
+- * /iot/gateway/** 与其余路径不挂本拦截器。认证实现为
+- * {@link StaticTokenInternalAuthChecker}（占位——完整网关令牌链归 0019/0020，接线
+- * 义务登记遗留）。
++ * <p>拦 /internal/v1/**（物理隔离原则，详细设计 §3 p20「内部系统间接口用 /internal/v1
++ * 前缀，与管理面、对外面物理隔离（不同网关路由与鉴权）」）。TASK-0017 注册 /internal/v1
++ * /gateway/**（心跳回写）；TASK-0019 凭据域接入 /internal/v1/credential/pull 时按 brief
++ * 裁决「把 /internal/v1/** 的认证器统一到 credential 域可复用形态（最小改动）」将模式
++ * 放宽到整个 /internal/v1/ 前缀——同一认证器（{@link InternalAuthChecker}，实现
++ * {@link StaticTokenInternalAuthChecker}：静态令牌 + IP 白名单）统一收口全部内部端点，
++ * 后续内部端点（0020 LWT/准入、0024 快照拉取等）零注册成本接入。管理面 /iot 前缀
++ * 与其余路径不挂本拦截器。
++ *
++ * <p>网关设备令牌链（校验令牌归属通道）归 TASK-0020/0027 裁决升级——届时替换实现类
++ * 而非扩散调用点（接口即接缝），遗留登记 0020/0027 brief。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -28,6 +34,6 @@ public class GatewayInternalAuthConfig implements WebMvcConfigurer {
+     @Override
+     public void addInterceptors(InterceptorRegistry registry) {
+         registry.addInterceptor(new InternalAuthInterceptor(internalAuthChecker))
+-                .addPathPatterns("/internal/v1/gateway/**");
++                .addPathPatterns("/internal/v1/**");
+     }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java
+index 631d9b1..15c3a77 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthChecker.java
+@@ -3,17 +3,22 @@ package net.otlab.admin.module.iot.gateway.auth;
+ import jakarta.servlet.http.HttpServletRequest;
+ 
+ /**
+- * 内部接口认证检查器（TASK-0017，占位裁决——brief「内部认证裁决（占位）」）
++ * 内部接口认证检查器（TASK-0017 引入；TASK-0019 完整化接线——统一覆盖 /internal/v1/**）
+  *
+- * <p>内部回写接口（/internal/v1/gateway/**）<b>无 Sa-Token</b>（管理面登录令牌体系不适用
+- * 于服务间调用），认证由本检查器承担：调用方须通过（静态令牌 + IP 白名单）双道校验。
+- * 校验入口统一收敛在 {@code check(HttpServletRequest)}——由拦截器层
+- * （{@link InternalAuthInterceptor}）在控制器之前调用，失败抛 BusinessException
+- * （401 令牌无效 / 403 白名单外），由 GlobalExceptionHandler 统一转框架响应体。
++ * <p>内部系统间接口（/internal/v1/**，0017 心跳回写、0019 凭据拉取等）<b>无 Sa-Token</b>
++ * （管理面登录令牌体系不适用于服务间调用），认证由本检查器承担：调用方须通过
++ * （静态令牌 + IP 白名单）双道校验。校验入口统一收敛在
++ * {@code check(HttpServletRequest)}——由拦截器层（{@link InternalAuthInterceptor}）在
++ * 控制器之前调用（0019 起拦截器统一挂 /internal/v1/**，见
++ * {@link GatewayInternalAuthConfig}），控制器内可再显式调用一道（纵深防御，0017/0019
++ * 同范式）；失败抛 BusinessException（401 令牌无效 / 403 白名单外），由
++ * GlobalExceptionHandler 统一转框架响应体。
+  *
+- * <p><b>接线义务（占位升级路径）</b>：本期为「配置静态令牌 + IP 白名单」占位实现
+- * （{@link StaticTokenInternalAuthChecker}）；完整网关令牌链归 TASK-0019（凭据域）与
+- * TASK-0020（LWT/接入准入）裁决升级——届时替换实现类而非扩散调用点（接口即接缝）。
++ * <p><b>升级路径</b>：本期为「配置静态令牌 + IP 白名单」实现
++ * （{@link StaticTokenInternalAuthChecker}）——凭据拉取按 0019 brief 裁决「静态令牌即
++ * 准入」；完整网关设备令牌链（校验令牌归属通道）归 TASK-0020（LWT/接入准入）与
++ * TASK-0027 裁决升级——届时替换实现类而非扩散调用点（接口即接缝，credential 域零改动
++ * 复用）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java
+index 01ab0a8..ff8e936 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/InternalAuthInterceptor.java
+@@ -5,13 +5,16 @@ import jakarta.servlet.http.HttpServletResponse;
+ import org.springframework.web.servlet.HandlerInterceptor;
+ 
+ /**
+- * 内部接口认证拦截器（TASK-0017）——brief 裁决「校验在过滤器/拦截器层」。
++ * 内部接口认证拦截器（TASK-0017 引入；TASK-0019 完整化接线）——brief 裁决「校验在
++ * 过滤器/拦截器层」。
+  *
+- * <p>挂在 /internal/v1/gateway/**（{@link GatewayInternalAuthConfig}），控制器之前调用
++ * <p>挂在 /internal/v1/**（0019 起统一覆盖全部内部端点，见
++ * {@link GatewayInternalAuthConfig}），控制器之前调用
+  * {@link InternalAuthChecker#check}（静态令牌 + IP 白名单）；失败抛 BusinessException
+  * 由 GlobalExceptionHandler 统一转框架响应体（HTTP 200 + 业务码 401/403）。
+  *
+- * <p>管理面五接口不受影响（路径前缀不同）；完整网关令牌链归 0019/0020。
++ * <p>管理面接口不受影响（路径前缀不同）；网关设备令牌链归 0020/0027（届时替换
++ * checker 实现类，调用点不扩散）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java
+index b1ec0c2..b7df432 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/auth/StaticTokenInternalAuthChecker.java
+@@ -16,20 +16,21 @@ import java.util.Locale;
+ import java.util.Set;
+ 
+ /**
+- * 内部认证检查器·配置静态令牌 + IP 白名单实现（TASK-0017 占位裁决，brief「内部认证裁决
+- * （占位）」）
++ * 内部认证检查器·配置静态令牌 + IP 白名单实现（TASK-0017 引入；TASK-0019 起统一覆盖
++ * /internal/v1/** 全部内部端点——凭据拉取按 0019 brief 裁决「静态令牌即准入」）
+  *
+- * <p><b>静态令牌</b>：{@code ot.gateway.internal-token} 经环境变量注入（yml 占位键为
+- * 本任务唯一新增键），比对请求头 {@code X-Internal-Token}——常量时间比较（MessageDigest
++ * <p><b>静态令牌</b>：{@code ot.gateway.internal-token} 经环境变量注入（0017 唯一新增
++ * yml 键），比对请求头 {@code X-Internal-Token}——常量时间比较（MessageDigest
+  * .isEqual，防逐字节时序侧信道）。<b>fail-closed</b>：配置为空（未注入）时一律拒绝并
+  * WARN，绝不放行。
+  *
+  * <p><b>IP 白名单</b>：{@code ot.gateway.internal-ip-whitelist}（默认 127.0.0.1，逗号分隔，
+- * 代码默认值——brief 只授权 yml 新增 internal-token 一个键，故白名单键经 @Value 默认值
+- * 交付，部署时可经环境变量 OT_GATEWAY_INTERNAL_IP_WHITELIST 覆盖）。来源 IP 取
++ * 代码默认值——0017 brief 只授权 yml 新增 internal-token 一个键，故白名单键经 @Value
++ * 默认值交付，部署时可经环境变量 OT_GATEWAY_INTERNAL_IP_WHITELIST 覆盖）。来源 IP 取
+  * {@link OtIpUtils#getClientIp}（受 ot.ip.behind-proxy 开关控制，防伪造转发头）。
+  *
+- * <p>校验在拦截器层触发（{@link InternalAuthInterceptor}）；完整网关令牌链归 0019/0020。
++ * <p>校验在拦截器层触发（{@link InternalAuthInterceptor}，/internal/v1/** 统一挂载）；
++ * 完整网关设备令牌链（校验令牌归属通道）归 0020/0027——届时替换本实现类，调用点不扩散。
+  *
+  * @author dowei
+  * @date 2026-11-22
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/audit/IotCredentialAuditNoPlaintextTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/audit/IotCredentialAuditNoPlaintextTest.java
+new file mode 100644
+index 0000000..32deee8
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/audit/IotCredentialAuditNoPlaintextTest.java
+@@ -0,0 +1,290 @@
++package net.otlab.admin.module.iot.credential.audit;
++
++import net.otlab.admin.module.iot.credential.controller.IotCredentialController;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.admin.module.system.aspect.OperateLogAspect;
++import net.otlab.admin.module.system.entity.SysOperateLog;
++import net.otlab.admin.module.system.service.OperateLogService;
++import net.otlab.admin.module.system.service.SysDeptService;
++import net.otlab.admin.module.system.service.SysUserService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.OtIpUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.aop.aspectj.annotation.AspectJProxyFactory;
++import org.springframework.mock.web.MockHttpServletRequest;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.web.context.request.RequestContextHolder;
++import org.springframework.web.context.request.ServletRequestAttributes;
++
++import java.lang.reflect.Method;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 凭据审计无明文 grep 级测试（TASK-0019 验收硬项）
++ *
++ * <p>brief：「写入/轮换/查看/吊销四动作全部 @OperateLog；日志与快照无明文：测试断言
++ * sys_operate_log 的请求参数/返回值字段不含明文与密文（掩码或占位符）——grep 级验证写进单测」。
++ *
++ * <p>实现方式：真实 {@link OperateLogAspect} 经 AspectJProxyFactory 织入真实
++ * {@link IotCredentialController}（服务层 mock），捕获落库 {@link SysOperateLog} 全文，
++ * 对 param/response/failReason 列做明文/密文子串断言——整链（注解标志 → 切面序列化 →
++ * 脱敏器 → 实体列）真实走通后 grep，不是注解标志的纸面检查。
++ *
++ * <p>关键断言：
++ * <ul>
++ * <li>写入（入参含明文）：param 列为空（saveParam=false），failReason/response 无明文；</li>
++ * <li>查看（响应含明文）：response 列为空（saveResponse=false），param 列只有 id 无明文；</li>
++ * <li>失败路径（BusinessException）：failReason 与 param 均无明文/密文（{v1} 前缀子串亦无）；</li>
++ * <li>吊销/列表：param/response 无明文（掩码出口不入日志列）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotCredentialAuditNoPlaintextTest {
++
++    private static final String PLAINTEXT = "mqtt-secret-abcd1234";
++    private static final String CIPHERTEXT = "{v1}AAECAwQFBgcICQ==:AAECAwQFBgcICQ==";
++
++    @Mock
++    private IotCredentialService credentialService;
++
++    @Mock
++    private OperateLogService operateLogService;
++
++    @Mock
++    private SysUserService sysUserService;
++
++    @Mock
++    private SysDeptService sysDeptService;
++
++    private AutoCloseable mocks;
++    private MockedStatic<OtIpUtils> otIpUtils;
++
++    /** 已捕获的落库日志实体（saveOperateLog 异步线程池在单测中为 mock，同步捕获） */
++    private SysOperateLog capturedLog;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        request.setRequestURI("/iot/channel/credential");
++        request.setMethod("POST");
++        request.addHeader("User-Agent", "JUnit-Agent");
++        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
++
++        otIpUtils = Mockito.mockStatic(OtIpUtils.class);
++        otIpUtils.when(() -> OtIpUtils.getClientIp(any())).thenReturn("127.0.0.1");
++        otIpUtils.when(() -> OtIpUtils.getRegion(any())).thenReturn("");
++
++        Mockito.doAnswer(invocation -> {
++            capturedLog = invocation.getArgument(0);
++            return true;
++        }).when(operateLogService).saveOperateLog(any(SysOperateLog.class));
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        RequestContextHolder.resetRequestAttributes();
++        if (otIpUtils != null) {
++            otIpUtils.close();
++        }
++        if (mocks != null) {
++            mocks.close();
++        }
++    }
++
++    /** 真实切面织入真实控制器：返回代理后的控制器（@OperateLog 环绕真实生效） */
++    private IotCredentialController proxiedController() {
++        IotCredentialController controller = new IotCredentialController();
++        ReflectionTestUtils.setField(controller, "credentialService", credentialService);
++        OperateLogAspect aspect = new OperateLogAspect();
++        ReflectionTestUtils.setField(aspect, "operateLogService", operateLogService);
++        ReflectionTestUtils.setField(aspect, "sysUserService", sysUserService);
++        ReflectionTestUtils.setField(aspect, "sysDeptService", sysDeptService);
++        AspectJProxyFactory factory = new AspectJProxyFactory(controller);
++        factory.addAspect(aspect);
++        factory.setProxyTargetClass(true);
++        return factory.getProxy();
++    }
++
++    private CredentialWriteForm writeForm() {
++        CredentialWriteForm form = new CredentialWriteForm();
++        form.setChannelId(100L);
++        form.setCredType("MQTT_PASSWORD");
++        form.setCredential(PLAINTEXT);
++        return form;
++    }
++
++    /**
++     * grep 断言：日志实体全部文本列不含明文与密文值；param/response/failReason 三个动态列
++     * 额外禁 {@code {v1}} 前缀（content 列为开发者撰写的静态 @Operation 摘要，合法以 {v1}
++     * 指称密文<b>格式名</b>而非密文本身——brief 硬验收口径为「请求参数/返回值字段不含
++     * 明文与密文」，动态列从严）。
++     */
++    private void assertNoPlaintextNoCiphertext(SysOperateLog log, String plaintext, String ciphertext) {
++        assertNotNull(log, "操作日志未落库——审计链路断裂");
++        String[] allColumns = {log.getParam(), log.getResponse(), log.getFailReason(),
++                log.getContent(), log.getModule(), log.getUrl(), log.getMethod()};
++        for (String column : allColumns) {
++            if (column == null) {
++                continue;
++            }
++            assertFalse(column.contains(plaintext), "审计列不得含凭据明文: " + column);
++            assertFalse(column.contains(ciphertext), "审计列不得含凭据密文: " + column);
++        }
++        for (String dynamic : new String[] {log.getParam(), log.getResponse(), log.getFailReason()}) {
++            if (dynamic == null) {
++                continue;
++            }
++            assertFalse(dynamic.contains("{v1}"), "审计动态列不得含密文版本前缀: " + dynamic);
++        }
++    }
++
++    @Test
++    @DisplayName("写入审计 - 入参含明文：param 列不落库（saveParam=false），其余列 grep 无明文/密文")
++    void testWriteAudit_ParamColumnNeverHoldsPlaintext() {
++        Mockito.doReturn(true).when(credentialService).writeCredential(any(CredentialWriteForm.class));
++
++        proxiedController().write(writeForm());
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertEquals("通道凭据", log.getModule());
++        assertTrue(log.getParam() == null || log.getParam().isEmpty(),
++                "写入入参含明文——param 列必须为空（saveParam=false），实测: " + log.getParam());
++        assertNoPlaintextNoCiphertext(log, PLAINTEXT, CIPHERTEXT);
++    }
++
++    @Test
++    @DisplayName("写入审计 - 业务异常路径：failReason/param 均无明文（异常文案不含凭据值）")
++    void testWriteAudit_FailurePathNoPlaintext() {
++        Mockito.doThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "凭据加密失败，拒绝保存（fail-closed）"))
++                .when(credentialService).writeCredential(any(CredentialWriteForm.class));
++
++        try {
++            proxiedController().write(writeForm());
++        } catch (BusinessException expected) {
++            // 切面 AfterThrowing 先落审计再抛出——异常照常上抛
++        }
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertEquals(0, log.getStatus(), "失败记录 status=0");
++        assertTrue(log.getParam() == null || log.getParam().isEmpty());
++        assertEquals("凭据加密失败，拒绝保存（fail-closed）", log.getFailReason());
++        assertNoPlaintextNoCiphertext(log, PLAINTEXT, CIPHERTEXT);
++    }
++
++    @Test
++    @DisplayName("查看审计 - 响应含明文：response 列不落库（saveResponse=false），param 列只有 id 无明文")
++    void testViewAudit_ResponseColumnNeverHoldsPlaintext() {
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        request.setRequestURI("/iot/channel/credential/view/200");
++        request.setMethod("GET");
++        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
++
++        CredentialViewVO vo = new CredentialViewVO();
++        vo.setId(200L);
++        vo.setChannelId(100L);
++        vo.setCredType("MQTT_PASSWORD");
++        vo.setCredential(PLAINTEXT);
++        vo.setKeyVersion("1");
++        vo.setStatus(1);
++        Mockito.doReturn(vo).when(credentialService).viewCredential(200L);
++
++        proxiedController().view(200L);
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertTrue(log.getResponse() == null || log.getResponse().isEmpty(),
++                "查看响应含明文——response 列必须为空（saveResponse=false），实测: " + log.getResponse());
++        assertNotNull(log.getParam());
++        assertFalse(log.getParam().contains(PLAINTEXT), "param 列只有 id，不含明文: " + log.getParam());
++        assertFalse(log.getParam().contains(CIPHERTEXT));
++        assertEquals("/iot/channel/credential/view/200", log.getUrl(), "审计「谁看了凭据」：url 承载凭据 id 定位");
++        assertNoPlaintextNoCiphertext(log, PLAINTEXT, CIPHERTEXT);
++    }
++
++    @Test
++    @DisplayName("吊销审计 - 入参/响应无敏感面：param 只有 id、response 无明文，全列 grep 干净")
++    void testRevokeAudit_NoPlaintext() {
++        Mockito.doReturn(true).when(credentialService).revokeCredential(200L);
++
++        proxiedController().revoke(200L);
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertNotNull(log.getParam());
++        assertFalse(log.getParam().contains(PLAINTEXT));
++        assertNoPlaintextNoCiphertext(log, PLAINTEXT, CIPHERTEXT);
++    }
++
++    @Test
++    @DisplayName("列表审计豁免 - 列表挂 iot:channel:list 权限但无 @OperateLog（brief 四动作口径），掩码不经审计列落库")
++    void testList_NoOperateLog() throws Exception {
++        Method list = IotCredentialController.class.getMethod("list", Long.class);
++        assertNotNull(list.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "列表仍受 iot:channel:list 权限控制");
++        assertNull(list.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "列表非四动作（写入/轮换/查看/吊销）——无 @OperateLog，掩码不入日志列");
++    }
++
++    @Test
++    @DisplayName("审计身份 - 未登录态身份列留空仍落库（BUG-0003 口径——拒绝/失败也留痕）")
++    void testAuditEntityPersistedWithoutLogin() {
++        Mockito.doReturn(true).when(credentialService).writeCredential(any(CredentialWriteForm.class));
++
++        proxiedController().write(writeForm());
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertEquals(1, log.getStatus(), "成功记录 status=1");
++        assertNotNull(log.getCreateTime(), "审计字段切面主线程回填（异步线程池无上下文）");
++    }
++
++    @Test
++    @DisplayName("toString 源端治理 - 写入表单/查看 VO 的 toString 不含明文、拉取 VO 不含密文"
++            + "（防 org.springframework.web DEBUG 请求/响应体日志泄漏——REQ-0011 验收 4）")
++    void testToStringExcludesSensitiveFields() {
++        assertFalse(writeForm().toString().contains(PLAINTEXT),
++                "CredentialWriteForm.toString 不得含凭据明文: " + writeForm());
++
++        CredentialViewVO viewVO = new CredentialViewVO();
++        viewVO.setId(200L);
++        viewVO.setCredential(PLAINTEXT);
++        assertFalse(viewVO.toString().contains(PLAINTEXT),
++                "CredentialViewVO.toString 不得含凭据明文: " + viewVO);
++
++        net.otlab.admin.module.iot.credential.dto.CredentialPullVO pullVO =
++                new net.otlab.admin.module.iot.credential.dto.CredentialPullVO();
++        pullVO.setCiphertext(CIPHERTEXT);
++        assertFalse(pullVO.toString().contains(CIPHERTEXT),
++                "CredentialPullVO.toString 不得含密文: " + pullVO);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/config/IotCredentialMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/config/IotCredentialMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..cea0ff0
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/config/IotCredentialMenuPermissionGuardTest.java
+@@ -0,0 +1,142 @@
++package net.otlab.admin.module.iot.credential.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.credential.controller.IotCredentialController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0019 守卫测试：凭据域菜单权限（sys_menu 4051-4052 两行）与控制器接口清单核对。
++ *
++ * <p>brief 硬要求「权限与接口一一对应」；凭据域形态（brief 明文）：凭据列表按 §3.1 续
++ * 复用 iot:channel:list（4046，TASK-0018 已登记——不重复登记），只登记
++ * iot:credential:edit / iot:credential:view 两行（4051-4052，parent_id=4013 通道管理页，
++ * 4050 已占故 4051 起连续取号）。本测试锁定（照 IotChannelMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_credential_domain.sql 的 sys_menu 两行种子
++ *     （id 4051-4052，parent_id=4013）权限码必须恰好等于预期映射——删行/换码/挪 parent 即红；</li>
++ * <li>代码侧：凭据管理面 @SaCheckPermission 权限码并集必须恰好等于三值集合
++ *     （iot:channel:list + iot:credential:edit + iot:credential:view）；</li>
++ * <li>双向核对：控制器三码全部被 SQL 登记（iot:channel:list 在 0018 脚本——跨脚本并集核对），
++ *     4051-4052 两行全部挂端点（无死行）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotCredentialMenuPermissionGuardTest {
++
++    /** 两行菜单种子的预期映射（id → perms），与升级脚本 4051-4052 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4051L, "iot:credential:edit",
++            4052L, "iot:credential:view");
++
++    /** 凭据管理面控制器预期权限码并集（§3.1 续 p23：list 复用 channel:list，edit/view 单设） */
++    private static final Set<String> EXPECTED_CONTROLLER_PERMS = Set.of(
++            "iot:channel:list", "iot:credential:edit", "iot:credential:view");
++
++    /** 本任务升级脚本路径 */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_credential_domain.sql";
++
++    /** 0018 通道域脚本（iot:channel:list 的登记处——跨脚本并集核对用） */
++    private static final String CHANNEL_SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_channel_domain.sql";
++
++    /** 菜单种子行形如 (4051, 4013, 4, '凭据写入', 3, NULL, NULL, NULL, 'iot:credential:edit', ...) */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[4-5]\\d),\\s*4013,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的凭据菜单行恰好等于预期两值映射（4051-4052，parent 4013）")
++    void scriptRegistersExactlyTheTwoMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript(SCRIPT_RELATIVE));
++        Map<Long, String> actualFiltered = new LinkedHashMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4051-4052 两行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 凭据管理面控制器权限码并集恰好等于三值集合（list 复用 + edit/view 单设）")
++    void controllerPermissionsAreExactlyTheThreePerms() {
++        Set<String> annotated = collectControllerPerms();
++        assertEquals(EXPECTED_CONTROLLER_PERMS, annotated,
++                "凭据管理面 @SaCheckPermission 权限码并集必须恰好等于三值集合（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向核对 - 控制器三码全部被 SQL 登记（跨脚本并集），4051-4052 全部挂端点（无死行）")
++    void controllerPermsAllRegisteredInSql() throws Exception {
++        Set<String> fromSql = new TreeSet<>();
++        fromSql.addAll(parseMenuRows(readScript(SCRIPT_RELATIVE)).values());
++        fromSql.addAll(parseMenuRows(readScript(CHANNEL_SCRIPT_RELATIVE)).values());
++
++        Set<String> fromCode = collectControllerPerms();
++        assertTrue(fromSql.containsAll(fromCode),
++                "管理面权限码必须全部在 sys_menu SQL 登记（BUG-0046 口径，iot:channel:list 在 0018 脚本）——否则任何角色（含超管）都无法持有");
++        for (String expected : EXPECTED_MENU_ROWS.values()) {
++            assertTrue(fromCode.contains(expected),
++                    "凭据域种子权限码 " + expected + " 必须挂端点（无死行）");
++        }
++    }
++
++    /** 收集凭据管理面控制器的全部 @SaCheckPermission 权限码（方法级 + 类级） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = IotCredentialController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（通道管理页 4013 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript(String relative) throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(relative);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialControllerTest.java
+new file mode 100644
+index 0000000..b7113b3
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialControllerTest.java
+@@ -0,0 +1,261 @@
++package net.otlab.admin.module.iot.credential.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.credential.dto.CredentialItemVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 凭据控制器测试（TASK-0019 接口层，管理面四接口）
++ *
++ * <p>standalone MockMvc + Mockito（照 IotChannelControllerTest 范式），权限/操作日志注解以
++ * 反射断言，路由与参数校验走真实 MockMvc 请求。接口契约照详细设计 §3.1 续 p23：
++ * list（iot:channel:list——按通道查，只回掩码）/ 写入轮换（iot:credential:edit——saveParam=false
++ * 入参含明文不落审计参数列）/ view（iot:credential:view——saveResponse=false 响应含明文不落
++ * 审计响应列）/ 吊销（iot:credential:edit——status 置禁用立即生效）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotCredentialControllerTest {
++
++    private static final String PLAINTEXT = "mqtt-secret-abcd1234";
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotCredentialService credentialService;
++
++    private IotCredentialController credentialController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        credentialController = new IotCredentialController();
++        ReflectionTestUtils.setField(credentialController, "credentialService", credentialService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(credentialController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private CredentialItemVO maskItem() {
++        CredentialItemVO vo = new CredentialItemVO();
++        vo.setId(200L);
++        vo.setChannelId(100L);
++        vo.setCredType("MQTT_PASSWORD");
++        vo.setCredentialMask("mqtt****1234");
++        vo.setKeyVersion("1");
++        vo.setStatus(1);
++        return vo;
++    }
++
++    private String writeBody() {
++        return "{\"channelId\":100,\"credType\":\"MQTT_PASSWORD\",\"credential\":\"" + PLAINTEXT + "\"}";
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 四端点 @SaCheckPermission 符合 §3.1 续 p23 契约（list→channel:list；"
++            + "write/revoke→credential:edit；view→credential:view 单设权限）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:channel:list", IotCredentialController.class
++                .getMethod("list", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:credential:edit", IotCredentialController.class
++                .getMethod("write", CredentialWriteForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:credential:view", IotCredentialController.class
++                .getMethod("view", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:credential:edit", IotCredentialController.class
++                .getMethod("revoke", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    // ---------- 操作日志注解（审计契约：四动作全审计 + 明文出口两侧不落列） ----------
++
++    @Test
++    @DisplayName("操作日志注解 - 四动作全部 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method list = IotCredentialController.class.getMethod("list", Long.class);
++        Method write = IotCredentialController.class.getMethod("write", CredentialWriteForm.class);
++        Method view = IotCredentialController.class.getMethod("view", Long.class);
++        Method revoke = IotCredentialController.class.getMethod("revoke", Long.class);
++        // 列表非四动作之一（brief：写入/轮换/查看/吊销四动作全审计），不强制挂注解
++        // 写入轮换 INSERT、查看 OTHER（读取语义）、吊销 UPDATE（status 置禁用，非物理删除）
++        assertEquals(BusinessType.INSERT, write.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.OTHER, view.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, revoke.getAnnotation(OperateLog.class).businessType());
++        assertNotNull(write.getAnnotation(OperateLog.class));
++        assertNotNull(view.getAnnotation(OperateLog.class));
++        assertNotNull(revoke.getAnnotation(OperateLog.class));
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 写入 saveParam=false（入参含明文，参数列不落库）；"
++            + "查看 saveResponse=false（响应含明文，响应列不落库）——审计无明文的注解级保证")
++    void testOperateLogSensitiveFlags() throws Exception {
++        OperateLog write = IotCredentialController.class
++                .getMethod("write", CredentialWriteForm.class).getAnnotation(OperateLog.class);
++        assertFalse(write.saveParam(), "写入入参含凭据明文——saveParam 必须 false（明文不进 sys_operate_log.param）");
++        OperateLog view = IotCredentialController.class
++                .getMethod("view", Long.class).getAnnotation(OperateLog.class);
++        assertFalse(view.saveResponse(), "查看响应含凭据明文——saveResponse 必须 false（明文不进 sys_operate_log.response）");
++        OperateLog revoke = IotCredentialController.class
++                .getMethod("revoke", Long.class).getAnnotation(OperateLog.class);
++        assertTrue(revoke.saveParam() && revoke.saveResponse(), "吊销入参/响应均无敏感面，默认全落");
++    }
++
++    // ---------- 路由（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("列表 - GET /iot/channel/credential/list?channelId= 返回掩码项；响应不含 ciphertext/credential 字段")
++    void testList_Success() throws Exception {
++        when(credentialService.listByChannel(100L)).thenReturn(List.of(maskItem()));
++
++        mockMvc.perform(get("/iot/channel/credential/list").param("channelId", "100"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data[0].credType").value("MQTT_PASSWORD"))
++                .andExpect(jsonPath("$.data[0].credentialMask").value("mqtt****1234"))
++                .andExpect(jsonPath("$.data[0].keyVersion").value("1"))
++                .andExpect(jsonPath("$.data[0].ciphertext").doesNotExist())
++                .andExpect(jsonPath("$.data[0].credential").doesNotExist());
++    }
++
++    @Test
++    @DisplayName("列表 - channelId 缺失 → 400（按通道查口径）")
++    void testList_ChannelIdRequired() throws Exception {
++        mockMvc.perform(get("/iot/channel/credential/list"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        verify(credentialService, never()).listByChannel(any());
++    }
++
++    @Test
++    @DisplayName("写入 - POST /iot/channel/credential 正常返回 200（服务层加密落库）")
++    void testWrite_Success() throws Exception {
++        when(credentialService.writeCredential(any(CredentialWriteForm.class))).thenReturn(true);
++
++        mockMvc.perform(post("/iot/channel/credential")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(writeBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(credentialService).writeCredential(any(CredentialWriteForm.class));
++    }
++
++    @Test
++    @DisplayName("写入 - 参数校验：channelId/credType/credential 缺失返回业务码 400，服务不被触达")
++    void testWrite_BeanValidation() throws Exception {
++        mockMvc.perform(post("/iot/channel/credential")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"credType\":\"MQTT_PASSWORD\",\"credential\":\"x\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        mockMvc.perform(post("/iot/channel/credential")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"channelId\":100,\"credential\":\"x\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        mockMvc.perform(post("/iot/channel/credential")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"channelId\":100,\"credType\":\"MQTT_PASSWORD\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        verify(credentialService, never()).writeCredential(any(CredentialWriteForm.class));
++    }
++
++    @Test
++    @DisplayName("写入 - 服务层异常透传（fail-closed 拒存文案原样返回）")
++    void testWrite_ServiceErrorPassthrough() throws Exception {
++        when(credentialService.writeCredential(any(CredentialWriteForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "凭据加密失败，拒绝保存（fail-closed）"));
++
++        mockMvc.perform(post("/iot/channel/credential")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(writeBody()))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("凭据加密失败，拒绝保存（fail-closed）"));
++    }
++
++    @Test
++    @DisplayName("查看 - GET /iot/channel/credential/view/{id} 解密返回明文（唯一明文出口）")
++    void testView_Success() throws Exception {
++        CredentialViewVO vo = new CredentialViewVO();
++        vo.setId(200L);
++        vo.setChannelId(100L);
++        vo.setCredType("MQTT_PASSWORD");
++        vo.setCredential(PLAINTEXT);
++        vo.setKeyVersion("1");
++        vo.setStatus(1);
++        when(credentialService.viewCredential(200L)).thenReturn(vo);
++
++        mockMvc.perform(get("/iot/channel/credential/view/{id}", 200L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.credential").value(PLAINTEXT))
++                .andExpect(jsonPath("$.data.credType").value("MQTT_PASSWORD"));
++        verify(credentialService).viewCredential(200L);
++    }
++
++    @Test
++    @DisplayName("吊销 - DELETE /iot/channel/credential/{id} 透传服务层（status 置禁用立即生效）")
++    void testRevoke_Success() throws Exception {
++        when(credentialService.revokeCredential(200L)).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/channel/credential/{id}", 200L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(credentialService).revokeCredential(200L);
++    }
++
++    @Test
++    @DisplayName("吊销 - 服务层拒绝透传（凭据不存在）")
++    void testRevoke_MissingPassthrough() throws Exception {
++        when(credentialService.revokeCredential(200L))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "凭据不存在或已删除"));
++
++        mockMvc.perform(delete("/iot/channel/credential/{id}", 200L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("凭据不存在或已删除"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalControllerTest.java
+new file mode 100644
+index 0000000..943d775
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/controller/IotCredentialInternalControllerTest.java
+@@ -0,0 +1,165 @@
++package net.otlab.admin.module.iot.credential.controller;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.credential.dto.CredentialPullVO;
++import net.otlab.admin.module.iot.credential.service.IotCredentialService;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthInterceptor;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.security.SmDataCrypto;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 凭据内部拉取控制器测试（TASK-0019，GET /internal/v1/credential/pull）
++ *
++ * <p>核心契约（详细设计 §3.1 续 p23 / REQ-0011 / ADR-0006 + brief）：无 Sa-Token（@Anonymous
++ * 跳过管理面登录，照 0017 内部模式）但 InternalAuthChecker 双调用断言（拦截器层 + 控制器层
++ * 同一实现）；返回密文与 key_version（调用方内存解密——服务端不解密传输）；凭据缺失/吊销/
++ * 通道禁用 → 403 透传；无 @OperateLog（内部高频链路，照 0017 心跳口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotCredentialInternalControllerTest {
++
++    private static final String PULL_URL = "/internal/v1/credential/pull";
++
++    @Mock
++    private IotCredentialService credentialService;
++
++    @Mock
++    private InternalAuthChecker internalAuthChecker;
++
++    private IotCredentialInternalController internalController;
++
++    private MockMvc mockMvc;
++
++    @BeforeAll
++    static void initCrypto() {
++        // SmDataCrypto 惰性初始化守卫（VO 不做加解密，此处仅为防其他用例静态态残留的防御）
++        SmDataCrypto.init("1234567890abcdef");
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        internalController = new IotCredentialInternalController();
++        ReflectionTestUtils.setField(internalController, "credentialService", credentialService);
++        ReflectionTestUtils.setField(internalController, "internalAuthChecker", internalAuthChecker);
++        // 拦截器层接线（与 GatewayInternalAuthConfig 同构）：checker 先于控制器执行
++        mockMvc = MockMvcBuilders.standaloneSetup(internalController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .addInterceptors(new InternalAuthInterceptor(internalAuthChecker))
++                .build();
++    }
++
++    private CredentialPullVO pullVO() {
++        CredentialPullVO vo = new CredentialPullVO();
++        vo.setChannelId(100L);
++        vo.setCredType("MQTT_PASSWORD");
++        vo.setCiphertext("{v1}AAECAwQFBgcICQ==:AAECAwQFBgcICQ==");
++        vo.setKeyVersion("3");
++        return vo;
++    }
++
++    // ---------- 注解与路由契约 ----------
++
++    @Test
++    @DisplayName("注解契约 - @Anonymous 跳过管理面登录；无 @SaCheckPermission；无 @OperateLog；GET /pull")
++    void testAnnotationContract() throws Exception {
++        Method pull = IotCredentialInternalController.class
++                .getMethod("pull", jakarta.servlet.http.HttpServletRequest.class, Long.class, String.class);
++        assertNotNull(pull.getAnnotation(Anonymous.class), "内部接口须 @Anonymous 跳过 Sa-Token 登录校验");
++        assertEquals(null, pull.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "内部接口不得挂管理面权限注解（准入=InternalAuthChecker 静态令牌）");
++        assertNull(pull.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "内部拉取不写操作日志（高频运行链路，照 0017 心跳口径）");
++        assertEquals("/pull", pull.getAnnotation(org.springframework.web.bind.annotation.GetMapping.class).value()[0],
++                "路由 GET /internal/v1/credential/pull");
++    }
++
++    // ---------- 认证接线 ----------
++
++    @Test
++    @DisplayName("内部认证 - InternalAuthChecker 双调用（拦截器层 + 控制器层纵深防御，照 0017 范式）")
++    void testPull_InvokesAuthCheckerTwice() throws Exception {
++        when(credentialService.pullCredential(100L, "MQTT_PASSWORD")).thenReturn(pullVO());
++
++        mockMvc.perform(get(PULL_URL).param("channelId", "100").param("credType", "MQTT_PASSWORD"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.ciphertext").value("{v1}AAECAwQFBgcICQ==:AAECAwQFBgcICQ=="))
++                .andExpect(jsonPath("$.data.keyVersion").value("3"))
++                .andExpect(jsonPath("$.data.credential").doesNotExist());
++
++        verify(internalAuthChecker, times(2)).check(any());
++    }
++
++    @Test
++    @DisplayName("内部认证 - 令牌无效（401）时服务层不被触达")
++    void testPull_TokenRejectedBeforeService() throws Exception {
++        Mockito_doThrowUnauthorized();
++
++        mockMvc.perform(get(PULL_URL).param("channelId", "100").param("credType", "MQTT_PASSWORD"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.UNAUTHORIZED.getCode()));
++
++        verify(credentialService, never()).pullCredential(any(), any());
++    }
++
++    private void Mockito_doThrowUnauthorized() {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效"))
++                .when(internalAuthChecker).check(any());
++    }
++
++    // ---------- 参数与服务透传 ----------
++
++    @Test
++    @DisplayName("参数校验 - channelId/credType 缺失 → 400，服务层不被触达")
++    void testPull_ParamRequired() throws Exception {
++        mockMvc.perform(get(PULL_URL).param("credType", "MQTT_PASSWORD"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        mockMvc.perform(get(PULL_URL).param("channelId", "100"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++        verify(credentialService, never()).pullCredential(any(), any());
++    }
++
++    @Test
++    @DisplayName("透传 - 凭据缺失/吊销/通道禁用 → 服务层 403 原样返回（吊销立即生效口径）")
++    void testPull_ForbiddenPassthrough() throws Exception {
++        when(credentialService.pullCredential(100L, "MQTT_PASSWORD"))
++                .thenThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "凭据不存在或已吊销"));
++
++        mockMvc.perform(get(PULL_URL).param("channelId", "100").param("credType", "MQTT_PASSWORD"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.FORBIDDEN.getCode()))
++                .andExpect(jsonPath("$.message").value("凭据不存在或已吊销"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java
+new file mode 100644
+index 0000000..be7e75a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java
+@@ -0,0 +1,469 @@
++package net.otlab.admin.module.iot.credential.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.credential.domain.CredentialMask;
++import net.otlab.admin.module.iot.credential.dto.CredentialItemVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialPullVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialViewVO;
++import net.otlab.admin.module.iot.credential.dto.CredentialWriteForm;
++import net.otlab.admin.module.iot.credential.entity.IotChannelCredential;
++import net.otlab.admin.module.iot.credential.mapper.IotChannelCredentialMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.security.SmDataCrypto;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 凭据服务单元测试（TASK-0019）
++ *
++ * <p>核心业务纪律（详细设计 §1.3A p8 / §3.1 续 p23 / REQ-0011 / ADR-0006 / brief）：
++ * SM4 {v1} 密文往返、明文 {v1} 前缀 fail-closed 拒存、写入=同 channel 同 cred_type 轮换
++ * （key_version 递增不新增行）、列表只回掩码永不回密文/明文、查看明文解密往返、吊销置
++ * status=0、内部拉取显式条件定位 + 启用校验 + 统一 403 拒绝（通道缺失/禁用、凭据缺失/
++ * 吊销、归属不一致均 403，不给探测面）。
++ *
++ * <p>standalone Mockito 范式（照 IotChannelServiceImplTest）：Mapper 全 mock 不触真实库；
++ * TenantContext 静态 mock 供会话租户取值；SmDataCrypto 以测试密钥真实加解密（往返断言）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotCredentialServiceImplTest {
++
++    private static final String TEST_KEY = "1234567890abcdef";
++    private static final String PLAINTEXT = "mqtt-secret-abcd1234";
++
++    @Mock
++    private IotChannelCredentialMapper baseMapper;
++
++    @Mock
++    private IotChannelMapper channelMapper;
++
++    private IotCredentialServiceImpl credentialService;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotChannelCredential.class);
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++        // 凭据加解密用测试密钥真实初始化（往返断言依赖真实 SM4；幂等 init）
++        SmDataCrypto.init(TEST_KEY);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        credentialService = new IotCredentialServiceImpl();
++        ReflectionTestUtils.setField(credentialService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(credentialService, "channelMapper", channelMapper);
++        // MP ServiceImpl 的 save/updateById 返回「受影响行数>0」——桩成功写入；
++        // getOne(wrapper) 经 selectList 实现（3.5.17 SqlHelper.getObject(list)），凭据定位桩默认空
++        when(baseMapper.insert(any(IotChannelCredential.class))).thenReturn(1);
++        when(baseMapper.updateById(any(IotChannelCredential.class))).thenReturn(1);
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of());
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private CredentialWriteForm writeForm(Long channelId, String credType, String credential) {
++        CredentialWriteForm form = new CredentialWriteForm();
++        form.setChannelId(channelId);
++        form.setCredType(credType);
++        form.setCredential(credential);
++        return form;
++    }
++
++    private IotChannel existingChannel() {
++        IotChannel ch = new IotChannel();
++        ch.setId(100L);
++        ch.setTenantId(1L);
++        ch.setGatewayId(10L);
++        ch.setChannelCode("CH_MQTT_01");
++        ch.setProtocolType("MQTT");
++        ch.setStatus(1);
++        return ch;
++    }
++
++    private IotChannelCredential storedRow(String plaintext, String keyVersion, int status) {
++        IotChannelCredential row = new IotChannelCredential();
++        row.setId(200L);
++        row.setTenantId(1L);
++        row.setChannelId(100L);
++        row.setCredType("MQTT_PASSWORD");
++        row.setCiphertext(SmDataCrypto.encrypt(plaintext));
++        row.setKeyVersion(keyVersion);
++        row.setStatus(status);
++        return row;
++    }
++
++    private void stubExistingRow(IotChannelCredential row) {
++        when(baseMapper.selectOne(any(Wrapper.class))).thenReturn(row);
++    }
++
++    // ---------- SM4 工具往返（{v1} 前缀格式） ----------
++
++    @Test
++    @DisplayName("SM4 往返 - encrypt 产 {v1} 前缀密文且 decrypt 还原明文（随机 IV 两次密文不同）")
++    void testSm4Roundtrip() {
++        String cipher1 = SmDataCrypto.encrypt(PLAINTEXT);
++        String cipher2 = SmDataCrypto.encrypt(PLAINTEXT);
++        assertTrue(cipher1.startsWith("{v1}"), "密文必须带 {v1} 版本前缀");
++        assertTrue(cipher1.contains(":"), "{v1}<iv>:<cipher> 结构");
++        assertTrue(SmDataCrypto.isCiphertext(cipher1));
++        assertNotEquals(cipher1, cipher2, "随机 IV——同一明文两次加密密文不同");
++        assertEquals(PLAINTEXT, SmDataCrypto.decrypt(cipher1));
++    }
++
++    // ---------- 写入（新建） ----------
++
++    @Test
++    @DisplayName("写入 - 新建落库：{v1} 密文 + key_version=1 + status=1 + tenant_id 会话覆盖，不落明文")
++    void testWrite_NewRow() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++
++        assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++
++        ArgumentCaptor<IotChannelCredential> captor = ArgumentCaptor.forClass(IotChannelCredential.class);
++        verify(baseMapper).insert(captor.capture());
++        IotChannelCredential entity = captor.getValue();
++        assertEquals(100L, entity.getChannelId());
++        assertEquals("MQTT_PASSWORD", entity.getCredType());
++        assertEquals(1L, entity.getTenantId(), "tenant_id 服务层会话覆盖");
++        assertEquals("1", entity.getKeyVersion(), "首次写入 key_version=1");
++        assertEquals(1, entity.getStatus());
++        assertTrue(entity.getCiphertext().startsWith("{v1}"), "落库必须为 {v1} SM4 密文");
++        assertEquals(PLAINTEXT, SmDataCrypto.decrypt(entity.getCiphertext()), "密文可解密还原");
++        assertFalse(entity.getCiphertext().equals(PLAINTEXT), "明文绝不直接落库");
++    }
++
++    @Test
++    @DisplayName("写入 fail-closed - 明文恰以 {v1} 开头（encrypt 幂等原样返回）时拒绝保存，不落伪密文")
++    void testWrite_V1PrefixedPlaintextRejected() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        String sneaky = "{v1}not-actually-encrypted";
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", sneaky)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++        verify(baseMapper, never()).updateById(any(IotChannelCredential.class));
++    }
++
++    @Test
++    @DisplayName("写入 - 空明文/超长明文（>1000）拒绝")
++    void testWrite_BlankAndOverlongRejected() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", "  "))).getCode());
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", "x".repeat(1001)))).getCode());
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++    }
++
++    @Test
++    @DisplayName("写入 - cred_type 字典外值拒绝（DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT 四值）")
++    void testWrite_UnknownCredTypeRejected() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "PASSWORD", "x"))).getCode());
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++    }
++
++    @Test
++    @DisplayName("写入 - 所属通道不存在/已删除拒绝（归属校验）")
++    void testWrite_ChannelMissingRejected() {
++        when(channelMapper.selectById(100L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT))).getCode());
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++    }
++
++    // ---------- 轮换（同 channel 同 cred_type 更新，不新增行） ----------
++
++    @Test
++    @DisplayName("轮换 - 同通道同类型已有行：更新密文与 key_version 递增（1→2），不新增行，status 复活为 1")
++    void testWrite_RotateUpdatesExistingRow() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        stubExistingRow(storedRow("old-plain-secret-xyz", "1", 0));
++
++        assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++        ArgumentCaptor<IotChannelCredential> captor = ArgumentCaptor.forClass(IotChannelCredential.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotChannelCredential upd = captor.getValue();
++        assertEquals(200L, upd.getId(), "轮换只更新原行");
++        assertEquals("2", upd.getKeyVersion(), "key_version 递增 1→2");
++        assertEquals(1, upd.getStatus(), "重写凭据=重新启用（吊销后再次写入视为重新配发）");
++        assertTrue(upd.getCiphertext().startsWith("{v1}"));
++        assertEquals(PLAINTEXT, SmDataCrypto.decrypt(upd.getCiphertext()));
++        assertNull(upd.getTenantId(), "轮换不迁移 tenant_id（白名单更新：仅密文/版本/状态）");
++    }
++
++    @Test
++    @DisplayName("轮换 - key_version 递增口径：null/非数值回落 1，数值继续递增（2→3）")
++    void testKeyVersionIncrement() {
++        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion(null));
++        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion("  "));
++        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion("legacy"));
++        assertEquals("2", IotCredentialServiceImpl.nextKeyVersion("1"));
++        assertEquals("3", IotCredentialServiceImpl.nextKeyVersion("2"));
++    }
++
++    @Test
++    @DisplayName("轮换并发兜底 - 新建撞 uk_channel_cred_type（DuplicateKey）转轮换更新，不向调用方报错")
++    void testWrite_DuplicateKeyFallsBackToRotate() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        when(baseMapper.selectOne(any(Wrapper.class))).thenReturn(null, storedRow("old-plain-secret-xyz", "1", 1));
++        Mockito.doThrow(new DuplicateKeyException("uk_channel_cred_type"))
++                .when(baseMapper).insert(any(IotChannelCredential.class));
++
++        assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++
++        verify(baseMapper).insert(any(IotChannelCredential.class));
++        verify(baseMapper).updateById(any(IotChannelCredential.class));
++    }
++
++    // ---------- 列表（只回掩码，永不回密文/明文） ----------
++
++    @Test
++    @DisplayName("列表 - 只返回类型/掩码/key_version/状态；掩码=前四****后四；VO 结构无密文字段（反射结构断言）")
++    void testList_MaskOnly() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(
++                storedRow(PLAINTEXT, "1", 1)));
++
++        List<CredentialItemVO> items = credentialService.listByChannel(100L);
++        assertEquals(1, items.size());
++        CredentialItemVO item = items.get(0);
++        assertEquals(200L, item.getId());
++        assertEquals("MQTT_PASSWORD", item.getCredType());
++        assertEquals("1", item.getKeyVersion());
++        assertEquals(1, item.getStatus());
++        assertEquals(CredentialMask.mask(PLAINTEXT), item.getCredentialMask(),
++                "掩码必须取自明文前四后四口径");
++        assertEquals("mqtt****1234", item.getCredentialMask(), "掩码格式 abcd****wxyz");
++
++        // grep 级结构断言：VO 类字段集合中不存在密文/明文承载体（ciphertext/credential/plain）
++        List<String> fieldNames = java.util.Arrays.stream(CredentialItemVO.class.getDeclaredFields())
++                .map(java.lang.reflect.Field::getName).toList();
++        for (String banned : List.of("ciphertext", "credential", "plaintext", "cipher")) {
++            assertFalse(fieldNames.contains(banned), "列表 VO 不得携带 " + banned + " 字段: " + fieldNames);
++        }
++        String voText = item.toString();
++        assertFalse(voText.contains(PLAINTEXT), "列表响应不得含明文");
++        assertFalse(voText.startsWith("{v1}") || voText.contains("ciphertext="), "列表响应不得含密文");
++    }
++
++    @Test
++    @DisplayName("列表 - 掩码口径边界：<8 纯占位、8-11 首四+占位（尾段隐藏≥4）、≥12 前四****后四（中段隐藏≥4）")
++    void testMaskBoundaries() {
++        assertEquals("****", CredentialMask.mask(null));
++        assertEquals("****", CredentialMask.mask(""));
++        assertEquals("****", CredentialMask.mask("abc"));
++        assertEquals("****", CredentialMask.mask("abcd123"), "7 字符短凭据全遮——隐藏段不足 4 字符不露");
++        assertEquals("abcd****", CredentialMask.mask("abcd1234"), "8 字符露首四，尾段 4 字符隐藏");
++        assertEquals("abcd****", CredentialMask.mask("abcdefghij"), "10 字符只露首四");
++        assertEquals("abcd****wxyz", CredentialMask.mask("abcdefghijklmnopqrstuvwxyz0123456789wxyz"));
++        assertEquals("abcd****wxyz", CredentialMask.mask("abcdZZZZZZZZwxyz"));
++    }
++
++    @Test
++    @DisplayName("列表 - 密文解密失败（密钥不匹配/损坏）时掩码退化为纯占位，列表不崩、不泄底")
++    void testList_DecryptFailureDegradesToFullMask() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        IotChannelCredential corrupt = storedRow(PLAINTEXT, "1", 1);
++        corrupt.setCiphertext("{v1}not-base64!!:not-base64!!");
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(corrupt));
++
++        List<CredentialItemVO> items = credentialService.listByChannel(100L);
++        assertEquals("****", items.get(0).getCredentialMask());
++    }
++
++    @Test
++    @DisplayName("列表 - channelId 缺失/通道不存在拒绝（归属校验，按通道查口径）")
++    void testList_ChannelRequired() {
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.listByChannel(null)).getCode());
++        when(channelMapper.selectById(100L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.listByChannel(100L)).getCode());
++    }
++
++    // ---------- 查看明文（解密展示） ----------
++
++    @Test
++    @DisplayName("查看 - SM4 解密返回明文（与落库密文解密一致）")
++    void testView_DecryptsPlaintext() {
++        when(baseMapper.selectById(200L)).thenReturn(storedRow(PLAINTEXT, "1", 1));
++
++        CredentialViewVO vo = credentialService.viewCredential(200L);
++        assertEquals(200L, vo.getId());
++        assertEquals(100L, vo.getChannelId());
++        assertEquals("MQTT_PASSWORD", vo.getCredType());
++        assertEquals("1", vo.getKeyVersion());
++        assertEquals(1, vo.getStatus());
++        assertEquals(PLAINTEXT, vo.getCredential(), "view 必须解密返回明文（唯一可读明文出口）");
++    }
++
++    @Test
++    @DisplayName("查看 - 凭据不存在/已删除拒绝")
++    void testView_MissingRejected() {
++        when(baseMapper.selectById(200L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.viewCredential(200L)).getCode());
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.viewCredential(null)).getCode());
++    }
++
++    // ---------- 吊销（status 置禁用，立即生效） ----------
++
++    @Test
++    @DisplayName("吊销 - status 置 0（字段白名单更新：不触密文/租户/类型），对已吊销行幂等")
++    void testRevoke() {
++        when(baseMapper.selectById(200L)).thenReturn(storedRow(PLAINTEXT, "1", 1));
++
++        assertTrue(credentialService.revokeCredential(200L));
++
++        ArgumentCaptor<IotChannelCredential> captor = ArgumentCaptor.forClass(IotChannelCredential.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotChannelCredential upd = captor.getValue();
++        assertEquals(200L, upd.getId());
++        assertEquals(0, upd.getStatus());
++        assertNull(upd.getCiphertext(), "吊销不得改密文");
++        assertNull(upd.getCredType(), "吊销不得改类型");
++        assertNull(upd.getTenantId(), "吊销不得迁移租户");
++    }
++
++    @Test
++    @DisplayName("吊销 - 凭据不存在拒绝")
++    void testRevoke_MissingRejected() {
++        when(baseMapper.selectById(200L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.revokeCredential(200L)).getCode());
++    }
++
++    // ---------- 内部拉取（无会话显式条件；统一 403 拒绝） ----------
++
++    @Test
++    @DisplayName("拉取 - 启用凭据返回密文与 key_version（服务端不解密传输）")
++    void testPull_Success() {
++        IotChannelCredential row = storedRow(PLAINTEXT, "3", 1);
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        stubExistingRow(row);
++
++        CredentialPullVO vo = credentialService.pullCredential(100L, "MQTT_PASSWORD");
++        assertEquals(100L, vo.getChannelId());
++        assertEquals("MQTT_PASSWORD", vo.getCredType());
++        assertEquals(row.getCiphertext(), vo.getCiphertext(), "拉取返回库内密文原文");
++        assertEquals("3", vo.getKeyVersion());
++        List<String> fieldNames = java.util.Arrays.stream(CredentialPullVO.class.getDeclaredFields())
++                .map(java.lang.reflect.Field::getName).toList();
++        assertFalse(fieldNames.contains("credential"), "拉取 VO 不设明文字段（调用方内存解密）");
++    }
++
++    @Test
++    @DisplayName("拉取 - 通道不存在/已删除 → 403")
++    void testPull_ChannelMissingForbidden() {
++        when(channelMapper.selectById(100L)).thenReturn(null);
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "MQTT_PASSWORD"));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("拉取 - 通道禁用 → 403（REQ-0011 验收 5）")
++    void testPull_ChannelDisabledForbidden() {
++        IotChannel disabled = existingChannel();
++        disabled.setStatus(0);
++        when(channelMapper.selectById(100L)).thenReturn(disabled);
++        assertEquals(ResultCode.FORBIDDEN.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "MQTT_PASSWORD")).getCode());
++        verify(baseMapper, never()).selectList(any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("拉取 - 凭据不存在/未知 credType → 403（统一拒绝，不给类型枚举探测面）")
++    void testPull_CredentialMissingForbidden() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        assertEquals(ResultCode.FORBIDDEN.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "MQTT_PASSWORD")).getCode());
++        assertEquals(ResultCode.FORBIDDEN.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "NOT_A_TYPE")).getCode());
++    }
++
++    @Test
++    @DisplayName("拉取 - 凭据已吊销（status=0）→ 403（吊销立即生效）")
++    void testPull_RevokedForbidden() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        stubExistingRow(storedRow(PLAINTEXT, "1", 0));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "MQTT_PASSWORD")).getCode());
++    }
++
++    @Test
++    @DisplayName("拉取 - 凭据与通道租户不一致（防御断言）→ 403")
++    void testPull_TenantMismatchForbidden() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        IotChannelCredential foreign = storedRow(PLAINTEXT, "1", 1);
++        foreign.setTenantId(999L);
++        stubExistingRow(foreign);
++        assertEquals(ResultCode.FORBIDDEN.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, "MQTT_PASSWORD")).getCode());
++    }
++
++    @Test
++    @DisplayName("拉取 - channelId/credType 缺失 → 400 参数错误（令牌校验在认证器层）")
++    void testPull_ParamRequired() {
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(null, "MQTT_PASSWORD")).getCode());
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), assertThrows(BusinessException.class,
++                () -> credentialService.pullCredential(100L, " ")).getCode());
++        verify(channelMapper, never()).selectById(anyLong());
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_iot_credential_domain.sql b/resources/sql/upgrade/20261122_iot_credential_domain.sql
+new file mode 100644
+index 0000000..6974c6f
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_credential_domain.sql
+@@ -0,0 +1,104 @@
++-- ============================================================
++-- 存量库升级脚本：iot_channel_credential 通道凭据表 + 凭据管理按钮权限种子（TASK-0019 / FEAT-0006 / REQ-0011 / ADR-0006）
++--
++-- 用途：
++--   1) 建 iot_channel_credential 通道凭据表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1
++--      附录 A p35，pypdf 提取核对；字形规范化不改语义）；
++--   2) sys_menu 登记凭据管理按钮权限两行（menu_type=3，挂 4013「通道管理」页下）：
++--      iot:credential:edit（4051 写入/轮换/吊销）与 iot:credential:view（4052 查看明文，
++--      单设权限——ADR-0006「能配通道的人」与「能看凭据的人」分权先例）；凭据列表按
++--      §3.1 续复用 iot:channel:list（4046，20261122_iot_channel_domain.sql 已登记），
++--      本脚本不重复登记；
++--   3) sys_role_menu 将上述两行授予超级管理员（role_id=1；照 20261122_iot_gateway_domain.sql
++--      / 20261122_iot_channel_domain.sql 范式）。
++--
++-- 与上游差异（无）：附录 A p35 逐字 DDL 的两处索引（uk_channel_cred_type / idx_tenant_channel）
++--   在 MySQL 8 InnoDB 键长均可行（bigint+varchar(32) utf8mb4 = 8+128 字节），无需前缀降级，
++--   头注如实登记「无差异」。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 续 p23 + 本任务 brief）：
++--   iot:credential:edit  POST   /iot/channel/credential（写入/轮换凭据：明文只走 HTTPS 入参，
++--                                 服务端 SM4 加密落 {v1} 密文；同 channel 同 cred_type 重复
++--                                 写入=轮换 key_version 递增不新增行；加密失败 fail-closed）
++--                        DELETE /iot/channel/credential/{id}（吊销：status 置禁用，立即生效
++--                                 ——内部拉取接口随即 403；非物理删除）
++--   iot:credential:view  GET    /iot/channel/credential/view/{id}（查看明文：SM4 解密展示，
++--                                 单设权限——无此权限角色不可见入口且直调 403（越权留痕走
++--                                 PermissionDeniedAuditListener 既有链路）；审计响应列不落库）
++--   iot:channel:list     GET    /iot/channel/credential/list?channelId=（凭据列表：只返回类型/
++--                                 掩码/key_version/状态，永不返回密文——4046 已登记，不重复）
++--   （守卫：backend IotCredentialMenuPermissionGuardTest 强制 SQL 4051-4052 与控制器注解
++--   双向核对；SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4041-4045：TASK-0017 占用（网关按钮五行）；
++--   sys_menu id 4046-4050：TASK-0018 占用（通道按钮五行）；
++--   本脚本占用 sys_menu id 4051-4052（凭据按钮两行，parent_id=4013），连续取号。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.3A p8 / §3.1 续 p23 / REQ-0011 / ADR-0006）：
++--   密钥不入库：SM4 密钥由环境变量提供（ot.crypto.data-key，与 sys_user 敏感字段同一
++--   加密口径 {v1} 前缀），数据库、配置快照、代码仓库均不得出现密钥明文；key_version
++--   只标识版本（一期单密钥部署下按写入/轮换代次递增——brief 裁决；多密钥并行选钥为
++--   密钥服务替换位预留），不含密钥材料。
++--   凭据不进配置快照：不写入 iot_config_version 快照体，也不出现在 config.changed 通知
++--   载荷中（ADR-0006；快照里通道只带「是否有凭据、凭据类型」标记——快照链路 0024 交付
++--   时排除项，本期登记口径）。
++--   uk_channel_cred_type 为 (channel_id, cred_type) 物理唯一索引：一条通道一类凭据一行，
++--   重复写入=轮换（更新密文与 key_version 递增），不新增行；吊销=status 置 0（立即生效），
++--   非物理删除、不软删（行保留审计）。
++--   多租户：iot_channel_credential 属 iot_ 前缀表，由 TASK-0002 TenantLineInnerInterceptor
++--   （OtTenantLineHandler 前缀规则）自动按会话租户注入条件；内部拉取链路（无会话）插件
++--   跳过注入，服务层显式条件定位 + 租户一致断言（0017 心跳同口径）。
++--   内部拉取：GET /internal/v1/credential/pull（无 Sa-Token——InternalAuthChecker 静态令牌
++--   即准入，TASK-0019 完整化接线统一覆盖 /internal/v1/**）；网关设备令牌链（校验令牌归属
++--   通道）归 TASK-0020/0027，遗留登记。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4013 在位）与 20261122_iot_channel_domain.sql（通道表在位——channel_id 外键语义）的
++--   存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_channel_credential` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '凭据 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `channel_id` bigint NOT NULL COMMENT '所属通道 ID',
++  `cred_type` varchar(32) NOT NULL COMMENT '凭据类型',
++  `ciphertext` varchar(2000) NOT NULL COMMENT 'SM4 密文（{v1} 前缀）',
++  `key_version` varchar(16) DEFAULT NULL COMMENT '密钥版本',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_channel_cred_type` (`channel_id`,`cred_type`),
++  KEY `idx_tenant_channel` (`tenant_id`,`channel_id`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='通道凭据表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4051, 4013, 4, '凭据写入', 3, NULL, NULL, NULL, 'iot:credential:edit', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4052, 4013, 4, '凭据查看', 3, NULL, NULL, NULL, 'iot:credential:view', NULL, 7, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4051), (1, 4052);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构、第二条应 2 行、第三条应 2 行）：
++--   SHOW CREATE TABLE iot_channel_credential;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4051 AND 4052;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4051 AND 4052;
++-- ============================================================

@@ -1,0 +1,2978 @@
+commit d74d56f73b7b80a72ce304a6bb6432319316cb40
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 18:21:30 2026 +0800
+
+    feat(iot): 状态规则配置接口与校验 + 状态编码稳定字典——iot_status_rule 七端点（list/add/edit/binding-map/remove）+ iot_status_dict 只增不删三端点（list/add/disable，seq=max+1 禁用不复用）+ Expander 同口径条件表达式校验（SELF 引用存在性 4001）+ priority uk 双道闸 4002 + 规则条数上限 10 条 + 直绑映射 binding_map 随规则行（TASK-0048）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusDictController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusDictController.java
+new file mode 100644
+index 0000000..5f8abbd
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusDictController.java
+@@ -0,0 +1,74 @@
++package net.otlab.admin.module.iot.statusrule.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusDictCreateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import net.otlab.admin.module.iot.statusrule.service.IotStatusDictService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 状态字典控制器（TASK-0048，TD-0013 状态编码稳定字典——只增不删；模板管理页 4009 之下
++ * 按钮权限行 4067-4069）
++ *
++ * <p>接口面三端点（list/add/disable）——<b>无删除接口、无编辑（名称修正）接口、无恢复
++ * 启用接口</b>：只增不删纪律（TD-0013「禁用不复用序号、历史 st_item_value 序号不漂移」），
++ * 名称修正属语义变更须评估漂移，本期不开放（报告登记）。seq 由服务层取本租户 max(seq)+1
++ * （含禁用行），请求不携带也不信任。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "状态字典")
++@RestController
++@RequestMapping("/iot/statusdict")
++public class IotStatusDictController {
++
++    @Autowired
++    private IotStatusDictService statusDictService;
++
++    @Operation(summary = "状态字典分页列表（seq 升序——稳定序号锚定排序；过滤 statusCode/"
++            + "statusName/status）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:statusdict:list")
++    public Result<Page<IotStatusDict>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                            @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                            IotStatusDict query) {
++        return Result.success(statusDictService.selectDictList(pageNum, pageSize, query));
++    }
++
++    @OperateLog(title = "状态字典", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增状态编码（只增：seq 服务层取本租户 max(seq)+1——禁用行序号"
++            + "不复用，uk_tenant_seq 物理唯一保漂移不可能；status_code 租户内唯一双道闸 4002；"
++            + "新增即启用，禁用走独立 disable 且一次性）")
++    @PostMapping
++    @SaCheckPermission("iot:statusdict:add")
++    public Result<Void> add(@Valid @RequestBody IotStatusDictCreateForm form) {
++        statusDictService.createDict(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "状态字典", businessType = BusinessType.UPDATE)
++    @Operation(summary = "禁用状态编码（一次性——无恢复接口；不触碰 seq——禁用不复用序号"
++            + "（TD-0013）；已禁用重复禁用为幂等 no-op；无删除/无名称编辑接口——只增不删纪律）")
++    @PutMapping("/{id}/disable")
++    @SaCheckPermission("iot:statusdict:disable")
++    public Result<Void> disable(@PathVariable("id") Long id) {
++        statusDictService.disableDict(id);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusRuleController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusRuleController.java
+new file mode 100644
+index 0000000..96de39d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/controller/IotStatusRuleController.java
+@@ -0,0 +1,108 @@
++package net.otlab.admin.module.iot.statusrule.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleBindingMapForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleCreateForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleUpdateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import net.otlab.admin.module.iot.statusrule.service.IotStatusRuleService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.List;
++
++/**
++ * 状态规则控制器（TASK-0048，管理面——规则挂模板，模板管理页 4009 之下按钮权限行
++ * 4063-4066；FEAT-0016 模板状态规则集配置——TASK-0056 占位按钮对应此域）
++ *
++ * <p>路径命名空间 /iot/statusrule（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
++ * iot:statusrule:*（sys_menu 4063-4066，parent_id=4009）。brief 接口面五端点（list/add/
++ * edit/binding-map/remove）：无 detail 端点（规则集按模板整读——list 承载；4063 仅 list
++ * 一码，无 query 码）；binding-map 与 edit 共用 iot:statusrule:edit（直绑映射是规则配置的
++ * 一部分——TD-0014）。
++ *
++ * <p>启停由 edit 承载 enabled 0/1（brief 口径，无独立启停端点）；template_id/priority
++ * 不可改（调优先级=删旧建新）；保存≠生效——规则随配置发布下发计算引擎（0024 发布链，
++ * 照 0021/0023 口径登记）。规则条数上限 ≤10（同模板活跃数）；condition_expr 0013
++ * Expander 同口径语法校验 + SELF 相对引用存在性（4001）；status_code 字典锚定（TD-0013）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "状态规则")
++@RestController
++@RequestMapping("/iot/statusrule")
++public class IotStatusRuleController {
++
++    @Autowired
++    private IotStatusRuleService statusRuleService;
++
++    @Operation(summary = "按模板分页读状态规则集（priority 升序小者优先；模板存在同租户校验）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:statusrule:list")
++    public Result<Page<IotStatusRule>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                            @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                            @RequestParam("templateId") Long templateId) {
++        return Result.success(statusRuleService.selectRuleList(pageNum, pageSize, templateId));
++    }
++
++    @OperateLog(title = "状态规则", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增状态规则（单条：priority 同模板唯一双道闸 4002；规则条数上限 "
++            + "≤10——同模板活跃数 ≥10 拒；condition_expr Expander 同口径语法 + SELF 相对引用"
++            + "存在性（模板数据项，4001）；status_code 须为字典已登记且启用编码——未登记 4001 "
++            + "拒并提示先建状态编码）")
++    @PostMapping
++    @SaCheckPermission("iot:statusrule:add")
++    public Result<Void> add(@Valid @RequestBody IotStatusRuleCreateForm form) {
++        statusRuleService.createRule(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "状态规则", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改状态规则（白名单 conditionExpr/statusCode/statusName/color/"
++            + "enabled——启停由编辑承载 enabled 0/1；template_id/priority 不可改——调优先级="
++            + "删旧建新；携带 conditionExpr/statusCode 时按新增同口径全量校验）")
++    @PutMapping
++    @SaCheckPermission("iot:statusrule:edit")
++    public Result<Void> edit(@Valid @RequestBody IotStatusRuleUpdateForm form) {
++        statusRuleService.updateRule(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "状态规则", businessType = BusinessType.UPDATE)
++    @Operation(summary = "直绑映射配置（TD-0014 挂模板随发布下发：ruleId+pointId+枚举值映射"
++            + "数组 [{enumValue,statusCode}]，整份 JSON 幂等覆盖规则行 binding_map 列；"
++            + "statusCode 校验字典存在启用；pointId 校验存在；权限复用 iot:statusrule:edit）")
++    @PutMapping("/binding-map")
++    @SaCheckPermission("iot:statusrule:edit")
++    public Result<Void> bindingMap(@Valid @RequestBody IotStatusRuleBindingMapForm form) {
++        statusRuleService.saveBindingMap(form);
++        return Result.success();
++    }
++
++    @OperateLog(title = "状态规则", businessType = BusinessType.DELETE)
++    @Operation(summary = "批量删除状态规则（逻辑删；fail-closed 任一不存在整批拒绝；优先级"
++            + "删除归档不复用——uk_template_priority 不含 deleted 列；调优先级=删旧建新的"
++            + "「删旧」即本原语）")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:statusrule:remove")
++    public Result<Void> remove(@PathVariable("ids") List<Long> ids) {
++        statusRuleService.deleteRules(ids);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusDictCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusDictCreateForm.java
+new file mode 100644
+index 0000000..3a233b6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusDictCreateForm.java
+@@ -0,0 +1,36 @@
++package net.otlab.admin.module.iot.statusrule.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 状态字典新增表单（TASK-0048，只增——无 status 字段：新增即启用落 1（DDL DEFAULT '1'
++ * 同值），禁用走独立 disable 接口且一次性；无编辑表单/无删除表单——只增不删纪律，
++ * 名称修正属语义变更须评估漂移，本期不开放）。
++ *
++ * <p>seq 由服务层取「本租户当前 max(seq)+1」（含禁用行——禁用不复用序号），请求不携带
++ * 也不信任 seq。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "状态字典新增表单（TASK-0048）")
++public class IotStatusDictCreateForm {
++
++    @NotBlank(message = "状态编码不能为空")
++    @Size(max = 32, message = "状态编码长度不能超过 32")
++    @Schema(description = "状态编码（租户内唯一，冲突 4002）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String statusCode;
++
++    @NotBlank(message = "状态名称不能为空")
++    @Size(max = 50, message = "状态名称长度不能超过 50")
++    @Schema(description = "状态名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String statusName;
++
++    @Size(max = 16, message = "展示颜色长度不能超过 16")
++    @Schema(description = "展示颜色（可空）")
++    private String color;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleBindingMapForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleBindingMapForm.java
+new file mode 100644
+index 0000000..f57e0cb
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleBindingMapForm.java
+@@ -0,0 +1,59 @@
++package net.otlab.admin.module.iot.statusrule.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.Valid;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotEmpty;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 直绑映射配置表单（TASK-0048，TD-0014 挂模板随发布下发；brief 裁决映射存规则行 binding_map）
++ *
++ * <p>body：ruleId + pointId + 枚举值映射数组 [{enumValue, statusCode}]——brief 原文仅列
++ * pointId + 映射数组；存储裁决为「随规则行」（iot_status_rule.binding_map 列）故补 ruleId
++ * 定位规则行（报告登记）。整份 JSON 幂等覆盖该规则行 binding_map（一条规则行承载一个
++ * 点位的枚举映射）。statusCode 逐项校验字典存在且启用；pointId 校验存在（4001 同款）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "直绑映射配置表单（TASK-0048，TD-0014）")
++public class IotStatusRuleBindingMapForm {
++
++    @NotNull(message = "规则ID不能为空")
++    @Schema(description = "规则ID（映射随该规则行存储）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long ruleId;
++
++    @NotNull(message = "点位ID不能为空")
++    @Schema(description = "点位ID（枚举值来源点位）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long pointId;
++
++    @NotEmpty(message = "枚举值映射数组不能为空")
++    @Valid
++    @Schema(description = "枚举值映射数组 [{enumValue, statusCode}]", requiredMode = Schema.RequiredMode.REQUIRED)
++    private List<EnumMapping> mappings;
++
++    /**
++     * 单条枚举值映射（点位枚举值 → 状态编码）。
++     */
++    @Data
++    @Schema(description = "单条枚举值映射")
++    public static class EnumMapping {
++
++        @NotBlank(message = "枚举值不能为空")
++        @Size(max = 64, message = "枚举值长度不能超过 64")
++        @Schema(description = "点位枚举值（如 0/1/2）", requiredMode = Schema.RequiredMode.REQUIRED)
++        private String enumValue;
++
++        @NotBlank(message = "状态编码不能为空")
++        @Size(max = 32, message = "状态编码长度不能超过 32")
++        @Schema(description = "映射目标状态编码（须为 iot_status_dict 已登记且启用编码）",
++                requiredMode = Schema.RequiredMode.REQUIRED)
++        private String statusCode;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleCreateForm.java
+new file mode 100644
+index 0000000..2a5b271
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleCreateForm.java
+@@ -0,0 +1,54 @@
++package net.otlab.admin.module.iot.statusrule.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 状态规则新增表单（TASK-0048，单条——brief 口径；批量场景无授权不开放）
++ *
++ * <p>templateId/priority 创建锚点（创建后均不可改——调优先级=删旧建新）；condition_expr
++ * 服务层做 Expander 同口径语法校验 + SELF 相对引用存在性（模板数据项，4001）；status_code
++ * 服务层校验字典存在且启用（未登记 4001 拒并提示先建状态编码）；enabled 未携带落 1（DDL
++ * DEFAULT '1' 同值）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "状态规则新增表单（TASK-0048）")
++public class IotStatusRuleCreateForm {
++
++    @NotNull(message = "所属模板不能为空")
++    @Schema(description = "所属模板ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long templateId;
++
++    @NotNull(message = "优先级不能为空")
++    @Schema(description = "优先级（小者优先；同模板唯一，冲突 4002）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer priority;
++
++    @NotBlank(message = "条件表达式不能为空")
++    @Size(max = 1000, message = "条件表达式长度不能超过 1000")
++    @Schema(description = "条件表达式（Aviator 相对引用，如 {SELF.ELEC} > 0 且 {SELF.RUN_STATE} == 1）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String conditionExpr;
++
++    @NotBlank(message = "状态编码不能为空")
++    @Size(max = 32, message = "状态编码长度不能超过 32")
++    @Schema(description = "状态编码（须为 iot_status_dict 已登记且启用编码）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String statusCode;
++
++    @NotBlank(message = "状态名称不能为空")
++    @Size(max = 50, message = "状态名称长度不能超过 50")
++    @Schema(description = "状态名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String statusName;
++
++    @Size(max = 16, message = "展示颜色长度不能超过 16")
++    @Schema(description = "展示颜色（可空）")
++    private String color;
++
++    @Schema(description = "是否启用 0 停用 1 启用（未携带落 1）")
++    private Integer enabled;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleUpdateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleUpdateForm.java
+new file mode 100644
+index 0000000..3bb91cc
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/dto/IotStatusRuleUpdateForm.java
+@@ -0,0 +1,45 @@
++package net.otlab.admin.module.iot.statusrule.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 状态规则修改表单（TASK-0048，字段白名单：conditionExpr/statusCode/statusName/color/enabled）
++ *
++ * <p><b>template_id / priority 不在表单</b>（结构性不可改——brief 口径「调优先级=删旧建新，
++ * 报告说明」；规则不换模板）。enabled 承载启停（0/1）；未携带字段不进更新集（MP null 跳过
++ * 保持库内原值）；conditionExpr/statusCode 携带时服务层按新增同口径全量校验（语法 + 引用
++ * 存在性 + 字典存在启用）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "状态规则修改表单（TASK-0048）")
++public class IotStatusRuleUpdateForm {
++
++    @NotNull(message = "规则ID不能为空")
++    @Schema(description = "规则ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long id;
++
++    @Size(max = 1000, message = "条件表达式长度不能超过 1000")
++    @Schema(description = "条件表达式（携带时全量校验；未携带不改）")
++    private String conditionExpr;
++
++    @Size(max = 32, message = "状态编码长度不能超过 32")
++    @Schema(description = "状态编码（携带时校验字典存在且启用；未携带不改）")
++    private String statusCode;
++
++    @Size(max = 50, message = "状态名称长度不能超过 50")
++    @Schema(description = "状态名称（未携带不改）")
++    private String statusName;
++
++    @Size(max = 16, message = "展示颜色长度不能超过 16")
++    @Schema(description = "展示颜色（未携带不改）")
++    private String color;
++
++    @Schema(description = "是否启用 0 停用 1 启用（启停由编辑承载；未携带不改）")
++    private Integer enabled;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusDict.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusDict.java
+new file mode 100644
+index 0000000..9b3f275
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusDict.java
+@@ -0,0 +1,57 @@
++package net.otlab.admin.module.iot.statusrule.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 状态编码稳定字典实体类（TASK-0048，ADR-0009 TD-0013 语义落表）
++ *
++ * <p>iot_status_dict 表为本任务定义（上游详细设计附录 A 无状态字典表 DDL——TD-0013 只给
++ * 语义，本表按语义落表并登记「与上游差异，建议回写上游」）：<b>状态编码独立稳定字典，
++ * 只增不删、禁用不复用序号——历史 st_item_value 序号不漂移</b>（REQ-0007 核心规则：
++ * 状态变化以 value=稳定序号写 st_item_value，序号漂移则状态时长与变位历史还原失真）。
++ *
++ * <p><b>seq 稳定序号</b>：服务层新增时取「本租户当前 max(seq)+1」（含禁用行——禁用行序号
++ * 不复用），uk_tenant_seq (tenant_id, seq) 物理唯一使序号漂移结构性不可能；<b>无删除接口、
++ * 无名称编辑接口</b>（名称修正属语义变更须评估漂移，本期不开放）——接口面只有
++ * list / add / disable 三端点（禁用一次性，无恢复接口）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_status_dict")
++@Schema(description = "状态编码稳定字典（TASK-0048，TD-0013）")
++public class IotStatusDict extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "状态字典ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "稳定序号（只增不复用——历史 st_item_value 序号不漂移的锚；服务层 max+1 分配）")
++    private Integer seq;
++
++    @Schema(description = "状态编码（租户内唯一）")
++    private String statusCode;
++
++    @Schema(description = "状态名称")
++    private String statusName;
++
++    @Schema(description = "展示颜色")
++    private String color;
++
++    @Schema(description = "状态 0 禁用 1 启用（禁用不复用序号；无恢复接口）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusRule.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusRule.java
+new file mode 100644
+index 0000000..a87455c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/entity/IotStatusRule.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.statusrule.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 状态判定规则实体类（TASK-0048，详细设计 §1.5B / 附录 A p35 逐字 DDL + TD-0014 补列）
++ *
++ * <p>iot_status_rule 表随本任务升级脚本（20261122_iot_status_rule_domain.sql）建立，DDL
++ * 逐字照附录 A p35（brief 已提取），<b>较逐字 DDL 增补一列 binding_map</b>（TD-0014 直绑
++ * 映射，上游无列——升级脚本头注登记「与上游差异」，建议回写上游）。
++ *
++ * <p>(template_id, priority) 模板内唯一（uk_template_priority 物理唯一索引、不含 deleted
++ * 列——逻辑删行永久占用优先级，删除归档不复用）；规则条数上限 ≤10（同模板活跃数，≥10 拒
++ * 新增）。priority 创建后不可改（调优先级=删旧建新）；template_id 不可改（规则不换模板）。
++ *
++ * <p>condition_expr 模板态相对引用（Aviator、花括号占位）：保存时 0013 Expander 同口径
++ * 语法校验 + SELF 相对引用存在性（模板数据项范围，4001）；表达式真语义校验归计算引擎
++ * （0036 同款口径）。status_code 必须在 iot_status_dict 存在且启用（TD-0013 稳定字典）。
++ *
++ * <p>enabled 即启停（0 停用 1 启用，DDL DEFAULT '1'），由编辑接口承载；规则随配置发布
++ * 下发计算引擎（保存≠生效——0024 发布链，照 0021/0023 口径登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_status_rule")
++@Schema(description = "状态判定规则（TASK-0048）")
++public class IotStatusRule extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "规则ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "所属模板ID（创建后不可改）")
++    private Long templateId;
++
++    @Schema(description = "优先级（小者优先；同模板唯一，创建后不可改——调优先级=删旧建新）")
++    private Integer priority;
++
++    @Schema(description = "条件表达式（Aviator 相对引用；0013 Expander 同口径校验）")
++    private String conditionExpr;
++
++    @Schema(description = "状态编码（iot_status_dict 存在且启用）")
++    private String statusCode;
++
++    @Schema(description = "状态名称")
++    private String statusName;
++
++    @Schema(description = "展示颜色")
++    private String color;
++
++    @Schema(description = "是否启用 0 停用 1 启用（编辑承载启停）")
++    private Integer enabled;
++
++    @Schema(description = "直绑映射 JSON（TD-0014 上游无列本任务新增：{pointId,mappings:[{enumValue,statusCode}]}）")
++    private String bindingMap;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictCodeRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictCodeRow.java
+new file mode 100644
+index 0000000..bfefa81
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictCodeRow.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.statusrule.mapper;
++
++import lombok.Data;
++
++/**
++ * 状态编码占用行（uk_tenant_status_code 双道闸预检的旁路查询结果行，TASK-0048）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、编码、deleted 标记——uk_tenant_status_code 物理唯一
++ * 索引不含 deleted 列；字典行经 API 无删除途径（TD-0013 只增不删纪律使然），含已删行预检
++ * 为防御性口径（物理索引作用域语义一致），调用方据此区分「已存在」/「已被删除记录占用，
++ * 不可复用」文案（0011/0021/0043 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotStatusDictCodeRow {
++
++    private Long id;
++
++    private String statusCode;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictMapper.java
+new file mode 100644
+index 0000000..72827ce
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusDictMapper.java
+@@ -0,0 +1,52 @@
++package net.otlab.admin.module.iot.statusrule.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 状态编码稳定字典 Mapper（TASK-0048）
++ *
++ * <p>预检旁路方法照 0021 IotPointCodeMapper / 0043 IotMetricCodeMapper 显式条件范式：
++ * {@code @InterceptorIgnore(tenantLine = "true")} + 显式 tenant_id 条件（服务层从会话取，
++ * 禁请求携带）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotStatusDictMapper extends BaseMapper<IotStatusDict> {
++
++    /**
++     * 本租户当前最大稳定序号（含禁用行——「禁用不复用序号」TD-0013：seq 分配基线取全量
++     * max 而非活跃 max，禁用行的序号永久占用；uk_tenant_seq 物理唯一保漂移不可能）。
++     * 空表返回 0（COALESCE）。
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @return 当前最大 seq；空表 0
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT COALESCE(MAX(seq), 0) FROM iot_status_dict WHERE tenant_id = #{tenantId}")
++    int selectMaxSeq(@Param("tenantId") Long tenantId);
++
++    /**
++     * 按 (tenant_id, status_code) 显式查占用行（含已删行，携带 deleted 标记）。
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param codes    待预检编码集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, status_code, deleted FROM iot_status_dict "
++            + "WHERE tenant_id = #{tenantId} AND status_code IN "
++            + "<foreach collection='codes' item='c' open='(' separator=',' close=')'>#{c}</foreach>"
++            + "</script>")
++    List<IotStatusDictCodeRow> selectOccupiedByCodes(@Param("tenantId") Long tenantId,
++                                                     @Param("codes") Collection<String> codes);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRuleMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRuleMapper.java
+new file mode 100644
+index 0000000..14dce2b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRuleMapper.java
+@@ -0,0 +1,56 @@
++package net.otlab.admin.module.iot.statusrule.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 状态判定规则 Mapper（TASK-0048）
++ *
++ * <p>预检旁路方法照 0021 IotPointCodeMapper / 0043 IotMetricCodeMapper 显式条件范式：
++ * {@code @InterceptorIgnore(tenantLine = "true")} + 显式 tenant_id 条件（服务层从会话取，
++ * 禁请求携带），预检语义与物理唯一索引 uk_template_priority 的作用域 (template_id,
++ * priority) 精确一致。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotStatusRuleMapper extends BaseMapper<IotStatusRule> {
++
++    /**
++     * 按 (tenant_id, template_id, priority) 显式查占用行（含已删行，携带 deleted 标记）。
++     *
++     * @param tenantId   会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param templateId 模板 id
++     * @param priorities 待预检优先级集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, priority, deleted FROM iot_status_rule "
++            + "WHERE tenant_id = #{tenantId} AND template_id = #{templateId} AND priority IN "
++            + "<foreach collection='priorities' item='p' open='(' separator=',' close=')'>#{p}</foreach>"
++            + "</script>")
++    List<IotStatusRulePriorityRow> selectOccupiedByPriorities(@Param("tenantId") Long tenantId,
++                                                              @Param("templateId") Long templateId,
++                                                              @Param("priorities") Collection<Integer> priorities);
++
++    /**
++     * 同模板活跃规则数（规则条数上限 ≤10 预检用——逻辑删行不计入「活跃」）。
++     *
++     * @param tenantId   会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param templateId 模板 id
++     * @return 活跃规则数（deleted=0，含停用行——停用仍占规则条数）
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("SELECT COUNT(*) FROM iot_status_rule "
++            + "WHERE tenant_id = #{tenantId} AND template_id = #{templateId} AND deleted = 0")
++    long selectActiveCountByTemplate(@Param("tenantId") Long tenantId,
++                                     @Param("templateId") Long templateId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRulePriorityRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRulePriorityRow.java
+new file mode 100644
+index 0000000..c5634a9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/mapper/IotStatusRulePriorityRow.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.statusrule.mapper;
++
++import lombok.Data;
++
++/**
++ * 规则优先级占用行（uk_template_priority 双道闸预检的旁路查询结果行，TASK-0048）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、优先级、deleted 标记——deleted=1 为逻辑删行
++ * （uk_template_priority 物理唯一索引不含 deleted 列，逻辑删行永久占用 (template_id,
++ * priority)——优先级删除归档不复用），调用方据此区分「优先级已存在」/「优先级已被删除
++ * 记录占用，不可复用」文案（0011/0021/0043 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotStatusRulePriorityRow {
++
++    private Long id;
++
++    private Integer priority;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusDictService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusDictService.java
+new file mode 100644
+index 0000000..9ed9143
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusDictService.java
+@@ -0,0 +1,45 @@
++package net.otlab.admin.module.iot.statusrule.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusDictCreateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++
++/**
++ * 状态编码稳定字典服务接口（TASK-0048，TD-0013 只增不删）
++ *
++ * <p>接口面三端点：list / add / disable——<b>无删除接口、无编辑（名称修正）接口</b>
++ * （名称修正属语义变更须评估历史 st_item_value 序号漂移，本期不开放，报告登记）；
++ * disable 一次性（无恢复接口）。seq 由服务层取「本租户当前 max(seq)+1」（含禁用行——
++ * 禁用不复用序号），uk_tenant_seq 物理唯一保漂移不可能。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotStatusDictService {
++
++    /**
++     * 字典分页列表（seq 升序——稳定序号锚定排序；过滤 statusCode/statusName/status）。
++     *
++     * @param pageNum 页码
++     * @param pageSize 页大小
++     * @param query 过滤条件（statusCode/statusName LIKE、status eq）
++     * @return 字典分页
++     */
++    Page<IotStatusDict> selectDictList(Integer pageNum, Integer pageSize, IotStatusDict query);
++
++    /**
++     * 新增状态编码（只增）：seq = max+1；status_code 租户内唯一双道闸 4002。
++     *
++     * @param form 新增表单
++     * @return 是否成功
++     */
++    boolean createDict(IotStatusDictCreateForm form);
++
++    /**
++     * 禁用状态编码（status=0，一次性；不触碰 seq——禁用不复用序号）。
++     *
++     * @param id 字典行 id
++     * @return 是否成功
++     */
++    boolean disableDict(Long id);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusRuleService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusRuleService.java
+new file mode 100644
+index 0000000..423217e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/IotStatusRuleService.java
+@@ -0,0 +1,67 @@
++package net.otlab.admin.module.iot.statusrule.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleBindingMapForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleCreateForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleUpdateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++
++import java.util.List;
++
++/**
++ * 状态判定规则服务接口（TASK-0048，规则挂模板——FEAT-0016 模板状态规则集配置）
++ *
++ * <p>接口面五端点：按模板读规则集（priority 升序）/ 单条新增 / 修改（白名单 + 启停承载）/
++ * 直绑映射配置（TD-0014）/ 批量逻辑删。规则条数上限 ≤10（同模板活跃数）；condition_expr
++ * 0013 Expander 同口径语法校验 + SELF 相对引用存在性（模板数据项，4001）；status_code
++ * 须为 iot_status_dict 已登记且启用编码（未登记 4001 拒并提示先建状态编码）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotStatusRuleService {
++
++    /**
++     * 按模板分页读规则集（priority 升序，priority 相同按 id 稳定序）。
++     *
++     * @param pageNum    页码
++     * @param pageSize   页大小
++     * @param templateId 模板 id（必填；模板存在同租户校验）
++     * @return 规则分页
++     */
++    Page<IotStatusRule> selectRuleList(Integer pageNum, Integer pageSize, Long templateId);
++
++    /**
++     * 单条新增规则（同模板 priority 唯一双道闸 4002 + 规则条数上限 ≤10 + 表达式与
++     * 状态编码校验）。
++     *
++     * @param form 新增表单
++     * @return 是否成功
++     */
++    boolean createRule(IotStatusRuleCreateForm form);
++
++    /**
++     * 修改规则（白名单 conditionExpr/statusCode/statusName/color/enabled——启停由编辑
++     * 承载 enabled 0/1；template_id/priority 不可改——调优先级=删旧建新）。
++     *
++     * @param form 修改表单
++     * @return 是否成功
++     */
++    boolean updateRule(IotStatusRuleUpdateForm form);
++
++    /**
++     * 直绑映射配置（TD-0014）：整份 JSON 幂等覆盖规则行 binding_map 列。
++     *
++     * @param form 映射表单（ruleId + pointId + 枚举值映射数组）
++     * @return 是否成功
++     */
++    boolean saveBindingMap(IotStatusRuleBindingMapForm form);
++
++    /**
++     * 批量逻辑删除规则（fail-closed：任一不存在整批拒绝；优先级删除归档不复用）。
++     *
++     * @param ids 规则 id 集合
++     * @return 是否成功
++     */
++    boolean deleteRules(List<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImpl.java
+new file mode 100644
+index 0000000..cab8429
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImpl.java
+@@ -0,0 +1,168 @@
++package net.otlab.admin.module.iot.statusrule.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusDictCreateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictCodeRow;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictMapper;
++import net.otlab.admin.module.iot.statusrule.service.IotStatusDictService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.List;
++
++/**
++ * 状态编码稳定字典服务实现类（TASK-0048，ADR-0009 TD-0013 只增不删语义落表）
++ *
++ * <p><b>只增不删纪律</b>（TD-0013：历史 st_item_value 序号不漂移的锚）：接口面仅
++ * list / add / disable 三端点——无删除、无名称编辑（名称修正属语义变更须评估漂移，
++ * 本期不开放，报告登记）；disable 一次性（无恢复接口）。<b>seq 稳定序号</b>：新增时
++ * 服务层取「本租户当前 max(seq)+1」（{@link IotStatusDictMapper#selectMaxSeq} 含禁用行
++ * ——禁用行序号不复用），uk_tenant_seq (tenant_id, seq) 物理唯一使序号漂移结构性不可能；
++ * 并发分配撞 uk_tenant_seq 由 DuplicateKey 兜底 4002 重试（物理唯一保漂移不可能）。
++ *
++ * <p><b>编码唯一双道闸 4002</b>（0011/0021/0043 同款口径）：uk_tenant_status_code 为
++ * (tenant_id, status_code) 物理唯一索引、不含 deleted 列；第一道含已删行旁路预检
++ * （{@link IotStatusDictMapper#selectOccupiedByCodes}——字典行经 API 无删除途径，含已删
++ * 行预检为防御性口径）+ 第二道 DuplicateKey 兜底。字典行无逻辑删路径（无删除接口），
++ * 编码与序号永久占用。
++ *
++ * <p><b>字段白名单</b>：新增不落请求实体——status 新增恒 1（只增接口无 status 字段，
++ * 禁用走独立 disable 且一次性）、seq 服务层分配（请求不携带也不信任）、tenant_id 会话
++ * 覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经 API 注入，杜绝 mass assignment。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotStatusDictServiceImpl extends ServiceImpl<IotStatusDictMapper, IotStatusDict> implements IotStatusDictService {
++
++    /** varchar 限长口径（与 iot_status_dict DDL 一致；表单 @Size 之外的服务层双保险） */
++    private static final int MAX_LEN_STATUS_CODE = 32;
++    private static final int MAX_LEN_STATUS_NAME = 50;
++    private static final int MAX_LEN_COLOR = 16;
++
++    /** 新增即启用（只增接口无 status 字段；DDL DEFAULT '1' 同值） */
++    private static final int STATUS_ENABLED = 1;
++
++    @Override
++    public Page<IotStatusDict> selectDictList(Integer pageNum, Integer pageSize, IotStatusDict query) {
++        LambdaQueryWrapper<IotStatusDict> wrapper = new LambdaQueryWrapper<>();
++        if (query != null) {
++            if (query.getStatusCode() != null) {
++                wrapper.like(IotStatusDict::getStatusCode, SqlLikeUtils.escape(query.getStatusCode()));
++            }
++            if (query.getStatusName() != null) {
++                wrapper.like(IotStatusDict::getStatusName, SqlLikeUtils.escape(query.getStatusName()));
++            }
++            if (query.getStatus() != null) {
++                wrapper.eq(IotStatusDict::getStatus, query.getStatus());
++            }
++        }
++        // seq 升序——稳定序号锚定排序（展示端翻译/历史还原以 seq 为锚）
++        wrapper.orderByAsc(IotStatusDict::getSeq);
++        return this.page(new Page<>(pageNum == null ? 1 : pageNum, pageSize == null ? 10 : pageSize), wrapper);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createDict(IotStatusDictCreateForm form) {
++        Long tenantId = TenantContext.getTenantId();
++        String statusCode = validateStatusCode(form.getStatusCode());
++        if (form.getStatusName() == null || form.getStatusName().isBlank()) {
++            throw paramError("状态名称不能为空");
++        }
++        if (form.getStatusName().length() > MAX_LEN_STATUS_NAME) {
++            throw paramError("状态名称超长（上限 " + MAX_LEN_STATUS_NAME + " 字符）");
++        }
++        if (form.getColor() != null && form.getColor().length() > MAX_LEN_COLOR) {
++            throw paramError("展示颜色超长（上限 " + MAX_LEN_COLOR + " 字符）");
++        }
++
++        // 双道闸第一道：含已删行占用预检（uk_tenant_status_code 不含 deleted 列——字典行
++        // 经 API 无删除途径，含已删行预检为防御性口径；文案区分活跃行/已删行）
++        List<IotStatusDictCodeRow> occupied = baseMapper.selectOccupiedByCodes(tenantId, List.of(statusCode));
++        if (!occupied.isEmpty()) {
++            throw duplicateDictCode(occupied.get(0));
++        }
++
++        // seq 稳定序号分配：本租户当前 max(seq)+1（含禁用行——禁用不复用序号，TD-0013；
++        // uk_tenant_seq 物理唯一使序号漂移结构性不可能）
++        int seq = baseMapper.selectMaxSeq(tenantId) + 1;
++
++        // 白名单构建（seq/status/tenantId 服务层定——请求不携带也不信任）
++        IotStatusDict entity = new IotStatusDict();
++        entity.setTenantId(tenantId);
++        entity.setSeq(seq);
++        entity.setStatusCode(statusCode);
++        entity.setStatusName(form.getStatusName());
++        entity.setColor(form.getColor());
++        entity.setStatus(STATUS_ENABLED);
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检/取 seq 与落库之间的真实并发插入窗口（uk_tenant_status_code 或
++            // uk_tenant_seq 物理唯一索引）——重试即取新 max+1，序号不漂移
++            throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "状态编码或稳定序号并发冲突，请重试");
++        }
++        log.info("状态编码新增（TD-0013 只增，seq=max+1）: tenantId={}, statusCode={}, seq={}",
++                tenantId, statusCode, seq);
++        return true;
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean disableDict(Long id) {
++        if (id == null) {
++            throw paramError("请选择要禁用的状态编码");
++        }
++        IotStatusDict existing = this.getById(id);
++        if (existing == null) {
++            throw paramError("状态编码不存在或已删除");
++        }
++        // 禁用一次性（无恢复接口——只增不删纪律）：只更新 status 字段，不触碰 seq
++        // （禁用不复用序号——TD-0013）；已禁用行重复禁用为幂等 no-op
++        IotStatusDict upd = new IotStatusDict();
++        upd.setId(existing.getId());
++        upd.setStatus(0);
++        this.updateById(upd);
++        log.info("状态编码禁用（一次性，seq 保留不复用）: tenantId={}, id={}, statusCode={}, seq={}",
++                existing.getTenantId(), existing.getId(), existing.getStatusCode(), existing.getSeq());
++        return true;
++    }
++
++    /** 编码校验：非空、长度 ≤32（表单 @Size 之外的服务层双保险） */
++    private String validateStatusCode(String statusCode) {
++        if (statusCode == null || statusCode.isBlank()) {
++            throw paramError("状态编码不能为空");
++        }
++        if (statusCode.length() > MAX_LEN_STATUS_CODE) {
++            throw paramError("状态编码超长（上限 " + MAX_LEN_STATUS_CODE + " 字符）");
++        }
++        return statusCode;
++    }
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011-0043 口径） */
++    private BusinessException duplicateDictCode(IotStatusDictCodeRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "状态编码已被删除记录占用，不可复用: " + row.getStatusCode());
++        }
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                "状态编码已存在: " + row.getStatusCode());
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java
+new file mode 100644
+index 0000000..e948dc7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java
+@@ -0,0 +1,421 @@
++package net.otlab.admin.module.iot.statusrule.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleBindingMapForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleCreateForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleUpdateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictMapper;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRuleMapper;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRulePriorityRow;
++import net.otlab.admin.module.iot.statusrule.service.IotStatusRuleService;
++import net.otlab.admin.module.iot.statusrule.service.support.ConditionExprValidator;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++
++/**
++ * 状态判定规则服务实现类（TASK-0048，规则挂模板——FEAT-0016 模板状态规则集配置）
++ *
++ * <p><b>规则条数上限 ≤10</b>（任务正文，FEAT-0016 异常与边界「规则条数上限（建议≤10）」
++ * 收口为硬限）：同模板活跃规则数 ≥10 时新增拒（400「状态规则上限 10 条」）；「活跃」=
++ * 未逻辑删（deleted=0，含停用行——停用规则仍是已配置规则集成员，不腾条数）。
++ *
++ * <p><b>priority 同模板唯一双道闸 4002</b>（0011/0021/0043 同款口径）：uk_template_priority
++ * 为 (template_id, priority) 物理唯一索引、不含 deleted 列——逻辑删行永久占用优先级
++ * （删除归档不复用）；第一道含已删行旁路预检（{@link IotStatusRuleMapper#selectOccupiedByPriorities}，
++ * 文案区分「优先级已存在」/「优先级已被删除记录占用，不可复用」）+ 第二道 DuplicateKey
++ * 兜底（预检与落库之间的真实并发插入窗口）。<b>priority 创建后不可改</b>（修改表单结构性
++ * 无此字段）——调优先级=删旧建新（brief 口径，报告说明）。
++ *
++ * <p><b>condition_expr 一期校验口径</b>（brief：Expander 同口径语法 + 相对引用存在性；
++ * 表达式真语义校验归计算引擎——0036 同款口径登记）：{@link ConditionExprValidator} 承载
++ * 语法面（花括号 token / SELF-PARENT 前缀白名单 / 引用编码字符集 / 长度 ≤1000 / 括号
++ * 配平）；SELF 相对引用存在性核对模板数据项（iot_data_item_template，引用不存在 4001
++ * 拒存）；PARENT 与绝对全键引用同 0036 一期口径收集不核存在性（被引实例可能后建；模板层
++ * 无法解析父模板——报告登记）。
++ *
++ * <p><b>status_code 字典锚定</b>（TD-0013）：必须在 iot_status_dict 存在且启用（新增与
++ * 修改携带时同口径；未登记 → 4001 拒并提示先建状态编码；已禁用 → 4001 拒——禁用一次性，
++ * 引用方须改用其他编码）。
++ *
++ * <p><b>写路径防线</b>（brief：写路径 resolve 防线照 0021 范式对模板判定——规则挂模板，
++ * 模板可见性决定）：编辑/删除/直绑映射三写原语先 resolve 规则所属模板（存在同租户，
++ * 多租户插件注入会话租户条件即同租户保证）；规则无部门锚点（模板无 dept_id，数据权限
++ * 裁剪按 brief 口径收敛为模板同租户校验——报告登记）。
++ *
++ * <p><b>直绑映射</b>（TD-0014）：整份 JSON 幂等覆盖规则行 binding_map 列（brief 裁决
++ * 「映射存 iot_status_rule 表新增 binding_map json 列（轻量，随规则行）」，与上游差异
++ * 登记）；statusCode 逐项校验字典存在且启用；pointId 校验点位存在（4001 同款）。
++ *
++ * <p><b>字段白名单</b>：新增/更新均不直接落请求实体——enabled 创建未携带落 1（DDL
++ * DEFAULT '1' 同值）、tenant_id 会话覆盖、审计字段由 MetaObjectHandler 回填、deleted
++ * 不可经 API 注入，杜绝 mass assignment；规则行无 config_version 列（上游 DDL 无此列），
++ * 保存≠生效——生效走 0024 配置快照发布链路（照 0021/0023 口径登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, IotStatusRule> implements IotStatusRuleService {
++
++    /** varchar 限长口径（与 iot_status_rule DDL 一致；表单 @Size 之外的服务层双保险） */
++    private static final int MAX_LEN_STATUS_CODE = 32;
++    private static final int MAX_LEN_STATUS_NAME = 50;
++    private static final int MAX_LEN_COLOR = 16;
++
++    /** 规则条数上限（任务正文：同模板活跃规则数 ≥10 时新增拒） */
++    private static final int RULE_COUNT_LIMIT = 10;
++
++    /** 启停开关值域（enabled） */
++    private static final Set<Integer> FLAG_VALUES = Set.of(0, 1);
++
++    /** 创建未携带 enabled 时落库默认（DDL DEFAULT '1' 同值） */
++    private static final int DEFAULT_ENABLED = 1;
++
++    /** 引用不存在拒存码（4001——TC-0014 口径同款；ot-core ResultCode 未设枚举，常量直用） */
++    private static final int CODE_REFERENCE_NOT_FOUND = 4001;
++
++    private static final ObjectMapper JSON = new ObjectMapper();
++
++    @Autowired
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Autowired
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Autowired
++    private IotStatusDictMapper statusDictMapper;
++
++    @Autowired
++    private IotPointMapper pointMapper;
++
++    // ---------- 列表 ----------
++
++    @Override
++    public Page<IotStatusRule> selectRuleList(Integer pageNum, Integer pageSize, Long templateId) {
++        // 列表按模板读（brief：detail/list 校验模板存在同租户即可——模板无部门锚点，
++        // 数据权限裁剪收敛为模板同租户校验，多租户插件注入会话租户条件）
++        resolveTemplate(templateId);
++        LambdaQueryWrapper<IotStatusRule> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(IotStatusRule::getTemplateId, templateId);
++        // priority 升序（小者优先——FEAT-0016 业务规则），同优先级按 id 稳定序
++        wrapper.orderByAsc(IotStatusRule::getPriority).orderByAsc(IotStatusRule::getId);
++        return this.page(new Page<>(pageNum == null ? 1 : pageNum, pageSize == null ? 10 : pageSize), wrapper);
++    }
++
++    // ---------- 创建 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createRule(IotStatusRuleCreateForm form) {
++        Long tenantId = TenantContext.getTenantId();
++        Long templateId = form.getTemplateId();
++        if (templateId == null) {
++            throw paramError("所属模板不能为空");
++        }
++        // 存在性 → 业务校验（规则无独立创建侧数据权限防线——模板同租户校验即防线，
++        // brief 口径「detail/list 校验模板存在同租户即可，写路径 resolve 防线对模板判定」）
++        resolveTemplate(templateId);
++        if (form.getPriority() == null) {
++            throw paramError("优先级不能为空");
++        }
++
++        // 规则条数上限（同模板活跃数 ≥10 拒——先于唯一性预检，超限批不消耗索引核对）
++        long activeCount = baseMapper.selectActiveCountByTemplate(tenantId, templateId);
++        if (activeCount >= RULE_COUNT_LIMIT) {
++            throw paramError("状态规则上限 10 条（当前 " + activeCount + " 条），新增拒绝");
++        }
++
++        // 双道闸第一道：priority 占用预检（含已删行——uk_template_priority 不含 deleted 列，
++        // 逻辑删行永久占用优先级，删除归档不复用）
++        List<IotStatusRulePriorityRow> occupied =
++                baseMapper.selectOccupiedByPriorities(tenantId, templateId, List.of(form.getPriority()));
++        if (!occupied.isEmpty()) {
++            throw duplicatePriority(occupied.get(0));
++        }
++
++        // condition_expr 校验（Expander 同口径语法 + SELF 引用存在性 4001）
++        validateConditionExpr(templateId, form.getConditionExpr());
++        // status_code 字典锚定（TD-0013：存在且启用，未登记 4001 拒并提示先建状态编码）
++        requireDictCodeEnabled(form.getStatusCode());
++        validateCommonTexts(form.getStatusName(), form.getColor());
++
++        // 白名单构建（tenant_id 会话覆盖；enabled 未携带落 1；审计字段框架回填）
++        IotStatusRule entity = new IotStatusRule();
++        entity.setTenantId(tenantId);
++        entity.setTemplateId(templateId);
++        entity.setPriority(form.getPriority());
++        entity.setConditionExpr(form.getConditionExpr().trim());
++        entity.setStatusCode(form.getStatusCode());
++        entity.setStatusName(form.getStatusName());
++        entity.setColor(form.getColor());
++        entity.setEnabled(resolveEnabled(form.getEnabled()));
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的真实并发插入窗口（物理唯一索引 uk_template_priority）
++            throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "优先级并发冲突，请重试: " + form.getPriority());
++        }
++        log.info("状态规则新增: tenantId={}, templateId={}, priority={}, statusCode={}",
++                tenantId, templateId, form.getPriority(), form.getStatusCode());
++        return true;
++    }
++
++    // ---------- 修改（白名单 + 启停承载） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateRule(IotStatusRuleUpdateForm form) {
++        if (form.getId() == null) {
++            throw paramError("规则ID不能为空");
++        }
++        IotStatusRule existing = this.getById(form.getId());
++        if (existing == null) {
++            throw paramError("状态规则不存在或已删除");
++        }
++        // 写路径防线（brief：resolve 防线照 0021 范式对模板判定）——规则所属模板必须存在
++        // 同租户；模板不存在（含跨租户不可见）即拒
++        resolveTemplate(existing.getTemplateId());
++
++        // template_id/priority 不可改：修改表单结构性无此二字段（调优先级=删旧建新，brief
++        // 口径；规则不换模板——历史留旧键，照模板数据项 templateId 不进更新集同口径）
++        if (form.getConditionExpr() != null) {
++            // 携带时按新增同口径全量校验（语法 + SELF 引用存在性——仍属原模板数据项范围）
++            validateConditionExpr(existing.getTemplateId(), form.getConditionExpr());
++        }
++        if (form.getStatusCode() != null) {
++            requireDictCodeEnabled(form.getStatusCode());
++            if (form.getStatusCode().length() > MAX_LEN_STATUS_CODE) {
++                throw paramError("状态编码超长（上限 " + MAX_LEN_STATUS_CODE + " 字符）");
++            }
++        }
++        validateCommonTexts(form.getStatusName(), form.getColor());
++        resolveEnabled(form.getEnabled());
++
++        // 字段白名单构建更新（null 不进更新集，MP 自动跳过保持库内原值；不可变字段不回写、
++        // 连 no-op 都不进 SET）：仅 conditionExpr/statusCode/statusName/color/enabled 可变
++        IotStatusRule upd = new IotStatusRule();
++        upd.setId(existing.getId());
++        upd.setConditionExpr(form.getConditionExpr() == null ? null : form.getConditionExpr().trim());
++        upd.setStatusCode(form.getStatusCode());
++        upd.setStatusName(form.getStatusName());
++        upd.setColor(form.getColor());
++        upd.setEnabled(form.getEnabled());
++        this.updateById(upd);
++        log.info("状态规则修改（白名单 conditionExpr/statusCode/statusName/color/enabled）: id={}, templateId={}",
++                existing.getId(), existing.getTemplateId());
++        return true;
++    }
++
++    // ---------- 直绑映射（TD-0014） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean saveBindingMap(IotStatusRuleBindingMapForm form) {
++        if (form.getRuleId() == null) {
++            throw paramError("规则ID不能为空");
++        }
++        IotStatusRule existing = this.getById(form.getRuleId());
++        if (existing == null) {
++            throw paramError("状态规则不存在或已删除");
++        }
++        // 写路径防线（照 0021 范式对模板判定）
++        resolveTemplate(existing.getTemplateId());
++        if (form.getPointId() == null) {
++            throw paramError("点位ID不能为空");
++        }
++        // 点位存在性（4001 同款——直绑映射的枚举值来源点位必须命中本租户活跃行；
++        // 多租户插件注入会话租户条件即同租户保证）
++        IotPoint point = pointMapper.selectById(form.getPointId());
++        if (point == null) {
++            throw referenceNotFound("直绑映射的点位不存在或已删除: " + form.getPointId());
++        }
++        List<IotStatusRuleBindingMapForm.EnumMapping> mappings = form.getMappings();
++        if (mappings == null || mappings.isEmpty()) {
++            throw paramError("枚举值映射数组不能为空");
++        }
++
++        // 逐项校验：statusCode 字典存在且启用；批内枚举值互撞拒（同一枚举值双映射无判定语义）
++        Set<String> seenEnums = new LinkedHashSet<>(mappings.size());
++        for (IotStatusRuleBindingMapForm.EnumMapping mapping : mappings) {
++            if (mapping.getEnumValue() == null || mapping.getEnumValue().isBlank()) {
++                throw paramError("枚举值不能为空");
++            }
++            if (!seenEnums.add(mapping.getEnumValue())) {
++                throw paramError("直绑映射枚举值重复: " + mapping.getEnumValue());
++            }
++            if (mapping.getStatusCode() == null || mapping.getStatusCode().isBlank()) {
++                throw paramError("映射状态编码不能为空");
++            }
++            requireDictCodeEnabled(mapping.getStatusCode());
++        }
++
++        // 整份 JSON 幂等覆盖规则行 binding_map（brief 裁决「随规则行」轻量存储——一条规则行
++        // 承载一个点位的枚举映射；TD-0014 挂模板随发布下发，生效走 0024 发布链）
++        Map<String, Object> payload = new LinkedHashMap<>();
++        payload.put("pointId", form.getPointId());
++        payload.put("mappings", mappings);
++        String bindingMapJson;
++        try {
++            bindingMapJson = JSON.writeValueAsString(payload);
++        } catch (JsonProcessingException e) {
++            // JSON 列序列化失败（理论上不可达——payload 全为可序列化类型）：显式 400 而非 500
++            throw paramError("直绑映射序列化失败，请检查映射数组格式");
++        }
++        IotStatusRule upd = new IotStatusRule();
++        upd.setId(existing.getId());
++        upd.setBindingMap(bindingMapJson);
++        this.updateById(upd);
++        log.info("直绑映射保存（TD-0014，随规则行 binding_map）: ruleId={}, templateId={}, pointId={}, mappings={}",
++                existing.getId(), existing.getTemplateId(), form.getPointId(), mappings.size());
++        return true;
++    }
++
++    // ---------- 批量删除 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteRules(List<Long> ids) {
++        if (ids == null || ids.isEmpty()) {
++            throw paramError("请选择要删除的状态规则");
++        }
++        // fail-closed：批内全部 id 必须存在且活跃（@TableLogic 过滤已删行），缺失即整批拒绝（不半删）
++        List<IotStatusRule> existingList = this.listByIds(ids);
++        if (existingList.size() < ids.size()) {
++            Map<Long, IotStatusRule> found = existingList.stream()
++                    .collect(Collectors.toMap(IotStatusRule::getId, Function.identity(), (a, b) -> a, LinkedHashMap::new));
++            List<Long> missing = ids.stream().filter(id -> !found.containsKey(id)).toList();
++            throw paramError("状态规则不存在或已删除: " + missing);
++        }
++        // 写路径防线（照 0021 范式对模板判定）：批内规则所属模板逐一存在同租户校验
++        existingList.forEach(rule -> resolveTemplate(rule.getTemplateId()));
++        // 逻辑删（@TableLogic，deleted=1）；优先级删除归档不复用（uk_template_priority 不含
++        // deleted 列——预检含已删行口径），调优先级=删旧建新的「删旧」即本原语
++        return this.removeByIds(ids);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 模板存在同租户校验（列表/写路径防线共闸——多租户插件注入会话租户条件即同租户保证） */
++    private IotModelTemplate resolveTemplate(Long templateId) {
++        if (templateId == null) {
++            throw paramError("所属模板不能为空");
++        }
++        IotModelTemplate template = modelTemplateMapper.selectById(templateId);
++        if (template == null) {
++            throw paramError("所属模板不存在或已删除: " + templateId);
++        }
++        return template;
++    }
++
++    /**
++     * condition_expr 校验（brief 口径）：Expander 同口径语法（花括号/字符集/前缀白名单/
++     * 长度 ≤1000/括号配平）+ SELF 相对引用存在性（模板数据项范围——引用不存在 4001 拒存）；
++     * PARENT 与绝对全键引用收集不核存在性（0036 一期口径，报告登记）；表达式真语义校验
++     * 归计算引擎（0036 同款口径登记）。
++     */
++    private void validateConditionExpr(Long templateId, String conditionExpr) {
++        ConditionExprValidator.Outcome outcome = ConditionExprValidator.validate(conditionExpr);
++        if (outcome.selfCodes().isEmpty()) {
++            return;
++        }
++        // SELF 编码存在性：模板活跃数据项编码集（iot_data_item_template，多租户插件注入
++        // 会话租户条件即同租户保证；本表无 status 列——存在即活跃）
++        Set<String> templateCodes = dataItemTemplateMapper.selectList(
++                new LambdaQueryWrapper<IotDataItemTemplate>()
++                        .eq(IotDataItemTemplate::getTemplateId, templateId)).stream()
++                .map(IotDataItemTemplate::getDataCode)
++                .collect(Collectors.toSet());
++        for (String selfCode : outcome.selfCodes()) {
++            if (!templateCodes.contains(selfCode)) {
++                throw referenceNotFound("条件表达式引用的数据项不存在: SELF." + selfCode
++                        + "（模板 " + templateId + "）");
++            }
++        }
++    }
++
++    /**
++     * status_code 字典锚定（TD-0013）：必须在 iot_status_dict 存在且启用——未登记 → 4001
++     * 拒并提示先建状态编码；已禁用 → 4001 拒（禁用一次性，引用方须改用其他编码）。
++     */
++    private void requireDictCodeEnabled(String statusCode) {
++        if (statusCode == null || statusCode.isBlank()) {
++            throw paramError("状态编码不能为空");
++        }
++        IotStatusDict dict = statusDictMapper.selectOne(new LambdaQueryWrapper<IotStatusDict>()
++                .eq(IotStatusDict::getStatusCode, statusCode));
++        if (dict == null) {
++            throw referenceNotFound("状态编码未登记，请先在状态字典中创建: " + statusCode);
++        }
++        if (dict.getStatus() == null || dict.getStatus() != 1) {
++            throw referenceNotFound("状态编码已禁用，不可被规则引用: " + statusCode);
++        }
++    }
++
++    /** 名称/颜色限长校验（表单 @Size 之外的服务层双保险） */
++    private void validateCommonTexts(String statusName, String color) {
++        if (statusName != null && statusName.length() > MAX_LEN_STATUS_NAME) {
++            throw paramError("状态名称超长（上限 " + MAX_LEN_STATUS_NAME + " 字符）");
++        }
++        if (color != null && color.length() > MAX_LEN_COLOR) {
++            throw paramError("展示颜色超长（上限 " + MAX_LEN_COLOR + " 字符）");
++        }
++    }
++
++    /** 启停开关值域解析（enabled——0/1；创建未携带落 1） */
++    private Integer resolveEnabled(Integer enabled) {
++        if (enabled == null) {
++            return DEFAULT_ENABLED;
++        }
++        if (!FLAG_VALUES.contains(enabled)) {
++            throw paramError("启用状态仅允许 0 停用 / 1 启用");
++        }
++        return enabled;
++    }
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011-0043 口径） */
++    private BusinessException duplicatePriority(IotStatusRulePriorityRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "优先级已被删除记录占用，不可复用: " + row.getPriority());
++        }
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                "该模板下优先级已存在: " + row.getPriority());
++    }
++
++    /** 引用不存在拒存（4001——照 0013 数据项域/0043 指标域 referenceNotFound 口径） */
++    private BusinessException referenceNotFound(String message) {
++        return new BusinessException(CODE_REFERENCE_NOT_FOUND, message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidator.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidator.java
+new file mode 100644
+index 0000000..d799d2f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidator.java
+@@ -0,0 +1,129 @@
++package net.otlab.admin.module.iot.statusrule.service.support;
++
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++
++import java.util.LinkedHashSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * 状态规则条件表达式校验器（TASK-0048，brief「Expander 同口径语法」）
++ *
++ * <p><b>与 0013 {@code RelativeRefExpander} 同口径</b>（语法权威照 brief 指定）：相对引用
++ * 以<b>花括号包裹</b>——{@code {SELF.<code>}} / {@code {PARENT.<code>}}（关键字大小写
++ * 不敏感、编码字符集 [A-Za-z0-9_]）；花括号包裹的点分形态按绝对全键引用处理
++ * （{@code {F01.WS01.EQ002.ELEC_CONS}} 剥壳保留键）；两个正则与 Expander 的
++ * RELATIVE_REF / BRACE_REF 同形。<b>本类只做语法与引用收集</b>：
++ * <ul>
++ * <li>非空必填（NOT NULL 列 + 恒真空表达式无判定语义）；</li>
++ * <li>长度 ≤{@value #MAX_LEN_CONDITION}（condition_expr varchar(1000) 列宽口径）；</li>
++ * <li>括号配平：() 与 {} 各自计数配平（照 0011 默认公式一期降级校验同款基础格式面）；</li>
++ * <li>前缀白名单：相对引用关键字仅 SELF / PARENT（大小写不敏感）；其余花括号 token 按
++ *     绝对全键引用剥壳（Expander 同款），<b>展开/剥壳后残留花括号 = 畸形/超纲 token</b>
++ *     （如 {@code { SELF.X }} 带空格、{@code {SELF.ELEC-X}} 非法编码字符）→ 400 拒。</li>
++ * </ul>
++ * <b>相对引用存在性由服务层持模板数据项清单后核对</b>（SELF 编码 ⊆ 模板数据项——引用
++ * 不存在 4001 拒存）；PARENT 与绝对全键引用同 0036 一期口径<b>收集不核存在性</b>
++ * （被引实例可能后建；模板层无法解析父模板——报告登记）。
++ * <b>表达式真语义校验归计算引擎</b>（FEAT-0012/0049——0036 公式同款口径登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class ConditionExprValidator {
++
++    /** condition_expr 限长口径（与 iot_status_rule DDL condition_expr varchar(1000) 一致） */
++    public static final int MAX_LEN_CONDITION = 1000;
++
++    /** 相对引用 token：{SELF.<code>} / {PARENT.<code>}（与 RelativeRefExpander.RELATIVE_REF 同口径） */
++    private static final Pattern RELATIVE_REF =
++            Pattern.compile("\\{(SELF|PARENT)\\.([A-Za-z0-9_]+)\\}", Pattern.CASE_INSENSITIVE);
++
++    /** 任意花括号引用 token（含绝对全键引用）——与 RelativeRefExpander.BRACE_REF 同口径 */
++    private static final Pattern BRACE_REF = Pattern.compile("\\{([A-Za-z0-9_.]+)\\}");
++
++    /** 校验结果：SELF 编码集 + PARENT 编码集 + 绝对全键引用集（保序去重） */
++    public record Outcome(LinkedHashSet<String> selfCodes,
++                          LinkedHashSet<String> parentCodes,
++                          LinkedHashSet<String> absoluteRefs) {
++    }
++
++    private ConditionExprValidator() {
++    }
++
++    /**
++     * 条件表达式语法校验 + 引用收集。
++     *
++     * @param conditionExpr 模板态条件表达式（花括号占位形态；非空必填）
++     * @return 引用收集结果（SELF/PARENT 编码集 + 绝对全键引用集）
++     * @throws BusinessException 空白 / 超长 / 括号不配平 / 残留畸形花括号 token（400）
++     */
++    public static Outcome validate(String conditionExpr) {
++        if (conditionExpr == null || conditionExpr.isBlank()) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "条件表达式不能为空");
++        }
++        String expr = conditionExpr.trim();
++        if (expr.length() > MAX_LEN_CONDITION) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "条件表达式超长（上限 " + MAX_LEN_CONDITION + " 字符，实际 " + expr.length() + "）");
++        }
++        // 括号配平（照 0011 默认公式基础格式校验同款：() 与 {} 各自计数配平；{} 的形态
++        // 合法性由下方 token 提取 + 残留终检进一步收敛）
++        long parens = expr.chars().filter(c -> c == '(').count()
++                - expr.chars().filter(c -> c == ')').count();
++        long braces = expr.chars().filter(c -> c == '{').count()
++                - expr.chars().filter(c -> c == '}').count();
++        if (parens != 0 || braces != 0) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "条件表达式基础格式非法：括号/占位符不配平（表达式真语义校验归计算引擎，"
++                            + "本任务仅做基础格式校验）");
++        }
++
++        // 第一遍：相对引用 token 提取（SELF/PARENT 前缀白名单，关键字大小写不敏感）
++        LinkedHashSet<String> selfCodes = new LinkedHashSet<>();
++        LinkedHashSet<String> parentCodes = new LinkedHashSet<>();
++        Matcher relative = RELATIVE_REF.matcher(expr);
++        StringBuilder stripped = new StringBuilder();
++        while (relative.find()) {
++            String kind = relative.group(1).toUpperCase();
++            String code = relative.group(2);
++            if ("SELF".equals(kind)) {
++                selfCodes.add(code);
++            } else {
++                parentCodes.add(code);
++            }
++            relative.appendReplacement(stripped, "");
++        }
++        relative.appendTail(stripped);
++
++        // 第二遍：剩余花括号 token 按绝对全键引用剥壳（Expander 同款口径）
++        LinkedHashSet<String> absoluteRefs = new LinkedHashSet<>();
++        Matcher absolute = BRACE_REF.matcher(stripped.toString());
++        StringBuilder bare = new StringBuilder();
++        while (absolute.find()) {
++            absoluteRefs.add(absolute.group(1));
++            absolute.appendReplacement(bare, "");
++        }
++        absolute.appendTail(bare);
++
++        // 残留花括号终检（0013 修订轮 I-1 同口径）：两个正则都不匹配的花括号段 = 畸形/超纲
++        // token（如 { SELF.X } 带空格、{SELF.ELEC-X} 非法编码字符、{FOO!} 等），坏表达式拒存
++        String rest = bare.toString();
++        if (rest.indexOf('{') >= 0 || rest.indexOf('}') >= 0) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "条件表达式包含无法识别的引用 token（残留花括号）: 示例 " + firstResidualToken(rest));
++        }
++        return new Outcome(selfCodes, parentCodes, absoluteRefs);
++    }
++
++    /** 残留 token 示例（第一个花括号段起、截 40 字符防消息过长，0013 修订轮 I-1 同口径） */
++    private static String firstResidualToken(String rest) {
++        int start = rest.indexOf('{');
++        if (start < 0) {
++            start = rest.indexOf('}');
++        }
++        String token = rest.substring(Math.max(0, start));
++        return token.length() > 40 ? token.substring(0, 40) : token;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/config/IotStatusRuleMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/config/IotStatusRuleMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..9ef7d95
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/config/IotStatusRuleMenuPermissionGuardTest.java
+@@ -0,0 +1,166 @@
++package net.otlab.admin.module.iot.statusrule.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.statusrule.controller.IotStatusDictController;
++import net.otlab.admin.module.iot.statusrule.controller.IotStatusRuleController;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleBindingMapForm;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++import java.util.stream.Collectors;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0048 守卫测试：状态规则/状态字典域菜单权限（sys_menu 4063-4069 七行）与控制器接口
++ * 对应。
++ *
++ * <p>brief 硬要求「权限标识与接口清单一一对应」（照 IotDataItemMenuPermissionGuardTest
++ * 范式，按本任务实际接口面调整）。本测试锁定：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_status_rule_domain.sql 的 sys_menu 七行种子
++ *     （id 4063-4069，parent_id=4009）权限码必须恰好等于预期的七值映射——删行/换码/
++ *     挪 parent 即红；</li>
++ * <li>代码侧：状态规则/字典域两个 @RestController 全部 @SaCheckPermission 权限码并集必须
++ *     ⊆ 七值集合（写错码/未登记码即红），且两控制器各自恰好等于其子集（双向不漂移）；</li>
++ * <li>只增不删纪律（TD-0013）：字典控制器接口面锁定为恰好三端点（list/add/disable）——
++ *     出现删除/名称编辑/恢复启用端点即红；</li>
++ * <li>精确锚点：直绑映射=iot:statusrule:edit（4065 复用——TD-0014 映射是规则配置的一部分）。</li>
++ * </ul>
++ *
++ * <p>种子七行构成说明（brief 种子段与字典段裁决并读）：规则域接口清单无 detail 端点故无
++ * query 码；实际使用权限码 = 规则四（list/add/edit/remove）+ 字典三（list/add/disable）
++ * = 七，4063-4069 恰按一一对应落位（升级脚本头注登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotStatusRuleMenuPermissionGuardTest {
++
++    /** 七行菜单种子的预期映射（id → perms），与升级脚本 4063-4069 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4063L, "iot:statusrule:list",
++            4064L, "iot:statusrule:add",
++            4065L, "iot:statusrule:edit",
++            4066L, "iot:statusrule:remove",
++            4067L, "iot:statusdict:list",
++            4068L, "iot:statusdict:add",
++            4069L, "iot:statusdict:disable");
++
++    /** 升级脚本路径（从测试工作目录向上定位仓库根的 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_status_rule_domain.sql";
++
++    /** 菜单种子行形如 (4063, 4009, 4, '状态规则查询', 3, NULL, NULL, NULL, 'iot:statusrule:list', ...) */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[6-9]\\d),\\s*4009,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的状态域菜单行恰好等于预期七值映射（4063-4069）")
++    void scriptRegistersExactlyTheSevenMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4063-4069 七行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 两控制器权限码并集 ⊆ 七值集合（多注解/未登记码必红）")
++    void controllerPermissionsAreSubsetOfTheSevenPerms() {
++        Set<String> annotated = collectControllerPerms();
++        Set<String> expected = Set.copyOf(EXPECTED_MENU_ROWS.values());
++        assertTrue(expected.containsAll(annotated),
++                "控制器权限码越出登记集合（未登记码在 sys_menu 无行，任何角色都无法获得）: "
++                        + annotated + " vs " + expected);
++    }
++
++    @Test
++    @DisplayName("代码侧 - 规则控制器权限码恰好 = 规则四码（list/add/edit/remove）")
++    void ruleControllerPermsExact() {
++        Set<String> perms = collectPerms(IotStatusRuleController.class);
++        assertEquals(Set.of("iot:statusrule:list", "iot:statusrule:add", "iot:statusrule:edit",
++                "iot:statusrule:remove"), perms);
++    }
++
++    @Test
++    @DisplayName("代码侧 - 字典控制器权限码恰好 = 字典三码（list/add/disable）")
++    void dictControllerPermsExact() {
++        Set<String> perms = collectPerms(IotStatusDictController.class);
++        assertEquals(Set.of("iot:statusdict:list", "iot:statusdict:add", "iot:statusdict:disable"), perms);
++    }
++
++    @Test
++    @DisplayName("只增不删纪律 - 字典控制器恰好三端点（无删除/无名称编辑/无恢复启用端点）")
++    void dictControllerSurfaceLocked() {
++        long endpoints = Arrays.stream(IotStatusDictController.class.getDeclaredMethods())
++                .filter(m -> Arrays.stream(m.getAnnotations()).anyMatch(a ->
++                        a.annotationType().getSimpleName().matches("(Get|Post|Put|Delete|Request)Mapping")))
++                .count();
++        assertEquals(3, endpoints, "字典控制器端点数漂移（TD-0013 只增不删——只允许 list/add/disable）");
++    }
++
++    @Test
++    @DisplayName("精确锚点 - 直绑映射复用 iot:statusrule:edit（TD-0014 映射是规则配置的一部分）")
++    void bindingMapReusesEditPerm() throws Exception {
++        Method bindingMap = IotStatusRuleController.class.getMethod("bindingMap",
++                IotStatusRuleBindingMapForm.class);
++        SaCheckPermission anno = bindingMap.getAnnotation(SaCheckPermission.class);
++        assertEquals("iot:statusrule:edit", anno.value()[0]);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 反射收集两控制器全部 @SaCheckPermission 权限码（去重） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = collectPerms(IotStatusRuleController.class);
++        perms.addAll(collectPerms(IotStatusDictController.class));
++        return perms;
++    }
++
++    private Set<String> collectPerms(Class<?> controllerClass) {
++        return Arrays.stream(controllerClass.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(SaCheckPermission.class))
++                .flatMap(m -> Arrays.stream(m.getAnnotation(SaCheckPermission.class).value()))
++                .collect(Collectors.toSet());
++    }
++
++    /** 从测试工作目录逐级向上定位仓库根的升级脚本（照 IotDataItemMenuPermissionGuardTest 口径） */
++    private String readScript() throws Exception {
++        Path cwd = Paths.get("").toAbsolutePath();
++        Path p = cwd;
++        while (p != null) {
++            Path candidate = p.resolve(SCRIPT_RELATIVE);
++            if (Files.exists(candidate)) {
++                return Files.readString(candidate, StandardCharsets.UTF_8);
++            }
++            p = p.getParent();
++        }
++        throw new IllegalStateException("升级脚本未找到: " + SCRIPT_RELATIVE + "（cwd=" + cwd + "）");
++    }
++
++    private Map<Long, String> parseMenuRows(String script) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(script);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImplTest.java
+new file mode 100644
+index 0000000..5b5599a
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusDictServiceImplTest.java
+@@ -0,0 +1,296 @@
++package net.otlab.admin.module.iot.statusrule.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusDictCreateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictCodeRow;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 状态字典服务单元测试（TASK-0048，TD-0013 只增不删）
++ *
++ * <p>测试口径（brief）：新增只增（seq 服务层取 max+1）/ seq 自增不复用断言（禁用后再增
++ * 新码 seq 跳号——分配基线含禁用行）/ 禁用不复用序号（disable 只置 status 不触碰 seq）/
++ * status_code 重复拒（4002 双道闸）/ 名称无编辑接口（服务接口面无 edit 方法——由
++ * IotStatusRuleMenuPermissionGuardTest 在控制器面锁定，本类锁定无编辑路径可触达）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotStatusDictServiceImplTest {
++
++    private static final long TENANT = 1L;
++
++    @Mock
++    private IotStatusDictMapper baseMapper;
++
++    private IotStatusDictServiceImpl dictService;
++
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotStatusDict.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++
++        dictService = new IotStatusDictServiceImpl();
++        ReflectionTestUtils.setField(dictService, "baseMapper", baseMapper);
++
++        // 默认编码未占用 / max(seq)=3 / 落库成功（异常用例逐用例覆盖）
++        when(baseMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++        when(baseMapper.selectMaxSeq(TENANT)).thenReturn(3);
++        when(baseMapper.insert(any(IotStatusDict.class))).thenReturn(1);
++        when(baseMapper.updateById(any(IotStatusDict.class))).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    private IotStatusDictCreateForm form() {
++        IotStatusDictCreateForm form = new IotStatusDictCreateForm();
++        form.setStatusCode("RUNNING");
++        form.setStatusName("运行");
++        form.setColor("#00FF00");
++        return form;
++    }
++
++    // ---------- 新增只增：seq 稳定序号 ----------
++
++    @Test
++    @DisplayName("新增成功：seq = max+1 服务层分配（请求不携带也不信任）、status 恒 1、tenant 会话覆盖")
++    void testCreate_Success() {
++        assertTrue(dictService.createDict(form()));
++        ArgumentCaptor<IotStatusDict> captor = ArgumentCaptor.forClass(IotStatusDict.class);
++        verify(baseMapper).insert(captor.capture());
++        IotStatusDict entity = captor.getValue();
++        assertEquals(TENANT, entity.getTenantId());
++        assertEquals(4, entity.getSeq());
++        assertEquals("RUNNING", entity.getStatusCode());
++        assertEquals("运行", entity.getStatusName());
++        assertEquals("#00FF00", entity.getColor());
++        assertEquals(1, entity.getStatus());
++        assertNull(entity.getDeleted());
++    }
++
++    @Test
++    @DisplayName("seq 跳号断言：禁用后（含禁用行的 max）再增新码取 max+1——禁用行序号不复用")
++    void testCreate_SeqSkipsDisabledRowNumber() {
++        // 场景：RUNNING(seq1)/STOPPED(seq2)/ALARM(seq3)，ALARM 禁用后 max(seq) 仍为 3
++        // （selectMaxSeq 含禁用行——Mapper 契约）；新增 FAULT 必得 seq=4，不得复用 3
++        when(baseMapper.selectMaxSeq(TENANT)).thenReturn(3);
++        IotStatusDictCreateForm f = form();
++        f.setStatusCode("FAULT");
++        assertTrue(dictService.createDict(f));
++        ArgumentCaptor<IotStatusDict> captor = ArgumentCaptor.forClass(IotStatusDict.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(4, captor.getValue().getSeq());
++    }
++
++    @Test
++    @DisplayName("空表首码：max=0 → seq=1")
++    void testCreate_FirstSeq() {
++        when(baseMapper.selectMaxSeq(TENANT)).thenReturn(0);
++        assertTrue(dictService.createDict(form()));
++        ArgumentCaptor<IotStatusDict> captor = ArgumentCaptor.forClass(IotStatusDict.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(1, captor.getValue().getSeq());
++    }
++
++    @Test
++    @DisplayName("status_code 活跃占用拒（4002——双道闸第一道）")
++    void testCreate_DuplicateActive() {
++        IotStatusDictCodeRow row = new IotStatusDictCodeRow();
++        row.setId(9L);
++        row.setStatusCode("RUNNING");
++        row.setDeleted(0);
++        when(baseMapper.selectOccupiedByCodes(TENANT, List.of("RUNNING"))).thenReturn(List.of(row));
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.createDict(form()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("状态编码已存在"));
++        verify(baseMapper, never()).insert(any(IotStatusDict.class));
++    }
++
++    @Test
++    @DisplayName("status_code 已删行占用拒（4002——uk 不含 deleted，防御性口径：API 无删除途径）")
++    void testCreate_DuplicateDeletedRow() {
++        IotStatusDictCodeRow row = new IotStatusDictCodeRow();
++        row.setId(9L);
++        row.setStatusCode("RUNNING");
++        row.setDeleted(1);
++        when(baseMapper.selectOccupiedByCodes(TENANT, List.of("RUNNING"))).thenReturn(List.of(row));
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.createDict(form()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("已被删除记录占用，不可复用"));
++        verify(baseMapper, never()).insert(any(IotStatusDict.class));
++    }
++
++    @Test
++    @DisplayName("DuplicateKey 兜底拒（4002——预检/取 seq 与落库之间并发窗口，重试取新 max+1）")
++    void testCreate_DuplicateKeyFallback() {
++        when(baseMapper.insert(any(IotStatusDict.class))).thenThrow(new DuplicateKeyException("uk_tenant_seq"));
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.createDict(form()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("并发冲突"));
++    }
++
++    @Test
++    @DisplayName("字段校验：编码空白/超长、名称空白/超长、颜色超长（400）")
++    void testCreate_FieldValidation() {
++        IotStatusDictCreateForm f = form();
++        f.setStatusCode(" ");
++        BusinessException e1 = assertThrows(BusinessException.class, () -> dictService.createDict(f));
++        assertEquals(400, e1.getCode());
++
++        IotStatusDictCreateForm f2 = form();
++        f2.setStatusCode("A".repeat(33));
++        BusinessException e2 = assertThrows(BusinessException.class, () -> dictService.createDict(f2));
++        assertTrue(e2.getMessage().contains("状态编码超长"));
++
++        IotStatusDictCreateForm f3 = form();
++        f3.setStatusName(null);
++        BusinessException e3 = assertThrows(BusinessException.class, () -> dictService.createDict(f3));
++        assertTrue(e3.getMessage().contains("状态名称不能为空"));
++
++        IotStatusDictCreateForm f4 = form();
++        f4.setStatusName("名".repeat(51));
++        BusinessException e4 = assertThrows(BusinessException.class, () -> dictService.createDict(f4));
++        assertTrue(e4.getMessage().contains("状态名称超长"));
++
++        IotStatusDictCreateForm f5 = form();
++        f5.setColor("#1234567890ABCDEF");
++        BusinessException e5 = assertThrows(BusinessException.class, () -> dictService.createDict(f5));
++        assertTrue(e5.getMessage().contains("展示颜色超长"));
++
++        verify(baseMapper, never()).insert(any(IotStatusDict.class));
++    }
++
++    // ---------- 禁用：一次性、不触碰 seq ----------
++
++    private IotStatusDict existing() {
++        IotStatusDict row = new IotStatusDict();
++        row.setId(9L);
++        row.setTenantId(TENANT);
++        row.setSeq(3);
++        row.setStatusCode("ALARM");
++        row.setStatusName("告警");
++        row.setStatus(1);
++        return row;
++    }
++
++    @Test
++    @DisplayName("禁用成功：只置 status=0，不触碰 seq（禁用不复用序号——TD-0013）")
++    void testDisable_Success() {
++        when(baseMapper.selectById(9L)).thenReturn(existing());
++        assertTrue(dictService.disableDict(9L));
++        ArgumentCaptor<IotStatusDict> captor = ArgumentCaptor.forClass(IotStatusDict.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotStatusDict upd = captor.getValue();
++        assertEquals(9L, upd.getId());
++        assertEquals(0, upd.getStatus());
++        // seq 不进更新集（禁用不复用序号）
++        assertNull(upd.getSeq());
++        assertNull(upd.getStatusCode());
++    }
++
++    @Test
++    @DisplayName("禁用幂等：已禁用行重复禁用 no-op 成功")
++    void testDisable_Idempotent() {
++        IotStatusDict disabled = existing();
++        disabled.setStatus(0);
++        when(baseMapper.selectById(9L)).thenReturn(disabled);
++        assertTrue(dictService.disableDict(9L));
++        verify(baseMapper).updateById(any(IotStatusDict.class));
++    }
++
++    @Test
++    @DisplayName("禁用：不存在拒（400）")
++    void testDisable_NotFound() {
++        when(baseMapper.selectById(9L)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> dictService.disableDict(9L));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("不存在或已删除"));
++        verify(baseMapper, never()).updateById(any(IotStatusDict.class));
++    }
++
++    // ---------- 列表 ----------
++
++    @Test
++    @DisplayName("列表 Wrapper：seq 升序锚定排序（稳定序号锚）")
++    void testList_WrapperShape() {
++        when(baseMapper.selectPage(any(), any())).thenAnswer(inv -> inv.getArgument(0));
++        dictService.selectDictList(1, 10, null);
++        ArgumentCaptor<Wrapper<IotStatusDict>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getTargetSql();
++        assertTrue(sql.toUpperCase().contains("SEQ"), "应含 seq 排序: " + sql);
++        assertTrue(sql.toUpperCase().contains("ASC"), "seq 升序断言: " + sql);
++    }
++
++    @Test
++    @DisplayName("列表过滤：statusCode/statusName LIKE、status eq")
++    void testList_Filters() {
++        when(baseMapper.selectPage(any(), any())).thenAnswer(inv -> inv.getArgument(0));
++        IotStatusDict query = new IotStatusDict();
++        query.setStatusCode("RUN");
++        query.setStatusName("运");
++        query.setStatus(1);
++        dictService.selectDictList(1, 10, query);
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotStatusDict>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getTargetSql();
++        assertTrue(sql.contains("status_code"), sql);
++        assertTrue(sql.contains("status_name"), sql);
++        assertTrue(sql.contains("status =") || sql.toUpperCase().contains("STATUS"), sql);
++    }
++
++    @Test
++    @DisplayName("Page<Page> 透传：selectPage 返回值原样返回")
++    void testList_Passthrough() {
++        Page<IotStatusDict> expected = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(), any())).thenReturn(expected);
++        Page<IotStatusDict> actual = dictService.selectDictList(1, 10, null);
++        assertEquals(expected, actual);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java
+new file mode 100644
+index 0000000..1d8867c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java
+@@ -0,0 +1,629 @@
++package net.otlab.admin.module.iot.statusrule.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleBindingMapForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleCreateForm;
++import net.otlab.admin.module.iot.statusrule.dto.IotStatusRuleUpdateForm;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusDict;
++import net.otlab.admin.module.iot.statusrule.entity.IotStatusRule;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusDictMapper;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRuleMapper;
++import net.otlab.admin.module.iot.statusrule.mapper.IotStatusRulePriorityRow;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 状态规则服务单元测试（TASK-0048）
++ *
++ * <p>校验矩阵（brief 测试口径）：priority 重复 uk+预检 4002（含已删行占用「不可复用」+
++ * DuplicateKey 兜底）/ 规则条数上限 10 条拒 / condition_expr 语法拒绝（Expander 同口径：
++ * 畸形 token 残留、括号不配平、超长）/ 引用不存在 4001 / status_code 未登记或禁用拒 /
++ * 修改白名单与启停承载（template_id/priority 结构性不可改）/ 直绑映射保存与校验
++ * （statusCode 字典锚定、pointId 存在、枚举值批内互撞、JSON 幂等覆盖）/ 随模板读
++ * （模板存在同租户校验 + priority 升序）/ 批量删除 fail-closed。
++ *
++ * <p>standalone Mockito 范式（照 IotMetricServiceImplTest）：Mapper 全 mock 不触真实库；
++ * TenantContext 静态 mock 供会话租户取值。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotStatusRuleServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long TEMPLATE_ID = 5L;
++    private static final long POINT_ID = 7L;
++
++    @Mock
++    private IotStatusRuleMapper baseMapper;
++
++    @Mock
++    private IotModelTemplateMapper modelTemplateMapper;
++
++    @Mock
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Mock
++    private IotStatusDictMapper statusDictMapper;
++
++    @Mock
++    private IotPointMapper pointMapper;
++
++    private IotStatusRuleServiceImpl ruleService;
++
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotStatusRule.class);
++        TableInfoHelper.initTableInfo(assistant, IotStatusDict.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotPoint.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++
++        ruleService = new IotStatusRuleServiceImpl();
++        ReflectionTestUtils.setField(ruleService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(ruleService, "modelTemplateMapper", modelTemplateMapper);
++        ReflectionTestUtils.setField(ruleService, "dataItemTemplateMapper", dataItemTemplateMapper);
++        ReflectionTestUtils.setField(ruleService, "statusDictMapper", statusDictMapper);
++        ReflectionTestUtils.setField(ruleService, "pointMapper", pointMapper);
++
++        // 默认模板存在 / 条数未超 / 优先级未占用 / 表达式引用项存在 / 字典编码启用 / 点位存在 /
++        // 落库成功（异常用例逐用例覆盖）
++        when(modelTemplateMapper.selectById(anyLong())).thenAnswer(inv -> templateRow(inv.getArgument(0, Long.class)));
++        when(baseMapper.selectActiveCountByTemplate(anyLong(), anyLong())).thenReturn(0L);
++        when(baseMapper.selectOccupiedByPriorities(anyLong(), anyLong(), anyCollection())).thenReturn(List.of());
++        when(dataItemTemplateMapper.selectList(any())).thenAnswer(inv -> List.of(itemRow("ELEC"), itemRow("RUN_STATE")));
++        when(statusDictMapper.selectOne(any())).thenAnswer(inv -> dictRow("RUNNING", 1));
++        when(pointMapper.selectById(anyLong())).thenAnswer(inv -> pointRow(inv.getArgument(0, Long.class)));
++        when(baseMapper.insert(any(IotStatusRule.class))).thenReturn(1);
++        when(baseMapper.updateById(any(IotStatusRule.class))).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具构建 ----------
++
++    private IotModelTemplate templateRow(Long id) {
++        IotModelTemplate row = new IotModelTemplate();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setTemplateCode("TPL00" + id);
++        row.setTemplateName("模板-" + id);
++        return row;
++    }
++
++    private IotDataItemTemplate itemRow(String code) {
++        IotDataItemTemplate row = new IotDataItemTemplate();
++        row.setId(code.hashCode() & 0xffffL);
++        row.setTemplateId(TEMPLATE_ID);
++        row.setTenantId(TENANT);
++        row.setDataCode(code);
++        row.setDataName("项-" + code);
++        return row;
++    }
++
++    private IotStatusDict dictRow(String code, Integer status) {
++        IotStatusDict row = new IotStatusDict();
++        row.setId(code.hashCode() & 0xffffL);
++        row.setTenantId(TENANT);
++        row.setSeq(1);
++        row.setStatusCode(code);
++        row.setStatusName("状态-" + code);
++        row.setStatus(status);
++        return row;
++    }
++
++    private IotPoint pointRow(Long id) {
++        IotPoint row = new IotPoint();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setPointCode("P00" + id);
++        row.setPointName("点位-" + id);
++        return row;
++    }
++
++    private IotStatusRule ruleRow(long id, int priority, String code) {
++        IotStatusRule row = new IotStatusRule();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setTemplateId(TEMPLATE_ID);
++        row.setPriority(priority);
++        row.setConditionExpr("{SELF.ELEC} > 0");
++        row.setStatusCode(code);
++        row.setStatusName("运行");
++        row.setEnabled(1);
++        return row;
++    }
++
++    private IotStatusRuleCreateForm createForm() {
++        IotStatusRuleCreateForm form = new IotStatusRuleCreateForm();
++        form.setTemplateId(TEMPLATE_ID);
++        form.setPriority(1);
++        form.setConditionExpr("{SELF.ELEC} > 0 && {SELF.RUN_STATE} == 1");
++        form.setStatusCode("RUNNING");
++        form.setStatusName("运行");
++        form.setColor("#00FF00");
++        return form;
++    }
++
++    // ---------- 新增：主链与优先级唯一双道闸 ----------
++
++    @Test
++    @DisplayName("新增成功：白名单落库断言（tenant 会话覆盖 / enabled 默认 1 / 表达式裁剪）")
++    void testCreate_Success() {
++        IotStatusRuleCreateForm form = createForm();
++        assertTrue(ruleService.createRule(form));
++
++        ArgumentCaptor<IotStatusRule> captor = ArgumentCaptor.forClass(IotStatusRule.class);
++        verify(baseMapper).insert(captor.capture());
++        IotStatusRule entity = captor.getValue();
++        assertEquals(TENANT, entity.getTenantId());
++        assertEquals(TEMPLATE_ID, entity.getTemplateId());
++        assertEquals(1, entity.getPriority());
++        assertEquals("{SELF.ELEC} > 0 && {SELF.RUN_STATE} == 1", entity.getConditionExpr());
++        assertEquals("RUNNING", entity.getStatusCode());
++        assertEquals("运行", entity.getStatusName());
++        assertEquals("#00FF00", entity.getColor());
++        assertEquals(1, entity.getEnabled());
++        assertNull(entity.getBindingMap());
++        assertNull(entity.getDeleted());
++    }
++
++    @Test
++    @DisplayName("新增携带 enabled=0：落库 0（创建可带停用态，值域 0/1）")
++    void testCreate_EnabledCarried() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setEnabled(0);
++        assertTrue(ruleService.createRule(form));
++        ArgumentCaptor<IotStatusRule> captor = ArgumentCaptor.forClass(IotStatusRule.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(0, captor.getValue().getEnabled());
++    }
++
++    @Test
++    @DisplayName("enabled 值域外拒（400）")
++    void testCreate_EnabledOutOfRange() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setEnabled(2);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("仅允许 0 停用 / 1 启用"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("priority 活跃占用预检拒（4002——uk 双道闸第一道）")
++    void testCreate_PriorityOccupiedActive() {
++        IotStatusRulePriorityRow row = new IotStatusRulePriorityRow();
++        row.setId(99L);
++        row.setPriority(1);
++        row.setDeleted(0);
++        when(baseMapper.selectOccupiedByPriorities(TENANT, TEMPLATE_ID, List.of(1))).thenReturn(List.of(row));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("优先级已存在"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("priority 已删行占用拒（4002——uk 不含 deleted，删除归档不复用）")
++    void testCreate_PriorityOccupiedDeletedRow() {
++        IotStatusRulePriorityRow row = new IotStatusRulePriorityRow();
++        row.setId(99L);
++        row.setPriority(1);
++        row.setDeleted(1);
++        when(baseMapper.selectOccupiedByPriorities(TENANT, TEMPLATE_ID, List.of(1))).thenReturn(List.of(row));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("已被删除记录占用，不可复用"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("DuplicateKey 兜底拒（4002——预检与落库之间并发窗口）")
++    void testCreate_DuplicateKeyFallback() {
++        when(baseMapper.insert(any(IotStatusRule.class))).thenThrow(new DuplicateKeyException("uk_template_priority"));
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("并发冲突"));
++    }
++
++    @Test
++    @DisplayName("规则条数上限：同模板活跃数 ≥10 拒（400「状态规则上限 10 条」）")
++    void testCreate_CapReject() {
++        when(baseMapper.selectActiveCountByTemplate(TENANT, TEMPLATE_ID)).thenReturn(10L);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("状态规则上限 10 条"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("模板不存在拒（400——列表/写路径防线对模板判定）")
++    void testCreate_TemplateMissing() {
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("所属模板不存在或已删除"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    // ---------- 新增：condition_expr 校验（Expander 同口径 + 引用存在性） ----------
++
++    @Test
++    @DisplayName("表达式畸形 token 拒（400——{ SELF.ELEC } 带空格残留花括号）")
++    void testCreate_ConditionResidualBrace() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setConditionExpr("{ SELF.ELEC } > 0");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("无法识别的引用 token"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("表达式括号不配平拒（400）")
++    void testCreate_ConditionUnbalanced() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setConditionExpr("({SELF.ELEC} > 0 && {SELF.RUN_STATE} == 1");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("不配平"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("表达式超长拒（400——varchar(1000) 列宽口径）")
++    void testCreate_ConditionTooLong() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setConditionExpr("{SELF.ELEC} > 0" + " + 1".repeat(400));
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("超长"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("SELF 引用不存在拒（4001——模板数据项范围）")
++    void testCreate_SelfRefMissing() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setConditionExpr("{SELF.ELEC} > 0 && {SELF.NOT_THERE} == 1");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(form));
++        assertEquals(4001, e.getCode());
++        assertTrue(e.getMessage().contains("条件表达式引用的数据项不存在"));
++        assertTrue(e.getMessage().contains("SELF.NOT_THERE"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("PARENT/绝对引用收集不核存在性（0036 一期口径——被引实例可能后建）")
++    void testCreate_ParentAndAbsoluteRefsUnchecked() {
++        IotStatusRuleCreateForm form = createForm();
++        form.setConditionExpr("{SELF.ELEC} > 0 && {PARENT.NOT_THERE} == 1 && {F99.WS99.EQ999.NOPE} > 0");
++        assertTrue(ruleService.createRule(form));
++        verify(baseMapper).insert(any(IotStatusRule.class));
++    }
++
++    // ---------- 新增：status_code 字典锚定 ----------
++
++    @Test
++    @DisplayName("status_code 未登记拒（4001——提示先建状态编码）")
++    void testCreate_StatusCodeNotRegistered() {
++        when(statusDictMapper.selectOne(any())).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(4001, e.getCode());
++        assertTrue(e.getMessage().contains("请先在状态字典中创建"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("status_code 已禁用拒（4001——禁用一次性，引用方须改用其他编码）")
++    void testCreate_StatusCodeDisabled() {
++        when(statusDictMapper.selectOne(any())).thenReturn(dictRow("RUNNING", 0));
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        assertEquals(4001, e.getCode());
++        assertTrue(e.getMessage().contains("已禁用"));
++        verify(baseMapper, never()).insert(any(IotStatusRule.class));
++    }
++
++    // ---------- 修改：白名单 + 启停承载 ----------
++
++    private IotStatusRule existingRule() {
++        return ruleRow(11L, 1, "RUNNING");
++    }
++
++    @Test
++    @DisplayName("修改不存在拒（400）")
++    void testUpdate_NotFound() {
++        when(baseMapper.selectById(11L)).thenReturn(null);
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.updateRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("不存在或已删除"));
++    }
++
++    @Test
++    @DisplayName("写路径防线：规则所属模板不存在拒（400——0021 范式对模板判定）")
++    void testUpdate_TemplateMissing() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(null);
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setStatusName("改名");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.updateRule(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("所属模板不存在或已删除"));
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("修改白名单：仅携带字段进更新集（启停由编辑承载 enabled 0/1）")
++    void testUpdate_WhitelistAndToggle() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setStatusName("运行中");
++        form.setColor("#FF0000");
++        form.setEnabled(0);
++        assertTrue(ruleService.updateRule(form));
++
++        ArgumentCaptor<IotStatusRule> captor = ArgumentCaptor.forClass(IotStatusRule.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotStatusRule upd = captor.getValue();
++        assertEquals(11L, upd.getId());
++        assertEquals("运行中", upd.getStatusName());
++        assertEquals("#FF0000", upd.getColor());
++        assertEquals(0, upd.getEnabled());
++        // 未携带字段不进更新集（null → MP 跳过保持库内原值）
++        assertNull(upd.getConditionExpr());
++        assertNull(upd.getStatusCode());
++        // template_id/priority 结构性不进更新集（调优先级=删旧建新）
++        assertNull(upd.getTemplateId());
++        assertNull(upd.getPriority());
++    }
++
++    @Test
++    @DisplayName("修改携带 conditionExpr：全量重校验（引用不存在 4001 拒）")
++    void testUpdate_ConditionExprRevalidated() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setConditionExpr("{SELF.MISSING} > 0");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.updateRule(form));
++        assertEquals(4001, e.getCode());
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("修改携带合法 conditionExpr：裁剪后进更新集")
++    void testUpdate_ConditionExprValid() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setConditionExpr("  {SELF.RUN_STATE} == 0  ");
++        assertTrue(ruleService.updateRule(form));
++        ArgumentCaptor<IotStatusRule> captor = ArgumentCaptor.forClass(IotStatusRule.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals("{SELF.RUN_STATE} == 0", captor.getValue().getConditionExpr());
++    }
++
++    @Test
++    @DisplayName("修改携带 statusCode：字典锚定重校验（禁用 4001 拒）")
++    void testUpdate_StatusCodeDisabled() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        when(statusDictMapper.selectOne(any())).thenReturn(dictRow("STOPPED", 0));
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setStatusCode("STOPPED");
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.updateRule(form));
++        assertEquals(4001, e.getCode());
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    // ---------- 直绑映射（TD-0014） ----------
++
++    private IotStatusRuleBindingMapForm bindingForm() {
++        IotStatusRuleBindingMapForm form = new IotStatusRuleBindingMapForm();
++        form.setRuleId(11L);
++        form.setPointId(POINT_ID);
++        IotStatusRuleBindingMapForm.EnumMapping m1 = new IotStatusRuleBindingMapForm.EnumMapping();
++        m1.setEnumValue("1");
++        m1.setStatusCode("RUNNING");
++        IotStatusRuleBindingMapForm.EnumMapping m2 = new IotStatusRuleBindingMapForm.EnumMapping();
++        m2.setEnumValue("0");
++        m2.setStatusCode("STOPPED");
++        form.setMappings(List.of(m1, m2));
++        return form;
++    }
++
++    @Test
++    @DisplayName("直绑映射保存：整份 JSON 幂等覆盖 binding_map（pointId+枚举值→状态编码）")
++    void testBindingMap_Success() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        assertTrue(ruleService.saveBindingMap(bindingForm()));
++
++        ArgumentCaptor<IotStatusRule> captor = ArgumentCaptor.forClass(IotStatusRule.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotStatusRule upd = captor.getValue();
++        assertEquals(11L, upd.getId());
++        String json = upd.getBindingMap();
++        assertTrue(json.contains("\"pointId\":" + POINT_ID));
++        assertTrue(json.contains("\"enumValue\":\"1\""));
++        assertTrue(json.contains("\"statusCode\":\"RUNNING\""));
++        assertTrue(json.contains("\"statusCode\":\"STOPPED\""));
++        // 白名单：只进 bindingMap，其他字段不夹带
++        assertNull(upd.getStatusName());
++        assertNull(upd.getEnabled());
++    }
++
++    @Test
++    @DisplayName("直绑映射：规则不存在拒（400）/ 点位不存在拒（4001）")
++    void testBindingMap_RuleAndPointValidation() {
++        when(baseMapper.selectById(11L)).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> ruleService.saveBindingMap(bindingForm()));
++        assertEquals(400, e1.getCode());
++
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        when(pointMapper.selectById(POINT_ID)).thenReturn(null);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> ruleService.saveBindingMap(bindingForm()));
++        assertEquals(4001, e2.getCode());
++        assertTrue(e2.getMessage().contains("点位不存在"));
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("直绑映射：批内枚举值互撞拒（400）")
++    void testBindingMap_DuplicateEnum() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        IotStatusRuleBindingMapForm form = bindingForm();
++        IotStatusRuleBindingMapForm.EnumMapping m3 = new IotStatusRuleBindingMapForm.EnumMapping();
++        m3.setEnumValue("1");
++        m3.setStatusCode("ALARM");
++        form.setMappings(List.of(form.getMappings().get(0), m3));
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.saveBindingMap(form));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("枚举值重复"));
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    @Test
++    @DisplayName("直绑映射：statusCode 未登记/禁用逐项拒（4001）")
++    void testBindingMap_StatusCodeValidation() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        when(statusDictMapper.selectOne(any())).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.saveBindingMap(bindingForm()));
++        assertEquals(4001, e.getCode());
++        assertTrue(e.getMessage().contains("请先在状态字典中创建"));
++        verify(baseMapper, never()).updateById(any(IotStatusRule.class));
++    }
++
++    // ---------- 列表（随模板读） ----------
++
++    @Test
++    @DisplayName("列表按模板读：模板缺失拒（400）；命中走 selectPage 透传")
++    void testList_ByTemplate() {
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> ruleService.selectRuleList(1, 10, TEMPLATE_ID));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("所属模板不存在或已删除"));
++
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(templateRow(TEMPLATE_ID));
++        List<IotStatusRule> rows = List.of(ruleRow(2L, 1, "RUNNING"), ruleRow(1L, 2, "STOPPED"));
++        when(baseMapper.selectPage(any(), any())).thenAnswer(inv -> {
++            Page<IotStatusRule> p = inv.getArgument(0);
++            p.setRecords(rows);
++            p.setTotal(rows.size());
++            return p;
++        });
++        Page<IotStatusRule> page = ruleService.selectRuleList(1, 10, TEMPLATE_ID);
++        assertEquals(2, page.getRecords().size());
++        verify(baseMapper).selectPage(any(), any());
++    }
++
++    @Test
++    @DisplayName("列表 templateId 缺失拒（400）")
++    void testList_TemplateRequired() {
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.selectRuleList(1, 10, null));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("所属模板不能为空"));
++    }
++
++    // ---------- 批量删除 ----------
++
++    @Test
++    @DisplayName("批量删除成功（逻辑删——removeByIds/deleteByIds）；模板防线通过")
++    void testDelete_Success() {
++        IotStatusRule r1 = ruleRow(1L, 1, "RUNNING");
++        IotStatusRule r2 = ruleRow(2L, 2, "STOPPED");
++        when(baseMapper.selectByIds(List.of(1L, 2L))).thenReturn(List.of(r1, r2));
++        when(baseMapper.deleteByIds(anyCollection())).thenReturn(1);
++        assertTrue(ruleService.deleteRules(List.of(1L, 2L)));
++        verify(modelTemplateMapper, org.mockito.Mockito.times(2)).selectById(TEMPLATE_ID);
++        verify(baseMapper).deleteByIds(anyCollection());
++    }
++
++    @Test
++    @DisplayName("批量删除 fail-closed：任一不存在整批拒绝（不半删）")
++    void testDelete_MissingFailClosed() {
++        when(baseMapper.selectByIds(List.of(1L, 2L))).thenReturn(List.of(ruleRow(1L, 1, "RUNNING")));
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.deleteRules(List.of(1L, 2L)));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("不存在或已删除"));
++        verify(baseMapper, never()).deleteByIds(anyCollection());
++    }
++
++    @Test
++    @DisplayName("批量删除：写路径防线（模板不存在）整批拒绝")
++    void testDelete_TemplateMissing() {
++        when(baseMapper.selectByIds(List.of(1L))).thenReturn(List.of(ruleRow(1L, 1, "RUNNING")));
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> ruleService.deleteRules(List.of(1L)));
++        assertEquals(400, e.getCode());
++        verify(baseMapper, never()).deleteByIds(anyCollection());
++    }
++
++    @Test
++    @DisplayName("列表 Wrapper：template_id 等值条件 + priority 升序（小者优先）")
++    void testList_WrapperShape() {
++        when(baseMapper.selectPage(any(), any())).thenAnswer(inv -> inv.getArgument(0));
++        ruleService.selectRuleList(1, 10, TEMPLATE_ID);
++        ArgumentCaptor<Wrapper<IotStatusRule>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getTargetSql();
++        assertTrue(sql.contains("template_id"), "wrapper 应含 template_id 条件: " + sql);
++        assertTrue(sql.toUpperCase().contains("PRIORITY"), "应含 priority 排序: " + sql);
++        assertTrue(sql.toUpperCase().contains("ASC"), "priority 升序断言: " + sql);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidatorTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidatorTest.java
+new file mode 100644
+index 0000000..e1e5f19
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/support/ConditionExprValidatorTest.java
+@@ -0,0 +1,91 @@
++package net.otlab.admin.module.iot.statusrule.service.support;
++
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 条件表达式校验器单元测试（TASK-0048，Expander 同口径语法矩阵）
++ *
++ * <p>覆盖：非空必填 / 长度 ≤1000 / 括号配平 / SELF-PARENT 前缀白名单（大小写不敏感）/
++ * 引用编码字符集（畸形 token 残留终检）/ 绝对全键引用剥壳 / 引用收集保序去重。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class ConditionExprValidatorTest {
++
++    @Test
++    @DisplayName("合法表达式：SELF/PARENT/绝对引用收集，括号与运算符放行")
++    void validExpressionCollectsRefs() {
++        ConditionExprValidator.Outcome outcome = ConditionExprValidator.validate(
++                "{SELF.ELEC} > 0 && {SELF.Run_State} == 1 || ({PARENT.RUN} == 0 && DELTA({F01.WS01.EQ002.ELEC_CONS}) > 10)");
++        assertEquals(2, outcome.selfCodes().size());
++        assertTrue(outcome.selfCodes().contains("ELEC") && outcome.selfCodes().contains("Run_State"));
++        assertEquals(1, outcome.parentCodes().size());
++        assertTrue(outcome.parentCodes().contains("RUN"));
++        assertEquals(1, outcome.absoluteRefs().size());
++        assertTrue(outcome.absoluteRefs().contains("F01.WS01.EQ002.ELEC_CONS"));
++    }
++
++    @Test
++    @DisplayName("空白/缺失表达式拒（400——非空必填）")
++    void blankRejected() {
++        BusinessException e1 = assertThrows(BusinessException.class, () -> ConditionExprValidator.validate(null));
++        BusinessException e2 = assertThrows(BusinessException.class, () -> ConditionExprValidator.validate("   "));
++        assertEquals(400, e1.getCode());
++        assertTrue(e2.getMessage().contains("条件表达式不能为空"));
++    }
++
++    @Test
++    @DisplayName("超长拒（400——condition_expr varchar(1000) 列宽口径）")
++    void tooLongRejected() {
++        String expr = "{SELF.ELEC} > 0" + " + 1".repeat(300);
++        BusinessException e = assertThrows(BusinessException.class, () -> ConditionExprValidator.validate(expr));
++        assertEquals(400, e.getCode());
++        assertTrue(e.getMessage().contains("超长"));
++    }
++
++    @Test
++    @DisplayName("括号不配平拒（400——() 与 {} 各自配平）")
++    void unbalancedRejected() {
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> ConditionExprValidator.validate("({SELF.ELEC} > 0 && {SELF.RUN} == 1"));
++        assertTrue(e1.getMessage().contains("不配平"));
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> ConditionExprValidator.validate("{SELF.ELEC} > 0 && {SELF.RUN"));
++        assertTrue(e2.getMessage().contains("不配平"));
++    }
++
++    @Test
++    @DisplayName("畸形 token 残留终检拒（400——{ SELF.X } 带空格 / {SELF.ELEC-X} 非法编码字符）")
++    void malformedTokenRejected() {
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> ConditionExprValidator.validate("{ SELF.ELEC } > 0"));
++        assertTrue(e1.getMessage().contains("无法识别的引用 token"));
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> ConditionExprValidator.validate("{SELF.ELEC-X} > 0"));
++        assertTrue(e2.getMessage().contains("无法识别的引用 token"));
++    }
++
++    @Test
++    @DisplayName("SELF/PARENT 关键字大小写不敏感（Expander 同口径），编码大小写保留")
++    void keywordCaseInsensitive() {
++        ConditionExprValidator.Outcome outcome = ConditionExprValidator.validate("{self.elec} > 0 || {Parent.RUN} == 1");
++        assertTrue(outcome.selfCodes().contains("elec"));
++        assertTrue(outcome.parentCodes().contains("RUN"));
++    }
++
++    @Test
++    @DisplayName("重复引用保序去重")
++    void duplicateRefsDeduped() {
++        ConditionExprValidator.Outcome outcome = ConditionExprValidator.validate(
++                "{SELF.ELEC} > 0 && {SELF.ELEC} < 100 && {SELF.POWER} > 0");
++        assertEquals(2, outcome.selfCodes().size());
++        assertEquals("ELEC", outcome.selfCodes().iterator().next());
++    }
++}
+diff --git a/resources/sql/upgrade/20261122_iot_status_rule_domain.sql b/resources/sql/upgrade/20261122_iot_status_rule_domain.sql
+new file mode 100644
+index 0000000..f64a14f
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_status_rule_domain.sql
+@@ -0,0 +1,168 @@
++-- ============================================================
++-- 存量库升级脚本：iot_status_rule 状态判定规则表 + iot_status_dict 状态编码稳定字典表
++--   + 模板管理页按钮权限种子（TASK-0048 / FEAT-0016 / REQ-0007 / ADR-0009 TD-0013、TD-0014）
++--
++-- 用途：
++--   1) 建 iot_status_rule 状态判定规则表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1
++--      附录 A p35，brief 已提取；字形规范化（⼾→户、⼩→小、⽐→比、⽤→用、⽰→示等康熙
++--      部首区字形）不改语义）；
++--   2) 建 iot_status_dict 状态编码稳定字典表（TD-0013 语义落表——见下方「与上游差异」1）；
++--   3) sys_menu 登记模板管理页（4009「模板管理」，20261121_iot_console_menus.sql 已建）
++--      之下的七个按钮权限行（menu_type=3）：iot:statusrule:list/add/edit/remove +
++--      iot:statusdict:list/add/disable；
++--   4) sys_role_menu 将上述七行授予超级管理员（role_id=1；照 20261122_iot_metric_domain.sql 范式）。
++--
++-- 与上游差异（两处，均登记待回写上游）：
++--   1) **iot_status_dict 为本任务定义的新表**：上游详细设计（数据库与接口）附录 A 无状态
++--      字典表 DDL，ADR-0009 TD-0013 只给语义（「状态编码独立稳定字典：只增不删、禁用
++--      不复用序号、历史 st_item_value 序号不漂移」）。本表按该语义定义（seq 稳定序号 +
++--      uk_tenant_seq 物理唯一保漂移不可能；无删除接口、禁用接口不触碰 seq）。
++--      **建议回写上游**（照 TASK-0021 补 tenant_id 先例的「攒下一版小修订」处理）。
++--   2) **iot_status_rule 较附录 A p35 逐字 DDL 增补一列 `binding_map` json DEFAULT NULL**：
++--      TD-0014 直绑映射（点位枚举值→状态编码）上游逐字 DDL 无对应列，brief 裁决「映射存
++--      iot_status_rule 表新增 binding_map json 列（轻量，随规则行）」——直绑映射随规则配置
++--      存储与随发布下发（0024 发布链）。**建议回写上游**（同上处理）。
++--   逐字部分（列序/列型/注释/索引）与附录 A p35 完全一致：uk_template_priority
++--   (template_id, priority) 在 MySQL 8 InnoDB 可行（bigint+int），无需前缀降级。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 + 本任务 brief；规则挂模板、
++--   状态规则入口挂模板管理页内——TASK-0056 占位按钮对应此页）：
++--   iot:statusrule:list    GET    /iot/statusrule/list?templateId=（按模板读规则集，
++--                            priority 升序；模板存在同租户校验）
++--   iot:statusrule:add     POST   /iot/statusrule（单条新增：同模板 priority 唯一双道闸
++--                            4002（uk_template_priority 物理拒绝 + 含已删行预检——uk 不含
++--                            deleted 列，逻辑删行永久占用优先级，删除归档不复用）；规则条数
++--                            上限 ≤10 条（同模板活跃数 ≥10 拒，400「状态规则上限 10 条」）；
++--                            condition_expr 校验：0013 RelativeRefExpander 同口径语法
++--                            （花括号 token 合法性/SELF-PARENT 前缀白名单/引用编码字符集/
++--                            长度 ≤1000/括号配平）+ 相对引用存在性（模板数据项范围，
++--                            引用不存在 4001 拒存；表达式真语义校验归计算引擎——0036
++--                            同款口径登记）；status_code 必须在 iot_status_dict 存在且启用
++--                            （未登记 4001 拒并提示先建状态编码））
++--   iot:statusrule:edit    PUT    /iot/statusrule（修改：白名单 conditionExpr/statusCode/
++--                            statusName/color/enabled（启停由 edit 承载 enabled 0/1）；
++--                            template_id/priority 不可改——调优先级=删旧建新；status_code
++--                            改值时同样校验字典存在启用；condition_expr 改值时同样全量校验）
++--   iot:statusrule:edit    PUT    /iot/statusrule/binding-map（直绑映射配置——TD-0014 挂
++--                            模板随发布下发：body ruleId+pointId+枚举值映射数组
++--                            [{enumValue,statusCode}]，整份 JSON 存该规则行 binding_map 列
++--                            （幂等覆盖）；statusCode 校验字典存在启用；pointId 校验存在）
++--   iot:statusrule:remove  DELETE /iot/statusrule/{ids}（批量逻辑删；优先级删除归档不复用
++--                            ——uk_template_priority 不含 deleted）
++--   iot:statusdict:list    GET    /iot/statusdict/list（字典分页列表，seq 升序——稳定序号
++--                            锚定排序）
++--   iot:statusdict:add     POST   /iot/statusdict（只增：seq 由服务层取本租户当前
++--                            max(seq)+1（禁用行序号不复用；uk_tenant_seq 物理唯一保漂移
++--                            不可能）；status_code 租户内唯一双道闸 4002）
++--   iot:statusdict:disable PUT    /iot/statusdict/{id}/disable（禁用不复用序号——无删除/
++--                            无名称编辑接口：只增不删纪律，名称修正属语义变更须评估漂移，
++--                            本期不开放，报告登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4058-4062：TASK-0043 占用（指标按钮五行，4062 已占）；
++--   本脚本占用 sys_menu id 4063-4069（七行，parent_id=4009），连续取号。
++--   行构成说明：brief 种子枚举「iot:statusrule:list/query/add/edit/remove +
++--   iot:statusdict:add/disable 共七行」与字典段裁决「新设 iot:statusdict:list 权限行」
++--   并读——本任务接口面实际使用七个权限码（规则四 + 字典三；规则域 brief 接口清单无
++--   detail 端点故无 query 码），七行 4063-4069 恰按「权限标识与接口清单一一对应」落位。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（REQ-0007 / FEAT-0016 / ADR-0009 TD-0013、TD-0014 / 本任务 brief）：
++--   状态编码稳定字典只增不删（TD-0013）：无删除接口、无名称编辑接口（名称修正属语义
++--   变更须评估历史 st_item_value 序号漂移，本期不开放）；禁用（status=0）不复用序号——
++--   seq 由服务层取「本租户当前 max(seq)+1」（含禁用行），uk_tenant_seq 物理唯一使序号
++--   漂移结构性不可能；历史 st_item_value 以 value=seq 留痕，序号不漂移则时长与变位历史
++--   还原正确。
++--   uk_tenant_status_code / uk_tenant_seq 均不含 deleted 列：字典行经 API 无删除途径
++--   （纪律使然），编码与序号永久占用。
++--   规则表 uk_template_priority 不含 deleted 列：逻辑删行永久占用 (template_id, priority)，
++--   优先级删除归档不复用；预检走含已删行旁路（文案区分「已存在」/「已被删除记录占用，
++--   不可复用」）+ DuplicateKey 兜底（0011/0021/0043 双道闸同款）。
++--   规则条数上限 ≤10（同模板活跃数，任务正文）：≥10 拒新增（400 文案「状态规则上限
++--   10 条」）——防规则集膨胀拖垮判定求值（FEAT-0016 异常与边界）。
++--   condition_expr 一期校验口径（brief：Expander 同口径语法 + 相对引用存在性；表达式
++--   真语义校验归计算引擎——0036 同款口径登记）：语法（花括号 token/前缀白名单/字符集/
++--   长度/括号配平）由 ConditionExprValidator 承载；SELF 相对引用存在性核对模板数据项
++--   （iot_data_item_template），PARENT 与绝对全键引用同 0036 一期口径收集不核存在性
++--   （被引实例可能后建；模板层无法解析父模板——报告登记）。
++--   规则随配置发布下发：规则行无 config_version 列（上游 DDL 无此列），保存≠生效——
++--   生效走 0024 配置快照发布链路（照 0021/0023 口径登记，报告登记 0024 发布链承接）。
++--   多租户：iot_status_rule / iot_status_dict 属 iot_ 前缀表，由 TASK-0002
++--   TenantLineInnerInterceptor（OtTenantLineHandler 前缀规则）自动按会话租户注入条件，
++--   tenant_id 服务层从会话覆盖、禁前端传参；规则挂模板——列表/写路径以「模板存在同租户」
++--   为防线（模板无部门锚点，数据权限裁剪按 brief 口径收敛为模板同租户校验）。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4009 在位）的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_status_rule` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '规则 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `template_id` bigint NOT NULL COMMENT '所属模板 ID',
++  `priority` int NOT NULL COMMENT '优先级（小者优先）',
++  `condition_expr` varchar(1000) NOT NULL COMMENT '条件表达式（相对引用）',
++  `status_code` varchar(32) NOT NULL COMMENT '状态编码',
++  `status_name` varchar(50) NOT NULL COMMENT '状态名称',
++  `color` varchar(16) DEFAULT NULL COMMENT '展示颜色',
++  `enabled` tinyint DEFAULT '1' COMMENT '是否启用 0 停用 1 启用',
++  `binding_map` json DEFAULT NULL COMMENT '直绑映射（TD-0014 上游无列本任务新增：{pointId,mappings:[{enumValue,statusCode}]}）',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_template_priority` (`template_id`,`priority`),
++  KEY `idx_tenant_template` (`tenant_id`,`template_id`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='状态判定规则表';
++
++CREATE TABLE IF NOT EXISTS `iot_status_dict` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '状态字典 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `seq` int NOT NULL COMMENT '稳定序号（只增不复用——历史 st_item_value 序号不漂移的锚）',
++  `status_code` varchar(32) NOT NULL COMMENT '状态编码',
++  `status_name` varchar(50) NOT NULL COMMENT '状态名称',
++  `color` varchar(16) DEFAULT NULL COMMENT '展示颜色',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用（禁用不复用序号）',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_status_code` (`tenant_id`,`status_code`),
++  UNIQUE KEY `uk_tenant_seq` (`tenant_id`,`seq`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='状态编码稳定字典表（TD-0013）';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4063, 4009, 4, '状态规则查询', 3, NULL, NULL, NULL, 'iot:statusrule:list', NULL, 7, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4064, 4009, 4, '状态规则新增', 3, NULL, NULL, NULL, 'iot:statusrule:add', NULL, 8, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4065, 4009, 4, '状态规则修改', 3, NULL, NULL, NULL, 'iot:statusrule:edit', NULL, 9, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4066, 4009, 4, '状态规则删除', 3, NULL, NULL, NULL, 'iot:statusrule:remove', NULL, 10, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4067, 4009, 4, '状态字典查询', 3, NULL, NULL, NULL, 'iot:statusdict:list', NULL, 11, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4068, 4009, 4, '状态字典新增', 3, NULL, NULL, NULL, 'iot:statusdict:add', NULL, 12, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4069, 4009, 4, '状态字典禁用', 3, NULL, NULL, NULL, 'iot:statusdict:disable', NULL, 13, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4063), (1, 4064), (1, 4065), (1, 4066), (1, 4067), (1, 4068), (1, 4069);
++
++-- ============================================================
++-- 执行后核对（第一条/第二条应见表结构、第三条应 7 行、第四条应 7 行）：
++--   SHOW CREATE TABLE iot_status_rule;
++--   SHOW CREATE TABLE iot_status_dict;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4063 AND 4069;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4063 AND 4069;
++-- ============================================================

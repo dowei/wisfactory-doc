@@ -1,0 +1,3009 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/controller/IotChannelController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/controller/IotChannelController.java
+new file mode 100644
+index 0000000..04d2f1d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/controller/IotChannelController.java
+@@ -0,0 +1,108 @@
++package net.otlab.admin.module.iot.channel.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.channel.domain.ChannelProtocols;
++import net.otlab.admin.module.iot.channel.dto.IotChannelCreateForm;
++import net.otlab.admin.module.iot.channel.dto.IotChannelUpdateForm;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.service.IotChannelService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 通道控制器（TASK-0018，管理面 CRUD——详细设计 §3.1 p21 通道段）
++ *
++ * <p>路径命名空间 /iot/channel（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
++ * iot:channel:*（sys_menu 4046-4050，通道管理页 4013 之下）。§3.1 通道段五接口
++ * （list/add/edit/remove/detail）与菜单五行一一对应（detail 挂 iot:channel:query）。
++ *
++ * <p>list 按 gatewayId 必传查通道列表（§3.1 口径——通道列表按网关查）；add/edit 对
++ * MODBUS/OPCUA（一期预留协议，可建不可启用——REQ-0010 验收 2）返回带标注的成功文案
++ * 「未启用适配器，一期不产生接入行为」（响应标注；请求携带 status=1 一律落库 0，服务层
++ * 强制）。保存≠生效：本控制器不提供任何下发动作，通道变更对接入生效走 TASK-0024 配置
++ * 快照发布链路（REQ-0010 验收 4）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "采集通道")
++@RestController
++@RequestMapping("/iot/channel")
++public class IotChannelController {
++
++    /** 预留协议成功文案（响应/文档标注——「未启用适配器，一期不产生接入行为」） */
++    private static final String RESERVED_PROTOCOL_MESSAGE =
++            "通道保存成功：该协议一期未启用适配器，status 已置 0（不产生接入行为，二期适配器上线后可启用）";
++
++    @Autowired
++    private IotChannelService channelService;
++
++    @Operation(summary = "通道分页列表（gatewayId 必传——按网关查；过滤 channelCode/protocolType/status）")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:channel:list")
++    public Result<Page<IotChannel>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                         @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                         IotChannel query) {
++        Page<IotChannel> page = new Page<>(pageNum, pageSize);
++        return Result.success(channelService.selectChannelList(page, query));
++    }
++
++    @Operation(summary = "通道详情（含 conn_config JSON 原文——不含凭据，ADR-0006）")
++    @GetMapping("/{id}")
++    @SaCheckPermission("iot:channel:query")
++    public Result<IotChannel> detail(@PathVariable("id") Long id) {
++        return Result.success(channelService.getChannelDetail(id));
++    }
++
++    @OperateLog(title = "采集通道", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增通道（channel_code 网关内唯一双道闸 4002；conn_config 按协议 Schema 校验"
++            + "且不含凭据；MODBUS/OPCUA 可建不可启用——status 强制 0）")
++    @PostMapping
++    @SaCheckPermission("iot:channel:add")
++    public Result<Void> add(@Valid @RequestBody IotChannelCreateForm form) {
++        channelService.createChannel(form);
++        return reservedProtocol(form.getProtocolType()) ? Result.success(RESERVED_PROTOCOL_MESSAGE, null)
++                : Result.success();
++    }
++
++    @OperateLog(title = "采集通道", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改通道（channel_code/gateway_id 不可改；conn_config 变更重新校验；"
++            + "MODBUS/OPCUA status 强制 0）")
++    @PutMapping
++    @SaCheckPermission("iot:channel:edit")
++    public Result<Void> edit(@Valid @RequestBody IotChannelUpdateForm form) {
++        channelService.updateChannel(form);
++        return reservedProtocol(form.getProtocolType()) ? Result.success(RESERVED_PROTOCOL_MESSAGE, null)
++                : Result.success();
++    }
++
++    @OperateLog(title = "采集通道", businessType = BusinessType.DELETE)
++    @Operation(summary = "删除通道（软删除；其下有点位则拒绝——点位表归 0021，guard 结构本期就位）")
++    @DeleteMapping("/{id}")
++    @SaCheckPermission("iot:channel:remove")
++    public Result<Void> remove(@PathVariable("id") Long id) {
++        channelService.deleteChannel(id);
++        return Result.success();
++    }
++
++    /** 编辑目标为预留协议（或协议改为预留协议）时返回标注文案；携带非法协议值时服务层先拒，不会走到文案分支 */
++    private boolean reservedProtocol(String protocolType) {
++        // Set.of 不可变集合对 contains(null) 抛 NPE——编辑未携带 protocolType（改名单纯场景）必须先判空
++        return protocolType != null && ChannelProtocols.RESERVED_NO_ADAPTER.contains(protocolType);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/domain/ChannelProtocols.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/domain/ChannelProtocols.java
+new file mode 100644
+index 0000000..85c408a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/domain/ChannelProtocols.java
+@@ -0,0 +1,29 @@
++package net.otlab.admin.module.iot.channel.domain;
++
++import java.util.Set;
++
++/**
++ * 通道协议类型字典（TASK-0018，REQ-0010 业务能力——MQTT/HTTP/MODBUS/OPCUA 四值）。
++ *
++ * <p>一期只实现 MQTT、HTTP 两种通道运行逻辑；{@link #RESERVED_NO_ADAPTER} 两值可建不可
++ * 启用（REQ-0010 验收 2：保存成功但标记未启用适配器，一期不产生接入行为——status 应用层
++ * 强制 0，请求携带 1 一律落库 0）。二期适配器实现归 REQ-0012/FEAT-0008，届时从
++ * RESERVED_NO_ADAPTER 移除即放开启停，CRUD 与 Schema 校验结构不变。
++ *
++ * <p>字典与服务层/控制器共用一处定义：服务层拒未知协议、控制器对预留协议拼「未启用
++ * 适配器」成功文案（响应/文档标注）均引用本类，杜绝双处漂移。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class ChannelProtocols {
++
++    /** 协议类型全集（protocol_type 字典四值，大写） */
++    public static final Set<String> ALL = Set.of("MQTT", "HTTP", "MODBUS", "OPCUA");
++
++    /** 一期预留协议（可建不可启用——status 强制 0，无适配器，不产生接入行为） */
++    public static final Set<String> RESERVED_NO_ADAPTER = Set.of("MODBUS", "OPCUA");
++
++    private ChannelProtocols() {
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelCreateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelCreateForm.java
+new file mode 100644
+index 0000000..c15eebd
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelCreateForm.java
+@@ -0,0 +1,57 @@
++package net.otlab.admin.module.iot.channel.dto;
++
++import tools.jackson.databind.JsonNode;
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 通道创建请求表单（TASK-0018，REQ-0010 业务能力）
++ *
++ * <p>channel_code 网关内唯一（双道闸 4002）且创建后不可改；gateway_id 必传并校验
++ * 存在/同租户/未删（多租户插件注入会话租户条件）；protocol_type ∈ 字典四值；conn_config
++ * 以 {@link JsonNode} 承载（请求即 JSON 对象字面量，无需预字符串化——冒烟实测纠正），
++ * 服务层按 protocol_type 匹配版本化 Schema 校验并做凭据关键词双保险（ADR-0006），
++ * 校验通过后紧凑归一化落库 json 列——表单层不做结构校验（错误信息需聚合到协议 Schema 语义）。
++ *
++ * <p>status 可选（0/1）：MQTT/HTTP 未携带落库 1（启用起步，DDL DEFAULT '1' 同值）、
++ * 携带时按请求值；MODBUS/OPCUA 一律强制 0（可建不可启用，REQ-0010 验收 2——请求携带
++ * status=1 也落库 0）。表单不携带 tenantId（服务层会话覆盖）/id/审计字段。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "通道创建表单（TASK-0018）")
++public class IotChannelCreateForm {
++
++    @NotNull(message = "所属网关不能为空")
++    @Schema(description = "所属网关ID（iot_gateway.id，创建后不可改；校验存在/同租户/未删）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long gatewayId;
++
++    @NotBlank(message = "通道编码不能为空")
++    @Size(max = 64, message = "通道编码长度不能超过 64")
++    @Schema(description = "通道编码（网关内唯一，创建后不可改）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String channelCode;
++
++    @NotBlank(message = "通道名称不能为空")
++    @Size(max = 100, message = "通道名称长度不能超过 100")
++    @Schema(description = "通道名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String channelName;
++
++    @NotBlank(message = "协议类型不能为空")
++    @Size(max = 16, message = "协议类型长度不能超过 16")
++    @Schema(description = "协议类型字典 MQTT/HTTP/MODBUS/OPCUA（未知协议拒；MODBUS/OPCUA 可建不可启用）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String protocolType;
++
++    @Schema(description = "连接配置 JSON 对象（按协议 Schema 校验；MQTT 必含 broker/topic，HTTP 必含 reportPath；凭据键拒——ADR-0006）")
++    private JsonNode connConfig;
++
++    @Schema(description = "状态 0 禁用 1 启用（未携带 MQTT/HTTP 落 1；MODBUS/OPCUA 一律强制 0）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelUpdateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelUpdateForm.java
+new file mode 100644
+index 0000000..20b0b8a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/dto/IotChannelUpdateForm.java
+@@ -0,0 +1,53 @@
++package net.otlab.admin.module.iot.channel.dto;
++
++import tools.jackson.databind.JsonNode;
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 通道修改请求表单（TASK-0018）
++ *
++ * <p><b>不可变字段</b>：channel_code（FEAT-0006 功能项与字段）与 gateway_id（通道属网关
++ * 固定，brief 明文）——携带不一致一律拒（携带同值为 no-op 不拦，前端回显场景）。可变：
++ * channelName / protocolType / connConfig / status。
++ *
++ * <p>conn_config 或 protocolType 任一携带即重新校验 conn_config（按目标协议的版本化
++ * Schema + 凭据关键词双保险）——协议变更时旧 conn_config 也必须能过新协议 Schema，
++ * 杜绝「协议 X 配协议 Y 的连接配置」落库。MODBUS/OPCUA 目标协议 status 一律强制 0。
++ *
++ * <p>null 字段不进更新集（MyBatis-Plus 跳过，保持库内原值）；tenantId/审计字段不进表单。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "通道修改表单（TASK-0018）")
++public class IotChannelUpdateForm {
++
++    @NotNull(message = "通道 id 不能为空")
++    @Schema(description = "通道ID", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Long id;
++
++    @Size(max = 64, message = "通道编码长度不能超过 64")
++    @Schema(description = "通道编码（不可改——携带不一致即拒，携带同值为 no-op）")
++    private String channelCode;
++
++    @Size(max = 100, message = "通道名称长度不能超过 100")
++    @Schema(description = "通道名称（未携带保持原值）")
++    private String channelName;
++
++    @Size(max = 16, message = "协议类型长度不能超过 16")
++    @Schema(description = "协议类型字典 MQTT/HTTP/MODBUS/OPCUA（未携带保持原值；变更则 conn_config 按新协议重新校验）")
++    private String protocolType;
++
++    @Schema(description = "连接配置 JSON 对象（携带即重新校验——按协议 Schema + 凭据双保险）")
++    private JsonNode connConfig;
++
++    @Schema(description = "状态 0 禁用 1 启用（MQTT/HTTP 正常启停；MODBUS/OPCUA 一律强制 0）")
++    private Integer status;
++
++    @Schema(description = "所属网关ID（不可改——通道属网关固定，携带不一致即拒）")
++    private Long gatewayId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/entity/IotChannel.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/entity/IotChannel.java
+new file mode 100644
+index 0000000..5572296
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/entity/IotChannel.java
+@@ -0,0 +1,62 @@
++package net.otlab.admin.module.iot.channel.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++/**
++ * 采集通道实体类（TASK-0018，详细设计 §1.3 p7 / 附录 A p30）
++ *
++ * <p>iot_channel 表随本任务升级脚本（20261122_iot_channel_domain.sql）建立，DDL 逐字照
++ * 附录 A p30。channel_code 网关内唯一（uk_gateway_channel_code 物理唯一索引）且创建后
++ * 不可改；gateway_id 通道属网关固定不可改；conn_config 为 JSON 列——结构由应用层版本化
++ * JSON Schema 约束（classpath schema/channel/&lt;协议&gt;-v1.json，{@link
++ * net.otlab.admin.module.iot.channel.schema.ChannelConnConfigValidator}），<b>凭据不入
++ * conn_config 明文</b>（ADR-0006，独立存 iot_channel_credential 归 TASK-0019）。
++ *
++ * <p>protocol_type 字典四值（MQTT/HTTP/MODBUS/OPCUA）：一期只实现 MQTT/HTTP 运行逻辑，
++ * MODBUS/OPCUA 可建不可启用（REQ-0010 验收 2——status 应用层强制 0，一期不产生接入行为）。
++ * status 0 禁用 1 启用；无 config_version 列（上游 DDL 无此列）——通道生效状态由配置快照
++ * 对账（FEAT-0008/TASK-0024 发布链路承载版本），保存≠生效。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_channel")
++@Schema(description = "采集通道（TASK-0018）")
++public class IotChannel extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "通道ID")
++    private Long id;
++
++    @Schema(description = "租户ID")
++    private Long tenantId;
++
++    @Schema(description = "所属网关ID（iot_gateway.id，创建后不可改）")
++    private Long gatewayId;
++
++    @Schema(description = "通道编码（网关内唯一；创建后不可改）")
++    private String channelCode;
++
++    @Schema(description = "通道名称")
++    private String channelName;
++
++    @Schema(description = "协议类型字典 MQTT/HTTP/MODBUS/OPCUA（MODBUS/OPCUA 可建不可启用）")
++    private String protocolType;
++
++    @Schema(description = "连接配置 JSON 原文（按协议 Schema 校验后存储，不含凭据——ADR-0006）")
++    private String connConfig;
++
++    @Schema(description = "状态 0 禁用 1 启用（MODBUS/OPCUA 一期强制 0）")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeMapper.java
+new file mode 100644
+index 0000000..99c89fe
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeMapper.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.channel.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
++
++/**
++ * 通道编码占用旁路 Mapper（TASK-0018，uk_gateway_channel_code 双道闸第一道预检专用）。
++ *
++ * <p><b>含已删行</b>：uk_gateway_channel_code 为 (gateway_id, channel_code) 物理唯一索引、
++ * 不含 deleted 列，逻辑删行仍占用编码且编码不复用（照 0011/0012/0017 修订轮 I-1 口径）——
++ * 预检若只看活跃行（@TableLogic 过滤），重存同码必撞物理索引且被误报为瞬态并发冲突。故
++ * 本方法绕过 @TableLogic（原生 @Select 不过逻辑删注入）返回占用行的 deleted 标记，由调用
++ * 方区分文案（「已存在」/「已被删除记录占用，不可复用」）。
++ *
++ * <p>旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}，照 TASK-0017
++ * IotGatewayCodeMapper 显式条件范式）：显式条件为 (tenant_id, gateway_id, channel_code)——
++ * tenant_id 显式取会话租户（调用方传入，禁请求携带），预检语义与物理唯一索引的作用域
++ * (gateway_id, channel_code) 精确一致且叠加租户边界（防御纵深）。调用方保证 codes 非空。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotChannelCodeMapper {
++
++    /**
++     * 按 (tenant_id, gateway_id, channel_code) 显式查占用行（含已删行，携带 deleted 标记）
++     *
++     * @param tenantId 会话租户 id（服务层从 TenantContext 取，禁请求携带）
++     * @param gatewayId 目标网关 id（服务层已校验归属本租户且未删）
++     * @param codes     待预检编码集合（非空）
++     * @return 命中的占用行；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, channel_code, deleted FROM iot_channel "
++            + "WHERE tenant_id = #{tenantId} AND gateway_id = #{gatewayId} AND channel_code IN "
++            + "<foreach collection='codes' item='code' open='(' separator=',' close=')'>#{code}</foreach>"
++            + "</script>")
++    List<IotChannelCodeRow> selectOccupiedByGatewayAndCodes(@Param("tenantId") Long tenantId,
++                                                            @Param("gatewayId") Long gatewayId,
++                                                            @Param("codes") Collection<String> codes);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeRow.java
+new file mode 100644
+index 0000000..7e3e589
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelCodeRow.java
+@@ -0,0 +1,23 @@
++package net.otlab.admin.module.iot.channel.mapper;
++
++import lombok.Data;
++
++/**
++ * 通道编码占用行（uk_gateway_channel_code 双道闸预检的旁路查询结果行，TASK-0018）。
++ *
++ * <p>仅携带判存所需最小列：占用行 id、编码、deleted 标记——deleted=1 为逻辑删行
++ * （uk_gateway_channel_code 物理唯一索引不含 deleted 列，逻辑删行永久占用编码），
++ * 调用方据此区分「已存在」/「已被删除记录占用，不可复用」文案（0011/0012/0017 同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class IotChannelCodeRow {
++
++    private Long id;
++
++    private String channelCode;
++
++    private Integer deleted;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelMapper.java
+new file mode 100644
+index 0000000..9b31587
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/mapper/IotChannelMapper.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.channel.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 通道数据访问层（TASK-0018）
++ *
++ * <p>空 BaseMapper：CRUD 与网关删除保护引用计数全部经 MyBatis-Plus 通用方法 + Lambda
++ * 条件构造。iot_ 前缀表的多租户条件由 TASK-0002 TenantLineInnerInterceptor 自动注入——
++ * 管理面会话链路天然只读本租户通道；编码占用预检走
++ * {@link IotChannelCodeMapper}（旁路 @TableLogic 与多租户插件，显式条件范式）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++public interface IotChannelMapper extends BaseMapper<IotChannel> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java
+new file mode 100644
+index 0000000..8640a95
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidator.java
+@@ -0,0 +1,290 @@
++package net.otlab.admin.module.iot.channel.schema;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.springframework.stereotype.Component;
++
++import java.net.URI;
++import java.util.ArrayList;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Pattern;
++
++/**
++ * 通道 conn_config 版本化 JSON Schema 校验器（TASK-0018，REQ-0010 核心规则「conn_config
++ * 结构由配置 JSON Schema 约束」+ ADR-0006 凭据不入 conn_config 明文）。
++ *
++ * <p><b>版本化</b>：Schema 文件存 classpath {@code schema/channel/<协议小写>-v<版本>.json}
++ * （一期 v1：mqtt-v1 / http-v1 / modbus-v1 / opcua-v1），版本号入文件名与文件内 $id，
++ * 变更升版本（新增 v2 文件并调 {@link #SCHEMA_VERSION} 映射，不动旧文件）。protocol_type
++ * 决定加载哪个 Schema（协议-Schema 匹配），资源缺失即未知协议拒。
++ *
++ * <p><b>校验器实现选型（brief 二选一）——手写最小校验器</b>：一期 Schema 词表固定且极小
++ * （type/required/properties/additionalProperties/enum/minLength/maxLength/pattern/
++ * format:uri），networknt json-schema-validator 的全量 draft 支持（$ref/assertion/远端
++ * 格式等）对一期是过剩能力，且引入新依赖与其传递依赖面；架构选型口径「组件能晚引入就
++ * 晚引入」（ADR-0006 放弃外部密钥服务同理）。Schema 文件本身为标准 draft-07 子集，
++ * 二期词表扩张（MODBUS/OPCUA 完整字段集）时可直接切换到标准库实现而不改 Schema 文件。
++ *
++ * <p><b>凭据防线（ADR-0006，双保险之二）</b>：MQTT/HTTP Schema 定义 additionalProperties:
++ * false 之外，本校验器对 conn_config 全部层级键名做显式凭据关键词拒绝（credential/
++ * password/passwd/secret/token/apikey/accesskey/privatekey，大小写不敏感子串匹配——
++ * 覆盖 mqttPassword/accessToken 等变体），含凭据字段的 conn_config 保存被拒。brief 口径
++ * 为「顶层禁」，本实现强化为递归全层级（宽松骨架协议 MODBUS/OPCUA 允许嵌套对象，仅查
++ * 顶层会漏 {@code {"tcp":{"password":...}}}）。
++ *
++ * <p><b>归一化</b>：校验通过后返回 Jackson 紧凑序列化原文（去空白，快照哈希确定性前置）；
++ * 入参 null/空白按空对象参与校验（MQTT/HTTP 必填字段即拒），宽松骨架协议返回 null 落库
++ * NULL（DDL DEFAULT NULL 口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class ChannelConnConfigValidator {
++
++    /** 当前生效的 Schema 版本（文件名与 $id 同版本；变更升版本新增文件后调此处映射） */
++    public static final String SCHEMA_VERSION = "v1";
++
++    /** classpath Schema 目录 */
++    private static final String SCHEMA_DIR = "schema/channel/";
++
++    /**
++     * 凭据关键词（小写；对键名做大小写不敏感的「包含」匹配——mqttPassword/accessToken 等
++     * 变体一并命中）。apiKey 注意区分：HTTP Schema 的 authType 枚举<b>值</b> "apiKey" 是
++     * 鉴权方式标记而非凭据本体，不受影响；键名 "apiKey" 携带实际密钥则被拒（走 0019 凭据表）。
++     */
++    private static final List<String> FORBIDDEN_KEY_WORDS =
++            List.of("credential", "password", "passwd", "secret", "token", "apikey", "accesskey", "privatekey");
++
++    /** 单条 conn_config 原文长度上限（UTF-16 code unit 计；通道连接配置为小文档，防误传大负载） */
++    private static final int MAX_CONN_CONFIG_LENGTH = 8192;
++
++    private static final ObjectMapper MAPPER = new ObjectMapper();
++
++    // ---------- 对外入口 ----------
++
++    /**
++     * 校验并归一化 conn_config。
++     *
++     * @param protocolType   协议类型（决定加载哪个 Schema；未知协议拒）
++     * @param rawConnConfig  请求携带的 conn_config JSON 原文（可为 null/空白）
++     * @return 归一化后的紧凑 JSON（入参空白且 Schema 无必填约束时返回 null——落库 NULL）
++     * @throws BusinessException PARAM_ERROR——未知协议 / 非法 JSON / 非对象 / 凭据键 / 结构不符
++     */
++    public String validateAndCanonicalize(String protocolType, String rawConnConfig) {
++        JsonSchema schema = loadSchema(protocolType);
++
++        if (rawConnConfig == null || rawConnConfig.isBlank()) {
++            // 空白按空对象参与校验：必填协议（MQTT/HTTP）在此即拒；宽松骨架（MODBUS/OPCUA）落 NULL
++            requireNoMissing(schema, Set.of());
++            return null;
++        }
++        if (rawConnConfig.length() > MAX_CONN_CONFIG_LENGTH) {
++            throw paramError("conn_config 超长（上限 " + MAX_CONN_CONFIG_LENGTH + " 字符）");
++        }
++
++        JsonNode root;
++        try {
++            root = MAPPER.readTree(rawConnConfig);
++        } catch (Exception e) {
++            throw paramError("conn_config 不是合法 JSON: " + e.getMessage());
++        }
++        if (root == null || !root.isObject()) {
++            throw paramError("conn_config 必须是 JSON 对象");
++        }
++
++        // 双保险之二：凭据关键词递归拒绝（先于结构校验，错误信息直指凭据防线语义）
++        Set<String> credentialKeys = new LinkedHashSet<>();
++        collectCredentialKeys("", root, credentialKeys);
++        if (!credentialKeys.isEmpty()) {
++            throw paramError("conn_config 不允许携带凭据字段（ADR-0006：凭据独立存凭据管理，不入 conn_config 明文）: "
++                    + String.join("、", credentialKeys));
++        }
++
++        List<String> errors = new ArrayList<>();
++        validateAgainstSchema("$", root, schema, errors);
++        if (!errors.isEmpty()) {
++            throw paramError("conn_config 不符合 " + protocolType + " " + SCHEMA_VERSION + " Schema: "
++                    + String.join("; ", errors));
++        }
++
++        requireNoMissing(schema, keySet(root));
++        return root.toString();
++    }
++
++    // ---------- Schema 加载 ----------
++
++    JsonSchema loadSchema(String protocolType) {
++        String lower = protocolType == null ? "" : protocolType.toLowerCase(Locale.ROOT);
++        String location = SCHEMA_DIR + lower + "-" + SCHEMA_VERSION + ".json";
++        ClassLoader cl = Thread.currentThread().getContextClassLoader();
++        if (cl == null) {
++            cl = ChannelConnConfigValidator.class.getClassLoader();
++        }
++        try (var in = cl.getResourceAsStream(location)) {
++            if (in == null) {
++                throw paramError("未知协议类型，仅允许 MQTT/HTTP/MODBUS/OPCUA: " + protocolType);
++            }
++            JsonNode node = MAPPER.readTree(in);
++            return parseSchema(node);
++        } catch (BusinessException e) {
++            throw e;
++        } catch (Exception e) {
++            throw paramError("协议 Schema 资源加载失败: " + location + "（" + e.getMessage() + "）");
++        }
++    }
++
++    private JsonSchema parseSchema(JsonNode node) {
++        JsonSchema schema = new JsonSchema();
++        schema.type = node.path("type").asText("object");
++        schema.additionalProperties = node.path("additionalProperties").asBoolean(true);
++        schema.required = new LinkedHashSet<>();
++        node.path("required").forEach(n -> schema.required.add(n.asText()));
++        schema.properties = new java.util.LinkedHashMap<>();
++        node.path("properties").fields().forEachRemaining(e -> schema.properties.put(e.getKey(), parseProperty(e.getValue())));
++        return schema;
++    }
++
++    private PropertySchema parseProperty(JsonNode node) {
++        PropertySchema p = new PropertySchema();
++        p.type = node.path("type").asText(null);
++        p.minLength = node.hasNonNull("minLength") ? node.get("minLength").asInt() : null;
++        p.maxLength = node.hasNonNull("maxLength") ? node.get("maxLength").asInt() : null;
++        p.pattern = node.hasNonNull("pattern") ? Pattern.compile(node.get("pattern").asText()) : null;
++        p.format = node.hasNonNull("format") ? node.get("format").asText() : null;
++        p.enumValues = new LinkedHashSet<>();
++        node.path("enum").forEach(n -> p.enumValues.add(n.asText()));
++        return p;
++    }
++
++    // ---------- 结构校验 ----------
++
++    private void validateAgainstSchema(String path, JsonNode value, JsonSchema schema, List<String> errors) {
++        if (!"object".equals(schema.type)) {
++            errors.add(path + " Schema 词表暂不支持 type=" + schema.type);
++            return;
++        }
++        if (value == null || !value.isObject()) {
++            errors.add(path + " 必须是 JSON 对象");
++            return;
++        }
++        if (!schema.additionalProperties) {
++            value.fieldNames().forEachRemaining(name -> {
++                if (!schema.properties.containsKey(name)) {
++                    errors.add(path + "." + name + " 为未知字段（additionalProperties=false）");
++                }
++            });
++        }
++        for (Map.Entry<String, PropertySchema> entry : schema.properties.entrySet()) {
++            JsonNode child = value.get(entry.getKey());
++            if (child == null || child.isNull()) {
++                continue;
++            }
++            validateProperty(path + "." + entry.getKey(), child, entry.getValue(), errors);
++        }
++    }
++
++    private void validateProperty(String path, JsonNode value, PropertySchema p, List<String> errors) {
++        if ("string".equals(p.type)) {
++            if (!value.isTextual()) {
++                errors.add(path + " 必须是字符串");
++                return;
++            }
++            String text = value.asText();
++            if (p.minLength != null && text.length() < p.minLength) {
++                errors.add(path + " 长度不得小于 " + p.minLength);
++            }
++            if (p.maxLength != null && text.length() > p.maxLength) {
++                errors.add(path + " 长度不能超过 " + p.maxLength);
++            }
++            if (p.pattern != null && !p.pattern.matcher(text).find()) {
++                errors.add(path + " 不满足格式约定（" + p.pattern.pattern() + "）");
++            }
++            if ("uri".equals(p.format) && !isAbsoluteUri(text)) {
++                errors.add(path + " 必须是绝对 URI（如 tcp://host:1883）");
++            }
++            if (!p.enumValues.isEmpty() && !p.enumValues.contains(text)) {
++                errors.add(path + " 仅允许取值 " + p.enumValues);
++            }
++            return;
++        }
++        if ("integer".equals(p.type)) {
++            if (!value.isIntegralNumber()) {
++                errors.add(path + " 必须是整数");
++                return;
++            }
++            if (!p.enumValues.isEmpty() && !p.enumValues.contains(value.asText())) {
++                errors.add(path + " 仅允许取值 " + p.enumValues);
++            }
++            return;
++        }
++        // 未知词表属性类型：按宽松处理（与 draft 注解语义一致），不误伤二期扩展
++    }
++
++    private Set<String> keySet(JsonNode object) {
++        Set<String> keys = new LinkedHashSet<>();
++        object.fieldNames().forEachRemaining(keys::add);
++        return keys;
++    }
++
++    private void requireNoMissing(JsonSchema schema, Set<String> presentKeys) {
++        List<String> missing = schema.required.stream().filter(r -> !presentKeys.contains(r)).toList();
++        if (!missing.isEmpty()) {
++            throw paramError("conn_config 缺少必填字段: " + missing);
++        }
++    }
++
++    private boolean isAbsoluteUri(String text) {
++        try {
++            URI uri = new URI(text);
++            return uri.getScheme() != null && !uri.getScheme().isBlank();
++        } catch (Exception e) {
++            return false;
++        }
++    }
++
++    // ---------- 凭据关键词扫描 ----------
++
++    private void collectCredentialKeys(String path, JsonNode node, Set<String> hits) {
++        node.fieldNames().forEachRemaining(name -> {
++            String normalized = name.toLowerCase(Locale.ROOT);
++            if (FORBIDDEN_KEY_WORDS.stream().anyMatch(normalized::contains)) {
++                hits.add(path.isEmpty() ? name : path + "." + name);
++            }
++        });
++        node.fields().forEachRemaining(e -> {
++            JsonNode child = e.getValue();
++            if (child.isObject()) {
++                collectCredentialKeys(path.isEmpty() ? e.getKey() : path + "." + e.getKey(), child, hits);
++            }
++        });
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++
++    // ---------- Schema 词表模型（draft-07 一期子集） ----------
++
++    static class JsonSchema {
++        String type;
++        boolean additionalProperties = true;
++        Set<String> required = Set.of();
++        Map<String, PropertySchema> properties = Map.of();
++    }
++
++    static class PropertySchema {
++        String type;
++        Integer minLength;
++        Integer maxLength;
++        Pattern pattern;
++        String format;
++        Set<String> enumValues = Set.of();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/ChannelReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/ChannelReferenceGuard.java
+new file mode 100644
+index 0000000..930adb5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/ChannelReferenceGuard.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.channel.service;
++
++/**
++ * 通道删除保护·引用计数接缝（TASK-0018 guard 结构就位，brief「remove（软删；其下有点位
++ * 则拒绝——点位表未建，guard 结构就位登记 0021 接线）」）
++ *
++ * <p>删除通道时其下有点位则拒绝（REQ-0010 核心规则「删除通道时其下有点位则拒绝」）。
++ * iot_point 表尚未建（归 TASK-0021，归属列直引 gateway_id 或经通道间接由 0021 brief 裁决）
++ * ——本期占位实现恒返回 0（{@code PlaceholderChannelReferenceGuard}），删除 guard 的
++ * <b>调用点与拒绝分支</b>在本服务内先行就位并被单测固化（计数 &gt; 0 即拒绝）；0021 建表后
++ * <b>按表扩展计数实现</b>（替换占位实现，不改调用点——照 TASK-0017 GatewayReferenceGuard
++ * 占位转正同款范式，0018 已实践一次）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface ChannelReferenceGuard {
++
++    /**
++     * 统计通道名下活跃点位数（iot_point 归属列以 TASK-0021 建表裁决为准，本期恒 0）
++     *
++     * @param channelId 通道 id
++     * @return 引用数
++     */
++    long countPoints(Long channelId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/IotChannelService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/IotChannelService.java
+new file mode 100644
+index 0000000..b628883
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/IotChannelService.java
+@@ -0,0 +1,43 @@
++package net.otlab.admin.module.iot.channel.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.channel.dto.IotChannelCreateForm;
++import net.otlab.admin.module.iot.channel.dto.IotChannelUpdateForm;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++
++/**
++ * 通道服务接口（TASK-0018）：管理面 CRUD + conn_config Schema 校验编排。
++ *
++ * <p>照网关/模板域范式：接口不继承 IService（实现类 ServiceImpl 承载通用方法），
++ * 领域方法显式声明。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotChannelService {
++
++    /**
++     * 分页查询通道（按 gatewayId 必传查通道列表——详细设计 §3.1 p21 口径；过滤
++     * channelCode/protocolType/status）
++     */
++    Page<IotChannel> selectChannelList(Page<IotChannel> page, IotChannel query);
++
++    /** 通道详情（不存在/已删除拒） */
++    IotChannel getChannelDetail(Long id);
++
++    /**
++     * 新增通道（channel_code 网关内唯一双道闸 4002；gateway_id 校验存在/同租户/未删；
++     * protocol_type ∈ 字典且未知协议拒；conn_config 按协议 Schema 校验 + 凭据双保险；
++     * MODBUS/OPCUA status 强制 0）
++     */
++    boolean createChannel(IotChannelCreateForm form);
++
++    /**
++     * 修改通道（channel_code/gateway_id 不可改；conn_config 或 protocolType 变更重新校验；
++     * MODBUS/OPCUA status 强制 0）
++     */
++    boolean updateChannel(IotChannelUpdateForm form);
++
++    /** 删除通道（软删；其下有点位则拒绝——guard 结构本期就位，点位表归 0021） */
++    boolean deleteChannel(Long id);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuard.java
+new file mode 100644
+index 0000000..6e215fc
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuard.java
+@@ -0,0 +1,55 @@
++package net.otlab.admin.module.iot.channel.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Component;
++
++import java.util.List;
++
++/**
++ * 网关删除保护·引用计数的通道侧实现（TASK-0018——0017 占位转正接线）。
++ *
++ * <p>iot_channel 随本任务建表（引用列 gateway_id），网关删除保护中的通道计数从恒零占位
++ * 转正：实查活跃行（@TableLogic 过滤），多租户条件由插件注入即同租户保证（照 0012
++ * countByInstanceIds 接线范式）。通道编码列表供网关删除拒绝文案「并提示通道编码」使用
++ * （brief 测试口径：种子通道行 → 删网关拒并提示通道编码）。本实现置于通道域（表归通道
++ * 域所有），替换 0017 的 {@code PlaceholderGatewayReferenceGuard}（已按其自身契约删除，
++ * 调用点与拒绝语义未改动）。
++ *
++ * <p>点位计数仍占位：iot_point 归 TASK-0021 建表，归属列（gateway_id 直引或经通道间接）
++ * 由 0021 brief 裁决——接线义务登记 0021 brief，届时按表扩展 {@link #countPoints}。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class IotChannelGatewayReferenceGuard implements GatewayReferenceGuard {
++
++    @Autowired
++    private IotChannelMapper channelMapper;
++
++    @Override
++    public long countChannels(Long gatewayId) {
++        return channelMapper.selectCount(new LambdaQueryWrapper<IotChannel>()
++                .eq(IotChannel::getGatewayId, gatewayId));
++    }
++
++    @Override
++    public List<String> channelCodes(Long gatewayId) {
++        return channelMapper.selectList(new LambdaQueryWrapper<IotChannel>()
++                        .select(IotChannel::getChannelCode)
++                        .eq(IotChannel::getGatewayId, gatewayId))
++                .stream()
++                .map(IotChannel::getChannelCode)
++                .toList();
++    }
++
++    @Override
++    public long countPoints(Long gatewayId) {
++        // TODO(TASK-0021 接线)：建表后按点位归属列（gateway_id 直引或经通道间接，0021 brief 裁决）计数
++        return 0L;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImpl.java
+new file mode 100644
+index 0000000..eac24d5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImpl.java
+@@ -0,0 +1,333 @@
++package net.otlab.admin.module.iot.channel.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.channel.dto.IotChannelCreateForm;
++import net.otlab.admin.module.iot.channel.dto.IotChannelUpdateForm;
++import net.otlab.admin.module.iot.channel.domain.ChannelProtocols;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelCodeMapper;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelCodeRow;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.channel.schema.ChannelConnConfigValidator;
++import net.otlab.admin.module.iot.channel.service.ChannelReferenceGuard;
++import net.otlab.admin.module.iot.channel.service.IotChannelService;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.List;
++import java.util.Set;
++
++/**
++ * 通道服务实现类（TASK-0018）
++ *
++ * <p><b>唯一性双道闸 4002</b>（照 0017 网关同款口径）：channel_code 网关内唯一——
++ * uk_gateway_channel_code 为 (gateway_id, channel_code) 物理唯一索引、不含 deleted 列，
++ * 逻辑删行永久占用编码且编码不复用；第一道含已删行旁路预检（{@link IotChannelCodeMapper}
++ * 区分「已存在」/「已被删除记录占用，不可复用」文案）+ 第二道 DuplicateKey 兜底（预检与
++ * 落库之间的真实并发插入窗口）。
++ *
++ * <p><b>归属校验</b>：gateway_id 必传且校验存在/同租户/未删（iot_ 前缀表多租户插件注入
++ * 会话租户条件即同租户保证，照 0017 validateInstance 范式；不校验网关 status——禁用网关
++ * 仍可配置通道，准入拦截在接入服务链路归 0020）。创建后 gateway_id 不可改（通道属网关
++ * 固定）、channel_code 不可改（FEAT-0006 功能项与字段——改码即改点位挂接标识）。
++ *
++ * <p><b>conn_config 校验编排</b>（{@link ChannelConnConfigValidator}）：protocol_type 决定
++ * 加载 classpath schema/channel/&lt;协议&gt;-v<版本>.json（未知协议拒）；MQTT/HTTP 严格
++ * Schema（additionalProperties=false + 必填字段），MODBUS/OPCUA 宽松骨架（二期定义，登记
++ * 遗留）；凭据关键词递归拒绝（ADR-0006 双保险之二——凭据独立存 REQ-0011/TASK-0019）。
++ * 校验通过存归一化紧凑 JSON；创建/编辑均校验（编辑仅在 conn_config 或 protocolType 携带
++ * 时重新校验，协议变更按新协议校验旧配置）。入参原文长度上限 8192（校验器内）。
++ *
++ * <p><b>可建不可启用</b>（REQ-0010 验收 2）：MODBUS/OPCUA 保存成功但 status 强制 0
++ * （请求携带 1 一律落库 0——一期无适配器、不产生接入行为；启开放启归二期适配器框架）；
++ * MQTT/HTTP 正常启停（创建未携带落 1 = DDL DEFAULT '1' 同值，编辑 0/1 皆可）。
++ *
++ * <p><b>保存≠生效</b>（REQ-0010 验收 4）：本服务无任何即时下发动作（无推送链路）——
++ * 通道变更对接入生效走 TASK-0024 配置快照发布链路（通道行无 config_version 列，上游
++ * DDL 无此列，生效状态由快照对账，FEAT-0008 承载）。
++ *
++ * <p><b>字段白名单</b>：新增/更新均不直接落请求实体——status 服务层解析、tenant_id 会话
++ * 覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经 API 注入，杜绝 mass assignment。
++ *
++ * <p><b>删除保护</b>：软删（@TableLogic）；其下有点位则拒绝——{@link ChannelReferenceGuard}
++ * 结构本期就位（点位表归 0021 建表，接线义务登记 0021 brief），拒绝分支被单测固化。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class IotChannelServiceImpl extends ServiceImpl<IotChannelMapper, IotChannel> implements IotChannelService {
++
++    /** varchar 限长口径（与 iot_channel DDL 一致） */
++    private static final int MAX_LEN_CHANNEL_CODE = 64;
++    private static final int MAX_LEN_CHANNEL_NAME = 100;
++    private static final int MAX_LEN_PROTOCOL_TYPE = 16;
++
++    /** 状态值域（0 禁用 1 启用） */
++    private static final Set<Integer> STATUS_VALUES = Set.of(0, 1);
++
++    /** 创建未携带 status 时 MQTT/HTTP 落库默认（DDL DEFAULT '1' 同值——新建通道启用起步） */
++    private static final int DEFAULT_STATUS = 1;
++
++    @Autowired
++    private IotChannelCodeMapper channelCodeMapper;
++
++    @Autowired
++    private IotGatewayMapper gatewayMapper;
++
++    @Autowired
++    private ChannelConnConfigValidator connConfigValidator;
++
++    @Autowired
++    private ChannelReferenceGuard channelReferenceGuard;
++
++    // ---------- 列表 / 详情 ----------
++
++    @Override
++    public Page<IotChannel> selectChannelList(Page<IotChannel> page, IotChannel query) {
++        // gatewayId 必传（§3.1 p21 口径：通道列表按网关查；不带网关的全租户通道列表无业务语义）
++        if (query == null || query.getGatewayId() == null) {
++            throw paramError("按网关查通道：gatewayId 必传");
++        }
++        // 多租户条件由插件注入（会话链路）；deleted 由 @TableLogic 运行时过滤；gateway_id 精确过滤（按网关查）
++        LambdaQueryWrapper<IotChannel> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(IotChannel::getGatewayId, query.getGatewayId());
++        if (query.getChannelCode() != null) {
++            wrapper.like(IotChannel::getChannelCode, SqlLikeUtils.escape(query.getChannelCode()));
++        }
++        if (query.getProtocolType() != null) {
++            wrapper.eq(IotChannel::getProtocolType, query.getProtocolType());
++        }
++        if (query.getStatus() != null) {
++            wrapper.eq(IotChannel::getStatus, query.getStatus());
++        }
++        wrapper.orderByAsc(IotChannel::getId);
++        return this.page(page, wrapper);
++    }
++
++    @Override
++    public IotChannel getChannelDetail(Long id) {
++        if (id == null) {
++            throw paramError("请选择要查询的通道");
++        }
++        IotChannel existing = this.getById(id);
++        if (existing == null) {
++            throw paramError("通道不存在或已删除");
++        }
++        return existing;
++    }
++
++    // ---------- 创建 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean createChannel(IotChannelCreateForm form) {
++        String protocolType = resolveProtocolType(form.getProtocolType());
++        String channelCode = validateChannelCode(form.getChannelCode());
++        if (form.getChannelName() == null || form.getChannelName().length() > MAX_LEN_CHANNEL_NAME) {
++            throw paramError("通道名称必填且长度不能超过 " + MAX_LEN_CHANNEL_NAME);
++        }
++        if (form.getGatewayId() == null) {
++            throw paramError("所属网关不能为空");
++        }
++
++        // 归属校验：网关存在/同租户/未删（多租户插件注入会话租户条件即同租户保证；
++        // selectById 经 @TableLogic 过滤已删行——null 即不存在或已删除）
++        IotGateway gateway = gatewayMapper.selectById(form.getGatewayId());
++        if (gateway == null) {
++            throw paramError("所属网关不存在或已删除: " + form.getGatewayId());
++        }
++
++        // conn_config 按协议 Schema 校验 + 凭据双保险（表单 JsonNode → 紧凑文本校验），存归一化紧凑 JSON
++        String connConfig = connConfigValidator.validateAndCanonicalize(protocolType,
++                form.getConnConfig() == null ? null : form.getConnConfig().toString());
++
++        // 字段白名单构建新增实体（照 IotGatewayServiceImpl.createGateway 范式）：
++        // 1) status 解析：MODBUS/OPCUA 一律强制 0（可建不可启用，请求携带 1 一律落 0）；
++        //    MQTT/HTTP 未携带落 1（DDL DEFAULT '1' 同值）、携带时值域 0/1；
++        // 2) tenant_id 服务层从会话覆盖（插件对 iot_ 前缀表 INSERT 自动补列与会话租户同值）；
++        // 3) id / 审计字段不复制（框架自增 + MetaObjectHandler 回填）。
++        IotChannel entity = new IotChannel();
++        entity.setGatewayId(form.getGatewayId());
++        entity.setChannelCode(channelCode);
++        entity.setChannelName(form.getChannelName());
++        entity.setProtocolType(protocolType);
++        entity.setConnConfig(connConfig);
++        entity.setStatus(resolveCreateStatus(protocolType, form.getStatus()));
++        entity.setTenantId(TenantContext.getTenantId());
++
++        // 双道闸第一道：含已删行占用预检（uk_gateway_channel_code 不含 deleted 列，逻辑删行
++        // 永久占用编码——文案区分活跃行「已存在」/已删行「已被删除记录占用，不可复用」）
++        Long tenantId = TenantContext.getTenantId();
++        List<IotChannelCodeRow> occupied = channelCodeMapper.selectOccupiedByGatewayAndCodes(
++                tenantId, form.getGatewayId(), List.of(channelCode));
++        if (!occupied.isEmpty()) {
++            throw duplicateChannelCode(occupied.get(0));
++        }
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的真实并发插入窗口（物理唯一索引）
++            throw duplicateCode4002("通道编码已存在: " + channelCode);
++        }
++        return true;
++    }
++
++    // ---------- 编辑 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateChannel(IotChannelUpdateForm form) {
++        IotChannel existing = this.getById(form.getId());
++        if (existing == null) {
++            throw paramError("通道不存在或已删除");
++        }
++        // channel_code 不可改（FEAT-0006）：携带不一致一律拒（携带同值为 no-op 不拦）
++        if (form.getChannelCode() != null && !form.getChannelCode().equals(existing.getChannelCode())) {
++            throw paramError("通道编码不允许修改: " + existing.getChannelCode());
++        }
++        // gateway_id 不可改（通道属网关固定，brief 明文）：携带不一致一律拒（同值 no-op 不拦）
++        if (form.getGatewayId() != null && !form.getGatewayId().equals(existing.getGatewayId())) {
++            throw paramError("通道不允许更换所属网关: " + existing.getGatewayId());
++        }
++        if (form.getChannelName() != null && form.getChannelName().length() > MAX_LEN_CHANNEL_NAME) {
++            throw paramError("通道名称长度不能超过 " + MAX_LEN_CHANNEL_NAME);
++        }
++        if (form.getStatus() != null && !STATUS_VALUES.contains(form.getStatus())) {
++            throw paramError("通道状态仅允许 0 禁用 / 1 启用");
++        }
++
++        // 目标协议：携带则必须在字典内；conn_config/protocol 任一携带即重新校验 conn_config
++        // （协议变更时旧 conn_config 也必须过新协议 Schema——杜绝「协议 X 配协议 Y 的配置」落库）
++        String targetProtocol = existing.getProtocolType();
++        boolean protocolChanged = form.getProtocolType() != null;
++        if (protocolChanged) {
++            targetProtocol = resolveProtocolType(form.getProtocolType());
++        }
++        boolean connConfigChanged = form.getConnConfig() != null;
++        String connConfig = existing.getConnConfig();
++        if (protocolChanged || connConfigChanged) {
++            // 校验源：conn_config 携带则校验请求原文（JsonNode → 紧凑文本）；仅协议变更则校验库内现有配置（必须过新协议 Schema）
++            connConfig = connConfigValidator.validateAndCanonicalize(targetProtocol,
++                    connConfigChanged ? form.getConnConfig().toString() : existing.getConnConfig());
++        }
++
++        // status 解析：MODBUS/OPCUA 目标协议一律强制 0（可建不可启用）；MQTT/HTTP 按请求值启停
++        Integer status = form.getStatus();
++        if (ChannelProtocols.RESERVED_NO_ADAPTER.contains(targetProtocol)) {
++            status = 0;
++        }
++
++        // 字段白名单构建更新（null 不进更新集，MP 自动跳过保持库内原值）：仅 channelName/
++        // protocolType/connConfig/status 可变——channelCode/gatewayId/tenantId/审计字段永不进 SET
++        IotChannel upd = new IotChannel();
++        upd.setId(existing.getId());
++        upd.setChannelName(form.getChannelName());
++        if (protocolChanged) {
++            upd.setProtocolType(targetProtocol);
++        }
++        if (protocolChanged || connConfigChanged) {
++            upd.setConnConfig(connConfig);
++        }
++        upd.setStatus(status);
++        return this.updateById(upd);
++    }
++
++    // ---------- 删除 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteChannel(Long id) {
++        if (id == null) {
++            throw paramError("请选择要删除的通道");
++        }
++        IotChannel existing = this.getById(id);
++        if (existing == null) {
++            throw paramError("通道不存在或已删除");
++        }
++
++        // 删除保护 guard（REQ-0010 核心规则「删除通道时其下有点位则拒绝」）：调用点与拒绝
++        // 分支本期就位并被单测固化——iot_point 归 0021 建表，占位实现本期恒零引用（接线义务
++        // 登记 0021 brief；届时按表扩展计数实现，不改本调用点）
++        long pointCount = channelReferenceGuard.countPoints(id);
++        if (pointCount > 0) {
++            throw paramError("通道存在点位，禁止删除（点位 " + pointCount + " 个，先清理点位）");
++        }
++
++        // 无引用：逻辑删（@TableLogic，deleted=1）；编码不复用（预检含已删行）
++        return this.removeById(id);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /** 协议字典校验：∈ 四值字典（大写），未知协议拒（协议-Schema 匹配的入口闸） */
++    private String resolveProtocolType(String protocolType) {
++        if (protocolType == null || protocolType.isBlank()) {
++            throw paramError("协议类型不能为空");
++        }
++        if (protocolType.length() > MAX_LEN_PROTOCOL_TYPE) {
++            throw paramError("协议类型长度不能超过 " + MAX_LEN_PROTOCOL_TYPE);
++        }
++        if (!ChannelProtocols.ALL.contains(protocolType)) {
++            throw paramError("协议类型仅允许 MQTT/HTTP/MODBUS/OPCUA: " + protocolType);
++        }
++        return protocolType;
++    }
++
++    /** 编码校验：非空、长度 ≤64（表单 @Size 之外的服务层双保险；DB varchar(64)） */
++    private String validateChannelCode(String channelCode) {
++        if (channelCode == null || channelCode.isBlank()) {
++            throw paramError("通道编码不能为空");
++        }
++        if (channelCode.length() > MAX_LEN_CHANNEL_CODE) {
++            throw paramError("通道编码超长（上限 " + MAX_LEN_CHANNEL_CODE + " 字符）");
++        }
++        return channelCode;
++    }
++
++    /**
++     * 创建期 status 解析：MODBUS/OPCUA 一律强制 0（REQ-0010 验收 2——请求携带 1 一律落库 0，
++     * 「未启用适配器，一期不产生接入行为」）；MQTT/HTTP 未携带落 1（DDL DEFAULT '1' 同值），
++     * 携带时值域 0/1
++     */
++    private Integer resolveCreateStatus(String protocolType, Integer requested) {
++        if (ChannelProtocols.RESERVED_NO_ADAPTER.contains(protocolType)) {
++            return 0;
++        }
++        if (requested == null) {
++            return DEFAULT_STATUS;
++        }
++        if (!STATUS_VALUES.contains(requested)) {
++            throw paramError("通道状态仅允许 0 禁用 / 1 启用");
++        }
++        return requested;
++    }
++
++    /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011/0017 口径） */
++    private BusinessException duplicateChannelCode(IotChannelCodeRow row) {
++        if (row.getDeleted() != null && row.getDeleted() == 1) {
++            return duplicateCode4002("通道编码已被删除记录占用，不可复用: " + row.getChannelCode());
++        }
++        return duplicateCode4002("通道编码已存在: " + row.getChannelCode());
++    }
++
++    private BusinessException duplicateCode4002(String message) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), message);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/PlaceholderChannelReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/PlaceholderChannelReferenceGuard.java
+new file mode 100644
+index 0000000..751c2f9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/channel/service/impl/PlaceholderChannelReferenceGuard.java
+@@ -0,0 +1,25 @@
++package net.otlab.admin.module.iot.channel.service.impl;
++
++import net.otlab.admin.module.iot.channel.service.ChannelReferenceGuard;
++import org.springframework.stereotype.Component;
++
++/**
++ * 通道删除保护·引用计数占位实现（TASK-0018，恒零引用）。
++ *
++ * <p>iot_point 表尚未建（TASK-0021），本期计数恒 0——删除 guard 的拒绝分支实际不可达
++ * （结构就位、单测以 mock 计数固化）；0021 建表后<b>按表扩展本实现</b>（点位归属列直引
++ * gateway_id 或经通道间接，由 0021 brief 裁决），接线义务已登记 0021 brief。替换本实现时
++ * 不得改动 {@code IotChannelServiceImpl.deleteChannel} 的调用点与拒绝语义。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class PlaceholderChannelReferenceGuard implements ChannelReferenceGuard {
++
++    @Override
++    public long countPoints(Long channelId) {
++        // TODO(TASK-0021 接线)：建表后按点位归属列（gateway_id 直引或经通道间接，0021 brief 裁决）计数
++        return 0L;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java
+index 4fd8b1f..c5639b6 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/GatewayReferenceGuard.java
+@@ -5,11 +5,10 @@ package net.otlab.admin.module.iot.gateway.service;
+  * （引用计数调用点按表扩展），本期实际恒零引用，接线义务登记 0018/0021 brief」）
+  *
+  * <p>网关删除时其下有点位/通道则拒绝（REQ-0009 核心规则「删除网关时其下有点位/通道
+- * 则拒绝」；详细设计 §3.1 p21「其下有点位时拒绝并提示」）。两表尚未建：iot_channel 归
+- * TASK-0018 建表（引用列 gateway_id）、iot_point 归 TASK-0021 建表——本期占位实现恒返回 0
+- * （{@code PlaceholderGatewayReferenceGuard}），删除 guard 的<b>调用点与拒绝分支</b>在本
+- * 服务内先行就位并被单测固化（计数 &gt; 0 即拒绝）；0018/0021 建表后<b>按表扩展计数实现</b>
+- * （替换占位实现，不改调用点）。
++ * 则拒绝」；详细设计 §3.1 p21「其下有点位时拒绝并提示」）。iot_channel 已随 TASK-0018
++ * 建表（引用列 gateway_id）——通道侧计数自 0018 起由通道域实现 {@code
++ * IotChannelGatewayReferenceGuard} 转正（0017 占位实现按其自身契约替换，调用点与拒绝
++ * 语义未改动）；iot_point 归 TASK-0021 建表，点位计数仍恒 0（接线义务登记 0021 brief）。
+  *
+  * <p>计数语义：活跃行（@TableLogic 过滤）且归属目标网关——通道按 gateway_id 直引；
+  * 点位按其建表后的归属列（直引 gateway_id 或经通道间接，由 0021 brief 裁决）。
+@@ -20,13 +19,23 @@ package net.otlab.admin.module.iot.gateway.service;
+ public interface GatewayReferenceGuard {
+ 
+     /**
+-     * 统计网关名下活跃采集通道数（iot_channel.gateway_id；表归 TASK-0018 建表，本期恒 0）
++     * 统计网关名下活跃采集通道数（iot_channel.gateway_id；TASK-0018 建表后转正实查）
+      *
+      * @param gatewayId 网关 id
+      * @return 引用数
+      */
+     long countChannels(Long gatewayId);
+ 
++    /**
++     * 网关名下活跃采集通道编码列表（TASK-0018 接线）：删除拒绝文案「并提示通道编码」
++     * （详细设计 §3.1 p21 提示口径 + 0018 brief 测试口径）——调用方仅在 countChannels &gt; 0
++     * 的拒绝分支调用
++     *
++     * @param gatewayId 网关 id
++     * @return 通道编码列表（无引用返回空表）
++     */
++    java.util.List<String> channelCodes(Long gatewayId);
++
+     /**
+      * 统计网关名下活跃点位数（iot_point 归属列以 TASK-0021 建表裁决为准，本期恒 0）
+      *
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+index e09d2ea..a633cf2 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+@@ -58,9 +58,10 @@ import java.util.stream.Collectors;
+  * 更新仅 gatewayName/instanceId/deptId/heartbeatPeriod/status 可变（brief「remark 类」
+  * 按库内实际列——p30 DDL 无 remark 列），杜绝 mass assignment。
+  *
+- * <p><b>删除保护 guard 结构就位</b>：{@link GatewayReferenceGuard} 双计数（通道/点位）
+- * 调用点与拒绝分支先行就位并被单测固化；两表归 0018/0021 建表，占位实现恒零引用——
+- * 接线义务登记 0018/0021 brief（届时按表扩展计数实现，不改调用点）。
++     * <p><b>删除保护 guard 转正</b>：{@link GatewayReferenceGuard} 双计数（通道/点位）
++     * 调用点与拒绝分支语义不变——通道计数自 TASK-0018 建表起由通道域实现转正
++     * （{@code IotChannelGatewayReferenceGuard}），拒绝文案按 §3.1 p21 补提示通道编码；
++     * 点位计数仍归 0021（恒零引用，接线义务登记 0021 brief）。
+  *
+  * <p><b>心跳回写</b>（内部接口，无 Sa-Token 会话）：多租户插件对无会话链路跳过注入
+  * （OtTenantLineHandler ignoreTable 短路），全部查询/更新显式携带 (tenant_id, gateway_code)
+@@ -285,11 +286,14 @@ public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGate
+         }
+ 
+         // 删除保护 guard（REQ-0009 核心规则「删除网关时其下有点位/通道则拒绝」）：双计数
+-        // 调用点就位——通道/点位两表归 0018/0021 建表，占位实现本期恒零引用（接线义务
+-        // 登记 0018/0021 brief；届时按表扩展计数实现，不改本调用点）
++        // 调用点就位——通道计数自 TASK-0018 建表起由通道域实现转正（IotChannelGatewayReferenceGuard），
++        // 点位仍归 0021（恒零引用）。拒绝分支语义不变（计数>0 即拒），文案按 §3.1 p21
++        // 「拒绝并提示」补通道编码（0018 brief 测试口径：种子通道行 → 删网关拒并提示通道编码）
+         long channelCount = referenceGuard.countChannels(id);
+         if (channelCount > 0) {
+-            throw paramError("网关存在采集通道，禁止删除（通道 " + channelCount + " 条，先清理通道）");
++            List<String> channelCodes = referenceGuard.channelCodes(id);
++            String codeDetail = channelCodes.isEmpty() ? "" : ": " + String.join("、", channelCodes);
++            throw paramError("网关存在采集通道，禁止删除（通道 " + channelCount + " 条" + codeDetail + "，先清理通道）");
+         }
+         long pointCount = referenceGuard.countPoints(id);
+         if (pointCount > 0) {
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java
+deleted file mode 100644
+index f007c3a..0000000
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/PlaceholderGatewayReferenceGuard.java
++++ /dev/null
+@@ -1,33 +0,0 @@
+-package net.otlab.admin.module.iot.gateway.service.impl;
+-
+-import net.otlab.admin.module.iot.gateway.service.GatewayReferenceGuard;
+-import org.springframework.stereotype.Component;
+-
+-/**
+- * 网关删除保护·引用计数占位实现（TASK-0017，恒零引用）。
+- *
+- * <p>iot_channel（TASK-0018）/ iot_point（TASK-0021）两表尚未建，本期计数恒 0——删除
+- * guard 的拒绝分支实际不可达（结构就位、单测以 mock 计数固化）；0018/0021 建表后<b>按表
+- * 扩展本实现</b>（多租户条件由插件注入即同租户保证，照 0012 countByInstanceIds 接线范式），
+- * 接线义务已登记 0018/0021 brief。替换本实现时不得改动
+- * {@code IotGatewayServiceImpl.deleteGateway} 的调用点与拒绝语义。
+- *
+- * @author dowei
+- * @date 2026-11-22
+- */
+-@Component
+-public class PlaceholderGatewayReferenceGuard implements GatewayReferenceGuard {
+-
+-    @Override
+-    public long countChannels(Long gatewayId) {
+-        // TODO(TASK-0018 接线)：建表后改为 SELECT COUNT(*) FROM iot_channel WHERE gateway_id = ?
+-        //   （活跃行，多租户条件由插件注入；照 0012 dataItemService.countByInstanceIds 范式）
+-        return 0L;
+-    }
+-
+-    @Override
+-    public long countPoints(Long gatewayId) {
+-        // TODO(TASK-0021 接线)：建表后按点位归属列（gateway_id 直引或经通道间接，0021 brief 裁决）计数
+-        return 0L;
+-    }
+-}
+diff --git a/backend/ot-admin/src/main/resources/schema/channel/http-v1.json b/backend/ot-admin/src/main/resources/schema/channel/http-v1.json
+new file mode 100644
+index 0000000..d1872b2
+--- /dev/null
++++ b/backend/ot-admin/src/main/resources/schema/channel/http-v1.json
+@@ -0,0 +1,24 @@
++{
++  "$id": "urn:ot:iot:channel:conn-config:http:v1",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "HTTP 通道连接配置 v1（TASK-0018 / REQ-0010 一期最小字段集）",
++  "description": "iot_channel.conn_config 的 HTTP 协议结构约束；凭据不入本配置（ADR-0006，apiKey 等凭据独立存 iot_channel_credential 归 TASK-0019）。版本号入文件名与 $id，变更升版本（v2 起新文件）。",
++  "type": "object",
++  "additionalProperties": false,
++  "required": ["reportPath"],
++  "properties": {
++    "reportPath": {
++      "type": "string",
++      "minLength": 1,
++      "maxLength": 255,
++      "pattern": "^/.*$",
++      "description": "上报路径（以 / 开头，如 /api/v1/report），必填"
++    },
++    "authType": {
++      "type": "string",
++      "enum": ["none", "apiKey"],
++      "default": "none",
++      "description": "鉴权方式：none/apiKey，缺省按 none 处理；apiKey 的实际凭据走凭据管理（TASK-0019）"
++    }
++  }
++}
+diff --git a/backend/ot-admin/src/main/resources/schema/channel/modbus-v1.json b/backend/ot-admin/src/main/resources/schema/channel/modbus-v1.json
+new file mode 100644
+index 0000000..01616b2
+--- /dev/null
++++ b/backend/ot-admin/src/main/resources/schema/channel/modbus-v1.json
+@@ -0,0 +1,9 @@
++{
++  "$id": "urn:ot:iot:channel:conn-config:modbus:v1",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "Modbus 通道连接配置 v1（宽松骨架）",
++  "description": "iot_channel.conn_config 的 MODBUS 协议结构约束——一期仅约束顶层 object，结构字段暂空、additionalProperties 允许（二期随适配器框架 REQ-0012 定义完整字段集后升 v2）。一期可建不可启用（status 强制 0，REQ-0010 验收 2）；凭据不入本配置（ADR-0006，应用层显式关键词校验双保险对本协议同样生效）。",
++  "type": "object",
++  "additionalProperties": true,
++  "properties": {}
++}
+diff --git a/backend/ot-admin/src/main/resources/schema/channel/mqtt-v1.json b/backend/ot-admin/src/main/resources/schema/channel/mqtt-v1.json
+new file mode 100644
+index 0000000..02a7084
+--- /dev/null
++++ b/backend/ot-admin/src/main/resources/schema/channel/mqtt-v1.json
+@@ -0,0 +1,30 @@
++{
++  "$id": "urn:ot:iot:channel:conn-config:mqtt:v1",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "MQTT 通道连接配置 v1（TASK-0018 / REQ-0010 一期最小字段集）",
++  "description": "iot_channel.conn_config 的 MQTT 协议结构约束；凭据不入本配置（ADR-0006，独立存 iot_channel_credential 归 TASK-0019）。版本号入文件名与 $id，变更升版本（v2 起新文件）。",
++  "type": "object",
++  "additionalProperties": false,
++  "required": ["broker", "topic"],
++  "properties": {
++    "broker": {
++      "type": "string",
++      "minLength": 1,
++      "maxLength": 255,
++      "format": "uri",
++      "description": "MQTT broker URI（如 tcp://host:1883 / ssl://host:8883），必填"
++    },
++    "topic": {
++      "type": "string",
++      "minLength": 1,
++      "maxLength": 255,
++      "description": "订阅/上报主题（按工厂/网关分段），必填"
++    },
++    "qos": {
++      "type": "integer",
++      "enum": [0, 1, 2],
++      "default": 0,
++      "description": "QoS 等级 0/1/2，缺省按 0 处理（一期不落库补省，语义默认 0）"
++    }
++  }
++}
+diff --git a/backend/ot-admin/src/main/resources/schema/channel/opcua-v1.json b/backend/ot-admin/src/main/resources/schema/channel/opcua-v1.json
+new file mode 100644
+index 0000000..cce2a92
+--- /dev/null
++++ b/backend/ot-admin/src/main/resources/schema/channel/opcua-v1.json
+@@ -0,0 +1,9 @@
++{
++  "$id": "urn:ot:iot:channel:conn-config:opcua:v1",
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "title": "OPC UA 通道连接配置 v1（宽松骨架）",
++  "description": "iot_channel.conn_config 的 OPCUA 协议结构约束——一期仅约束顶层 object，结构字段暂空、additionalProperties 允许（二期随适配器框架 REQ-0012 定义完整字段集后升 v2）。一期可建不可启用（status 强制 0，REQ-0010 验收 2）；凭据不入本配置（ADR-0006，应用层显式关键词校验双保险对本协议同样生效）。",
++  "type": "object",
++  "additionalProperties": true,
++  "properties": {}
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/config/IotChannelMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/config/IotChannelMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..d2739e5
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/config/IotChannelMenuPermissionGuardTest.java
+@@ -0,0 +1,139 @@
++package net.otlab.admin.module.iot.channel.config;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.channel.controller.IotChannelController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0018 守卫测试：通道域菜单权限（sys_menu 4046-4050 五行）与控制器接口清单核对。
++ *
++ * <p>brief 硬要求「权限与接口一一对应」；通道域的形态：§3.1 p21 通道段<b>五接口</b>
++ * （list/add/edit/remove/detail）+ 菜单<b>五行种子</b>（brief 明文：list/query/add/edit/
++ * remove）——detail 挂 iot:channel:query（与网关域「query 预留不挂端点」不同，通道有
++ * detail 行），五端点 ↔ 五菜单行<b>精确双向一一对应</b>。本测试锁定（照
++ * IotGatewayMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261122_iot_channel_domain.sql 的 sys_menu 五行种子
++ *     （id 4046-4050，parent_id=4013）权限码必须恰好等于预期的五值映射——删行/换码/
++ *     挪 parent 即红；</li>
++ * <li>代码侧：通道管理面 @SaCheckPermission 权限码并集必须恰好等于五值集合（多注解/
++ *     漏注解/写错码即红）；</li>
++ * <li>双向核对（五端点全部被 SQL 登记，SQL 五行全部有端点挂载——无预留差异）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotChannelMenuPermissionGuardTest {
++
++    /** 五行菜单种子的预期映射（id → perms），与升级脚本 4046-4050 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4046L, "iot:channel:list",
++            4047L, "iot:channel:query",
++            4048L, "iot:channel:add",
++            4049L, "iot:channel:edit",
++            4050L, "iot:channel:remove");
++
++    /** 管理面控制器预期权限码（§3.1 通道段五接口；detail 挂 query） */
++    private static final Set<String> EXPECTED_CONTROLLER_PERMS = Set.of(
++            "iot:channel:list", "iot:channel:query", "iot:channel:add", "iot:channel:edit", "iot:channel:remove");
++
++    /** 升级脚本路径（从模块目录或仓库根目录向上定位 resources/sql） */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_channel_domain.sql";
++
++    /** 菜单种子行形如 (4046, 4013, 4, '通道查询', 3, NULL, NULL, NULL, 'iot:channel:list', ...） */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[4-5]\\d),\\s*4013,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的通道菜单行恰好等于预期五值映射（4046-4050，parent 4013）")
++    void scriptRegistersExactlyTheFiveMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript());
++        Map<Long, String> actualFiltered = new TreeMap<>();
++        for (Map.Entry<Long, String> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
++                "sys_menu 4046-4050 五行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++    }
++
++    @Test
++    @DisplayName("代码侧 - 通道管理面控制器权限码并集恰好等于五值集合（§3.1 五接口）")
++    void controllerPermissionsAreExactlyTheFivePerms() {
++        Set<String> annotated = collectControllerPerms();
++        assertEquals(EXPECTED_CONTROLLER_PERMS, annotated,
++                "通道管理面 @SaCheckPermission 权限码并集必须恰好等于 §3.1 五行（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向核对 - 五端点权限码全部被 SQL 登记，SQL 五行全部挂端点（无预留差异）")
++    void controllerPermsAllRegisteredInSql() throws Exception {
++        Set<String> fromSql = new TreeSet<>(parseMenuRows(readScript()).values());
++        Set<String> fromCode = collectControllerPerms();
++        assertTrue(fromSql.containsAll(fromCode),
++                "管理面权限码必须全部在 sys_menu SQL 登记（BUG-0046 口径）——否则任何角色（含超管）都无法持有");
++        assertTrue(fromCode.containsAll(fromSql),
++                "SQL 五行必须全部挂端点（通道域无 query 预留差异——detail 挂 iot:channel:query），出现死行即失败");
++    }
++
++    /** 收集通道管理面控制器的全部 @SaCheckPermission 权限码（方法级 + 类级） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = IotChannelController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → perms) 映射（通道管理页 4013 之下的行） */
++    private Map<Long, String> parseMenuRows(String sqlText) {
++        Map<Long, String> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)), matcher.group(3));
++        }
++        return rows;
++    }
++
++    private String readScript() throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(SCRIPT_RELATIVE);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/controller/IotChannelControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/controller/IotChannelControllerTest.java
+new file mode 100644
+index 0000000..2c1fc23
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/controller/IotChannelControllerTest.java
+@@ -0,0 +1,323 @@
++package net.otlab.admin.module.iot.channel.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.channel.dto.IotChannelCreateForm;
++import net.otlab.admin.module.iot.channel.dto.IotChannelUpdateForm;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.service.IotChannelService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 通道控制器测试（TASK-0018 接口层，管理面 CRUD）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），权限注解以反射断言，路由与
++ * 参数校验走真实 MockMvc 请求（照 IotGatewayControllerTest 范式）。接口契约照详细设计
++ * §3.1 p21 通道段五接口（list/add/edit/remove/detail——detail 挂 iot:channel:query，
++ * 与网关域「query 预留不挂端点」不同，通道 §3.1 有 detail 行）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotChannelControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private IotChannelService channelService;
++
++    private IotChannelController channelController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        channelController = new IotChannelController();
++        ReflectionTestUtils.setField(channelController, "channelService", channelService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(channelController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++
++    private static final tools.jackson.databind.json.JsonMapper JSON_MAPPER =
++            tools.jackson.databind.json.JsonMapper.builder().build();
++
++    /** 表单 connConfig 以 JsonNode 承载（请求即 JSON 对象字面量）——测试夹具同步口径 */
++    private static tools.jackson.databind.JsonNode json(String raw) {
++        try {
++            return JSON_MAPPER.readTree(raw);
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private IotChannelCreateForm createForm() {
++        IotChannelCreateForm form = new IotChannelCreateForm();
++        form.setGatewayId(10L);
++        form.setChannelCode("CH_MQTT_01");
++        form.setChannelName("一号空压机 MQTT 通道");
++        form.setProtocolType("MQTT");
++        form.setConnConfig(json("{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}"));
++        return form;
++    }
++
++    private IotChannel testChannel() {
++        IotChannel ch = new IotChannel();
++        ch.setId(100L);
++        ch.setTenantId(1L);
++        ch.setGatewayId(10L);
++        ch.setChannelCode("CH_MQTT_01");
++        ch.setChannelName("一号空压机 MQTT 通道");
++        ch.setProtocolType("MQTT");
++        ch.setConnConfig("{\"broker\":\"tcp://192.168.1.10:1883\"}");
++        ch.setStatus(1);
++        return ch;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 五个端点 @SaCheckPermission 取值符合 iot:channel:* 契约（含 detail→query）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:channel:list", IotChannelController.class
++                .getMethod("list", Integer.class, Integer.class, IotChannel.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:channel:query", IotChannelController.class
++                .getMethod("detail", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:channel:add", IotChannelController.class
++                .getMethod("add", IotChannelCreateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:channel:edit", IotChannelController.class
++                .getMethod("edit", IotChannelUpdateForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:channel:remove", IotChannelController.class
++                .getMethod("remove", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 三个写操作（新增/编辑/删除）均有 @OperateLog 且业务类型正确")
++    void testOperateLogAnnotations() throws Exception {
++        Method add = IotChannelController.class.getMethod("add", IotChannelCreateForm.class);
++        Method edit = IotChannelController.class.getMethod("edit", IotChannelUpdateForm.class);
++        Method remove = IotChannelController.class.getMethod("remove", Long.class);
++        for (Method method : List.of(add, edit, remove)) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, add.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.UPDATE, edit.getAnnotation(OperateLog.class).businessType());
++        assertEquals(BusinessType.DELETE, remove.getAnnotation(OperateLog.class).businessType());
++    }
++
++    // ---------- 路由（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("分页列表 - GET /iot/channel/list?gatewayId= 返回分页数据（按网关查口径）")
++    void testList_Success() throws Exception {
++        Page<IotChannel> page = new Page<>(1, 10);
++        page.setRecords(List.of(testChannel()));
++        page.setTotal(1);
++        when(channelService.selectChannelList(any(), any(IotChannel.class))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/channel/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10")
++                        .param("gatewayId", "10")
++                        .param("protocolType", "MQTT")
++                        .param("status", "1"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.records").isArray())
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].channelCode").value("CH_MQTT_01"))
++                .andExpect(jsonPath("$.data.records[0].connConfig").isNotEmpty());
++    }
++
++    @Test
++    @DisplayName("详情 - GET /iot/channel/{id} 返回通道（含 conn_config 原文）")
++    void testDetail_Success() throws Exception {
++        when(channelService.getChannelDetail(100L)).thenReturn(testChannel());
++
++        mockMvc.perform(get("/iot/channel/{id}", 100L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.channelCode").value("CH_MQTT_01"))
++                .andExpect(jsonPath("$.data.protocolType").value("MQTT"));
++        verify(channelService).getChannelDetail(100L);
++    }
++
++    @Test
++    @DisplayName("新增 - POST /iot/channel MQTT 正常返回 200")
++    void testAdd_Success() throws Exception {
++        when(channelService.createChannel(any(IotChannelCreateForm.class))).thenReturn(true);
++
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(channelService).createChannel(any(IotChannelCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - MODBUS 可建不可启用：响应成功文案标注「未启用适配器，一期不产生接入行为」")
++    void testAdd_ReservedProtocolAnnotated() throws Exception {
++        when(channelService.createChannel(any(IotChannelCreateForm.class))).thenReturn(true);
++        IotChannelCreateForm form = createForm();
++        form.setChannelCode("CH_MB_01");
++        form.setProtocolType("MODBUS");
++        form.setConnConfig(json("{\"slaveId\":1}"));
++
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.message").value(
++                        "通道保存成功：该协议一期未启用适配器，status 已置 0（不产生接入行为，二期适配器上线后可启用）"));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：gatewayId/channelCode/protocolType 缺失返回业务码 400，服务不被触达")
++    void testAdd_BeanValidation() throws Exception {
++        IotChannelCreateForm noGateway = createForm();
++        noGateway.setGatewayId(null);
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(noGateway)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        IotChannelCreateForm noCode = createForm();
++        noCode.setChannelCode(null);
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(noCode)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        IotChannelCreateForm noProtocol = createForm();
++        noProtocol.setProtocolType(null);
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(noProtocol)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(channelService, org.mockito.Mockito.never()).createChannel(any(IotChannelCreateForm.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 重复编码透传服务层 4002")
++    void testAdd_DuplicateCode() throws Exception {
++        when(channelService.createChannel(any(IotChannelCreateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "通道编码已存在: CH_MQTT_01"));
++
++        mockMvc.perform(post("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(createForm())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4002));
++    }
++
++    // ---------- 编辑 / 删除 ----------
++
++    @Test
++    @DisplayName("编辑 - PUT /iot/channel 正常返回 200；改码拒透传 PARAM_ERROR")
++    void testEdit() throws Exception {
++        when(channelService.updateChannel(any(IotChannelUpdateForm.class))).thenReturn(true);
++        IotChannelUpdateForm form = new IotChannelUpdateForm();
++        form.setId(100L);
++        form.setChannelName("改名通道");
++
++        mockMvc.perform(put("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        when(channelService.updateChannel(any(IotChannelUpdateForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "通道编码不允许修改: CH_MQTT_01"));
++        IotChannelUpdateForm badForm = new IotChannelUpdateForm();
++        badForm.setId(100L);
++        badForm.setChannelCode("CH_NEW");
++
++        mockMvc.perform(put("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(badForm)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("编辑 - id 缺失被 bean 校验拒绝")
++    void testEdit_IdMissing() throws Exception {
++        IotChannelUpdateForm form = new IotChannelUpdateForm();
++        form.setChannelName("无 id 编辑");
++
++        mockMvc.perform(put("/iot/channel")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(form)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(channelService, org.mockito.Mockito.never()).updateChannel(any(IotChannelUpdateForm.class));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /iot/channel/{id} 透传服务层（§3.1 单 id 路径）")
++    void testRemove_Success() throws Exception {
++        when(channelService.deleteChannel(100L)).thenReturn(true);
++
++        mockMvc.perform(delete("/iot/channel/{id}", 100L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(channelService).deleteChannel(100L);
++    }
++
++    @Test
++    @DisplayName("删除 - 有点位引用透传服务层参数错误（guard 分支，0021 建表后计数转正）")
++    void testRemove_ReferenceProtected() throws Exception {
++        when(channelService.deleteChannel(anyLong()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "通道存在点位，禁止删除（点位 2 个，先清理点位）"));
++
++        mockMvc.perform(delete("/iot/channel/{id}", 100L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java
+new file mode 100644
+index 0000000..766aaa6
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/schema/ChannelConnConfigValidatorTest.java
+@@ -0,0 +1,238 @@
++package net.otlab.admin.module.iot.channel.schema;
++
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * conn_config 版本化 JSON Schema 校验器单测（TASK-0018）
++ *
++ * <p>覆盖 brief 测试口径「Schema：MQTT 合法/缺 broker 拒/qos 非法拒；HTTP 合法/缺路径拒；
++ * 含 credential 键拒（双保险）；MODBUS/OPCUA 保存 status 强制 0（服务层测试覆盖）；未知
++ * 协议拒」+ additionalProperties=false 未知键拒 / format uri / 归一化 / 版本化文件映射。
++ * Schema 文件取自 src/main/resources/schema/channel（测试类路径直读主资源）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class ChannelConnConfigValidatorTest {
++
++    private final ChannelConnConfigValidator validator = new ChannelConnConfigValidator();
++
++    // ---------- MQTT v1 ----------
++
++    @Test
++    @DisplayName("MQTT - 合法配置（broker URI + topic + qos）通过并返回紧凑归一化 JSON")
++    void testMqttValid() {
++        String canonical = validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}");
++        assertEquals("{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}", canonical);
++    }
++
++    @Test
++    @DisplayName("MQTT - qos 缺省合法（非必填，语义默认 0）")
++    void testMqttQosOptional() {
++        String canonical = validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"ssl://a.example.com:8883\",\"topic\":\"t\"}");
++        assertNotNull(canonical);
++        assertFalse(canonical.contains("qos"), "qos 非必填，缺省不注入（语义默认 0）");
++    }
++
++    @Test
++    @DisplayName("MQTT - 缺 broker 拒（required）；缺 topic 拒")
++    void testMqttMissingRequired() {
++        BusinessException e1 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"topic\":\"t\"}"));
++        assertTrue(e1.getMessage().contains("缺少必填字段"), e1.getMessage());
++        assertTrue(e1.getMessage().contains("broker"), e1.getMessage());
++
++        BusinessException e2 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"tcp://a:1883\"}"));
++        assertTrue(e2.getMessage().contains("topic"), e2.getMessage());
++
++        BusinessException e3 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT", null));
++        assertTrue(e3.getMessage().contains("缺少必填字段"), "conn_config 缺失按空对象校验即拒（MQTT 必填）");
++    }
++
++    @Test
++    @DisplayName("MQTT - qos 非法拒：3 超枚举 / \"1\" 字符串非整数 / 1.5 小数")
++    void testMqttQosInvalid() {
++        for (String bad : new String[]{
++                "{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"qos\":3}",
++                "{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"qos\":\"1\"}",
++                "{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"qos\":1.5}"}) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> validator.validateAndCanonicalize("MQTT", bad), bad + " 应被拒");
++            assertTrue(e.getMessage().contains("qos"), e.getMessage());
++        }
++    }
++
++    @Test
++    @DisplayName("MQTT - 未知键拒（additionalProperties=false）")
++    void testMqttUnknownKeyRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MQTT",
++                "{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"clientId\":\"c1\"}"));
++        assertTrue(e.getMessage().contains("未知字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("clientId"), e.getMessage());
++    }
++
++    @Test
++    @DisplayName("MQTT - broker 非 URI 拒（format:uri——纯 host 或纯 IP 缺 scheme 即拒）")
++    void testMqttBrokerNotUri() {
++        for (String bad : new String[]{
++                "{\"broker\":\"192.168.1.10\",\"topic\":\"t\"}",
++                "{\"broker\":\"\",\"topic\":\"t\"}"}) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> validator.validateAndCanonicalize("MQTT", bad), bad + " 应被拒");
++            assertTrue(e.getMessage().contains("URI"), e.getMessage());
++        }
++    }
++
++    // ---------- HTTP v1 ----------
++
++    @Test
++    @DisplayName("HTTP - 合法配置（reportPath + authType=apiKey）通过")
++    void testHttpValid() {
++        String canonical = validator.validateAndCanonicalize("HTTP",
++                "{\"reportPath\":\"/api/v1/report\",\"authType\":\"apiKey\"}");
++        assertNotNull(canonical);
++    }
++
++    @Test
++    @DisplayName("HTTP - 缺上报路径拒；authType 非枚举值拒；路径不以 / 开头拒")
++    void testHttpInvalid() {
++        BusinessException e1 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("HTTP",
++                "{\"authType\":\"none\"}"));
++        assertTrue(e1.getMessage().contains("reportPath"), e1.getMessage());
++
++        BusinessException e2 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("HTTP",
++                "{\"reportPath\":\"/r\",\"authType\":\"basic\"}"));
++        assertTrue(e2.getMessage().contains("authType"), e2.getMessage());
++
++        BusinessException e3 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("HTTP",
++                "{\"reportPath\":\"api/report\"}"));
++        assertTrue(e3.getMessage().contains("格式约定"), e3.getMessage());
++    }
++
++    @Test
++    @DisplayName("HTTP - 未知键拒（additionalProperties=false）")
++    void testHttpUnknownKeyRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("HTTP",
++                "{\"reportPath\":\"/r\",\"headers\":{\"X-Trace\":\"1\"}}"));
++        assertTrue(e.getMessage().contains("未知字段"), e.getMessage());
++    }
++
++    // ---------- MODBUS / OPCUA 宽松骨架 ----------
++
++    @Test
++    @DisplayName("MODBUS - 宽松骨架：任意键对象通过；空白 conn_config 落 NULL（归一化返回 null）")
++    void testModbusLoose() {
++        assertNotNull(validator.validateAndCanonicalize("MODBUS",
++                "{\"slaveId\":1,\"registerAddr\":\"40001\"}"));
++        assertNull(validator.validateAndCanonicalize("MODBUS", null), "宽松骨架无必填——空白落库 NULL");
++        assertNull(validator.validateAndCanonicalize("OPCUA", "   "), "空白串同口径");
++    }
++
++    @Test
++    @DisplayName("OPCUA - 宽松骨架：嵌套对象通过（additionalProperties=true）")
++    void testOpcuaLooseNested() {
++        assertNotNull(validator.validateAndCanonicalize("OPCUA",
++                "{\"endpoint\":\"opc.tcp://a:4840\",\"security\":{\"mode\":\"Sign\"}}"));
++    }
++
++    // ---------- 凭据关键词双保险（ADR-0006，全协议全层级） ----------
++
++    @Test
++    @DisplayName("凭据防线 - 顶层凭据键拒：password/credential/secret/token/apiKey（大小写不敏感）")
++    void testCredentialTopLevelRejected() {
++        assertThrowsWithCredential(validator, "MQTT",
++                "{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"password\":\"x\"}", "password");
++        assertThrowsWithCredential(validator, "HTTP",
++                "{\"reportPath\":\"/r\",\"credential\":\"x\"}", "credential");
++        assertThrowsWithCredential(validator, "MODBUS",
++                "{\"slaveId\":1,\"secret\":\"x\"}", "secret");
++        assertThrowsWithCredential(validator, "OPCUA",
++                "{\"endpoint\":\"opc.tcp://a:4840\",\"accessToken\":\"x\"}", "accessToken");
++        assertThrowsWithCredential(validator, "HTTP",
++                "{\"reportPath\":\"/r\",\"apiKey\":\"real-key\"}", "apiKey");
++        assertThrowsWithCredential(validator, "MODBUS",
++                "{\"mqttPassword\":\"x\"}", "mqttPassword");
++    }
++
++    @Test
++    @DisplayName("凭据防线 - 嵌套层级键拒（递归扫描，强于 brief 顶层口径——宽松骨架协议嵌套对象可携带）")
++    void testCredentialNestedRejected() {
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MODBUS",
++                "{\"tcp\":{\"host\":\"a\",\"password\":\"x\"}}"));
++        assertTrue(e.getMessage().contains("凭据字段"), e.getMessage());
++        assertTrue(e.getMessage().contains("tcp.password"), e.getMessage());
++    }
++
++    private void assertThrowsWithCredential(ChannelConnConfigValidator v, String protocol, String config, String key) {
++        BusinessException e = assertThrows(BusinessException.class, () -> v.validateAndCanonicalize(protocol, config),
++                protocol + " " + key + " 应被拒");
++        assertTrue(e.getMessage().contains("凭据字段"), e.getMessage());
++        assertTrue(e.getMessage().contains(key), e.getMessage());
++    }
++
++    // ---------- 通用结构 / 协议-Schema 匹配 ----------
++
++    @Test
++    @DisplayName("未知协议拒（协议-Schema 匹配：protocol_type 决定加载哪个 schema）")
++    void testUnknownProtocolRejected() {
++        for (String bad : new String[]{"COAP", "mqtt ", "Mqtts", ""}) {
++            final String p = bad;
++            BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize(p, "{}"),
++                    "协议 " + p + " 应被拒");
++            assertTrue(e.getMessage().contains("未知协议") || e.getMessage().contains("仅允许 MQTT/HTTP/MODBUS/OPCUA"),
++                    e.getMessage());
++        }
++    }
++
++    @Test
++    @DisplayName("非法 JSON / 非对象拒")
++    void testInvalidJsonAndNonObject() {
++        BusinessException e1 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MODBUS",
++                "{\"a\":"));
++        assertTrue(e1.getMessage().contains("不是合法 JSON"), e1.getMessage());
++
++        BusinessException e2 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MODBUS",
++                "[1,2,3]"));
++        assertTrue(e2.getMessage().contains("必须是 JSON 对象"), e2.getMessage());
++
++        BusinessException e3 = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("HTTP",
++                "\"/r\""));
++        assertTrue(e3.getMessage().contains("必须是 JSON 对象"), e3.getMessage());
++    }
++
++    @Test
++    @DisplayName("超长 conn_config 拒（服务层防线：8192 字符上限）")
++    void testOverlongRejected() {
++        String big = "{\"blob\":\"" + "x".repeat(9000) + "\"}";
++        BusinessException e = assertThrows(BusinessException.class, () -> validator.validateAndCanonicalize("MODBUS", big));
++        assertTrue(e.getMessage().contains("超长"), e.getMessage());
++    }
++
++    @Test
++    @DisplayName("版本化 - 四个协议 Schema 文件在位且 $id 版本与文件名一致（v1）")
++    void testSchemaResourcesPresentAndVersioned() throws Exception {
++        for (String protocol : new String[]{"mqtt", "http", "modbus", "opcua"}) {
++            String location = "schema/channel/" + protocol + "-v1.json";
++            try (var in = Thread.currentThread().getContextClassLoader().getResourceAsStream(location)) {
++                assertNotNull(in, location + " 必须在 classpath");
++                com.fasterxml.jackson.databind.JsonNode node =
++                        new com.fasterxml.jackson.databind.ObjectMapper().readTree(in);
++                assertTrue(node.get("$id").asText().endsWith(":v1"),
++                        location + " $id 版本段必须 v1: " + node.get("$id").asText());
++                assertEquals("object", node.get("type").asText(), location + " 顶层必须 object");
++            }
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuardTest.java
+new file mode 100644
+index 0000000..32d66a2
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelGatewayReferenceGuardTest.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.iot.channel.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.when;
++
++/**
++ * 网关删除保护·通道侧引用计数实现单测（TASK-0018——0017 占位转正接线）。
++ *
++ * <p>锁定接线契约：{@code IotChannelGatewayReferenceGuard} 实查 iot_channel 活跃行
++ * （gateway_id 精确过滤，多租户条件由插件注入；@TableLogic 过滤已删行）、channelCodes
++ * 供删除拒绝文案「并提示通道编码」、点位计数仍占位恒 0（0021 建表后按表扩展）。替换
++ * 0017 占位实现未改动 IotGatewayServiceImpl 删除调用点与拒绝语义（其单测固化不变）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotChannelGatewayReferenceGuardTest {
++
++    @Mock
++    private IotChannelMapper channelMapper;
++
++    private IotChannelGatewayReferenceGuard guard;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        guard = new IotChannelGatewayReferenceGuard();
++        ReflectionTestUtils.setField(guard, "channelMapper", channelMapper);
++    }
++
++    private IotChannel channel(Long id, String code) {
++        IotChannel ch = new IotChannel();
++        ch.setId(id);
++        ch.setGatewayId(1L);
++        ch.setChannelCode(code);
++        return ch;
++    }
++
++    @Test
++    @DisplayName("countChannels - 实查 iot_channel（gateway_id 精确过滤）返回活跃行数")
++    void testCountChannels() {
++        when(channelMapper.selectCount(any(Wrapper.class))).thenReturn(3L);
++        assertEquals(3L, guard.countChannels(1L));
++        ArgumentCaptor<Wrapper<IotChannel>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verifySelect(captor);
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("gateway_id ="), "按 gateway_id 精确过滤: " + segment);
++    }
++
++    @Test
++    @DisplayName("channelCodes - 返回网关名下通道编码列表（拒绝文案提示用）")
++    void testChannelCodes() {
++        when(channelMapper.selectList(any(Wrapper.class)))
++                .thenReturn(List.of(channel(1L, "CH_MQTT_01"), channel(2L, "CH_MB_02")));
++        assertEquals(List.of("CH_MQTT_01", "CH_MB_02"), guard.channelCodes(1L));
++        verifySelect(null);
++    }
++
++    @Test
++    @DisplayName("countPoints - 仍占位恒 0（iot_point 归 0021，接线义务登记 0021 brief）")
++    void testCountPointsPlaceholder() {
++        assertEquals(0L, guard.countPoints(1L));
++    }
++
++    private void verifySelect(ArgumentCaptor<Wrapper<IotChannel>> captor) {
++        if (captor == null) {
++            org.mockito.Mockito.verify(channelMapper).selectList(any(Wrapper.class));
++            return;
++        }
++        org.mockito.Mockito.verify(channelMapper).selectCount(captor.capture());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java
+new file mode 100644
+index 0000000..8110d28
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/channel/service/impl/IotChannelServiceImplTest.java
+@@ -0,0 +1,564 @@
++package net.otlab.admin.module.iot.channel.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.channel.dto.IotChannelCreateForm;
++import net.otlab.admin.module.iot.channel.dto.IotChannelUpdateForm;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelCodeMapper;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelCodeRow;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.channel.schema.ChannelConnConfigValidator;
++import net.otlab.admin.module.iot.channel.service.ChannelReferenceGuard;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 通道服务单元测试（TASK-0018）
++ *
++ * <p>核心业务纪律（详细设计 §1.3/§3.1 p21 / REQ-0010 / ADR-0006 / brief）：channel_code
++ * 网关内唯一双道闸 4002（含已删行预检 + DuplicateKey 兜底，编码不复用）、gateway_id 归属
++ * 校验（存在/同租户/未删）、协议字典四值未知拒、conn_config 按协议版本化 Schema 校验
++ * （真实校验器读主资源 Schema——MQTT 必填/HTTP 必填/凭据键拒/宽松骨架）、MODBUS/OPCUA
++ * 可建不可启用（status 强制 0）、编辑 channel_code/gateway_id 不可改 + conn_config 变更
++ * 重新校验、删除点位 guard 结构（恒零引用 + 计数&gt;0 拒绝分支）、列表 gatewayId 必传。
++ *
++ * <p>standalone Mockito 范式（照 IotGatewayServiceImplTest）：Mapper 全 mock 不触真实库；
++ * TenantContext 静态 mock 供会话租户取值；Schema 校验用真实
++ * {@link ChannelConnConfigValidator}（classpath 主资源，无外部依赖）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotChannelServiceImplTest {
++
++    @Mock
++    private IotChannelMapper baseMapper;
++
++    @Mock
++    private IotChannelCodeMapper channelCodeMapper;
++
++    @Mock
++    private IotGatewayMapper gatewayMapper;
++
++    @Mock
++    private ChannelReferenceGuard channelReferenceGuard;
++
++    private IotChannelServiceImpl channelService;
++
++    /** 创建消费会话租户上下文（静态 mock，逐用例注入） */
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++        TableInfoHelper.initTableInfo(assistant, IotGateway.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(1L);
++        channelService = new IotChannelServiceImpl();
++        ReflectionTestUtils.setField(channelService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(channelService, "channelCodeMapper", channelCodeMapper);
++        ReflectionTestUtils.setField(channelService, "gatewayMapper", gatewayMapper);
++        ReflectionTestUtils.setField(channelService, "connConfigValidator", new ChannelConnConfigValidator());
++        ReflectionTestUtils.setField(channelService, "channelReferenceGuard", channelReferenceGuard);
++        when(channelCodeMapper.selectOccupiedByGatewayAndCodes(any(), any(), anyCollection())).thenReturn(List.of());
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private static final tools.jackson.databind.json.JsonMapper JSON_MAPPER =
++            tools.jackson.databind.json.JsonMapper.builder().build();
++
++    /** 表单 connConfig 以 JsonNode 承载（请求即 JSON 对象字面量）——测试夹具同步口径 */
++    private static tools.jackson.databind.JsonNode json(String raw) {
++        try {
++            return JSON_MAPPER.readTree(raw);
++        } catch (Exception e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++
++    private IotChannelCreateForm mqttForm() {
++        IotChannelCreateForm form = new IotChannelCreateForm();
++        form.setGatewayId(10L);
++        form.setChannelCode("CH_MQTT_01");
++        form.setChannelName("一号空压机 MQTT 通道");
++        form.setProtocolType("MQTT");
++        form.setConnConfig(json("{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}"));
++        return form;
++    }
++
++    private IotGateway existingGateway() {
++        IotGateway gw = new IotGateway();
++        gw.setId(10L);
++        gw.setTenantId(1L);
++        gw.setGatewayCode("GW_F01_01");
++        gw.setStatus(1);
++        return gw;
++    }
++
++    private IotChannel existingChannel() {
++        IotChannel ch = new IotChannel();
++        ch.setId(100L);
++        ch.setTenantId(1L);
++        ch.setGatewayId(10L);
++        ch.setChannelCode("CH_MQTT_01");
++        ch.setChannelName("一号空压机 MQTT 通道");
++        ch.setProtocolType("MQTT");
++        ch.setConnConfig("{\"broker\":\"tcp://192.168.1.10:1883\",\"topic\":\"factory/gw01/up\",\"qos\":1}");
++        ch.setStatus(1);
++        return ch;
++    }
++
++    private IotChannelCodeRow occupiedRow(Integer deleted) {
++        IotChannelCodeRow row = new IotChannelCodeRow();
++        row.setId(9L);
++        row.setChannelCode("CH_MQTT_01");
++        row.setDeleted(deleted);
++        return row;
++    }
++
++    // ---------- 创建：唯一性双道闸 4002 ----------
++
++    @Test
++    @DisplayName("创建 - 双道闸第一道：活跃行占用预检命中报 4002「已存在」，不触发 save")
++    void testCreate_ActiveRowOccupied4002() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(channelCodeMapper.selectOccupiedByGatewayAndCodes(eq(1L), eq(10L), anyCollection()))
++                .thenReturn(List.of(occupiedRow(0)));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(mqttForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("通道编码已存在: CH_MQTT_01"));
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 已删行占用报 4002「已被删除记录占用，不可复用」（编码不复用，uk 不含 deleted）")
++    void testCreate_DeletedRowOccupied4002() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(channelCodeMapper.selectOccupiedByGatewayAndCodes(eq(1L), eq(10L), anyCollection()))
++                .thenReturn(List.of(occupiedRow(1)));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(mqttForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("已被删除记录占用，不可复用"));
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 双道闸第二道：预检未中但落库撞物理唯一索引（真实并发窗口）→ 兜底 4002")
++    void testCreate_DuplicateKeyFallback4002() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(baseMapper.insert(any(IotChannel.class))).thenThrow(new DuplicateKeyException("uk_gateway_channel_code"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(mqttForm()));
++        assertEquals(4002, e.getCode());
++        assertTrue(e.getMessage().contains("通道编码已存在"));
++    }
++
++    // ---------- 创建：归属 / 字典 / Schema / 白名单 ----------
++
++    @Test
++    @DisplayName("创建 - 归属校验：网关不存在/已删除即拒（存在/同租户/未删——同租户由插件注入）")
++    void testCreate_GatewayValidation() {
++        when(gatewayMapper.selectById(10L)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(mqttForm()));
++        assertTrue(e.getMessage().contains("所属网关不存在或已删除: 10"));
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 协议字典：未知协议拒（COAP/mqtts），四值放行")
++    void testCreate_ProtocolDictionary() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(baseMapper.insert(any(IotChannel.class))).thenReturn(1);
++
++        for (String bad : new String[]{"COAP", "mqtts", "mqtt "}) {
++            IotChannelCreateForm form = mqttForm();
++            form.setProtocolType(bad);
++            BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(form),
++                    "协议 " + bad + " 应被拒");
++            assertTrue(e.getMessage().contains("协议类型仅允许 MQTT/HTTP/MODBUS/OPCUA"), e.getMessage());
++        }
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - conn_config Schema：MQTT 缺 broker 拒且不落库（真实校验器）")
++    void testCreate_MqttSchemaViolation() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        IotChannelCreateForm form = mqttForm();
++        form.setConnConfig(json("{\"topic\":\"t\"}"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(form));
++        assertTrue(e.getMessage().contains("缺少必填字段"), e.getMessage());
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - conn_config 凭据键拒（ADR-0006 双保险）：含 password 键的合法 MQTT 配置被拒")
++    void testCreate_CredentialKeyRejected() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        IotChannelCreateForm form = mqttForm();
++        form.setConnConfig(json("{\"broker\":\"tcp://a:1883\",\"topic\":\"t\",\"password\":\"x\"}"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.createChannel(form));
++        assertTrue(e.getMessage().contains("凭据字段"), e.getMessage());
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("创建 - 白名单落库：MQTT status 未携带落 1（DDL DEFAULT '1' 同值）/ tenantId 会话覆盖 / connConfig 归一化")
++    void testCreate_WhitelistMqttDefaultStatus() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(baseMapper.insert(any(IotChannel.class))).thenReturn(1);
++
++        assertTrue(channelService.createChannel(mqttForm()));
++
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).insert(captor.capture());
++        IotChannel saved = captor.getValue();
++        assertEquals(10L, saved.getGatewayId());
++        assertEquals("CH_MQTT_01", saved.getChannelCode());
++        assertEquals("MQTT", saved.getProtocolType());
++        assertEquals(1, saved.getStatus(), "MQTT/HTTP 未携带 status 落 1（DDL DEFAULT '1' 同值）");
++        assertEquals(1L, saved.getTenantId(), "tenant_id 服务层从会话覆盖");
++        assertNotNull(saved.getConnConfig());
++        assertTrue(saved.getConnConfig().contains("\"broker\":\"tcp://192.168.1.10:1883\""), saved.getConnConfig());
++        assertNull(saved.getId());
++        assertNull(saved.getDeleted());
++    }
++
++    @Test
++    @DisplayName("创建 - 可建不可启用：MODBUS 携带 status=1 一律落库 0（REQ-0010 验收 2）；HTTP 携带 0 落 0")
++    void testCreate_ReservedProtocolStatusForced() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(baseMapper.insert(any(IotChannel.class))).thenReturn(1);
++
++        IotChannelCreateForm modbus = mqttForm();
++        modbus.setChannelCode("CH_MB_01");
++        modbus.setProtocolType("MODBUS");
++        modbus.setConnConfig(json("{\"slaveId\":1}"));
++        modbus.setStatus(1);
++        assertTrue(channelService.createChannel(modbus));
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).insert(captor.capture());
++        assertEquals(0, captor.getValue().getStatus(), "MODBUS 请求携带 status=1 一律落库 0");
++
++        IotChannelCreateForm http = mqttForm();
++        http.setChannelCode("CH_HTTP_01");
++        http.setProtocolType("HTTP");
++        http.setConnConfig(json("{\"reportPath\":\"/api/v1/report\",\"authType\":\"apiKey\"}"));
++        http.setStatus(0);
++        assertTrue(channelService.createChannel(http));
++        ArgumentCaptor<IotChannel> captor2 = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper, org.mockito.Mockito.times(2)).insert(captor2.capture());
++        assertEquals(0, captor2.getValue().getStatus(), "MQTT/HTTP 携带 0 落 0（正常启停）");
++    }
++
++    @Test
++    @DisplayName("创建 - OPCUA 空白 conn_config 落 NULL（宽松骨架无必填）")
++    void testCreate_OpcuaNullConnConfig() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(baseMapper.insert(any(IotChannel.class))).thenReturn(1);
++
++        IotChannelCreateForm form = mqttForm();
++        form.setChannelCode("CH_OPC_01");
++        form.setProtocolType("OPCUA");
++        form.setConnConfig(null);
++        assertTrue(channelService.createChannel(form));
++
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).insert(captor.capture());
++        assertNull(captor.getValue().getConnConfig());
++        assertEquals(0, captor.getValue().getStatus(), "OPCUA 同属预留协议——status 强制 0");
++    }
++
++    @Test
++    @DisplayName("创建 - 名称长度拒（>100）；编码超长拒（>64）")
++    void testCreate_BasicValidation() {
++        IotChannelCreateForm longName = mqttForm();
++        longName.setChannelName("名".repeat(101));
++        BusinessException e1 = assertThrows(BusinessException.class, () -> channelService.createChannel(longName));
++        assertTrue(e1.getMessage().contains("通道名称"));
++
++        IotChannelCreateForm longCode = mqttForm();
++        longCode.setChannelCode("A".repeat(65));
++        BusinessException e2 = assertThrows(BusinessException.class, () -> channelService.createChannel(longCode));
++        assertTrue(e2.getMessage().contains("通道编码"));
++        verify(baseMapper, never()).insert(any(IotChannel.class));
++    }
++
++    // ---------- 编辑：不可变字段 / 重新校验 / 可建不可启用 ----------
++
++    @Test
++    @DisplayName("编辑 - channel_code 不可改：携带不一致即拒（FEAT-0006）；gateway_id 不可改（通道属网关固定）")
++    void testUpdate_ImmutableFields() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++
++        IotChannelUpdateForm codeChange = new IotChannelUpdateForm();
++        codeChange.setId(100L);
++        codeChange.setChannelCode("CH_NEW");
++        BusinessException e1 = assertThrows(BusinessException.class, () -> channelService.updateChannel(codeChange));
++        assertTrue(e1.getMessage().contains("通道编码不允许修改: CH_MQTT_01"));
++
++        IotChannelUpdateForm gatewayChange = new IotChannelUpdateForm();
++        gatewayChange.setId(100L);
++        gatewayChange.setGatewayId(99L);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> channelService.updateChannel(gatewayChange));
++        assertTrue(e2.getMessage().contains("通道不允许更换所属网关: 10"));
++
++        verify(baseMapper, never()).updateById(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 改名+启停白名单：仅 channelName/status 进更新集；channelCode/gatewayId/protocolType/connConfig 不进 SET")
++    void testUpdate_WhitelistOnly() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++        when(baseMapper.updateById(any(IotChannel.class))).thenReturn(1);
++
++        IotChannelUpdateForm form = new IotChannelUpdateForm();
++        form.setId(100L);
++        form.setChannelCode("CH_MQTT_01");
++        form.setGatewayId(10L);
++        form.setChannelName("改名通道");
++        form.setStatus(0);
++
++        assertTrue(channelService.updateChannel(form));
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotChannel upd = captor.getValue();
++        assertEquals(100L, upd.getId());
++        assertEquals("改名通道", upd.getChannelName());
++        assertEquals(0, upd.getStatus());
++        assertNull(upd.getChannelCode(), "编码连 no-op 都不进 SET");
++        assertNull(upd.getGatewayId());
++        assertNull(upd.getProtocolType());
++        assertNull(upd.getConnConfig());
++        assertNull(upd.getTenantId());
++        assertNull(upd.getDeleted());
++    }
++
++    @Test
++    @DisplayName("编辑 - conn_config 变更重新校验：非法配置拒且不落库")
++    void testUpdate_ConnConfigRevalidated() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++
++        IotChannelUpdateForm form = new IotChannelUpdateForm();
++        form.setId(100L);
++        form.setConnConfig(json("{\"broker\":\"tcp://a:1883\"}"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.updateChannel(form));
++        assertTrue(e.getMessage().contains("缺少必填字段"), e.getMessage());
++        verify(baseMapper, never()).updateById(any(IotChannel.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 协议变更按新协议重新校验：MQTT→HTTP 携带旧 MQTT 配置拒；携带合法 HTTP 配置放行")
++    void testUpdate_ProtocolChangeRevalidatesConnConfig() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++
++        IotChannelUpdateForm bad = new IotChannelUpdateForm();
++        bad.setId(100L);
++        bad.setProtocolType("HTTP");
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.updateChannel(bad));
++        assertTrue(e.getMessage().contains("HTTP v1 Schema"), "旧 MQTT 配置必须过 HTTP Schema: " + e.getMessage());
++
++        IotChannelUpdateForm good = new IotChannelUpdateForm();
++        good.setId(100L);
++        good.setProtocolType("HTTP");
++        good.setConnConfig(json("{\"reportPath\":\"/api/v1/report\",\"authType\":\"none\"}"));
++        when(baseMapper.updateById(any(IotChannel.class))).thenReturn(1);
++        assertTrue(channelService.updateChannel(good));
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals("HTTP", captor.getValue().getProtocolType());
++        assertTrue(captor.getValue().getConnConfig().contains("reportPath"));
++    }
++
++    @Test
++    @DisplayName("编辑 - 可建不可启用：MODBUS 通道编辑携带 status=1 强制落 0（REQ-0010 验收 2）")
++    void testUpdate_ReservedProtocolStatusForced() {
++        IotChannel modbus = existingChannel();
++        modbus.setChannelCode("CH_MB_01");
++        modbus.setProtocolType("MODBUS");
++        modbus.setConnConfig(null);
++        when(baseMapper.selectById(100L)).thenReturn(modbus);
++        when(baseMapper.updateById(any(IotChannel.class))).thenReturn(1);
++
++        IotChannelUpdateForm form = new IotChannelUpdateForm();
++        form.setId(100L);
++        form.setStatus(1);
++        assertTrue(channelService.updateChannel(form));
++        ArgumentCaptor<IotChannel> captor = ArgumentCaptor.forClass(IotChannel.class);
++        verify(baseMapper).updateById(captor.capture());
++        assertEquals(0, captor.getValue().getStatus(), "MODBUS 编辑请求携带 status=1 一律落库 0");
++    }
++
++    @Test
++    @DisplayName("编辑 - 目标不存在/未选即拒；status 值域拒")
++    void testUpdate_BasicValidation() {
++        when(baseMapper.selectById(100L)).thenReturn(null);
++        IotChannelUpdateForm missing = new IotChannelUpdateForm();
++        missing.setId(100L);
++        BusinessException e0 = assertThrows(BusinessException.class, () -> channelService.updateChannel(missing));
++        assertTrue(e0.getMessage().contains("通道不存在或已删除"));
++
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++        IotChannelUpdateForm badStatus = new IotChannelUpdateForm();
++        badStatus.setId(100L);
++        badStatus.setStatus(2);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> channelService.updateChannel(badStatus));
++        assertTrue(e2.getMessage().contains("通道状态仅允许"));
++        verify(baseMapper, never()).updateById(any(IotChannel.class));
++    }
++
++    // ---------- 删除：点位 guard 结构就位 ----------
++
++    @Test
++    @DisplayName("删除 - guard 恒零引用（点位表未建）放行：计数被调用、removeById 软删")
++    void testDelete_ZeroReferencePasses() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++        when(baseMapper.deleteById(100L)).thenReturn(1);
++
++        assertTrue(channelService.deleteChannel(100L));
++        verify(channelReferenceGuard).countPoints(100L);
++        verify(baseMapper).deleteById(100L);
++    }
++
++    @Test
++    @DisplayName("删除 - 有点位引用拒绝（guard 分支固化，0021 建表后计数实现按表扩展）")
++    void testDelete_PointReferenceRejected() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++        when(channelReferenceGuard.countPoints(100L)).thenReturn(3L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.deleteChannel(100L));
++        assertTrue(e.getMessage().contains("通道存在点位，禁止删除"));
++        assertTrue(e.getMessage().contains("3"));
++        verify(baseMapper, never()).deleteById(any());
++    }
++
++    @Test
++    @DisplayName("删除 - 目标不存在/未选即拒")
++    void testDelete_MissingRejected() {
++        when(baseMapper.selectById(100L)).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> channelService.deleteChannel(100L));
++        assertTrue(e1.getMessage().contains("通道不存在或已删除"));
++
++        BusinessException e2 = assertThrows(BusinessException.class, () -> channelService.deleteChannel(null));
++        assertTrue(e2.getMessage().contains("请选择要删除的通道"));
++        verify(channelReferenceGuard, never()).countPoints(any());
++    }
++
++    // ---------- 列表 / 详情 ----------
++
++    @Test
++    @DisplayName("列表 - gatewayId 必传（§3.1 按网关查口径）：缺即拒")
++    void testList_GatewayIdRequired() {
++        BusinessException e1 = assertThrows(BusinessException.class,
++                () -> channelService.selectChannelList(new Page<>(1, 10), new IotChannel()));
++        assertTrue(e1.getMessage().contains("gatewayId 必传"));
++
++        IotChannel query = new IotChannel();
++        query.setGatewayId(null);
++        BusinessException e2 = assertThrows(BusinessException.class,
++                () -> channelService.selectChannelList(new Page<>(1, 10), query));
++        assertTrue(e2.getMessage().contains("gatewayId 必传"));
++        verify(baseMapper, never()).selectPage(any(Page.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("列表 - 过滤条件接线：channelCode LIKE + protocolType/status eq，按 id 稳定序")
++    void testList_Filters() {
++        Page<IotChannel> page = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(page);
++
++        IotChannel query = new IotChannel();
++        query.setGatewayId(10L);
++        query.setChannelCode("CH_MQTT");
++        query.setProtocolType("MQTT");
++        query.setStatus(1);
++        Page<IotChannel> result = channelService.selectChannelList(new Page<>(1, 10), query);
++        assertNotNull(result);
++
++        ArgumentCaptor<Wrapper<IotChannel>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("gateway_id ="), "gatewayId 精确过滤: " + segment);
++        assertTrue(segment.contains("channel_code LIKE"), "编码过滤 LIKE: " + segment);
++        assertTrue(segment.contains("protocol_type ="), "协议过滤 eq: " + segment);
++        assertTrue(segment.contains("status ="), "状态过滤 eq: " + segment);
++        assertTrue(segment.contains("ORDER BY id ASC"), "稳定序: " + segment);
++    }
++
++    @Test
++    @DisplayName("详情 - 存在返回原文 connConfig；不存在/未选拒")
++    void testDetail() {
++        when(baseMapper.selectById(100L)).thenReturn(existingChannel());
++        IotChannel detail = channelService.getChannelDetail(100L);
++        assertEquals("CH_MQTT_01", detail.getChannelCode());
++
++        when(baseMapper.selectById(100L)).thenReturn(null);
++        BusinessException e = assertThrows(BusinessException.class, () -> channelService.getChannelDetail(100L));
++        assertTrue(e.getMessage().contains("通道不存在或已删除"));
++    }
++
++    // ---------- 4002 兜底文案口径 ----------
++
++    @Test
++    @DisplayName("错误码 - 唯一性冲突 4002 / 结构性问题 PARAM_ERROR（400）")
++    void testErrorCodes() {
++        when(gatewayMapper.selectById(10L)).thenReturn(existingGateway());
++        when(channelCodeMapper.selectOccupiedByGatewayAndCodes(eq(1L), eq(10L), anyCollection()))
++                .thenReturn(List.of(occupiedRow(0)));
++        BusinessException dup = assertThrows(BusinessException.class, () -> channelService.createChannel(mqttForm()));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), dup.getCode());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+index a326e23..80a8b49 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+@@ -472,18 +472,33 @@ class IotGatewayServiceImplTest {
+     }
+ 
+     @Test
+-    @DisplayName("删除 - 有通道引用拒绝（guard 分支固化，0018 建表后计数实现按表扩展）")
++    @DisplayName("删除 - 有通道引用拒绝（0018 通道侧计数转正）：拒绝并提示通道编码（§3.1 p21「拒绝并提示」）")
+     void testDelete_ChannelReferenceRejected() {
+         when(baseMapper.selectById(1L)).thenReturn(existingGateway());
+         when(referenceGuard.countChannels(1L)).thenReturn(2L);
++        when(referenceGuard.channelCodes(1L)).thenReturn(List.of("CH_MQTT_01", "CH_MB_02"));
+ 
+         BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(1L));
+         assertTrue(e.getMessage().contains("网关存在采集通道，禁止删除"));
+         assertTrue(e.getMessage().contains("2"));
++        assertTrue(e.getMessage().contains("CH_MQTT_01"), "拒绝文案必须提示通道编码: " + e.getMessage());
++        assertTrue(e.getMessage().contains("CH_MB_02"), "拒绝文案必须提示通道编码: " + e.getMessage());
+         verify(referenceGuard, never()).countPoints(any());
+         verify(baseMapper, never()).deleteById(any());
+     }
+ 
++    @Test
++    @DisplayName("删除 - 有通道引用但编码列表为空时退回纯计数文案（防御分支，正常实现不可达）")
++    void testDelete_ChannelReferenceEmptyCodesFallback() {
++        when(baseMapper.selectById(1L)).thenReturn(existingGateway());
++        when(referenceGuard.countChannels(1L)).thenReturn(2L);
++        when(referenceGuard.channelCodes(1L)).thenReturn(List.of());
++
++        BusinessException e = assertThrows(BusinessException.class, () -> gatewayService.deleteGateway(1L));
++        assertTrue(e.getMessage().contains("网关存在采集通道，禁止删除（通道 2 条，先清理通道）"));
++        verify(baseMapper, never()).deleteById(any());
++    }
++
+     @Test
+     @DisplayName("删除 - 有点位引用拒绝（guard 分支固化，0021 建表后计数实现按表扩展）")
+     void testDelete_PointReferenceRejected() {
+diff --git a/resources/sql/upgrade/20261122_iot_channel_domain.sql b/resources/sql/upgrade/20261122_iot_channel_domain.sql
+new file mode 100644
+index 0000000..dc74bd3
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_channel_domain.sql
+@@ -0,0 +1,102 @@
++-- ============================================================
++-- 存量库升级脚本：iot_channel 通道表 + 通道管理按钮权限种子（TASK-0018 / FEAT-0006 / REQ-0010）
++--
++-- 用途：
++--   1) 建 iot_channel 采集通道表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1 附录 A p30，
++--      brief 已提取逐字贴回；字形规范化不改语义）；
++--   2) sys_menu 登记通道管理页（sys_menu 4013「通道管理」，20261121_iot_console_menus.sql
++--      已建）之下的五个按钮权限行（menu_type=3）：iot:channel:list/query/add/edit/remove；
++--   3) sys_role_menu 将上述五行授予超级管理员（role_id=1；照 20261122_iot_gateway_domain.sql 范式）。
++--
++-- 与上游差异（无）：附录 A p30 逐字 DDL 的两处索引（uk_gateway_channel_code / idx_tenant_gateway）
++--   在 MySQL 8 InnoDB 键长均可行（bigint+varchar(64) utf8mb4 = 8+256 字节），无需前缀降级，
++--   头注如实登记「无差异」。
++--
++-- 接口对应（「权限标识与接口清单一一对应」，详细设计 §3.1 p21 + 本任务 brief）：
++--   iot:channel:list    GET    /iot/channel/list（按 gatewayId 必传查通道列表——§3.1 口径，
++--                                分页过滤 channelCode/protocolType/status）
++--   iot:channel:query   GET    /iot/channel/{id}（通道详情，含 conn_config 原文）
++--   iot:channel:add     POST   /iot/channel（新增通道；channel_code 网关内唯一双道闸 4002；
++--                                conn_config 按 protocol_type 匹配 JSON Schema 校验（版本化，
++--                                classpath schema/channel/<协议>-v1.json）且不含凭据键（ADR-0006
++--                                双保险）；MODBUS/OPCUA 可建不可启用——status 强制 0）
++--   iot:channel:edit    PUT    /iot/channel（修改通道；channel_code/gateway_id 不可改；
++--                                conn_config 变更重新校验；MODBUS/OPCUA status 强制 0）
++--   iot:channel:remove  DELETE /iot/channel/{id}（软删除；其下有点位则拒绝——点位表归
++--                                TASK-0021 建表，guard 结构本期就位、实际恒零引用，接线义务登记
++--                                0021 brief）
++--   （守卫：backend IotChannelMenuPermissionGuardTest 强制 SQL 4046-4050 与控制器注解
++--   双向核对；SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4041-4045：TASK-0017 占用（网关按钮五行）；
++--   本脚本占用 sys_menu id 4046-4050（通道按钮五行，parent_id=4013），连续取号。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（详细设计 §1.3 p7 / REQ-0010 / ADR-0006）：
++--   uk_gateway_channel_code 为 (gateway_id, channel_code) 物理唯一索引；channel_code 网关内
++--   唯一且创建后不可改（FEAT-0006 功能项与字段），删除为逻辑删（deleted=1），编码不复用——
++--   双道闸预检含已删行（照 0011/0012/0017 修订轮 I-1 口径）；gateway_id 通道属网关固定不可改。
++--   conn_config 为 JSON 列：结构由应用层版本化 JSON Schema 约束（classpath
++--   schema/channel/<协议>-v1.json，一期最小字段集），凭据不入 conn_config 明文（ADR-0006，
++--   凭据独立存 iot_channel_credential 归 TASK-0019）——数据库层不拆列。
++--   MODBUS/OPCUA 可建不可启用（REQ-0010 验收 2）：status 强制 0（应用层强制落库，DDL
++--   DEFAULT '1' 仅对 MQTT/HTTP 缺省生效）。
++--   保存≠生效（REQ-0010 验收 4）：本表无 config_version 列（上游 DDL 无此列），通道生效
++--   状态由配置快照对账（FEAT-0008/TASK-0024 发布链路承载版本）——本期无即时下发动作。
++--   多租户：iot_channel 属 iot_ 前缀表，由 TASK-0002 TenantLineInnerInterceptor
++--   （OtTenantLineHandler 前缀规则）自动按会话租户注入条件，tenant_id 服务层从会话
++--   覆盖、禁前端传参。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4013 在位）与 20261122_iot_gateway_domain.sql（网关表在位——gateway_id 外键语义）的
++--   存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_channel` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '通道 ID',
++  `tenant_id` bigint NOT NULL COMMENT '租户 ID',
++  `gateway_id` bigint NOT NULL COMMENT '所属网关 ID',
++  `channel_code` varchar(64) NOT NULL COMMENT '通道编码（网关内唯一）',
++  `channel_name` varchar(100) NOT NULL COMMENT '通道名称',
++  `protocol_type` varchar(16) NOT NULL COMMENT '协议 MQTT/HTTP/MODBUS/OPCUA',
++  `conn_config` json DEFAULT NULL COMMENT '连接配置 JSON（不含凭据）',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_gateway_channel_code` (`gateway_id`,`channel_code`),
++  KEY `idx_tenant_gateway` (`tenant_id`,`gateway_id`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='采集通道表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4046, 4013, 4, '通道查询', 3, NULL, NULL, NULL, 'iot:channel:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4047, 4013, 4, '通道详情', 3, NULL, NULL, NULL, 'iot:channel:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4048, 4013, 4, '通道新增', 3, NULL, NULL, NULL, 'iot:channel:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4049, 4013, 4, '通道修改', 3, NULL, NULL, NULL, 'iot:channel:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4050, 4013, 4, '通道删除', 3, NULL, NULL, NULL, 'iot:channel:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4046), (1, 4047), (1, 4048), (1, 4049), (1, 4050);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构、第二条应 5 行、第三条应 5 行）：
++--   SHOW CREATE TABLE iot_channel;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4046 AND 4050;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4046 AND 4050;
++-- ============================================================

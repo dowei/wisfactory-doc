@@ -1,0 +1,872 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java
+index 5967630..5e2b6e0 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGate.java
+@@ -1,20 +1,14 @@
+ package net.otlab.admin.module.iot.publish.gate;
+ 
+ import lombok.extern.slf4j.Slf4j;
+-import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
+-import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+-import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
+ import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+-import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.RedisUtils;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.stereotype.Component;
+ 
+-import java.nio.charset.StandardCharsets;
+-
+ /**
+  * 发布确认门真实现（TASK-0015——ADR-0008 第二档「随发布生效，强制影响预览+二次确认」的
+- * 动作位；替换 0024 NoOp 占位成为生产唯一 Bean）。
++ * 动作位；替换 0024 NoOp 占位成为生产唯一 Bean。修订轮 I-1/M-1 凭据协议升级，见下）。
+  *
+  * <p><b>判档（内部完成，发布流程无感——brief「实现内部判档，仅二档触发确认」）</b>：
+  * 委托 {@link IotTemplateVersionService#hasPendingTier2Confirm}（存在待确认二档模板变更
+@@ -29,14 +23,25 @@ import java.nio.charset.StandardCharsets;
+  * <li>存在待确认二档变更 → 校验二次确认凭据（见下），false 即拒绝发布。</li>
+  * </ul>
+  *
+- * <p><b>二次确认凭据校验（brief 协议）</b>：影响预览 GET /iot/template/impact-preview 下发
+- * previewToken 并落 Redis 键 {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:
+- * {targetVersion}}（value=待发布内容摘要哈希——与发布流程同一组装/确定性序列化/SHA-256
+- * 链路，TTL=ot.publish.confirm-token-ttl-seconds 默认 300）。发布请求 PublishForm.
+- * confirmToken 原样回传，本实现校验：<b>token 非空 + Redis 凭据存在 + Redis 哈希与当前
+- * 待发布内容摘要一致</b>——缺失（未预览）/过期（TTL 逾时）/内容漂移（预览后配置又变更）
+- * → false，发布流程抛 BusinessException 5002 PUBLISH_NOT_CONFIRMED（ot-core ResultCode，
+- * FEAT-0008「未确认 5002」），重取预览重新确认后可发布。
++ * <p><b>二次确认凭据校验（brief 协议 + 修订轮 I-1/M-1 升级）</b>：影响预览
++ * GET /iot/template/impact-preview 下发 previewToken 并落 Redis 键
++ * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}，value=
++ * <b>「确认凭据复合哈希:previewToken」</b>（TTL=ot.publish.confirm-token-ttl-seconds
++ * 默认 300）。复合哈希=「计算域快照摘要 + 模板域内容摘要」
++ * （{@link IotTemplateVersionService#computeConfirmCredentialHash}——预览下发侧与本校验
++ * 侧共用同一链路，同参重算比对）。发布请求 PublishForm.confirmToken 原样回传，本实现
++ * 校验三件事：
++ * <ol>
++ * <li><b>token 非空</b>——缺失（未预览）即拒；</li>
++ * <li><b>凭据存在</b>——TTL 逾时/键漂移即拒（过期）；</li>
++ * <li><b>复合哈希一致</b>（修订轮 I-1：纯计算域哈希对模板域变更不敏感——模板域编辑不触
++ *     实例行，预览→再改 T2→旧凭据过门的漂移盲区已闭合；现计算域或模板域任一内容在
++ *     预览后变更即哈希不一致 → 拒——内容漂移）；</li>
++ * <li><b>token 匹配</b>（修订轮 M-1：凭据值绑定 previewToken，任意非空 token 不再可过；
++ *     同一 targetVersion 的后一次预览覆盖凭据值，旧 token 随之失效）。</li>
++ * </ol>
++ * 任一不成立 → false，发布流程抛 BusinessException 5002 PUBLISH_NOT_CONFIRMED
++ * （ot-core ResultCode，FEAT-0008「未确认 5002」），重取预览重新确认后可发布。
+  *
+  * <p>签名纪律：四参 {@link PublishConfirmGate#requireConfirm(Long, Integer, Long, Long)}
+  * 为 0024 原签名（本实现按判档语义覆写——凭据校验需要 token，经五参进入；四参路径在
+@@ -58,9 +63,6 @@ public class TemplateAwarePublishConfirmGate implements PublishConfirmGate {
+     @Autowired
+     private IotTemplateVersionService templateVersionService;
+ 
+-    @Autowired
+-    private ConfigSnapshotAssembler assembler;
+-
+     @Override
+     public boolean requireConfirm(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
+         return requireConfirm(tenantId, scopeType, scopeId, targetVersion, null);
+@@ -77,7 +79,7 @@ public class TemplateAwarePublishConfirmGate implements PublishConfirmGate {
+         if (!templateVersionService.hasPendingTier2Confirm(tenantId)) {
+             return true;
+         }
+-        // ---- 二档待确认：凭据校验（缺失/过期/内容漂移 → false → 5002 下发未确认） ----
++        // ---- 二档待确认：凭据校验（缺失/过期/内容漂移/token 不匹配 → false → 5002 下发未确认） ----
+         if (confirmToken == null || confirmToken.isBlank()) {
+             log.warn("[CONFIRM-GATE] publish rejected (token missing) tenant={} scope=2-{} targetVersion={}",
+                     tenantId, scopeId, targetVersion);
+@@ -90,23 +92,34 @@ public class TemplateAwarePublishConfirmGate implements PublishConfirmGate {
+                     + "targetVersion={} key={}", tenantId, scopeId, targetVersion, key);
+             return false;
+         }
+-        String expected = contentHash(tenantId, scopeType, scopeId, targetVersion);
+-        if (!expected.equals(String.valueOf(stored))) {
+-            // 内容漂移：预览后待发布内容已变更（预览→发布窗口内配置又改动）——旧凭据失效
+-            log.warn("[CONFIRM-GATE] publish rejected (content drifted since preview) tenant={} scope={}-{} "
+-                    + "targetVersion={} expectedHash={} storedHash={}", tenantId, scopeType, scopeId,
+-                    targetVersion, expected, stored);
++        // 凭据值协议（修订轮 M-1）：「复合哈希:previewToken」——哈希/token 均为十六进制，
++        // 以最后一个 ':' 分段；畸形值（旧协议裸哈希/人工构造）一律 fail-closed
++        String storedValue = String.valueOf(stored);
++        int separator = storedValue.lastIndexOf(':');
++        if (separator <= 0 || separator == storedValue.length() - 1) {
++            log.warn("[CONFIRM-GATE] publish rejected (malformed credential) tenant={} scope=2-{} "
++                    + "targetVersion={} key={}", tenantId, scopeId, targetVersion, key);
++            return false;
++        }
++        String storedHash = storedValue.substring(0, separator);
++        String storedToken = storedValue.substring(separator + 1);
++        // 复合哈希比对（修订轮 I-1：计算域快照摘要+模板域内容摘要——两侧同参重算，预览后
++        // 任一域内容变更即不一致；旧实现仅计算域哈希，模板域变更漂移不可见）
++        String expected = templateVersionService.computeConfirmCredentialHash(tenantId, scopeType, scopeId, targetVersion);
++        if (!expected.equals(storedHash)) {
++            log.warn("[CONFIRM-GATE] publish rejected (content drifted since preview) tenant={} scope=2-{} "
++                    + "targetVersion={} expectedHash={} storedHash={}", tenantId, scopeId,
++                    targetVersion, expected, storedHash);
+             return false;
+         }
+-        log.info("[CONFIRM-GATE] tier2 publish confirmed tenant={} scope={}-{} targetVersion={}",
+-                tenantId, scopeType, scopeId, targetVersion);
++        // token 比对（修订轮 M-1：凭据值绑定 previewToken——任意非空 token 不再可过）
++        if (!storedToken.equals(confirmToken)) {
++            log.warn("[CONFIRM-GATE] publish rejected (token mismatch) tenant={} scope=2-{} targetVersion={}",
++                    tenantId, scopeId, targetVersion);
++            return false;
++        }
++        log.info("[CONFIRM-GATE] tier2 publish confirmed tenant={} scope=2-{} targetVersion={}",
++                tenantId, scopeId, targetVersion);
+         return true;
+     }
+-
+-    /** 当前待发布内容摘要哈希（与发布流程/影响预览同一组装+确定性序列化+SHA-256 链路） */
+-    private String contentHash(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
+-        ConfigSnapshot snapshot = assembler.assemble(tenantId, scopeType, scopeId, targetVersion);
+-        String json = assembler.serialize(snapshot);
+-        return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+-    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java
+index e948dc7..36cac40 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImpl.java
+@@ -22,6 +22,7 @@ import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
+ import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
+ import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -77,6 +78,13 @@ import java.util.stream.Collectors;
+  * 不可经 API 注入，杜绝 mass assignment；规则行无 config_version 列（上游 DDL 无此列），
+  * 保存≠生效——生效走 0024 配置快照发布链路（照 0021/0023 口径登记）。
+  *
++ * <p><b>版本留痕接线（TASK-0015 修订轮 I-2）</b>：规则内容随模板内容快照进版本历史与
++ * 分档判定（conditionExpr/enabled/bindingMap/priority 变更与删除规则=二档，statusName/
++ * color=一档——TemplateTierRuleTable），四个写原语（新增/修改/直绑映射/批量删除）落库后
++ * 同事务钩 {@link IotTemplateVersionService#recordContentChange}——升版失败整体回滚
++ * （与模板头/数据项写路径钩子同事务语义）。修订前状态规则写路径整类绕过版本留痕与
++ * 确认门（ADR-0008 T2 明文含「状态规则门限/优先级」，REQ-0006 验收 2 覆盖全部 T2）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -115,6 +123,12 @@ public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, I
+     @Autowired
+     private IotPointMapper pointMapper;
+ 
++    /** 版本历史服务（TASK-0015 修订轮 I-2）：状态规则写路径钩升版——门限/优先级/启停/
++     * 直绑类 T2 变更不再绕过版本留痕与确认门（与模板域写路径钩子同事务语义：落库后
++     * 同事务 recordContentChange，基线/升版失败整体回滚） */
++    @Autowired
++    private IotTemplateVersionService templateVersionService;
++
+     // ---------- 列表 ----------
+ 
+     @Override
+@@ -183,6 +197,9 @@ public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, I
+             throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
+                     "优先级并发冲突，请重试: " + form.getPriority());
+         }
++        // 版本历史留痕（TASK-0015 修订轮 I-2）：新增规则=对象级一档变更（ADR-0008「新增只
++        // 兜底的状态规则」），与上一版本快照对比 diff 判档升版（同事务——失败整体回滚）
++        templateVersionService.recordContentChange(templateId);
+         log.info("状态规则新增: tenantId={}, templateId={}, priority={}, statusCode={}",
+                 tenantId, templateId, form.getPriority(), form.getStatusCode());
+         return true;
+@@ -229,6 +246,10 @@ public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, I
+         upd.setColor(form.getColor());
+         upd.setEnabled(form.getEnabled());
+         this.updateById(upd);
++        // 版本历史留痕（TASK-0015 修订轮 I-2）：conditionExpr（门限）/statusCode/enabled
++        // （启停改变判定流）/statusName/color 字段级逐条目判档（门限/启停=二档——ADR-0008
++        // 明文；名称/颜色=一档），与上一版本快照对比 diff 升版（同事务）；无变化零版本噪声
++        templateVersionService.recordContentChange(existing.getTemplateId());
+         log.info("状态规则修改（白名单 conditionExpr/statusCode/statusName/color/enabled）: id={}, templateId={}",
+                 existing.getId(), existing.getTemplateId());
+         return true;
+@@ -293,6 +314,9 @@ public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, I
+         upd.setId(existing.getId());
+         upd.setBindingMap(bindingMapJson);
+         this.updateById(upd);
++        // 版本历史留痕（TASK-0015 修订轮 I-2）：bindingMap（直绑映射语义）=二档——ADR-0008
++        // T2 明文含「状态规则门限/优先级」，直绑映射同属「已有判定结果改变」语义变更类
++        templateVersionService.recordContentChange(existing.getTemplateId());
+         log.info("直绑映射保存（TD-0014，随规则行 binding_map）: ruleId={}, templateId={}, pointId={}, mappings={}",
+                 existing.getId(), existing.getTemplateId(), form.getPointId(), mappings.size());
+         return true;
+@@ -318,7 +342,14 @@ public class IotStatusRuleServiceImpl extends ServiceImpl<IotStatusRuleMapper, I
+         existingList.forEach(rule -> resolveTemplate(rule.getTemplateId()));
+         // 逻辑删（@TableLogic，deleted=1）；优先级删除归档不复用（uk_template_priority 不含
+         // deleted 列——预检含已删行口径），调优先级=删旧建新的「删旧」即本原语
+-        return this.removeByIds(ids);
++        boolean removed = this.removeByIds(ids);
++        // 版本历史留痕（TASK-0015 修订轮 I-2）：删除状态规则=二档（ADR-0008「既有已知状态
++        // 判定结果改变」——语义变更类）；批内跨模板 distinct 逐模板留痕（同 deleteItems 范式）
++        existingList.stream()
++                .map(IotStatusRule::getTemplateId)
++                .distinct()
++                .forEach(templateVersionService::recordContentChange);
++        return removed;
+     }
+ 
+     // ---------- 内部辅助 ----------
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+index 50def9c..5861cef 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotTemplateVersionService.java
+@@ -48,13 +48,33 @@ public interface IotTemplateVersionService {
+      * 影响预览（GET /iot/template/impact-preview，复用 iot:template:query 查询权限）：
+      * 受影响实例数（引用且启用，locked 子集单列）+ 待生效 diff（相对未锁定跟随实例的
+      * 有效版本）+ previewToken（Redis 键 iot:pub:confirm:{tenantId}:2:0:{targetVersion}，
+-     * value=待发布内容摘要哈希，TTL=ot.publish.confirm-token-ttl-seconds）。
++     * value=「确认凭据复合哈希:previewToken」，TTL=ot.publish.confirm-token-ttl-seconds）。
+      *
+      * @param templateId 模板 id
+      * @return 预览响应（brief 字段面 + previewToken）
+      */
+     TemplateImpactPreviewVO previewImpact(Long templateId);
+ 
++    /**
++     * 确认凭据复合哈希（TASK-0015 修订轮 I-1/M-1——影响预览下发侧与发布确认门校验侧
++     * 共用的同一链路）。复合锚定面 = <b>计算域快照摘要</b>（既有——实例/点位/通道域变更
++     * 漂移即拒）+ <b>模板域内容摘要</b>（修订轮新增——租户内全部模板的内容快照 canonical
++     * 序列化摘要；模板域编辑不触实例行，纯计算域哈希对模板域变更不敏感，预览后新增的
++     * T2 模板变更曾可随旧凭据过门）。两摘要按 canonical JSON（TreeMap 键序）复合后再
++     * SHA-256——预览与校验两侧同参重算，任一域内容漂移即哈希不一致（fail-closed）。
++     *
++     * <p>凭据值协议（M-1）：Redis value = {@code 复合哈希 + ":" + previewToken}——发布
++     * 请求回传的 confirmToken 与凭据内 token 段比对，token 从「仅判非空」变为实质校验
++     * （同一 targetVersion 的后一次预览会覆盖凭据值，旧 token 随之失效）。
++     *
++     * @param tenantId      租户 id
++     * @param scopeType     范围 1 网关 2 计算（预览恒计算域 2,0；gate 侧透传发布 scope）
++     * @param scopeId       范围对象 ID
++     * @param targetVersion 本次发布将写入的版本号
++     * @return 复合哈希（64 位十六进制）
++     */
++    String computeConfirmCredentialHash(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion);
++
+     /**
+      * 确认门判档（PublishConfirmGate 真实现消费）：本租户是否存在「待确认的二档模板
+      * 变更」——判定两条件（同时成立）：
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+index 93ecac8..1aed317 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImpl.java
+@@ -35,6 +35,7 @@ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.RedisUtils;
+ import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+@@ -63,9 +64,11 @@ import java.util.stream.Collectors;
+  * （affectedInstanceCount），locked=1 子集单列（lockedInstanceCount，不跟随发布、进待升级
+  * 清单——ADR-0008 锁定口径）；diff 相对<b>未锁定跟随实例的最小有效版本</b>（锁定实例不跟随，
+  * 其滞后归待升级清单 TASK-0016 逐台展示）；previewToken 落 Redis 键
+- * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}（value=待发布
+- * 内容摘要哈希——与发布确认门同一组装/序列化/哈希链路，内容漂移即拒绝；TTL=
+- * {@code ot.publish.confirm-token-ttl-seconds} 默认 300）。锚定 scope 恒计算域
++ * {@code iot:pub:confirm:{tenantId}:{scopeType}:{scopeId}:{targetVersion}}（value=「确认
++ * 凭据复合哈希:previewToken」——复合哈希=计算域快照摘要+模板域内容摘要（修订轮 I-1：
++ * 模板域编辑不触实例行，纯计算域哈希对模板域变更不敏感；复合锚定后预览→再改 T2→旧凭据
++ * 过门的漂移盲区闭合）；token 并入凭据值实质校验（修订轮 M-1：任意非空 token 不再可过）；
++ * TTL={@code ot.publish.confirm-token-ttl-seconds} 默认 300）。锚定 scope 恒计算域
+  * (2,0)：模板内容（数据项/公式/指标）只经计算域快照进入发布链（网关域快照仅点位/通道，
+  * 不含模板内容——ConfigSnapshotAssembler 装载口径），确认凭据唯一锚定面。
+  *
+@@ -79,6 +82,14 @@ import java.util.stream.Collectors;
+  * save 与 publish 同秒的边界按「已发布」处理，误差窗口 1 秒内不影响二档确认的主语义，
+  * 报告登记）。
+  *
++ * <p><b>修订轮（TASK-0015 修订，评审 I-1/I-2/M-2/M-4 处置）</b>：①确认凭据改复合哈希
++ * +token 绑定（I-1/M-1，见上）；②状态规则写路径（IotStatusRuleServiceImpl 四原语）落库
++ * 后同事务钩 {@link #recordContentChange}——门限/优先级/启停/直绑类 T2 变更不再绕过
++ * 版本留痕与确认门（I-2）；③升版落库撞 uk_template_version 映射既有业务码 4002（M-2，
++ * 败者整事务回滚数据安全不变）；④status 不入内容快照（M-4 裁决：启停是运营动作非内容
++ * 变更——启停不产生版本行，版本留痕只覆盖内容面；规则表保留 template.status→T1 映射，
++ * 防旧历史行仍含 status 键时 diff 误触 fail-closed 二档默认）。
++ *
+  * @author dowei
+  * @date 2026-11-23
+  */
+@@ -142,7 +153,7 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+         row.setVersion(template.getVersion());
+         row.setContent(buildContentJson(template, loadItems(template.getId()), loadRules(template.getId())));
+         row.setTierSummary(null);
+-        versionMapper.insert(row);
++        insertVersionRow(row);
+         log.info("[TEMPLATE-VERSION] baseline recorded templateId={} version={}", template.getId(), template.getVersion());
+     }
+ 
+@@ -169,7 +180,7 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+             baseline.setVersion(template.getVersion());
+             baseline.setContent(currentContent);
+             baseline.setTierSummary(null);
+-            versionMapper.insert(baseline);
++            insertVersionRow(baseline);
+             log.info("[TEMPLATE-VERSION] baseline backfilled templateId={} version={}", templateId, template.getVersion());
+             return null;
+         }
+@@ -188,7 +199,7 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+         row.setVersion(newVersion);
+         row.setContent(currentContent);
+         row.setTierSummary(TemplateTierRuleTable.formatSummary(entries));
+-        versionMapper.insert(row);
++        insertVersionRow(row);
+         // 模板 version 回写=末版+1（uk_template_version 物理唯一兜底；REQ-0006「模板 version 字段递增留痕」）
+         modelTemplateMapper.update(null, new LambdaUpdateWrapper<IotModelTemplate>()
+                 .eq(IotModelTemplate::getId, templateId)
+@@ -244,15 +255,16 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+                 ? TemplateContentDiffEngine.diff(baselineNode, currentNode)
+                 : List.of();
+ 
+-        // previewToken（二次确认凭据）：锚定计算域发布（模板内容只经计算域快照进入发布链）
++        // previewToken（二次确认凭据）：锚定计算域发布 + 模板域内容（修订轮 I-1 复合哈希）；
++        // value=「复合哈希:token」——token 并入凭据值实质校验（修订轮 M-1）
+         Long tenantId = TenantContext.getTenantId();
+         Long lastVersion = configVersionMapper.selectMaxVersion(tenantId, SCOPE_COMPUTE, SCOPE_COMPUTE_ID);
+         long targetVersion = (lastVersion == null ? 0L : lastVersion) + 1;
+-        String contentHash = computePublishContentHash(tenantId, targetVersion);
++        String credentialHash = computeConfirmCredentialHash(tenantId, SCOPE_COMPUTE, SCOPE_COMPUTE_ID, targetVersion);
+         String token = UUID.randomUUID().toString().replace("-", "");
+         int ttlSeconds = properties.getConfirmTokenTtlSeconds() == null ? 300 : properties.getConfirmTokenTtlSeconds();
+         RedisUtils.set(CONFIRM_KEY_PREFIX + tenantId + ":" + SCOPE_COMPUTE + ":" + SCOPE_COMPUTE_ID
+-                + ":" + targetVersion, contentHash, ttlSeconds, TimeUnit.SECONDS);
++                + ":" + targetVersion, credentialHash + ":" + token, ttlSeconds, TimeUnit.SECONDS);
+         log.info("[TEMPLATE-VERSION] impact preview templateId={} targetVersion={} affected={} locked={} "
+                 + "summary={}", templateId, targetVersion, affected, locked, TemplateTierRuleTable.formatSummary(entries));
+ 
+@@ -310,10 +322,82 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+ 
+     // ---------- 内容快照构建（canonical 形态） ----------
+ 
++    /**
++     * 版本历史行落库（uk_template_version (tenant_id, template_id, version) 物理唯一兜底）。
++     * 并发保存同模板撞唯一键（M-2 修订轮）：败者整事务回滚（数据安全不变——基线/升版行与
++     * 写路径同事务），映射既有业务码 4002「并发冲突请重试」，不再裸 500（同域 insertTemplate/
++     * saveItems 的 4002 兜底范式）。
++     */
++    private void insertVersionRow(IotModelTemplateVersion row) {
++        try {
++            versionMapper.insert(row);
++        } catch (DuplicateKeyException e) {
++            throw new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                    "模板版本并发保存冲突，请重试: templateId=" + row.getTemplateId());
++        }
++    }
++
++    /**
++     * 确认凭据复合哈希（接口契约见 {@link IotTemplateVersionService#computeConfirmCredentialHash}）：
++     * 「计算域快照摘要 + 模板域内容摘要」canonical 复合后 SHA-256。预览下发侧（previewImpact）
++     * 与发布确认门校验侧（TemplateAwarePublishConfirmGate）共用本方法——两侧同参重算比对，
++     * 任一域内容漂移即凭据失效（fail-closed）。
++     */
++    @Override
++    public String computeConfirmCredentialHash(Long tenantId, Integer scopeType, Long scopeId, Long targetVersion) {
++        String computeHash = computePublishContentHash(tenantId, scopeType, scopeId, targetVersion);
++        String templateHash = computeTemplateDomainContentHash();
++        try {
++            Map<String, Object> composite = new TreeMap<>();
++            composite.put("compute", computeHash);
++            composite.put("template", templateHash);
++            String json = CANONICAL_MAPPER.writeValueAsString(composite);
++            return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++        } catch (Exception e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "确认凭据复合哈希序列化失败: " + e.getMessage());
++        }
++    }
++
++    /**
++     * 模板域内容摘要（修订轮 I-1 锚定面扩容）：租户内全部模板的内容快照（{@link
++     * #buildContentJson} canonical 形态，含数据项与状态规则清单）按 templateCode 索引
++     * canonical 序列化后 SHA-256。模板域写路径（模板头/数据项/状态规则）不触实例行——
++     * 纯计算域快照哈希对其不敏感，复合锚定后预览→再改 T2→旧凭据过门的漂移盲区闭合。
++     * 启停（status）不入内容快照（M-4 裁决：运营动作非内容变更），启停不使凭据失效。
++     */
++    private String computeTemplateDomainContentHash() {
++        try {
++            List<IotModelTemplate> templates = modelTemplateMapper.selectList(new LambdaQueryWrapper<>());
++            Map<String, Object> domain = new TreeMap<>();
++            for (IotModelTemplate template : templates) {
++                domain.put(template.getTemplateCode(),
++                        buildContentJson(template, loadItems(template.getId()), loadRules(template.getId())));
++            }
++            String json = CANONICAL_MAPPER.writeValueAsString(domain);
++            return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++        } catch (BusinessException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new BusinessException(ResultCode.ERROR.getCode(), "模板域内容摘要构建失败: " + e.getMessage());
++        }
++    }
++
++    /** 计算域快照摘要（与发布流程同一组装/确定性序列化/SHA-256 链路——内容漂移检测基准之一） */
++    private String computePublishContentHash(Long tenantId, Integer scopeType, Long scopeId, long targetVersion) {
++        ConfigSnapshot snapshot = assembler.assemble(tenantId, scopeType, scopeId, targetVersion);
++        String json = assembler.serialize(snapshot);
++        return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
++    }
++
+     /**
+      * 构建模板全量内容快照 JSON（canonical：TreeMap 键序 + dataItems 按 dataCode 排序 +
+      * statusRules 按 priority 排序 + NON_NULL——两次构建逐字节一致，diff 相等性与键序确定性
+      * 的直接前提；brief DDL content 注释「数据项/状态规则等」）。
++     *
++     * <p><b>status 不入内容快照</b>（M-4 修订轮裁决：启停是运营动作非内容变更——启停
++     * 不产生版本行、不触发 diff/确认门，版本留痕只覆盖内容面；启停轨迹由模板行 status
++     * 列与操作审计承载。旧历史行若仍含 status 键，diff 出的 status 条目由规则表保留的
++     * template.status→T1 映射兜住，不误触 fail-closed 二档默认）。
+      */
+     private String buildContentJson(IotModelTemplate template,
+                                     List<IotDataItemTemplate> items,
+@@ -325,7 +409,6 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+             header.put("templateName", template.getTemplateName());
+             header.put("nodeType", template.getNodeType());
+             header.put("remark", template.getRemark());
+-            header.put("status", template.getStatus());
+             content.put("template", header);
+             List<Map<String, Object>> itemMaps = new ArrayList<>();
+             for (IotDataItemTemplate item : sortBy(items, IotDataItemTemplate::getDataCode)) {
+@@ -365,13 +448,6 @@ public class IotTemplateVersionServiceImpl implements IotTemplateVersionService
+         }
+     }
+ 
+-    /** 待发布内容摘要哈希（与发布流程同一组装/确定性序列化/SHA-256 链路——内容漂移检测基准） */
+-    private String computePublishContentHash(Long tenantId, long targetVersion) {
+-        ConfigSnapshot snapshot = assembler.assemble(tenantId, SCOPE_COMPUTE, SCOPE_COMPUTE_ID, targetVersion);
+-        String json = assembler.serialize(snapshot);
+-        return SnapshotStorage.sha256Hex(json.getBytes(StandardCharsets.UTF_8));
+-    }
+-
+     private List<IotDataItemTemplate> loadItems(Long templateId) {
+         return dataItemTemplateMapper.selectList(new LambdaQueryWrapper<IotDataItemTemplate>()
+                 .eq(IotDataItemTemplate::getTemplateId, templateId));
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java
+index 625a8f5..3c38082 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/tier/TemplateTierRuleTable.java
+@@ -54,6 +54,9 @@ public final class TemplateTierRuleTable {
+         put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "templateName", TemplateChangeTier.TIER_1);
+         put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "nodeType", TemplateChangeTier.TIER_1);
+         put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "remark", TemplateChangeTier.TIER_1);
++        // status 不入内容快照（M-4 修订轮裁决：启停是运营动作非内容变更——启停不产生版本行）；
++        // 映射保留一档仅为兼容 0015 首版历史行（旧 content 仍含 status 键——下次编辑 diff 出
++        // status 条目按一档计，不误触未登记字段的 fail-closed 二档默认）
+         put(table, TemplateChangeEntry.OBJECT_TEMPLATE, "status", TemplateChangeTier.TIER_1);
+         // ---- 模板数据项 ----
+         put(table, TemplateChangeEntry.OBJECT_DATA_ITEM, "dataCode", TemplateChangeTier.FORBIDDEN);
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java
+index 2b87c94..6fdbba1 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/gate/TemplateAwarePublishConfirmGateTest.java
+@@ -1,7 +1,5 @@
+ package net.otlab.admin.module.iot.publish.gate;
+ 
+-import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
+-import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+ import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.utils.RedisUtils;
+ import org.junit.jupiter.api.AfterEach;
+@@ -14,8 +12,6 @@ import org.mockito.Mockito;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.test.util.ReflectionTestUtils;
+ 
+-import java.nio.charset.StandardCharsets;
+-
+ import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -26,12 +22,15 @@ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+ /**
+- * 发布确认门真实现单元测试（TASK-0015 测试口径：二档变更发布无 token→拒绝红→带 token 绿、
+- * token 过期/内容漂移拒绝、一档/三档放行、网关 scope 放行）。
++ * 发布确认门真实现单元测试（TASK-0015 测试口径 + 修订轮 I-1/M-1：二档变更发布无 token→
++ * 拒绝红→带 token 绿、token 过期/内容漂移/token 不匹配/凭据畸形拒绝、一档/三档放行、
++ * 网关 scope 放行）。
+  *
+  * <p>判档委托 {@code IotTemplateVersionService#hasPendingTier2Confirm}（mock——其判定逻辑
+- * 由 IotTemplateVersionServiceImplTest 锁定）；凭据校验=Redis 键
+- * iot:pub:confirm:{tenant}:{scopeType}:{scopeId}:{targetVersion} 与待发布内容摘要哈希比对。
++ * 由 IotTemplateVersionServiceImplTest 锁定）；凭据校验=Redis 值
++ * 「复合哈希:previewToken」与两侧同参重算的复合哈希
++ * （{@code computeConfirmCredentialHash} mock）+ 回传 token 双因子比对（修订轮 I-1：
++ * 复合哈希=计算域快照摘要+模板域内容摘要——模板域变更漂移可见；M-1：token 实质校验）。
+  *
+  * @author dowei
+  * @date 2026-11-23
+@@ -39,15 +38,12 @@ import static org.mockito.Mockito.when;
+ class TemplateAwarePublishConfirmGateTest {
+ 
+     private static final long TENANT = 1L;
+-    private static final String SNAPSHOT_JSON = "SNAPSHOT_JSON";
+-    private static final String EXPECTED_HASH = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
+-            .sha256Hex(SNAPSHOT_JSON.getBytes(StandardCharsets.UTF_8));
+ 
+-    @Mock
+-    private IotTemplateVersionService versionService;
++    /** 校验侧重算的复合哈希（mock 值——真实复合链路由 IotTemplateVersionServiceImplTest 锁定） */
++    private static final String COMPOSITE_HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+ 
+     @Mock
+-    private ConfigSnapshotAssembler assembler;
++    private IotTemplateVersionService versionService;
+ 
+     private TemplateAwarePublishConfirmGate gate;
+ 
+@@ -61,9 +57,7 @@ class TemplateAwarePublishConfirmGateTest {
+         redisUtils = Mockito.mockStatic(RedisUtils.class);
+         gate = new TemplateAwarePublishConfirmGate();
+         ReflectionTestUtils.setField(gate, "templateVersionService", versionService);
+-        ReflectionTestUtils.setField(gate, "assembler", assembler);
+-        when(assembler.assemble(anyLong(), any(), anyLong(), anyLong())).thenReturn(new ConfigSnapshot());
+-        when(assembler.serialize(any(ConfigSnapshot.class))).thenReturn(SNAPSHOT_JSON);
++        when(versionService.computeConfirmCredentialHash(TENANT, 2, 0L, 3L)).thenReturn(COMPOSITE_HASH);
+     }
+ 
+     @AfterEach
+@@ -109,20 +103,41 @@ class TemplateAwarePublishConfirmGateTest {
+     }
+ 
+     @Test
+-    @DisplayName("二档内容漂移 - Redis 凭据哈希与当前待发布内容摘要不一致 → false（预览后内容变更）")
++    @DisplayName("二档内容漂移（I-1）- 重算复合哈希与凭据哈希段不一致 → false"
++            + "（预览后计算域或模板域内容变更——旧凭据失效）")
+     void pendingTier2ContentDriftRejected() {
+         when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
+-        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn("stale-hash");
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L)))
++                .thenReturn("stale-composite-hash:tok-abc");
+         assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
+     }
+ 
+     @Test
+-    @DisplayName("二档绿 - token 存在且内容摘要一致 → true（影响预览后内容未漂移）")
++    @DisplayName("二档绿 - 凭据哈希与重算复合哈希一致且 token 匹配 → true（预览后无内容漂移）")
+     void pendingTier2ValidTokenPasses() {
+         when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
+-        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn(EXPECTED_HASH);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L)))
++                .thenReturn(COMPOSITE_HASH + ":tok-abc");
+         assertTrue(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
+-        verify(assembler).assemble(eq(TENANT), eq(2), eq(0L), eq(3L));
++        verify(versionService).computeConfirmCredentialHash(TENANT, 2, 0L, 3L);
++    }
++
++    @Test
++    @DisplayName("二档 token 必须被校验（M-1 修订轮）- 凭据存在但 token 不匹配 → false"
++            + "（任意非空 token 不得通过；后一次预览覆盖凭据值后旧 token 同此路径失效）")
++    void pendingTier2TokenMismatchRejected() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L)))
++                .thenReturn(COMPOSITE_HASH + ":tok-abc");
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "ARBITRARY-TOKEN"));
++    }
++
++    @Test
++    @DisplayName("二档凭据畸形 fail-closed - 凭据值不含 token 段（旧协议裸哈希/人工构造）→ false")
++    void pendingTier2MalformedCredentialRejected() {
++        when(versionService.hasPendingTier2Confirm(TENANT)).thenReturn(true);
++        redisUtils.when(() -> RedisUtils.get(key(2, 0L, 3L))).thenReturn(COMPOSITE_HASH);
++        assertFalse(gate.requireConfirm(TENANT, 2, 0L, 3L, "tok-abc"));
+     }
+ 
+     @Test
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java
+index 1d8867c..20f3b31 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/statusrule/service/impl/IotStatusRuleServiceImplTest.java
+@@ -18,6 +18,7 @@ import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
+ import net.otlab.admin.module.iot.template.entity.IotModelTemplate;
+ import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
+ import net.otlab.admin.module.iot.template.mapper.IotModelTemplateMapper;
++import net.otlab.admin.module.iot.template.service.IotTemplateVersionService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.tenant.TenantContext;
+ import org.apache.ibatis.builder.MapperBuilderAssistant;
+@@ -82,6 +83,9 @@ class IotStatusRuleServiceImplTest {
+     @Mock
+     private IotPointMapper pointMapper;
+ 
++    @Mock
++    private IotTemplateVersionService templateVersionService;
++
+     private IotStatusRuleServiceImpl ruleService;
+ 
+     private org.mockito.MockedStatic<TenantContext> tenantContext;
+@@ -110,6 +114,7 @@ class IotStatusRuleServiceImplTest {
+         ReflectionTestUtils.setField(ruleService, "dataItemTemplateMapper", dataItemTemplateMapper);
+         ReflectionTestUtils.setField(ruleService, "statusDictMapper", statusDictMapper);
+         ReflectionTestUtils.setField(ruleService, "pointMapper", pointMapper);
++        ReflectionTestUtils.setField(ruleService, "templateVersionService", templateVersionService);
+ 
+         // 默认模板存在 / 条数未超 / 优先级未占用 / 表达式引用项存在 / 字典编码启用 / 点位存在 /
+         // 落库成功（异常用例逐用例覆盖）
+@@ -626,4 +631,64 @@ class IotStatusRuleServiceImplTest {
+         assertTrue(sql.toUpperCase().contains("PRIORITY"), "应含 priority 排序: " + sql);
+         assertTrue(sql.toUpperCase().contains("ASC"), "priority 升序断言: " + sql);
+     }
++
++    // ---------- 版本留痕接线（TASK-0015 修订轮 I-2：状态规则写路径钩升版——与模板域
++    // 钩子同事务语义：落库后同事务 recordContentChange，ADR-0008 T2「状态规则门限/优先级」
++    // 不再绕过版本留痕与确认门） ----------
++
++    @Test
++    @DisplayName("版本留痕接线（I-2）- 新增规则落库后同事务钩 recordContentChange(templateId)")
++    void createRuleHooksVersionTracking() {
++        assertTrue(ruleService.createRule(createForm()));
++        verify(templateVersionService).recordContentChange(TEMPLATE_ID);
++    }
++
++    @Test
++    @DisplayName("版本留痕接线（I-2）- 修改规则落库后同事务钩 recordContentChange（门限/启停=T2 源）")
++    void updateRuleHooksVersionTracking() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        IotStatusRuleUpdateForm form = new IotStatusRuleUpdateForm();
++        form.setId(11L);
++        form.setConditionExpr("{SELF.ELEC} > 50");
++        assertTrue(ruleService.updateRule(form));
++        verify(baseMapper).updateById(any(IotStatusRule.class));
++        verify(templateVersionService).recordContentChange(TEMPLATE_ID);
++    }
++
++    @Test
++    @DisplayName("版本留痕接线（I-2）- 直绑映射保存后同事务钩 recordContentChange（bindingMap=T2 源）")
++    void saveBindingMapHooksVersionTracking() {
++        when(baseMapper.selectById(11L)).thenReturn(existingRule());
++        assertTrue(ruleService.saveBindingMap(bindingForm()));
++        verify(baseMapper).updateById(any(IotStatusRule.class));
++        verify(templateVersionService).recordContentChange(TEMPLATE_ID);
++    }
++
++    @Test
++    @DisplayName("版本留痕接线（I-2）- 批量删除后按 distinct templateId 逐模板钩 recordContentChange")
++    void deleteRulesHooksVersionTrackingPerDistinctTemplate() {
++        IotStatusRule r1 = ruleRow(1L, 1, "RUNNING");
++        r1.setTemplateId(5L);
++        IotStatusRule r2 = ruleRow(2L, 2, "STOPPED");
++        r2.setTemplateId(6L);
++        when(baseMapper.selectByIds(List.of(1L, 2L))).thenReturn(List.of(r1, r2));
++        when(baseMapper.deleteByIds(anyCollection())).thenReturn(1);
++        assertTrue(ruleService.deleteRules(List.of(1L, 2L)));
++        verify(templateVersionService).recordContentChange(5L);
++        verify(templateVersionService).recordContentChange(6L);
++        verify(templateVersionService, org.mockito.Mockito.times(2)).recordContentChange(anyLong());
++    }
++
++    @Test
++    @DisplayName("版本留痕接线（I-2）- 校验失败路径不钩（priority 占用预检拒——未落库无内容变更）")
++    void validationFailureDoesNotHookVersionTracking() {
++        IotStatusRulePriorityRow row = new IotStatusRulePriorityRow();
++        row.setId(99L);
++        row.setPriority(1);
++        row.setDeleted(0);
++        when(baseMapper.selectOccupiedByPriorities(anyLong(), anyLong(), anyCollection()))
++                .thenReturn(List.of(row));
++        assertThrows(BusinessException.class, () -> ruleService.createRule(createForm()));
++        verify(templateVersionService, never()).recordContentChange(anyLong());
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+index e359b98..6146919 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotTemplateVersionServiceImplTest.java
+@@ -22,6 +22,7 @@ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.tenant.TenantContext;
+ import net.otlab.core.utils.RedisUtils;
+ import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.springframework.dao.DuplicateKeyException;
+ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeAll;
+ import org.junit.jupiter.api.BeforeEach;
+@@ -41,6 +42,7 @@ import java.util.concurrent.TimeUnit;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+@@ -147,6 +149,25 @@ class IotTemplateVersionServiceImplTest {
+         return template;
+     }
+ 
++    private IotModelTemplate templateWithStatus(int version, int status) {
++        IotModelTemplate template = template(version);
++        template.setStatus(status);
++        return template;
++    }
++
++    private IotStatusRule rule(int priority, String conditionExpr) {
++        IotStatusRule rule = new IotStatusRule();
++        rule.setTemplateId(TEMPLATE_ID);
++        rule.setTenantId(TENANT);
++        rule.setPriority(priority);
++        rule.setConditionExpr(conditionExpr);
++        rule.setStatusCode("RUNNING");
++        rule.setStatusName("运行");
++        rule.setColor("#00FF00");
++        rule.setEnabled(1);
++        return rule;
++    }
++
+     private IotDataItemTemplate item(String code, String formula) {
+         IotDataItemTemplate item = new IotDataItemTemplate();
+         item.setTemplateId(TEMPLATE_ID);
+@@ -353,11 +374,18 @@ class IotTemplateVersionServiceImplTest {
+         assertFalse(vo.getPreviewToken().isBlank());
+         assertTrue(vo.getDiff().stream().anyMatch(e -> "T2".equals(e.getTier())
+                 && "defaultFormula".equals(e.getField())), "diff 含相对实例有效版本的公式变更");
+-        // previewToken 落 Redis：value=待发布内容摘要哈希（sha256("SNAPSHOT_JSON")），TTL=300s
+-        String expectedHash = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
++        // previewToken 落 Redis（修订轮 I-1/M-1 协议）：value=「复合哈希:previewToken」，
++        // 复合哈希=sha256(canonical{"compute":计算域摘要,"template":模板域摘要})——本测试
++        // 模板域装载为空（selectList 默认空清单 → "{}"），计算域=sha256("SNAPSHOT_JSON")，TTL=300s
++        String computeHash = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
+                 .sha256Hex("SNAPSHOT_JSON".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+-        redisUtils.verify(() -> RedisUtils.set(
+-                eq("iot:pub:confirm:" + TENANT + ":2:0:5"), eq(expectedHash), eq(300L), eq(TimeUnit.SECONDS)));
++        String emptyDomainHash = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
++                .sha256Hex("{}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
++        String compositeJson = "{\"compute\":\"" + computeHash + "\",\"template\":\"" + emptyDomainHash + "\"}";
++        String compositeHash = net.otlab.admin.module.iot.publish.storage.SnapshotStorage
++                .sha256Hex(compositeJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
++        redisUtils.verify(() -> RedisUtils.set(eq("iot:pub:confirm:" + TENANT + ":2:0:5"),
++                eq(compositeHash + ":" + vo.getPreviewToken()), eq(300L), eq(TimeUnit.SECONDS)));
+     }
+ 
+     @Test
+@@ -391,6 +419,127 @@ class IotTemplateVersionServiceImplTest {
+                 + "\"unit\":\"kWh\",\"valueKind\":2}],\"statusRules\":[]}";
+     }
+ 
++    // ---------- 确认凭据与内容快照（TASK-0015 修订轮 I-1/M-2/M-4） ----------
++
++    @Test
++    @DisplayName("凭据锚定模板域（I-1 修订轮）- 预览后模板内容变更（改公式）：凭据哈希必须改变（旧凭据失效）")
++    void credentialHashChangesWhenTemplateDomainChanges() {
++        // 模板域装载（模板+数据项+状态规则）：基线公式 f1
++        stubTemplateAndItems(2, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(instanceMapper.selectList(any())).thenReturn(List.of());
++        when(configVersionMapper.selectMaxVersion(TENANT, 2, 0L)).thenReturn(0L);
++        when(assembler.assemble(eq(TENANT), eq(2), eq(0L), eq(1L))).thenReturn(new ConfigSnapshot());
++        when(assembler.serialize(any(ConfigSnapshot.class))).thenReturn("SNAPSHOT_JSON");
++        when(modelTemplateMapper.selectList(any())).thenReturn(List.of(template(2)));
++
++        service.previewImpact(TEMPLATE_ID);
++
++        // 预览后模板域内容变更（公式改）——同一 targetVersion 再预览
++        stubTemplateAndItems(2, List.of(item("ELEC_CONS", "{ELEC_P1}*3")));
++        service.previewImpact(TEMPLATE_ID);
++
++        ArgumentCaptor<String> values = ArgumentCaptor.forClass(String.class);
++        redisUtils.verify(() -> RedisUtils.set(eq("iot:pub:confirm:" + TENANT + ":2:0:1"),
++                values.capture(), eq(300L), eq(TimeUnit.SECONDS)), Mockito.times(2));
++
++        // 模板域内容参与凭据锚定——两次哈希必须不同（否则 TTL 内旧凭据放行未预览的 T2 变更）
++        assertNotEquals(credentialHashOf(values.getAllValues().get(0)),
++                credentialHashOf(values.getAllValues().get(1)),
++                "模板域内容变更必须使预览凭据哈希漂移（I-1 内容漂移盲区）");
++    }
++
++    @Test
++    @DisplayName("模板启停不产生版本行（M-4 修订轮裁决）- 仅启停（status 翻转）→ 零版本噪声、不升版")
++    void statusToggleAloneProducesNoVersionRow() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        // 仅启停：模板行 status 1→0（启停是运营动作非内容变更——内容快照不含 status）
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(templateWithStatus(1, 0));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        assertNull(service.recordContentChange(TEMPLATE_ID), "启停不入内容快照——启停不产生版本行");
++        verify(versionMapper, Mockito.times(1)).insert(any(IotModelTemplateVersion.class));
++        verify(modelTemplateMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("模板启停不产生版本行（M-4）- 启停+改公式混合保存：仅公式条目（无 status 条目）")
++    void statusToggleMixedWithFormulaChangeOnlyReportsFormula() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}+{ELEC_P2}")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        when(modelTemplateMapper.selectById(TEMPLATE_ID)).thenReturn(templateWithStatus(1, 0));
++        when(dataItemTemplateMapper.selectList(any()))
++                .thenReturn(List.of(item("ELEC_CONS", "{ELEC_P1}*3")));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        List<TemplateChangeEntryVO> entries = service.recordContentChange(TEMPLATE_ID);
++        assertNotNull(entries);
++        assertEquals(1, entries.size(), "启停不入内容快照——混合保存只报公式条目");
++        assertEquals("defaultFormula", entries.get(0).getField());
++        assertEquals("T2", entries.get(0).getTier());
++    }
++
++    @Test
++    @DisplayName("并发保存撞 uk_template_version（M-2 修订轮）- DuplicateKey 映射 4002 业务码（不裸 500）")
++    void recordContentChangeDuplicateVersionMapsToDuplicateCode() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "{ELEC_P1}*3")));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineJsonOf("{ELEC_P1}+{ELEC_P2}"), null, LocalDateTime.now()));
++        when(versionMapper.insert(any(IotModelTemplateVersion.class)))
++                .thenThrow(new DuplicateKeyException("uk_template_version"));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.recordContentChange(TEMPLATE_ID));
++        assertEquals(4002, e.getCode(), "并发撞 uk_template_version 映射既有业务码 4002");
++        assertTrue(e.getMessage().contains("并发"), "文案提示并发冲突请重试: " + e.getMessage());
++    }
++
++    @Test
++    @DisplayName("状态规则 T2 变更→版本行（I-2 链路）- 改门限 conditionExpr：tier_summary=T2:1")
++    void statusRuleConditionChangeProducesTier2Row() {
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "f")));
++        when(statusRuleMapper.selectList(any())).thenReturn(List.of(rule(1, "{SELF.ELEC} > 10")));
++        when(versionMapper.selectList(any())).thenReturn(List.of());
++        service.recordBaseline(template(1));
++        ArgumentCaptor<IotModelTemplateVersion> baselineCaptor = ArgumentCaptor.captor();
++        verify(versionMapper).insert(baselineCaptor.capture());
++        String baselineContent = baselineCaptor.getValue().getContent();
++
++        // 门限变更（IotStatusRuleServiceImpl 写路径钩 recordContentChange 后走同一升版链）
++        stubTemplateAndItems(1, List.of(item("ELEC_CONS", "f")));
++        when(statusRuleMapper.selectList(any())).thenReturn(List.of(rule(1, "{SELF.ELEC} > 50")));
++        when(versionMapper.selectOne(any())).thenReturn(
++                historyRow(1, baselineContent, null, LocalDateTime.now()));
++
++        List<TemplateChangeEntryVO> entries = service.recordContentChange(TEMPLATE_ID);
++        assertNotNull(entries);
++        assertEquals(1, entries.size());
++        assertEquals("statusRule", entries.get(0).getObjectType());
++        assertEquals("conditionExpr", entries.get(0).getField());
++        assertEquals("T2", entries.get(0).getTier(), "门限=二档（ADR-0008）");
++        ArgumentCaptor<IotModelTemplateVersion> rowCaptor = ArgumentCaptor.captor();
++        verify(versionMapper, Mockito.times(2)).insert(rowCaptor.capture());
++        assertEquals("T2:1", rowCaptor.getAllValues().get(1).getTierSummary());
++    }
++
++    /** 凭据值取哈希段（协议=「复合哈希:token」——修订轮 M-1 起 value 绑定 token） */
++    private String credentialHashOf(String storedValue) {
++        int sep = storedValue.lastIndexOf(':');
++        return sep <= 0 ? storedValue : storedValue.substring(0, sep);
++    }
++
+     // ---------- 确认门判档 ----------
+ 
+     @Test

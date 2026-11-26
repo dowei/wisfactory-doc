@@ -1,0 +1,596 @@
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+index fa43b2d..b0f71fd 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+@@ -105,9 +105,11 @@ public final class ArithmeticEvaluator {
+         while (true) {
+             skipWs();
+             if (consume(">=")) {
+-                v = parseAdditive() >= v ? 1 : 0;
++                double r = parseAdditive();
++                v = v >= r ? 1 : 0;
+             } else if (consume("<=")) {
+-                v = parseAdditive() <= v ? 1 : 0;
++                double r = parseAdditive();
++                v = v <= r ? 1 : 0;
+             } else if (consume(">")) {
+                 double r = parseAdditive();
+                 v = v > r ? 1 : 0;
+diff --git a/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java b/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java
+index ba3c1fa..d3c72d8 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java
++++ b/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java
+@@ -62,6 +62,12 @@ public final class CalcPeriod {
+     /**
+      * 周期码 → CalcPeriod（与 backend mapCalcPeriod 同款口径 + MONTH/YEAR）。
+      * 未知码 fail-closed（不静默退化为到达驱动）。
++     *
++     * <p><b>F-06 边界</b>：本方法为 0081 同款口径的声明式实现（含 MONTH/YEAR 日历窗），
++     * 但生产快照契约 {@code iot_data_item.calcPeriod} 为整数秒（0=到达驱动，
++     * config-snapshot-schema.md），无法表达自然月/年；生产路径实际由 calcPeriod 秒数
++     * 经 {@link #fromSecondsLong(long)} 走 FIXED 窗。MONTH/YEAR 日历窗生产未接线
++     * （登记 deferred）；HOUR/DAY 等固定周期以秒表示经快照可达。
+      */
+     public static CalcPeriod fromCode(String code) {
+         if (code == null || code.isBlank()) {
+diff --git a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+index 015013c..f41e7aa 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
++++ b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+@@ -32,8 +32,9 @@ import org.slf4j.LoggerFactory;
+  * <p>到达通道以触发项的 fullKey 为根，仅重算其下游可达子图（影响面收敛）；周期通道
+  * 执行整图的周期项（calc_period>0 或汇总项），结果时间戳对齐周期边界（右边界）。
+  *
+- * <p>同项同窗口幂等由 {@link WindowIdempotencyGuard} 在执行器入口判定——DUPLICATE
+- * 直接返回空结果集（保留最后一次正确结果，不重复产出）。
++ * <p>同项同窗口幂等由 {@link WindowIdempotencyGuard} 在执行器入口判定：首次触发执行并新增
++ * 交付；同窗后续到达重算并按 windowKey **替换**已交付结果（保留最后正确结果——brief 决策 2，
++ * F-03 修订），对外同窗始终只有一次最终交付。多实例 Redis 化为演进位。
+  *
+  * @author dowei
+  * @date 2026-11-24
+@@ -80,10 +81,10 @@ public final class DualTriggerExecutor {
+      */
+     public List<CalcResult> execute(Trigger trigger, DependencyGraph graph) {
+         String windowKey = trigger.windowKey();
+-        if (windowKey != null && guard.tryAcquire(windowKey, trigger.at()) == WindowIdempotencyGuard.Decision.DUPLICATE) {
+-            log.info("[CALC-EXEC] 节流/幂等命中（同窗只算一次，保留最后正确结果）window={} trigger={}",
+-                    windowKey, trigger.kind());
+-            return List.of();
++        if (windowKey != null) {
++            WindowIdempotencyGuard.Decision decision = guard.tryAcquire(windowKey, trigger.at());
++            // FIRST=新增交付；REPLACE=同窗末值重算后覆盖交付（幂等：对外同窗只有一次最终产出）
++            log.debug("[CALC-EXEC] 窗口决策 window={} trigger={} decision={}", windowKey, trigger.kind(), decision);
+         }
+         Set<String> targets = selectTargets(trigger, graph);
+         long ts = resultTimestamp(trigger, graph);
+@@ -148,9 +149,13 @@ public final class DualTriggerExecutor {
+         }
+         lastVisitOrder = List.copyOf(visitOrder);
+         List<CalcResult> out = List.copyOf(results.values());
+-        sink.accept(trigger, out);
+-        log.info("[CALC-EXEC] 执行完成 trigger={} nodes={} results={} failed={} topo={}",
+-                trigger.kind(), visitOrder.size(), out.size(), failed.size(), visitOrder);
++        if (windowKey != null) {
++            sink.accept(windowKey, trigger, out); // 同窗覆盖（F-03 保留最后正确结果）
++        } else {
++            sink.accept(trigger, out);
++        }
++        log.info("[CALC-EXEC] 执行完成 trigger={} window={} nodes={} results={} failed={} topo={}",
++                trigger.kind(), windowKey, visitOrder.size(), out.size(), failed.size(), visitOrder);
+         return out;
+     }
+ 
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+index 4edc9d2..106afe9 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+@@ -46,7 +46,7 @@ public final class ExecutorRuntime implements AutoCloseable {
+         this.tenant = tenant;
+         this.guard = new WindowIdempotencyGuard(guardMaxEntries, guardTtlMillis);
+         this.executor = new DualTriggerExecutor(store, guard, sink);
+-        this.scheduler = new PeriodicScheduler(holder, executor, guard, tickSeconds);
++        this.scheduler = new PeriodicScheduler(holder, executor, tickSeconds);
+         this.subscriber = new RedisArrivalSubscriber(redisAddr, redisPassword, redisDatabase, tenant,
+                 (pointCode, sample) -> {
+                     arrivals.incrementAndGet();
+@@ -54,16 +54,21 @@ public final class ExecutorRuntime implements AutoCloseable {
+                     executor.acceptNewValue(pointCode, sample);
+                     // 同秒合并：key=数据项全键（点位编码）+ 秒窗（brief 决策 2）
+                     String windowKey = DualTriggerExecutor.windowKey(pointCode, 1000L, now);
+-                    lastWindow.put(pointCode, now);
++                    // F-03：同窗后续到达重算并覆盖交付（保留最后正确结果）；throttled 计数器
++                    // 语义从「丢弃」调整为「同窗合并重算次数」（仍暴露在 status.view）。
++                    Long prevWindow = lastWindow.put(pointCode, now);
++                    if (prevWindow != null
++                            && DualTriggerExecutor.windowKey(pointCode, 1000L, prevWindow).equals(windowKey)) {
++                        throttled.incrementAndGet();
++                    }
+                     net.otlab.calc.runtime.AppliedGraph applied = holder.current();
+                     if (applied == null) {
+                         return;
+                     }
+                     Trigger trigger = Trigger.arrival(pointCode, windowKey, now);
+-                    List<net.otlab.calc.executor.CalcResult> out = executor.execute(trigger, applied.graph());
+-                    if (out.isEmpty()) {
+-                        throttled.incrementAndGet();
+-                    }
++                    // F-03：同窗后续到达重算并覆盖交付（保留最后正确结果）——不再计为「丢弃/节流」；
++                    // 幂等仍成立：ResultSink 按 windowKey 覆盖，对外同窗只有一次最终产出。
++                    executor.execute(trigger, applied.graph());
+                 });
+     }
+ 
+@@ -107,6 +112,7 @@ public final class ExecutorRuntime implements AutoCloseable {
+         return arrivals.get();
+     }
+ 
++    /** 同窗合并重算次数（F-03 修订：旧「丢弃」语义已不存在，此处计同窗后续到达的覆盖次数） */
+     public long throttled() {
+         return throttled.get();
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java b/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java
+index eb76d76..e597d38 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java
++++ b/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java
+@@ -25,9 +25,12 @@ import org.slf4j.LoggerFactory;
+  * 换图后下一次 tick 自然读新图，零重注册。
+  *
+  * <p>调度粒度=tickSeconds（默认 1s；最小粒度小于所有周期项，因此任一整点都能在
+- * 下一个 tick 命中）；命中判据=当前时刻跨过周期边界（at % period == 0 的边界点），
+- * 用 {@link WindowIdempotencyGuard} 保证同一周期窗只触发一次（进程重启后由窗口键
+- * 去重——多实例化登记演进位）。
++ * 下一个 tick 命中）；命中判据=当前时刻所在周期窗 bucket 与上次触发不同（新窗开始后的
++ * 首个 tick）；同窗幂等由执行器的 {@link WindowIdempotencyGuard} 按 windowKey 统一完成。
++ *
++ * <p>F-06 边界：快照契约 {@code iot_data_item.calcPeriod} 为整数秒（0=到达驱动），
++ * 自然月/年无法在快照中表达——HOUR/DAY 以秒表示经快照可达，MONTH/YEAR 日历窗
++ * 只在 {@link CalcPeriod#fromCode(String)}（0081 同款口径）声明，生产未接线（登记 deferred）。
+  *
+  * @author dowei
+  * @date 2026-11-24
+@@ -38,19 +41,16 @@ public final class PeriodicScheduler {
+ 
+     private final GraphHolder holder;
+     private final DualTriggerExecutor executor;
+-    private final WindowIdempotencyGuard guard;
+     private final long tickSeconds;
+     private final Map<String, Long> lastFiredBucket = new ConcurrentHashMap<>();
+     private volatile ScheduledExecutorService scheduler;
+ 
+-    public PeriodicScheduler(GraphHolder holder, DualTriggerExecutor executor,
+-                             WindowIdempotencyGuard guard, long tickSeconds) {
++    public PeriodicScheduler(GraphHolder holder, DualTriggerExecutor executor, long tickSeconds) {
+         if (tickSeconds < 1) {
+             throw new IllegalArgumentException("tickSeconds 须 >= 1");
+         }
+         this.holder = holder;
+         this.executor = executor;
+-        this.guard = guard;
+         this.tickSeconds = tickSeconds;
+     }
+ 
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ResultSink.java b/calc/src/main/java/net/otlab/calc/executor/ResultSink.java
+index f4beed8..f383942 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ResultSink.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ResultSink.java
+@@ -15,13 +15,23 @@ import java.util.List;
+ public interface ResultSink {
+ 
+     /**
+-     * 交付一次执行的结果集。
++     * 交付一次执行的结果集（无窗口键——测试/无幂等场景）。
+      *
+      * @param trigger 触发上下文（周期/到达/来源）
+      * @param results 本次执行各节点结果（含失败项——失败项 sample=null）
+      */
+     void accept(Trigger trigger, List<CalcResult> results);
+ 
++    /**
++     * 按窗口键交付结果（TASK-0041 修订轮 F-03）：同一 windowKey 的后续交付**替换**既有
++     * 交付记录而非追加——「同窗多次触发只产出一次结果、保留最后正确结果」的落地语义：
++     * 中间值重算后覆盖，对外最终只暴露末值那一次交付。默认实现为替换；演进位真实 Sink
++     * 按 windowKey 覆盖写（st_item_value 同 fullKey+周期边界覆盖）。
++     */
++    default void accept(String windowKey, Trigger trigger, List<CalcResult> results) {
++        accept(trigger, results);
++    }
++
+     /** 内存假实现（测试与 live 冒烟观测面：记录最近若干次交付） */
+     final class InMemoryResultSink implements ResultSink {
+         private final java.util.List<Delivery> deliveries = new java.util.concurrent.CopyOnWriteArrayList<>();
+@@ -31,6 +41,19 @@ public interface ResultSink {
+             deliveries.add(new Delivery(trigger, List.copyOf(results)));
+         }
+ 
++        /** 同窗覆盖：按 windowKey 找到既有交付并替换（保留最后一次正确结果，不追加交付） */
++        @Override
++        public void accept(String windowKey, Trigger trigger, List<CalcResult> results) {
++            Delivery fresh = new Delivery(windowKey, trigger, List.copyOf(results));
++            for (int i = 0; i < deliveries.size(); i++) {
++                if (windowKey.equals(deliveries.get(i).windowKey())) {
++                    deliveries.set(i, fresh);
++                    return;
++                }
++            }
++            deliveries.add(fresh);
++        }
++
+         public List<Delivery> deliveries() {
+             return List.copyOf(deliveries);
+         }
+@@ -39,8 +62,11 @@ public interface ResultSink {
+             deliveries.clear();
+         }
+ 
+-        /** 一次交付记录 */
+-        public record Delivery(Trigger trigger, List<CalcResult> results) {
++        /** 一次交付记录（windowKey=null 表示无窗口键的交付） */
++        public record Delivery(String windowKey, Trigger trigger, List<CalcResult> results) {
++            public Delivery(Trigger trigger, List<CalcResult> results) {
++                this(null, trigger, results);
++            }
+         }
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ValueStore.java b/calc/src/main/java/net/otlab/calc/executor/ValueStore.java
+index a31e8ce..80e1041 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/ValueStore.java
++++ b/calc/src/main/java/net/otlab/calc/executor/ValueStore.java
+@@ -1,13 +1,18 @@
+ package net.otlab.calc.executor;
+ 
+ import java.util.Collections;
+-import java.util.HashMap;
+ import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
+ 
+ /**
+  * 输入值存储（进程内假实现——点位/数据项最新值；真实源=Redis 点位缓存
+  * {@code iot:pt:{tenant}:{code}}（0029 发射侧）/ st_item_value，演进位零改动替换）。
+  *
++ * <p><b>线程安全</b>：底层为 {@link ConcurrentHashMap}，get/put/snapshot/clear 全部线程安全——
++ * 周期调度线程与 Redis 到达订阅线程会并发读写本存储（TASK-0041 修订轮 F-02：旧 HashMap +
++ * 同步 put/非同步 get 构成数据竞争，已改）。{@link ValueSample} 为不可变 record，样本本身
++ * 无逃逸风险；snapshot 返回不可变副本，调用方改动不回写。
++ *
+  * <p>质量码纪律（CONV-02）：存储的是带质量的样本；缺失=无值（null），不以 0 冒充；
+  * 汇总时质量码 7（汇总不完整）的子级贡献不纳入但保留打标。
+  *
+@@ -16,27 +21,30 @@ import java.util.Map;
+  */
+ public final class ValueStore {
+ 
+-    private final Map<String, ValueSample> values = new HashMap<>();
++    private final Map<String, ValueSample> values = new ConcurrentHashMap<>();
+ 
+-    /** 节点键 → 最新样本；缺失返回 null（不造假值） */
++    /** 节点键 → 最新样本；缺失返回 null（不造假值）；线程安全 */
+     public ValueSample get(String key) {
+         return values.get(key);
+     }
+ 
+-    /** 写入样本（线程安全：synchronized 写 + 读用 volatile 语义的同步块） */
+-    public synchronized void put(String key, ValueSample sample) {
++    /** 写入样本（线程安全：ConcurrentHashMap 写） */
++    public void put(String key, ValueSample sample) {
+         values.put(key, sample);
+     }
+ 
+-    public synchronized void put(String key, double value, long ts) {
++    /** 写入正常质量样本（线程安全） */
++    public void put(String key, double value, long ts) {
+         values.put(key, ValueSample.of(value, ts));
+     }
+ 
+-    public synchronized Map<String, ValueSample> snapshot() {
+-        return Collections.unmodifiableMap(new HashMap<>(values));
++    /** 不可变快照（线程安全弱一致读——并发写入不抛异常） */
++    public Map<String, ValueSample> snapshot() {
++        return Collections.unmodifiableMap(new java.util.HashMap<>(values));
+     }
+ 
+-    public synchronized void clear() {
++    /** 清空（线程安全） */
++    public void clear() {
+         values.clear();
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java b/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java
+index 7433263..345c41e 100644
+--- a/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java
++++ b/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java
+@@ -21,10 +21,13 @@ public final class WindowIdempotencyGuard {
+ 
+     /** 触发决策 */
+     public enum Decision {
+-        /** 本窗口首次——执行 */
++        /** 本窗口首次——执行并新增交付 */
+         FIRST,
+-        /** 本窗口已登记——节流合并/幂等跳过（不重复产出） */
+-        DUPLICATE
++        /**
++         * 本窗口内重复到达——重算并替换同窗已交付结果（brief「同窗多次触发只产出一次结果、
++         * 保留最后正确结果」：中间值不算产出，最终只保留末值；ResultSink 按 windowKey 覆盖）。
++         */
++        REPLACE
+     }
+ 
+     private final int maxEntries;
+@@ -47,14 +50,15 @@ public final class WindowIdempotencyGuard {
+     }
+ 
+     /**
+-     * 尝试占用窗口键。首次返回 {@link Decision#FIRST}；重复/未过期返回
+-     * {@link Decision#DUPLICATE}。过期条目视为新窗口（TTL 到期后可再执行）。
++     * 尝试占用窗口键。首次返回 {@link Decision#FIRST}；同一窗口内再次到达返回
++     * {@link Decision#REPLACE}（重算并替换同窗已交付结果——保留最后正确结果）；
++     * TTL 到期后视为新窗口返回 FIRST。登记表有界（FIFO 淘汰最旧）。
+      */
+     public synchronized Decision tryAcquire(String windowKey, long nowMillis) {
+         Long at = entries.get(windowKey);
+         if (at != null) {
+             if (nowMillis - at < ttlMillis) {
+-                return Decision.DUPLICATE;
++                return Decision.REPLACE;
+             }
+             entries.remove(windowKey);
+         }
+diff --git a/calc/src/test/java/net/otlab/calc/executor/ArithmeticEvaluatorContractTest.java b/calc/src/test/java/net/otlab/calc/executor/ArithmeticEvaluatorContractTest.java
+new file mode 100644
+index 0000000..8c051fb
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/ArithmeticEvaluatorContractTest.java
+@@ -0,0 +1,59 @@
++package net.otlab.calc.executor;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++/**
++ * 公式求值比较运算契约测试（TASK-0041 修订轮 F-01 红转绿）：
++ * {@code >= <= > <} 四法的左右操作数方向必须正确——评审实测旧实现 {@code 10>=3} 得 0.0、
++ * {@code 3<=10} 得 0.0（静默错算）。本测试覆盖四种比较 × 正反两向 + 三元条件分支。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class ArithmeticEvaluatorContractTest {
++
++    private static double eval(String expr) {
++        return ArithmeticEvaluator.evaluate(expr, id -> switch (id) {
++            case "A" -> 10.0;
++            case "B" -> 3.0;
++            default -> null;
++        });
++    }
++
++    @Test
++    void greaterOrEqualComparesLeftAgainstRight() {
++        assertEquals(1.0, eval("10>=3"), "10>=3 真");
++        assertEquals(0.0, eval("3>=10"), "3>=10 假");
++        assertEquals(1.0, eval("A>=B"), "标识符左大右小");
++        assertEquals(0.0, eval("B>=A"), "标识符左小右大");
++        assertEquals(1.0, eval("3>=3"), "相等为真");
++    }
++
++    @Test
++    void lessOrEqualComparesLeftAgainstRight() {
++        assertEquals(0.0, eval("10<=3"), "10<=3 假");
++        assertEquals(1.0, eval("3<=10"), "3<=10 真");
++        assertEquals(0.0, eval("A<=B"), "标识符左大右小");
++        assertEquals(1.0, eval("B<=A"), "标识符左小右大");
++        assertEquals(1.0, eval("3<=3"), "相等为真");
++    }
++
++    @Test
++    void greaterAndLessRemainCorrect() {
++        assertEquals(1.0, eval("10>3"), "10>3");
++        assertEquals(0.0, eval("3>10"), "3>10");
++        assertEquals(0.0, eval("10<3"), "10<3");
++        assertEquals(1.0, eval("3<10"), "3<10");
++    }
++
++    @Test
++    void ternaryUsesCorrectComparisonDirection() {
++        // 评审点名：A>=10?1:0 旧实现因反转会走错分支
++        assertEquals(1.0, eval("A>=10?1:0"), "10>=10 真→1");
++        assertEquals(0.0, eval("B>=10?1:0"), "3>=10 假→0");
++        assertEquals(1.0, eval("B<=10?1:0"), "3<=10 真→1");
++        assertEquals(0.0, eval("A<=3?1:0"), "10<=3 假→0");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java b/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java
+index 55b563f..accf291 100644
+--- a/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java
+@@ -98,30 +98,40 @@ class DualTriggerExecutorContractTest {
+         ValueStore store = new ValueStore();
+         ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
+         DualTriggerExecutor ex = new DualTriggerExecutor(store, new WindowIdempotencyGuard(), sink);
+-        store.put("P1", 1.0, 1000L);
+-
+         String windowKey = DualTriggerExecutor.windowKey("P1", 1000L, 1000L);
+-        List<CalcResult> first = ex.execute(Trigger.arrival("P1", windowKey, 1000L), g);
+-        // 同一秒再来 9 条（最后一条值更新）
+-        store.put("P1", 9.0, 1000L);
+-        int duplicates = 0;
+-        for (int i = 0; i < 9; i++) {
+-            List<CalcResult> again = ex.execute(Trigger.arrival("P1", windowKey, 1000L), g);
+-            if (again.isEmpty()) {
+-                duplicates++;
++
++        // 同一秒 10 条新值：首值 1.0，后续 8 条中间值，末值 9.0（真实到达链路：每条先写 store 再触发）
++        double[] values = {1, 2, 3, 4, 5, 6, 7, 8, 3, 9};
++        List<CalcResult> first = null;
++        int emptyReturns = 0;
++        for (double value : values) {
++            store.put("P1", value, 1000L);
++            List<CalcResult> out = ex.execute(Trigger.arrival("P1", windowKey, 1000L), g);
++            if (first == null) {
++                first = out;
++            } else if (out.isEmpty()) {
++                emptyReturns++;
+             }
+         }
+ 
+-        assertEquals(1, first.size(), "首次产出一次");
+-        assertEquals(9, duplicates, "同窗 9 次全被节流合并");
+-        assertEquals(1, sink.deliveries().size(), "结果只交付一次（保留最后一次正确结果口径由窗口去重保证）");
++        assertEquals(1, first.size(), "首次触发产出一次");
++        // F-03（修订轮）：同窗后续到达重算并替换交付，因此每条都产出非空结果（重算值）；
++        // 「只产出一次」落在 ResultSink 的同窗覆盖语义——交付记录始终只有 1 条。
++        assertEquals(0, emptyReturns, "同窗后续到达重算替换（空返回=旧实现未保留末值）");
++        assertEquals(1, sink.deliveries().size(), "同窗最终只产出一次交付（窗键覆盖，不追加）");
++        // 保留最后正确结果：末值 P1=9.0 → A.V=10.0，不得是首值 2.0
++        CalcResult delivered = sink.deliveries().get(0).results().stream()
++                .filter(r -> r.fullKey().equals("A.V")).findFirst().orElseThrow();
++        assertEquals(10.0, delivered.sample().value(), 1e-6,
++                "同窗最终交付值须反映末值 9.0（9+1=10），而非首值 2.0");
+     }
+ 
+     @Test
+     void guardIsBoundedAndExpires() {
+         WindowIdempotencyGuard guard = new WindowIdempotencyGuard(2, 1000L);
+         assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("a", 0));
+-        assertEquals(WindowIdempotencyGuard.Decision.DUPLICATE, guard.tryAcquire("a", 500));
++        assertEquals(WindowIdempotencyGuard.Decision.REPLACE, guard.tryAcquire("a", 500),
++                "同窗重复到达=重算替换末值（F-03）");
+         assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("b", 500));
+         assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("c", 500), "有界 FIFO 淘汰 a");
+         assertEquals(2, guard.size());
+diff --git a/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java b/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java
+index 447389b..d4e7506 100644
+--- a/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java
+@@ -39,7 +39,7 @@ class PeriodicSchedulerContractTest {
+         store.put("P1", 5.0, 1000L);
+         ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
+         DualTriggerExecutor executor = new DualTriggerExecutor(store, new WindowIdempotencyGuard(), sink);
+-        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, new WindowIdempotencyGuard(), 1);
++        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, 1);
+ 
+         long onBoundary = Instant.parse("2026-01-01T00:01:00Z").toEpochMilli();
+         scheduler.tick(onBoundary);
+@@ -68,7 +68,7 @@ class PeriodicSchedulerContractTest {
+         ValueStore store = new ValueStore();
+         DualTriggerExecutor executor = new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
+                 new ResultSink.InMemoryResultSink());
+-        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, new WindowIdempotencyGuard(), 1);
++        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, 1);
+         assertDoesNotThrow(() -> scheduler.tick(System.currentTimeMillis()));
+         assertFalse(scheduler.isRunning(), "未 start 不 running");
+     }
+diff --git a/calc/src/test/java/net/otlab/calc/executor/ValueStoreConcurrencyContractTest.java b/calc/src/test/java/net/otlab/calc/executor/ValueStoreConcurrencyContractTest.java
+new file mode 100644
+index 0000000..18b511c
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/ValueStoreConcurrencyContractTest.java
+@@ -0,0 +1,106 @@
++package net.otlab.calc.executor;
++
++import java.lang.reflect.Modifier;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.ConcurrentMap;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * ValueStore 并发红线测试（TASK-0041 修订轮 F-02 红转绿）。
++ *
++ * <p>评审实证：旧实现 {@code get()} 未同步、底层 {@code HashMap} 被调度线程与订阅线程并发
++ * 读写（put 同步、get 不同步 = 无互斥），javadoc「线程安全」声明不成立。HashMap 的无同步
++ * 读竞争在 x86 上不保证稳定复现异常，故本测试双管齐下：
++ * <ol>
++ *   <li><b>结构性契约守卫（确定性红源）</b>：要么 get 为 synchronized，要么底层 map 为
++ *       {@link ConcurrentMap}——覆盖协调者裁决的两种合法修法，旧实现两者皆不满足；</li>
++ *   <li><b>真实并发压力（行为面）</b>：多写线程 put + 多读线程 get，断言无异常且最终值可见。</li>
++ * </ol>
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class ValueStoreConcurrencyContractTest {
++
++    @Test
++    void threadSafetyContractIsBackedByImplementation() throws Exception {
++        boolean getSynchronized = Modifier.isSynchronized(
++                ValueStore.class.getMethod("get", String.class).getModifiers());
++        boolean concurrentMap = false;
++        Field field = ValueStore.class.getDeclaredField("values");
++        field.setAccessible(true);
++        Object map = field.get(new ValueStore());
++        if (map instanceof ConcurrentMap) {
++            concurrentMap = true;
++        }
++        assertTrue(getSynchronized || concurrentMap,
++                "ValueStore 须线程安全：get 同步 或 底层 ConcurrentMap（旧 HashMap 无同步 get 必红）");
++    }
++
++    @Test
++    void concurrentPutGetHasNoExceptionAndValuesVisible() throws Exception {
++        ValueStore store = new ValueStore();
++        int writers = 4;
++        int readers = 4;
++        int perWriter = 500;
++        AtomicReference<Throwable> error = new AtomicReference<>();
++        CountDownLatch start = new CountDownLatch(1);
++        List<Thread> threads = new ArrayList<>();
++
++        for (int w = 0; w < writers; w++) {
++            final int id = w;
++            Thread t = new Thread(() -> {
++                try {
++                    start.await();
++                    for (int i = 0; i < perWriter; i++) {
++                        store.put("k" + id + "-" + i, ValueSample.of(id * 1000 + i, i));
++                    }
++                } catch (Throwable e) {
++                    error.compareAndSet(null, e);
++                }
++            });
++            threads.add(t);
++        }
++        for (int r = 0; r < readers; r++) {
++            Thread t = new Thread(() -> {
++                try {
++                    start.await();
++                    for (int i = 0; i < perWriter; i++) {
++                        // 读一个已稳定写入的键 + 扫描式读（触发潜在并发读问题）
++                        store.get("stable");
++                        store.get("k" + ((i % writers)) + "-" + i);
++                    }
++                } catch (Throwable e) {
++                    error.compareAndSet(null, e);
++                }
++            });
++            threads.add(t);
++        }
++        store.put("stable", ValueSample.of(42.0, 0L));
++        threads.forEach(Thread::start);
++        start.countDown();
++        for (Thread t : threads) {
++            t.join(10_000);
++            assertFalse(t.isAlive(), "并发线程须在 10s 内结束");
++        }
++        assertNull(error.get(), "并发 put/get 不得抛异常: " + error.get());
++        assertEquals(42.0, store.get("stable").value(), "稳定键最终值可见");
++        AtomicInteger visible = new AtomicInteger();
++        for (int w = 0; w < writers; w++) {
++            for (int i = 0; i < perWriter; i++) {
++                if (store.get("k" + w + "-" + i) != null) {
++                    visible.incrementAndGet();
++                }
++            }
++        }
++        assertEquals(writers * perWriter, visible.get(), "全部写入值最终可见");
++    }
++}

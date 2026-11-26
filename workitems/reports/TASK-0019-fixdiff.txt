@@ -1,0 +1,225 @@
+commit 46d939171e7751dfa98c074e3564e56ec4e02c7a
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 11:52:26 2026 +0800
+
+    fix(iot): 凭据轮换并发丢失更新修复（评审 I-1）——轮换改原子条件 UPDATE（SET 密文+status 复活+key_version=IFNULL(key_version,0)+1 服务端自增，WHERE id+前置读 key_version+deleted=0），影响行数 0 → VERSION_CONFLICT(5001)「凭据已被并发轮换，请刷新后重试」；ResultCode 追加 5001 版本冲突段常量；红转绿 2 用例（并发冲突 5001/同前置读双调用恰一胜出不丢更新）（TASK-0019 修订轮）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java
+index 02c7bc5..382967e 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImpl.java
+@@ -1,6 +1,7 @@
+ package net.otlab.admin.module.iot.credential.service.impl;
+ 
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.channel.entity.IotChannel;
+@@ -38,7 +39,9 @@ import java.util.List;
+  * 物理唯一索引保证一行——首写落 key_version=1，重复写入=轮换（更新密文与 key_version
+  * 递增），不新增行；重写即重新启用（吊销后再次写入视为重新配发，status 复活 1）。
+  * 新建并发撞键（DuplicateKeyException）转轮换更新（upsert 语义），预检与落库之间的
+- * 真实并发窗口不向调用方报错。
++ * 真实并发窗口不向调用方报错。<b>轮换走原子条件 UPDATE 乐观并发闸</b>（TASK-0019 修订轮
++ * 评审 I-1：SET key_version 服务端自增 + WHERE 前置读 key_version，影响行数 0 →
++ * VERSION_CONFLICT(5001) 拒绝——并发轮换不丢更新，key_version 代史与真实顺序严格对齐）。
+  *
+  * <p><b>列表永不回密文/明文</b>（REQ-0011 验收 1）：服务层解密后经 {@link CredentialMask}
+  * 掩码化（前四****后四口径），解密失败降级纯占位（列表不崩、不泄底）；列表 VO 结构上
+@@ -180,26 +183,29 @@ public class IotCredentialServiceImpl extends ServiceImpl<IotChannelCredentialMa
+         return rotate(existing, ciphertext);
+     }
+ 
+-    /** 轮换更新（字段白名单：仅密文/key_version/status 复活——tenantId/credType/审计列不进 SET） */
++    /**
++     * 轮换更新（TASK-0019 修订轮 I-1——原子条件 UPDATE 乐观并发闸）：SET 新密文 + status 复活 +
++     * {@code key_version = IFNULL(key_version,0) + 1}（<b>服务端自增</b>，DB 行内原子递增，非客户端
++     * 赋值）；WHERE id + <b>前置读 key_version</b>（乐观闸）+ deleted=0（@TableLogic 由 MP 对
++     * wrapper UPDATE 自动追加）。影响行数 0 = 版本已被并发改写 → {@link ResultCode#VERSION_CONFLICT}
++     * (5001) 拒绝——并发轮换不再丢失更新（两管理员同前置读：先到 200、后到 5001，DB key_version
++     * 恰 +1/成功次，(密文, key_version) 配对与真实代次严格对齐）。密文与 key_version 同语句落库，
++     * 读路径掩码为解密时派生（无掩码列），天然一致无回填需求。IFNULL 兼容 legacy null/非数值行
++     * 首次轮换归一 1（MySQL varchar 数值运算口径，与原 nextKeyVersion 回落语义一致）。
++     */
+     private boolean rotate(IotChannelCredential existing, String ciphertext) {
+-        IotChannelCredential upd = new IotChannelCredential();
+-        upd.setId(existing.getId());
+-        upd.setCiphertext(ciphertext);
+-        upd.setKeyVersion(nextKeyVersion(existing.getKeyVersion()));
+-        upd.setStatus(STATUS_ENABLED);
+-        return this.updateById(upd);
+-    }
+-
+-    /** key_version 递增口径：null/空白/非数值回落 1（legacy 行首次轮换归一），数值继续递增 */
+-    static String nextKeyVersion(String current) {
+-        if (current == null || current.isBlank()) {
+-            return INITIAL_KEY_VERSION;
+-        }
+-        try {
+-            return String.valueOf(Long.parseLong(current.trim()) + 1);
+-        } catch (NumberFormatException e) {
+-            return INITIAL_KEY_VERSION;
++        LambdaUpdateWrapper<IotChannelCredential> upd = new LambdaUpdateWrapper<IotChannelCredential>()
++                .set(IotChannelCredential::getCiphertext, ciphertext)
++                .set(IotChannelCredential::getStatus, STATUS_ENABLED)
++                .setSql("key_version = IFNULL(key_version,0) + 1")
++                .eq(IotChannelCredential::getId, existing.getId())
++                .eq(existing.getKeyVersion() != null, IotChannelCredential::getKeyVersion, existing.getKeyVersion())
++                .isNull(existing.getKeyVersion() == null, IotChannelCredential::getKeyVersion);
++        boolean updated = this.update(upd);
++        if (!updated) {
++            throw new BusinessException(ResultCode.VERSION_CONFLICT.getCode(), "凭据已被并发轮换，请刷新后重试");
+         }
++        return true;
+     }
+ 
+     // ---------- 查看明文 ----------
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java
+index be7e75a..a93b192 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/credential/service/impl/IotCredentialServiceImplTest.java
+@@ -41,6 +41,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.isNull;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+@@ -223,36 +224,85 @@ class IotCredentialServiceImplTest {
+         verify(baseMapper, never()).insert(any(IotChannelCredential.class));
+     }
+ 
+-    // ---------- 轮换（同 channel 同 cred_type 更新，不新增行） ----------
++    // ---------- 轮换（同 channel 同 cred_type 原子条件更新，不新增行；TASK-0019 修订轮 I-1） ----------
+ 
+     @Test
+-    @DisplayName("轮换 - 同通道同类型已有行：更新密文与 key_version 递增（1→2），不新增行，status 复活为 1")
++    @DisplayName("轮换 - 原子条件 UPDATE：SET 密文+status 复活+key_version 服务端自增（1→2），"
++            + "WHERE id+前置 key_version+deleted=0；不新增行不裸 updateById")
+     void testWrite_RotateUpdatesExistingRow() {
+         when(channelMapper.selectById(100L)).thenReturn(existingChannel());
+         stubExistingRow(storedRow("old-plain-secret-xyz", "1", 0));
++        when(baseMapper.update(isNull(), any(Wrapper.class))).thenReturn(1);
+ 
+         assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
+ 
+         verify(baseMapper, never()).insert(any(IotChannelCredential.class));
+-        ArgumentCaptor<IotChannelCredential> captor = ArgumentCaptor.forClass(IotChannelCredential.class);
+-        verify(baseMapper).updateById(captor.capture());
+-        IotChannelCredential upd = captor.getValue();
+-        assertEquals(200L, upd.getId(), "轮换只更新原行");
+-        assertEquals("2", upd.getKeyVersion(), "key_version 递增 1→2");
+-        assertEquals(1, upd.getStatus(), "重写凭据=重新启用（吊销后再次写入视为重新配发）");
+-        assertTrue(upd.getCiphertext().startsWith("{v1}"));
+-        assertEquals(PLAINTEXT, SmDataCrypto.decrypt(upd.getCiphertext()));
+-        assertNull(upd.getTenantId(), "轮换不迁移 tenant_id（白名单更新：仅密文/版本/状态）");
++        verify(baseMapper, never()).updateById(any(IotChannelCredential.class));
++        ArgumentCaptor<Wrapper<IotChannelCredential>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).update(isNull(), captor.capture());
++        com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<IotChannelCredential> wrapper =
++                (com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<IotChannelCredential>) captor.getValue();
++        String sqlSet = wrapper.getSqlSet();
++        assertTrue(sqlSet.contains("ciphertext="), "SET 必须落新密文");
++        assertTrue(sqlSet.contains("key_version = IFNULL(key_version,0) + 1"),
++                "key_version 必须服务端自增（原子递增，非客户端赋值——不丢更新的机制本体）: " + sqlSet);
++        assertTrue(sqlSet.contains("status="), "重写凭据=重新启用（吊销后再次写入视为重新配发）");
++        // WHERE eq 条件参数为惰性注册（MP Lazy SQL 片段，getSqlSegment 时才入 paramNameValuePairs）——先触发再断言
++        String where = wrapper.getSqlSegment();
++        assertTrue(where.contains("key_version ="), "WHERE 必须带前置读 key_version 条件（乐观并发闸）: " + where);
++        assertTrue(wrapper.getParamNameValuePairs().containsValue(200L), "WHERE id= 前置读凭据 id");
++        assertTrue(wrapper.getParamNameValuePairs().containsValue("1"),
++                "WHERE key_version= 前置读值（乐观并发闸）: " + wrapper.getParamNameValuePairs());
++        // 服务端自增表达式保证 DB 侧 key_version 恰 +1（"1"→2）；IFNULL 兼容 legacy null 行归一 1
+     }
+ 
+     @Test
+-    @DisplayName("轮换 - key_version 递增口径：null/非数值回落 1，数值继续递增（2→3）")
+-    void testKeyVersionIncrement() {
+-        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion(null));
+-        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion("  "));
+-        assertEquals("1", IotCredentialServiceImpl.nextKeyVersion("legacy"));
+-        assertEquals("2", IotCredentialServiceImpl.nextKeyVersion("1"));
+-        assertEquals("3", IotCredentialServiceImpl.nextKeyVersion("2"));
++    @DisplayName("轮换并发冲突 - 前置读条件 UPDATE 影响行数 0（key_version 已被并发改写）→ 5001 拒绝，不半写")
++    void testRotate_ConcurrentConflict5001() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        stubExistingRow(storedRow("old-plain-secret-xyz", "2", 1));
++        when(baseMapper.update(isNull(), any(Wrapper.class))).thenReturn(0);
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++        assertEquals(ResultCode.VERSION_CONFLICT.getCode(), ex.getCode(), "错误码 5001（配置与发布版本冲突段）");
++        assertEquals("凭据已被并发轮换，请刷新后重试", ex.getMessage());
++        verify(baseMapper, never()).insert(any(IotChannelCredential.class));
++        verify(baseMapper, never()).updateById(any(IotChannelCredential.class));
++    }
++
++    @Test
++    @DisplayName("并发轮换不丢更新 - 两调用同前置读（同毫秒双管理员）：先到 200、后到 5001，"
++            + "两个 UPDATE 均带同一前置读条件且服务端自增——DB key_version 恰 +1/成功次，绝不双成功单存活")
++    void testRotate_TwoCallsSamePreRead_OneWins() {
++        when(channelMapper.selectById(100L)).thenReturn(existingChannel());
++        // 两个并发调用都基于同一前置读快照（同一行 kv="2"——并发窗口内 selectOne 均读到旧值）
++        stubExistingRow(storedRow("old-plain-secret-xyz", "2", 1));
++        when(baseMapper.update(isNull(), any(Wrapper.class))).thenReturn(1, 0);
++
++        // 调用 A（先提交）：前置读 kv=2 → 条件命中 → 200
++        assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++        // 调用 B（后提交，同一前置读快照 kv=2）：条件不命中（DB 已被 A 递增为 3）→ 5001
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
++        assertEquals(ResultCode.VERSION_CONFLICT.getCode(), ex.getCode());
++
++        ArgumentCaptor<Wrapper<IotChannelCredential>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper, Mockito.times(2)).update(isNull(), captor.capture());
++        List<com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<IotChannelCredential>> wrappers =
++                captor.getAllValues().stream()
++                        .map(w -> (com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<IotChannelCredential>) w)
++                        .toList();
++        for (com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<IotChannelCredential> w : wrappers) {
++            assertTrue(w.getSqlSet().contains("key_version = IFNULL(key_version,0) + 1"),
++                    "两调用均必须服务端自增（丢失更新的堵点：谁赢谁 +1，输者显式失败）");
++            // WHERE 条件参数惰性注册（getSqlSegment 时才入 map）——先触发再断言同一前置读
++            String where = w.getSqlSegment();
++            assertTrue(where.contains("key_version ="), "两调用 WHERE 均带前置读 key_version 条件: " + where);
++            assertTrue(w.getParamNameValuePairs().containsValue("2"),
++                    "两调用均带同一前置读条件 kv=2: " + w.getParamNameValuePairs());
++        }
++        // DB 侧推演：A 命中 kv 2→3；B 条件 kv=2 不命中 → 终态 3 = 恰 +1（A），B 的密文未落库（不覆盖）
+     }
+ 
+     @Test
+@@ -262,11 +312,12 @@ class IotCredentialServiceImplTest {
+         when(baseMapper.selectOne(any(Wrapper.class))).thenReturn(null, storedRow("old-plain-secret-xyz", "1", 1));
+         Mockito.doThrow(new DuplicateKeyException("uk_channel_cred_type"))
+                 .when(baseMapper).insert(any(IotChannelCredential.class));
++        when(baseMapper.update(isNull(), any(Wrapper.class))).thenReturn(1);
+ 
+         assertTrue(credentialService.writeCredential(writeForm(100L, "MQTT_PASSWORD", PLAINTEXT)));
+ 
+         verify(baseMapper).insert(any(IotChannelCredential.class));
+-        verify(baseMapper).updateById(any(IotChannelCredential.class));
++        verify(baseMapper).update(isNull(), any(Wrapper.class));
+     }
+ 
+     // ---------- 列表（只回掩码，永不回密文/明文） ----------
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+index 1803641..60973dd 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+@@ -24,7 +24,12 @@ public enum ResultCode {
+ 
+     // 配额不足（TASK-0003 / ADR-0011 TD-0035：点位配额强控阻断新增；语义全局，
+     // 后续导出条数等配额类校验复用；message 为通用兜底文案，具体提示由抛出方携带）
+-    QUOTA_EXCEEDED(4003, "配额不足");
++    QUOTA_EXCEEDED(4003, "配额不足"),
++
++    // 版本冲突（详细设计 §3.4 错误码分段：5001=配置与发布版本冲突段；语义全局——乐观
++    // 并发闸的受检冲突：前置读条件 UPDATE 影响行数 0 即版本被并发改写，抛出方携带
++    // 「刷新后重试」类提示。TASK-0019 修订轮 I-1 凭据并发轮换先行使用）
++    VERSION_CONFLICT(5001, "版本冲突");
+ 
+     private final Integer code;
+     private final String message;

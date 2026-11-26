@@ -1,0 +1,981 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java
+new file mode 100644
+index 0000000..69ce68b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/controller/SysTenantController.java
+@@ -0,0 +1,92 @@
++package net.otlab.admin.module.iot.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.stream.Collectors;
++
++/**
++ * 租户管理控制器（TASK-0001）
++ *
++ * <p>路径扁平化 /tenant；权限前缀 iot:tenant:*（不沿用 system:* 惯例）；
++ * 配额字段（pointQuota/storageQuotaGb/expireTime）随新增/编辑接口下发，不单设权限点。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Tag(name = "租户管理")
++@RestController
++@RequestMapping("/tenant")
++public class SysTenantController {
++
++    @Autowired
++    protected SysTenantService tenantService;
++
++    @Operation(summary = "分页查询租户列表")
++    @GetMapping("/list")
++    @SaCheckPermission("iot:tenant:list")
++    public Result<Page<SysTenant>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++                                        @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++                                        SysTenant tenant) {
++        Page<SysTenant> page = new Page<>(pageNum, pageSize);
++        return Result.success(tenantService.selectTenantList(page, tenant));
++    }
++
++    @Operation(summary = "根据ID查询租户")
++    @GetMapping("/{id}")
++    @SaCheckPermission("iot:tenant:query")
++    public Result<SysTenant> getById(@PathVariable("id") Long id) {
++        return Result.success(tenantService.getById(id));
++    }
++
++    @OperateLog(title = "租户", businessType = BusinessType.INSERT)
++    @Operation(summary = "新增租户")
++    @PostMapping
++    @SaCheckPermission("iot:tenant:add")
++    public Result<Void> add(@Valid @RequestBody SysTenant tenant) {
++        tenantService.insertTenant(tenant);
++        return Result.success();
++    }
++
++    @OperateLog(title = "租户", businessType = BusinessType.UPDATE)
++    @Operation(summary = "修改租户")
++    @PutMapping
++    @SaCheckPermission("iot:tenant:edit")
++    public Result<Void> edit(@Valid @RequestBody SysTenant tenant) {
++        tenantService.updateTenant(tenant);
++        return Result.success();
++    }
++
++    @OperateLog(title = "租户", businessType = BusinessType.UPDATE)
++    @Operation(summary = "租户启停")
++    @PutMapping("/{id}/status")
++    @SaCheckPermission("iot:tenant:status")
++    public Result<Void> changeStatus(@PathVariable("id") Long id, @RequestBody SysTenant body) {
++        tenantService.updateTenantStatus(id, body.getStatus());
++        return Result.success();
++    }
++
++    @OperateLog(title = "租户", businessType = BusinessType.DELETE)
++    @Operation(summary = "删除租户")
++    @DeleteMapping("/{ids}")
++    @SaCheckPermission("iot:tenant:remove")
++    public Result<Void> remove(@PathVariable("ids") String ids) {
++        List<Long> idList = Arrays.stream(ids.split(","))
++                .map(Long::parseLong)
++                .collect(Collectors.toList());
++        tenantService.deleteTenantByIds(idList);
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java
+new file mode 100644
+index 0000000..4ad07ee
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/entity/SysTenant.java
+@@ -0,0 +1,70 @@
++package net.otlab.admin.module.iot.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Size;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.time.LocalDateTime;
++
++/**
++ * 租户实体类（TASK-0001）
++ *
++ * <p>tenant_code 全局唯一（uk_tenant_code 物理唯一索引）且创建后不可改；
++ * 逻辑删除不释放编码——删除后编码不复用（详细设计 §1.1 纪律）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("sys_tenant")
++@Schema(description = "租户")
++public class SysTenant extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "租户ID")
++    private Long id;
++
++    @NotBlank(message = "租户编码不能为空")
++    @Size(max = 32, message = "租户编码长度不能超过 32")
++    @Schema(description = "租户编码（全局唯一，创建后不可改）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String tenantCode;
++
++    @NotBlank(message = "租户名称不能为空")
++    @Size(max = 100, message = "租户名称长度不能超过 100")
++    @Schema(description = "租户名称", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String tenantName;
++
++    @Schema(description = "状态 0 禁用 1 启用")
++    private Integer status;
++
++    @Schema(description = "点位配额（个），空或 0 不限")
++    private Integer pointQuota;
++
++    @Schema(description = "存储配额（GB）")
++    private Integer storageQuotaGb;
++
++    @Schema(description = "到期时间，空为长期")
++    private LocalDateTime expireTime;
++
++    @Size(max = 50, message = "联系人长度不能超过 50")
++    @Schema(description = "联系人")
++    private String contactName;
++
++    @Size(max = 32, message = "联系电话长度不能超过 32")
++    @Schema(description = "联系电话")
++    private String contactPhone;
++
++    @Size(max = 500, message = "备注长度不能超过 500")
++    @Schema(description = "备注")
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/mapper/SysTenantMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/mapper/SysTenantMapper.java
+new file mode 100644
+index 0000000..858a860
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/mapper/SysTenantMapper.java
+@@ -0,0 +1,15 @@
++package net.otlab.admin.module.iot.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 租户数据访问层
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Mapper
++public interface SysTenantMapper extends BaseMapper<SysTenant> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+new file mode 100644
+index 0000000..9e11681
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/SysTenantService.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.IService;
++import net.otlab.admin.module.iot.entity.SysTenant;
++
++import java.util.List;
++
++/**
++ * 租户服务接口
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++public interface SysTenantService extends IService<SysTenant> {
++
++    Page<SysTenant> selectTenantList(Page<SysTenant> page, SysTenant tenant);
++
++    boolean insertTenant(SysTenant tenant);
++
++    boolean updateTenant(SysTenant tenant);
++
++    boolean updateTenantStatus(Long id, Integer status);
++
++    boolean deleteTenantByIds(List<Long> ids);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+new file mode 100644
+index 0000000..56247d3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+@@ -0,0 +1,104 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.SqlLikeUtils;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.util.List;
++
++/**
++ * 租户服务实现类（TASK-0001）
++ *
++ * <p>编码唯一性双道闸：先对活跃行（@TableLogic 过滤 deleted=0）预检，友好报 4002；
++ * 再捕获 {@link DuplicateKeyException} 兜底——uk_tenant_code 是物理唯一索引，
++ * 逻辑删不释放编码，兜底覆盖「已删除行仍占用编码」场景（删除后编码不复用，
++ * 详细设计 §1.1 既定纪律）。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++@Service
++public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant> implements SysTenantService {
++
++    @Override
++    public Page<SysTenant> selectTenantList(Page<SysTenant> page, SysTenant tenant) {
++        LambdaQueryWrapper<SysTenant> wrapper = new LambdaQueryWrapper<>();
++        if (tenant.getTenantCode() != null) {
++            wrapper.like(SysTenant::getTenantCode, SqlLikeUtils.escape(tenant.getTenantCode()));
++        }
++        if (tenant.getTenantName() != null) {
++            wrapper.like(SysTenant::getTenantName, SqlLikeUtils.escape(tenant.getTenantName()));
++        }
++        if (tenant.getStatus() != null) {
++            wrapper.eq(SysTenant::getStatus, tenant.getStatus());
++        }
++        wrapper.orderByDesc(SysTenant::getId);
++        return this.page(page, wrapper);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean insertTenant(SysTenant tenant) {
++        // 预检活跃行：友好报 4002（逻辑删除会自动过滤已删行）
++        LambdaQueryWrapper<SysTenant> wrapper = new LambdaQueryWrapper<>();
++        wrapper.eq(SysTenant::getTenantCode, tenant.getTenantCode());
++        if (this.count(wrapper) > 0) {
++            throw duplicateCode(tenant.getTenantCode());
++        }
++        try {
++            return this.save(tenant);
++        } catch (DuplicateKeyException e) {
++            // 兜底：已删除行仍占用编码（物理唯一索引不被逻辑删除释放）
++            throw duplicateCode(tenant.getTenantCode());
++        }
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateTenant(SysTenant tenant) {
++        SysTenant existing = this.getById(tenant.getId());
++        if (existing == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户不存在或已删除");
++        }
++        // 创建后编码不可改：请求携带的编码与库中不一致即拒绝
++        if (tenant.getTenantCode() == null || !tenant.getTenantCode().equals(existing.getTenantCode())) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户编码不允许修改");
++        }
++        return this.updateById(tenant);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean updateTenantStatus(Long id, Integer status) {
++        if (status == null || (status != 0 && status != 1)) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "状态值仅允许 0 或 1");
++        }
++        if (this.getById(id) == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户不存在或已删除");
++        }
++        // 只更新状态字段，不夹带其他业务字段
++        SysTenant upd = new SysTenant();
++        upd.setId(id);
++        upd.setStatus(status);
++        return this.updateById(upd);
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean deleteTenantByIds(List<Long> ids) {
++        return this.removeByIds(ids);
++    }
++
++    private BusinessException duplicateCode(String tenantCode) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "租户编码已存在: " + tenantCode);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java
+new file mode 100644
+index 0000000..800862c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/controller/SysTenantControllerTest.java
+@@ -0,0 +1,275 @@
++package net.otlab.admin.module.iot.controller;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 租户管理控制器测试（TASK-0001 接口层）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文）。权限注解在 standalone
++ * 环境不生效（无 Sa-Token 拦截器），故以反射断言 @SaCheckPermission / @OperateLog
++ * 的存在与取值，路由与参数校验走真实 MockMvc 请求。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysTenantControllerTest {
++
++    private MockMvc mockMvc;
++    private ObjectMapper objectMapper;
++
++    @Mock
++    private SysTenantService tenantService;
++
++    private SysTenantController tenantController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        tenantController = new SysTenantController();
++        ReflectionTestUtils.setField(tenantController, "tenantService", tenantService);
++        objectMapper = new ObjectMapper();
++        mockMvc = MockMvcBuilders.standaloneSetup(tenantController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    private SysTenant testTenant() {
++        SysTenant tenant = new SysTenant();
++        tenant.setId(1L);
++        tenant.setTenantCode("acme");
++        tenant.setTenantName("Acme 集团");
++        tenant.setStatus(1);
++        tenant.setPointQuota(100);
++        tenant.setStorageQuotaGb(20);
++        tenant.setContactName("张三");
++        tenant.setContactPhone("13800000000");
++        tenant.setRemark("测试租户");
++        return tenant;
++    }
++
++    // ---------- 权限注解（standalone 环境下以反射断言） ----------
++
++    @Test
++    @DisplayName("权限注解 - 六个接口的 @SaCheckPermission 取值符合 iot:tenant:* 契约")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:tenant:list", SysTenantController.class
++                .getMethod("list", Integer.class, Integer.class, SysTenant.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:tenant:query", SysTenantController.class
++                .getMethod("getById", Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:tenant:add", SysTenantController.class
++                .getMethod("add", SysTenant.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:tenant:edit", SysTenantController.class
++                .getMethod("edit", SysTenant.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:tenant:status", SysTenantController.class
++                .getMethod("changeStatus", Long.class, SysTenant.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:tenant:remove", SysTenantController.class
++                .getMethod("remove", String.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 四个写操作（新增/编辑/启停/删除）均有 @OperateLog")
++    void testOperateLogAnnotations() throws Exception {
++        Method[] writeMethods = {
++                SysTenantController.class.getMethod("add", SysTenant.class),
++                SysTenantController.class.getMethod("edit", SysTenant.class),
++                SysTenantController.class.getMethod("changeStatus", Long.class, SysTenant.class),
++                SysTenantController.class.getMethod("remove", String.class)
++        };
++        for (Method method : writeMethods) {
++            assertNotNull(method.getAnnotation(OperateLog.class), method.getName() + " 缺少 @OperateLog");
++        }
++        assertEquals(BusinessType.INSERT, SysTenantController.class.getMethod("add", SysTenant.class)
++                .getAnnotation(OperateLog.class).businessType());
++    }
++
++    // ---------- 路由与参数校验（真实 MockMvc 请求） ----------
++
++    @Test
++    @DisplayName("分页查询 - GET /tenant/list 返回分页数据")
++    void testList_Success() throws Exception {
++        Page<SysTenant> page = new Page<>(1, 10);
++        page.setRecords(java.util.List.of(testTenant()));
++        page.setTotal(1);
++        when(tenantService.selectTenantList(any(), any(SysTenant.class))).thenReturn(page);
++
++        mockMvc.perform(get("/tenant/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.records").isArray())
++                .andExpect(jsonPath("$.data.total").value(1))
++                .andExpect(jsonPath("$.data.records[0].tenantCode").value("acme"));
++
++        verify(tenantService).selectTenantList(any(), any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("详情查询 - GET /tenant/{id} 字段齐全（含配额/联系人）")
++    void testGetById_Success() throws Exception {
++        when(tenantService.getById(1L)).thenReturn(testTenant());
++
++        mockMvc.perform(get("/tenant/{id}", 1L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.id").value(1))
++                .andExpect(jsonPath("$.data.tenantCode").value("acme"))
++                .andExpect(jsonPath("$.data.tenantName").value("Acme 集团"))
++                .andExpect(jsonPath("$.data.status").value(1))
++                .andExpect(jsonPath("$.data.pointQuota").value(100))
++                .andExpect(jsonPath("$.data.storageQuotaGb").value(20))
++                .andExpect(jsonPath("$.data.contactName").value("张三"))
++                .andExpect(jsonPath("$.data.contactPhone").value("13800000000"))
++                .andExpect(jsonPath("$.data.remark").value("测试租户"));
++
++        verify(tenantService).getById(1L);
++    }
++
++    @Test
++    @DisplayName("新增 - POST /tenant 正常返回 200")
++    void testAdd_Success() throws Exception {
++        SysTenant tenant = testTenant();
++        when(tenantService.insertTenant(any(SysTenant.class))).thenReturn(true);
++
++        mockMvc.perform(post("/tenant")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(tenant)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(tenantService).insertTenant(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 参数校验：tenantCode 缺失返回业务码 400")
++    void testAdd_BlankCode_ParamError() throws Exception {
++        SysTenant tenant = testTenant();
++        tenant.setTenantCode(null);
++
++        mockMvc.perform(post("/tenant")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(tenant)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(tenantService, org.mockito.Mockito.never()).insertTenant(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("新增 - 重复编码透传服务层 4002")
++    void testAdd_DuplicateCode() throws Exception {
++        when(tenantService.insertTenant(any(SysTenant.class)))
++                .thenThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(), "租户编码已存在"));
++
++        mockMvc.perform(post("/tenant")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTenant())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(4002));
++    }
++
++    @Test
++    @DisplayName("编辑 - PUT /tenant 正常返回 200")
++    void testEdit_Success() throws Exception {
++        when(tenantService.updateTenant(any(SysTenant.class))).thenReturn(true);
++
++        mockMvc.perform(put("/tenant")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTenant())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(tenantService).updateTenant(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("编辑 - 改编码被服务层拒绝（PARAM_ERROR 400）")
++    void testEdit_RejectCodeChange() throws Exception {
++        when(tenantService.updateTenant(any(SysTenant.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户编码不允许修改"));
++
++        mockMvc.perform(put("/tenant")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(testTenant())))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("启停 - PUT /tenant/{id}/status 正常返回 200")
++    void testChangeStatus_Success() throws Exception {
++        when(tenantService.updateTenantStatus(any(), any())).thenReturn(true);
++
++        mockMvc.perform(put("/tenant/{id}/status", 1L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(Map.of("status", 0))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(tenantService).updateTenantStatus(1L, 0);
++    }
++
++    @Test
++    @DisplayName("启停 - 非法状态值透传服务层参数错误")
++    void testChangeStatus_InvalidStatus() throws Exception {
++        when(tenantService.updateTenantStatus(any(), any()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "状态值仅允许 0 或 1"));
++
++        mockMvc.perform(put("/tenant/{id}/status", 1L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(Map.of("status", 2))))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("删除 - DELETE /tenant/{ids} 支持逗号分隔批量")
++    void testRemove_Success() throws Exception {
++        when(tenantService.deleteTenantByIds(any())).thenReturn(true);
++
++        mockMvc.perform(delete("/tenant/{ids}", "1,2"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(tenantService).deleteTenantByIds(java.util.List.of(1L, 2L));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java
+new file mode 100644
+index 0000000..f22a15e
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java
+@@ -0,0 +1,249 @@
++package net.otlab.admin.module.iot.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.mapper.SysTenantMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.time.LocalDateTime;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 租户服务单元测试（TASK-0001）
++ *
++ * <p>核心业务纪律：tenant_code 全局唯一且创建后不可改（重复码 4002——活跃行预检与
++ * 已删行占码的 DuplicateKeyException 兜底两道闸）；启停仅接受 0/1；配额字段随编辑写入。
++ *
++ * @author dowei
++ * @date 2026-11-21
++ */
++class SysTenantServiceImplTest {
++
++    @Mock
++    private SysTenantMapper baseMapper;
++
++    private SysTenantServiceImpl tenantService;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper 解析实体列需要实体 lambda 缓存
++        TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), ""), SysTenant.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        tenantService = new SysTenantServiceImpl();
++        ReflectionTestUtils.setField(tenantService, "baseMapper", baseMapper);
++    }
++
++    private SysTenant newTenant() {
++        SysTenant tenant = new SysTenant();
++        tenant.setTenantCode("acme");
++        tenant.setTenantName("Acme 集团");
++        tenant.setStatus(1);
++        return tenant;
++    }
++
++    @Test
++    @DisplayName("新建租户 - 正常情况：预检活跃行后落库")
++    void testInsertTenant_Success() {
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysTenant.class))).thenReturn(1);
++
++        assertTrue(tenantService.insertTenant(newTenant()));
++
++        verify(baseMapper).selectCount(any());
++        verify(baseMapper).insert(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("新建租户 - 编码重复（活跃行预检）报 4002 且不落库")
++    void testInsertTenant_DuplicateActiveCode() {
++        when(baseMapper.selectCount(any())).thenReturn(1L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.insertTenant(newTenant()));
++
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals(4002, e.getCode());
++        // 预检条件必须按 tenant_code 精确匹配
++        ArgumentCaptor<Wrapper<SysTenant>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectCount(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("tenant_code"), "重复预检应按 tenant_code 过滤");
++        verify(baseMapper, never()).insert(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("新建租户 - 编码被已删除行占用（uk_tenant_code 不释放）兜底映射 4002")
++    void testInsertTenant_DeletedRowOccupiesCode() {
++        // 活跃行预检通过（逻辑删除过滤罩住了占码残留行），落库撞物理唯一索引
++        when(baseMapper.selectCount(any())).thenReturn(0L);
++        when(baseMapper.insert(any(SysTenant.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry 'acme' for key 'uk_tenant_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.insertTenant(newTenant()));
++
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals(4002, e.getCode());
++    }
++
++    @Test
++    @DisplayName("编辑租户 - 请求编码与库中不一致被拒（创建后编码不可改），PARAM_ERROR 400")
++    void testUpdateTenant_RejectCodeChange() {
++        SysTenant existing = newTenant();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++
++        SysTenant request = newTenant();
++        request.setId(1L);
++        request.setTenantCode("other");
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.updateTenant(request));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getDefaultMessage().contains("租户编码不允许修改"));
++        verify(baseMapper, never()).updateById(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("编辑租户 - 租户不存在（或已删除）报参数错误")
++    void testUpdateTenant_NotFound() {
++        when(baseMapper.selectById(99L)).thenReturn(null);
++
++        SysTenant request = newTenant();
++        request.setId(99L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> tenantService.updateTenant(request));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).updateById(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("编辑租户 - 同码携带时放行，配额字段（点位/存储/到期）随编辑写入")
++    void testUpdateTenant_QuotaFieldsSaved() {
++        SysTenant existing = newTenant();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        SysTenant request = newTenant();
++        request.setId(1L);
++        request.setTenantName("Acme 集团改");
++        request.setPointQuota(200);
++        request.setStorageQuotaGb(50);
++        request.setExpireTime(LocalDateTime.of(2027, 12, 31, 0, 0));
++
++        assertTrue(tenantService.updateTenant(request));
++
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        SysTenant saved = captor.getValue();
++        assertEquals("acme", saved.getTenantCode());
++        assertEquals(200, saved.getPointQuota());
++        assertEquals(50, saved.getStorageQuotaGb());
++        assertEquals(LocalDateTime.of(2027, 12, 31, 0, 0), saved.getExpireTime());
++    }
++
++    @Test
++    @DisplayName("租户启停 - 仅接受 0/1，其余值（含空）报参数错误且不触库")
++    void testUpdateTenantStatus_OnlyZeroOrOne() {
++        for (Integer invalid : new Integer[]{2, -1, 99, null}) {
++            BusinessException e = assertThrows(BusinessException.class,
++                    () -> tenantService.updateTenantStatus(1L, invalid), "status=" + invalid + " 应被拒绝");
++            assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode(), "status=" + invalid + " 应为 400");
++        }
++        verify(baseMapper, never()).selectById(any());
++        verify(baseMapper, never()).updateById(any(SysTenant.class));
++    }
++
++    @Test
++    @DisplayName("租户启停 - 0/1 均放行且仅更新状态字段")
++    void testUpdateTenantStatus_AcceptZeroAndOne() {
++        SysTenant existing = newTenant();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        assertTrue(tenantService.updateTenantStatus(1L, 0));
++        assertTrue(tenantService.updateTenantStatus(1L, 1));
++
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper, times(2)).updateById(captor.capture());
++        List<SysTenant> saved = captor.getAllValues();
++        assertEquals(0, saved.get(0).getStatus());
++        assertEquals(1, saved.get(1).getStatus());
++        // 只改状态：编码/名称等业务字段不得夹带进 UPDATE SET
++        for (SysTenant upd : saved) {
++            assertEquals(1L, upd.getId());
++            assertEquals(null, upd.getTenantName());
++            assertEquals(null, upd.getTenantCode());
++        }
++    }
++
++    @Test
++    @DisplayName("分页查询 - 传入 tenantCode/tenantName/status 时按条件过滤")
++    void testSelectTenantList_WithConditions() {
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
++        SysTenant query = new SysTenant();
++        query.setTenantCode("ac");
++        query.setTenantName("厂");
++        query.setStatus(1);
++
++        tenantService.selectTenantList(new Page<>(1, 10), query);
++
++        ArgumentCaptor<Wrapper<SysTenant>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String seg = captor.getValue().getSqlSegment();
++        assertTrue(seg.contains("tenant_code"), "应按 tenant_code 过滤");
++        assertTrue(seg.contains("tenant_name"), "应按 tenant_name 过滤");
++        assertTrue(seg.contains("status"), "应按 status 过滤");
++    }
++
++    @Test
++    @DisplayName("分页查询 - 无条件时不夹带业务过滤条件")
++    void testSelectTenantList_NoConditions() {
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
++
++        tenantService.selectTenantList(new Page<>(1, 10), new SysTenant());
++
++        ArgumentCaptor<Wrapper<SysTenant>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String seg = captor.getValue().getSqlSegment();
++        assertTrue(!seg.contains("tenant_code"), "无条件查询不应过滤 tenant_code");
++        assertTrue(!seg.contains("status"), "无条件查询不应过滤 status");
++    }
++
++    @Test
++    @DisplayName("批量删除 - 走逻辑删除批量接口")
++    void testDeleteTenantByIds() {
++        when(baseMapper.deleteByIds(any())).thenReturn(2);
++
++        assertTrue(tenantService.deleteTenantByIds(List.of(1L, 2L)));
++
++        verify(baseMapper).deleteByIds(any());
++    }
++}
+diff --git a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+index ee2827b..2c9f81c 100644
+--- a/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
++++ b/backend/ot-core/src/main/java/net/otlab/core/result/ResultCode.java
+@@ -16,7 +16,11 @@ public enum ResultCode {
+     UNAUTHORIZED(401, "未授权"),
+     FORBIDDEN(403, "无权限"),
+     NOT_FOUND(404, "资源不存在"),
+-    METHOD_NOT_ALLOWED(405, "请求方法不支持");
++    METHOD_NOT_ALLOWED(405, "请求方法不支持"),
++
++    // 编码重复（详细设计 §3.4 错误码分段：4001-4099 参数与校验，4002=编码重复；
++    // 语义取「编码重复」不取「租户编码重复」，后续 iot_data_dict 等复用）
++    DUPLICATE_CODE(4002, "编码重复");
+ 
+     private final Integer code;
+     private final String message;
+diff --git a/resources/sql/upgrade/20261121_sys_tenant.sql b/resources/sql/upgrade/20261121_sys_tenant.sql
+new file mode 100644
+index 0000000..34b463a
+--- /dev/null
++++ b/resources/sql/upgrade/20261121_sys_tenant.sql
+@@ -0,0 +1,85 @@
++-- ============================================================
++-- 存量库升级脚本：sys_tenant 租户表 + 智慧工厂模块菜单/权限种子（TASK-0001 / FEAT-0001 / REQ-0001）
++--
++-- 用途：
++--   1) 建 sys_tenant 租户主数据表（DDL 逐字来自《工厂数据采集系统详细设计》V1.1 附录 A）；
++--   2) sys_module 新增智慧工厂模块（id=4, code=iot）；
++--   3) sys_menu 登记「智慧工厂」目录 + 租户管理页面 + 六个按钮权限点（iot:tenant:*）；
++--   4) sys_role_menu 将上述八行授予超级管理员（role_id=1；admin 的权限集在代码层是
++--      sys_menu 实时并集，本行保证「角色管理」界面回显与脚本一致性）；
++--   5) 播种私有化默认租户（id=1, tenant_code=default）——REQ-0001 §0.3 单租户初始化约定，
++--      TASK-0002 登录租户注入依赖此行。
++--
++-- 适用环境：
++--   已按 01_base.sql + 02_survey.sql + 03_wechat.sql 初始化的存量库与全新库均可直接执行。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE——重复执行不报错、不重复插入、不改已有行。
++--   可安全重复执行。
++--
++-- 占用号段（本 brief 定版，后续任务不得复用）：
++--   sys_module id=4（iot 模块）；
++--   sys_menu id 4000-4099（智慧工厂段：4000 目录 / 4001 页面 / 4002-4007 按钮）；
++--   sys_tenant id=1（默认租户 default）。
++--   sys_menu 上游自增从 3000 起、survey/wechat 已占 legacy 与 2000 段，故智慧工厂段显式用 4000 起。
++--
++-- 注意：
++--   uk_tenant_code 为物理唯一索引，逻辑删除不释放编码——删除后编码不复用（详细设计 §1.1 纪律），
++--   服务层对重复码双道闸（活跃行预检 + DuplicateKeyException 兜底）均映射业务码 4002。
++--   ⚠ 排版约定（兼容 backend/scripts/sql-exec.sh）：该执行器按「行尾分号」切分语句块，并整块跳过
++--     以 -- 开头的块——故从 CREATE TABLE 到文件尾核对段之间的每条语句，其前面不得挂 -- 注释行
++--     （否则语句被吞）。说明文字全部集中在本头部与文件尾；语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `sys_tenant` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '租户 ID',
++  `tenant_code` varchar(32) NOT NULL COMMENT '租户编码（全局唯一，创建后不可改）',
++  `tenant_name` varchar(100) NOT NULL COMMENT '租户名称',
++  `status` tinyint DEFAULT '1' COMMENT '状态 0 禁用 1 启用',
++  `point_quota` int DEFAULT NULL COMMENT '点位配额（个），空或 0 不限',
++  `storage_quota_gb` int DEFAULT NULL COMMENT '存储配额（GB）',
++  `expire_time` datetime DEFAULT NULL COMMENT '到期时间，空为长期',
++  `contact_name` varchar(50) DEFAULT NULL COMMENT '联系人',
++  `contact_phone` varchar(32) DEFAULT NULL COMMENT '联系电话',
++  `remark` varchar(500) DEFAULT NULL COMMENT '备注',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  UNIQUE KEY `uk_tenant_code` (`tenant_code`),
++  KEY `idx_status` (`status`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='租户表';
++
++INSERT IGNORE INTO `sys_module`
++  (`id`, `module_code`, `module_name`, `icon`, `sort`, `status`, `remark`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4, 'iot', '智慧工厂', 'AppstoreOutlined', 4, 1, '智慧工厂（租户/点位/采集分析，FEAT-0001 起挂载）', NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4000, 0, 4, '智慧工厂', 1, '/iot', NULL, NULL, NULL, 'AppstoreOutlined', 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4001, 4000, 4, '租户管理', 2, '/iot/tenant', 'iot/tenant/index', NULL, NULL, 'TeamOutlined', 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4002, 4001, 4, '租户查询', 3, NULL, NULL, NULL, 'iot:tenant:list', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4003, 4001, 4, '租户详情', 3, NULL, NULL, NULL, 'iot:tenant:query', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4004, 4001, 4, '租户新增', 3, NULL, NULL, NULL, 'iot:tenant:add', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4005, 4001, 4, '租户修改', 3, NULL, NULL, NULL, 'iot:tenant:edit', NULL, 4, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4006, 4001, 4, '租户删除', 3, NULL, NULL, NULL, 'iot:tenant:remove', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4007, 4001, 4, '租户启停', 3, NULL, NULL, NULL, 'iot:tenant:status', NULL, 6, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4000), (1, 4001), (1, 4002), (1, 4003), (1, 4004), (1, 4005), (1, 4006), (1, 4007);
++
++INSERT IGNORE INTO `sys_tenant` (`id`, `tenant_code`, `tenant_name`, `status`) VALUES (1, 'default', '默认租户', 1);
++
++-- ============================================================
++-- 执行后核对（各应返回 1 行 / 8 行）：
++--   SELECT id, tenant_code, tenant_name, status FROM sys_tenant WHERE id = 1
++--   SELECT id, module_code, module_name FROM sys_module WHERE id = 4
++--   SELECT id, menu_name, perms FROM sys_menu WHERE id BETWEEN 4000 AND 4007
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4000 AND 4007
++--   SHOW CREATE TABLE sys_tenant （核验 uk_tenant_code 存在）
++-- ============================================================

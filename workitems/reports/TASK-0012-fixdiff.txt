@@ -1,0 +1,503 @@
+commit 46e923d0ef55d10f5b8a8e6e5b2c75b6cb3dd910
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 05:21:08 2026 +0800
+
+    fix(iot): 实例域修订轮 I-1/I-2/M-3/M-7——写路径数据权限防线/混合角色可见集/锁定禁删/树骨架收窄（TASK-0012 修订轮，评审 Critical 0/Important 2/Minor 8）
+    
+    - I-1：编辑/删除目标实例与子级创建的父实例补 resolve+可见集成员校验（403 文案不泄露实例标识，
+      与详情同范式；顶级实例创建不受限）——封堵「改绑 dept_id 反向扩大可见集」的写原语穿透
+    - I-2：树/列表短路条件改仅 instanceIds.isEmpty()（createByOnly 是角色标记非用户类别，混合
+      角色可见集不得清空）；列表补 ADR-0016 裁决 4 OR 分支 id IN(可见集) OR create_by=me
+      （实例属配置类，0010 评审 Minor③ 真实回归）；树不挂 create_by 分支（层级导航视图，口径留痕）
+    - M-3：locked=1 禁止删除（「实例已锁定，禁止删除」；数据权限防线先于锁定防线，不向无权者泄露状态）
+    - M-7：树骨架路径节点字段收窄为 id/instanceCode/instanceName/nodeType/status（与详情 403 不泄露面一致）
+    - 测试 47 用例（净增 10）：红转绿记录=修订轮前 9 红（I-1×5/M-3×2/I-2×3/M-7 计入）→ 恢复实现后全绿
+    - 全量 1400=1390+10 全绿；dev 冒烟复核：受限用户 PUT 不可见工厂 deptId/DELETE 不可见叶子/
+      DELETE locked+不可见 → 403，混合角色树/列表回归（树无 FMIX、列表含 create_by=me 自建厂），
+      admin DELETE locked → 400
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+index d38a063..168dae1 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImpl.java
+@@ -66,11 +66,21 @@ import java.util.stream.Collectors;
+  * selectById 注入会话租户条件即同租户保证）；设备/组件级可空（可从模板实例生成链继承，
+  * 归 TASK-0013）。
+  *
++ * <p><b>写路径数据权限防线</b>（修订轮 I-1）：编辑/删除目标实例与子级创建的父实例必须 ∈
++ * 可见集（allTenant 直过），与读裁剪同源同口径——「持编辑菜单+窄数据范围」是合法配置，
++ * 写原语不得穿透 TC-0002 红线（改绑 dept_id 反向扩大可见集的升级链封堵）；顶级实例创建
++ * 不受限（顶层建厂是运营动作，菜单权限已控）。
++ *
+  * <p><b>树裁剪接线</b>（本任务核心，FEAT-0002 组件首个真实消费方）：resolve(当前用户) →
+  * VisibleScope——allTenant 全树；受限用户只保留可见集节点及其到根的路径骨架（无权兄弟节点
+- * 不返回）；createByOnly 按空树返回（实例树属数据查询语义，ADR-0016 裁决 3/4）。列表同样
+- * 裁剪（id ∈ 可见集，brief 口径 createByOnly → 空集）；详情按裁决 2 走详情类 403
+- * （{@link DataPermAccessStrategy.DenyStrategy#SCOPE_FORBIDDEN} 首个真实消费点）。
++ * 不返回；骨架节点字段收窄为 id/instanceCode/instanceName/nodeType/status，修订轮 M-7，
++ * 与详情 403 的不泄露面一致）；短路条件仅看 instanceIds（修订轮 I-2：createByOnly 是
++ * 「存在 scope=4 角色」标记而非用户类别，混合角色可见集由部门角色产出，不得清空；纯
++ * scope=4 用户 instanceIds 本为空——树不挂 create_by 分支，层级导航视图 scope=4 不贡献
++ * 树可见性，ADR-0016 裁决 4 口径）。列表裁剪同口径且按裁决 4 补 OR 分支：
++ * {@code id ∈ 可见集 OR (createByOnly AND create_by=当前用户)}（实例属配置类对象）。
++ * 详情按裁决 2 走详情类 403（{@link DataPermAccessStrategy.DenyStrategy#SCOPE_FORBIDDEN}
++ * 首个真实消费点）。
+  *
+  * <p>字段白名单：新增/更新均不直接落请求实体——status 创建时强制 1、locked 创建时强制 0、
+  * tenant_id 会话覆盖、审计字段由 MetaObjectHandler 回填、deleted 不可经 API 注入；更新仅
+@@ -130,6 +140,12 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         // 父实例解析与校验（顶级 parentId=null/0）：存在性/同租户（插件注入）/status=1；
+         // 同步维护 ancestors（仿 sys_dept）与全码长度预检
+         IotModelInstance parent = resolveParent(form.getParentId());
++        // 修订轮 I-1：写路径数据权限防线（与读裁剪同源同口径）——顶级实例创建不受限
++        // （顶层建厂是运营动作，菜单权限已控）；子级创建的父实例必须 ∈ 可见集，否则受限用户
++        // 可在不可见子树下建实例（写原语穿透 TC-0002 红线）
++        if (parent != null) {
++            requireDataPerm(parent.getId(), "无权在该实例下创建子实例（数据权限不命中）");
++        }
+         String fullCode = buildFullCode(parent, form.getShortCode());
+ 
+         // 选模板语义（TD-0008）：设备/组件必填，模板存在、启用、node_type 一致
+@@ -266,6 +282,9 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         if (existing == null) {
+             throw paramError("实例不存在或已删除");
+         }
++        // 修订轮 I-1：写路径数据权限防线——编辑目标必须 ∈ 可见集（防「改绑 dept_id 反向扩大
++        // 可见集」的写原语穿透 TC-0002 红线，403 文案不泄露实例标识，与详情同范式）
++        requireDataPerm(existing.getId(), "无权操作该实例（数据权限不命中）");
+         validateImmutability(form, existing);
+ 
+         if (form.getStatus() != null && form.getStatus() != 0 && form.getStatus() != 1) {
+@@ -351,6 +370,25 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+             throw paramError("实例不存在或已删除: " + missing);
+         }
+ 
++        // 修订轮 I-1：写路径数据权限防线——删除目标必须 ∈ 可见集（批内任一不可见即整批拒绝，
++        // 403 文案不泄露实例标识；防线先于锁定校验，不向无权者泄露锁定状态）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant()) {
++            for (IotModelInstance target : existingList) {
++                if (!scope.instanceIds().contains(target.getId())) {
++                    throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该实例（数据权限不命中）");
++                }
++            }
++        }
++
++        // 修订轮 M-3：锁定实例禁止删除（REQ-0005「锁定后配置变更受限」含删除——锁定防线
++        // 此前只落在编辑）。fail-closed：批内任一锁定即整批拒绝
++        boolean anyLocked = existingList.stream()
++                .anyMatch(target -> target.getLocked() != null && target.getLocked() == 1);
++        if (anyLocked) {
++            throw paramError("实例已锁定，禁止删除");
++        }
++
+         // 子实例保护：有子实例（parent_id 引用）→ 拒并提示子实例编码（fail-closed，防孤儿节点）
+         List<IotModelInstance> children = this.list(new LambdaQueryWrapper<IotModelInstance>()
+                 .select(IotModelInstance::getId, IotModelInstance::getInstanceCode)
+@@ -374,9 +412,12 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+     public List<IotInstanceTreeVO> selectInstanceTree() {
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+ 
+-        // createByOnly：实例树属数据查询语义 → 空树（ADR-0016 裁决 3/4：仅本人对数据类=空集；
+-        // 可见集为空（无锚点命中/超限截断后空集）同口径短路，不查库）
+-        if (!scope.allTenant() && (scope.createByOnly() || scope.instanceIds().isEmpty())) {
++        // 修订轮 I-2：短路条件仅看 instanceIds——createByOnly 只是「存在 scope=4 角色」标记，
++        // 混合角色（scope∈{2,3,5} 与 4 并存）用户的可见集由部门角色产出（ADR-0016 裁决 4），
++        // 不得因 createByOnly 清空；纯 scope=4 用户 instanceIds 本为空，行为不变（空树）。
++        // 树不挂 create_by 分支：层级导航视图，scope=4 只对配置类列表生效（裁决 4/裁决 3
++        // 适用集），不贡献树可见性（口径留痕，随修订轮报告登记）
++        if (!scope.allTenant() && scope.instanceIds().isEmpty()) {
+             return List.of();
+         }
+ 
+@@ -390,8 +431,11 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         }
+ 
+         List<IotModelInstance> kept;
++        Set<Long> fullFieldIds;
+         if (scope.allTenant()) {
+             kept = all;
++            fullFieldIds = all.stream().map(IotModelInstance::getId)
++                    .collect(Collectors.toCollection(LinkedHashSet::new));
+         } else {
+             // 只保留可见集节点及其到根的路径节点：路径节点仅作骨架展示、无权兄弟节点不返回
+             // （REQ-0002 验收「实例树接口无权节点不返回」）。ancestors 逗号路径整 token 解析
+@@ -411,8 +455,10 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+                 return List.of();
+             }
+             kept = all.stream().filter(node -> keep.contains(node.getId())).collect(Collectors.toList());
++            // 修订轮 M-7：骨架路径节点（可见集之外的到根路径节点）字段收窄——骨架仅作导航展示
++            fullFieldIds = scope.instanceIds();
+         }
+-        return buildTree(kept);
++        return buildTree(kept, fullFieldIds);
+     }
+ 
+     /** ancestors 逗号路径 → 存在于当前行的祖先 id 集合（防御性：已删祖先 id 不补骨架） */
+@@ -437,7 +483,7 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+     }
+ 
+     /** 组装树：输入已按 sort,id 升序，groupingBy 保序 → 子节点天然有序；父不在场（骨架防御）的节点视作根 */
+-    private List<IotInstanceTreeVO> buildTree(List<IotModelInstance> nodes) {
++    private List<IotInstanceTreeVO> buildTree(List<IotModelInstance> nodes, Set<Long> fullFieldIds) {
+         Map<Long, List<IotModelInstance>> byParent = new HashMap<>();
+         Set<Long> presentIds = new LinkedHashSet<>();
+         for (IotModelInstance node : nodes) {
+@@ -449,22 +495,42 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         for (IotModelInstance node : nodes) {
+             Long parentId = node.getParentId() == null ? 0L : node.getParentId();
+             if (parentId == 0L || !presentIds.contains(parentId)) {
+-                roots.add(assemble(node, byParent));
++                roots.add(assemble(node, byParent, fullFieldIds));
+             }
+         }
+         return roots;
+     }
+ 
+-    private IotInstanceTreeVO assemble(IotModelInstance node, Map<Long, List<IotModelInstance>> byParent) {
+-        IotInstanceTreeVO vo = IotInstanceTreeVO.from(node);
++    private IotInstanceTreeVO assemble(IotModelInstance node, Map<Long, List<IotModelInstance>> byParent, Set<Long> fullFieldIds) {
++        // 修订轮 M-7：可见集节点全字段；骨架路径节点收窄为 id/instanceCode/instanceName/
++        // nodeType/status——与详情 403 的不泄露面一致（无权节点连详情都不可看，骨架不应
++        // 反而携带 deptId/templateId/locked 等锚点与配置面）
++        IotInstanceTreeVO vo = fullFieldIds.contains(node.getId())
++                ? IotInstanceTreeVO.from(node)
++                : skeletonVo(node);
+         List<IotInstanceTreeVO> children = new ArrayList<>();
+         for (IotModelInstance child : byParent.getOrDefault(node.getId(), List.of())) {
+-            children.add(assemble(child, byParent));
++            children.add(assemble(child, byParent, fullFieldIds));
+         }
+         vo.setChildren(children);
+         return vo;
+     }
+ 
++    /**
++     * 骨架节点（修订轮 M-7）：仅导航所需最小字段 id/instanceCode/instanceName/nodeType/status；
++     * deptId/templateId/appliedTemplateVersion/locked/parentId/ancestors/sort 不携带——
++     * 与详情 403 的不泄露面一致。
++     */
++    private IotInstanceTreeVO skeletonVo(IotModelInstance node) {
++        IotInstanceTreeVO vo = new IotInstanceTreeVO();
++        vo.setId(node.getId());
++        vo.setInstanceCode(node.getInstanceCode());
++        vo.setInstanceName(node.getInstanceName());
++        vo.setNodeType(node.getNodeType());
++        vo.setStatus(node.getStatus());
++        return vo;
++    }
++
+     // ---------- 列表（数据权限裁剪同样生效） ----------
+ 
+     @Override
+@@ -472,15 +538,31 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+         LambdaQueryWrapper<IotModelInstance> wrapper = new LambdaQueryWrapper<>();
+         if (!scope.allTenant()) {
+-            // brief 口径：createByOnly → 空集（与树查询同一数据查询语义，不做 OR create_by 分支）；
+-            // 可见集为空同口径短路（避免 IN () 空集 SQL）
+-            if (scope.createByOnly() || scope.instanceIds().isEmpty()) {
++            // 修订轮 I-2：createByOnly 只是「存在 scope=4 角色」标记（ADR-0016 裁决 4），
++            // 混合角色用户的可见集由部门角色产出，不得因 createByOnly 短路清空；纯 scope=4
++            // 用户 instanceIds 本为空 → 走 create_by 分支。实例属配置类对象（裁决 3 适用集：
++            // iot_ 配置表的管理面列表查询）
++            boolean hasVisible = !scope.instanceIds().isEmpty();
++            if (!hasVisible && !scope.createByOnly()) {
++                // 部门角色无锚点命中/截断空集：空集短路（避免 IN () 空集 SQL）
+                 page.setRecords(List.of());
+                 page.setTotal(0);
+                 return page;
+             }
+-            // 照 ADR-0016 裁决 6 点位类形态的实例版：id ∈ 可见集（配置类条件 instance_id IN）
+-            wrapper.in(IotModelInstance::getId, scope.instanceIds());
++            if (scope.createByOnly()) {
++                // ADR-0016 裁决 4：最终条件 = (id ∈ 可见集) OR (create_by = 当前用户，仅配置类)
++                // ——0010 评审 Minor③ 指出的 OR 分支在实例列表的真实回归
++                Long currentUserId = SecurityUtils.getUserId();
++                if (hasVisible) {
++                    wrapper.and(w -> w.in(IotModelInstance::getId, scope.instanceIds())
++                            .or().eq(IotModelInstance::getCreateBy, currentUserId));
++                } else {
++                    wrapper.eq(IotModelInstance::getCreateBy, currentUserId);
++                }
++            } else {
++                // 照 ADR-0016 裁决 6 点位类形态的实例版：id ∈ 可见集（配置类条件 instance_id IN）
++                wrapper.in(IotModelInstance::getId, scope.instanceIds());
++            }
+         }
+         if (query.getInstanceCode() != null) {
+             wrapper.like(IotModelInstance::getInstanceCode, SqlLikeUtils.escape(query.getInstanceCode()));
+@@ -529,6 +611,21 @@ public class IotModelInstanceServiceImpl extends ServiceImpl<IotModelInstanceMap
+ 
+     // ---------- 内部辅助 ----------
+ 
++    /**
++     * 写路径数据权限防线（修订轮 I-1，与读裁剪同源同口径）：resolve(当前用户) → VisibleScope，
++     * allTenant 直过；否则目标实例必须 ∈ 可见集，不在即 403——文案不泄露实例标识（照详情范式）。
++     *
++     * <p>依据 REQ-0002「菜单权限与数据权限分离」：「持编辑菜单 + 窄数据范围」是合法常态配置，
++     * 写原语不得穿透 TC-0002 红线（最 concrete 的升级链：把不可见实例的 dept_id 改绑到自己
++     * 部门，经组件步骤 3-4 子树展开后该不可见子树整体变为可见）。
++     */
++    private void requireDataPerm(Long targetId, String message) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(targetId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), message);
++        }
++    }
++
+     private void validateNodeType(Integer nodeType) {
+         if (nodeType == null || nodeType < NODE_TYPE_MIN || nodeType > NODE_TYPE_MAX) {
+             throw paramError("节点类型仅允许 1-5（1 工厂 2 车间 3 产线 4 设备 5 组件）");
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+index 79a6fb3..28b0ec3 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/instance/service/impl/IotModelInstanceServiceImplTest.java
+@@ -120,6 +120,9 @@ class IotModelInstanceServiceImplTest {
+         ReflectionTestUtils.setField(instanceService, "instanceCodeMapper", instanceCodeMapper);
+         ReflectionTestUtils.setField(instanceService, "deptMapper", deptMapper);
+         ReflectionTestUtils.setField(instanceService, "dataPermService", dataPermService);
++        // 修订轮 I-1：写路径（编辑/删除/带父创建）新增数据权限防线——默认注入全租户可见域
++        // 使既有写路径用例维持原语义；受限场景在各用例内显式覆盖 resolve(1L)
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
+     }
+ 
+     @AfterEach
+@@ -699,17 +702,52 @@ class IotModelInstanceServiceImplTest {
+         assertNotNull(eq, "可见子节点完整返回");
+         assertNull(flattenFind(tree, 3L), "WS02 无权不返回");
+         assertNull(flattenFind(tree, 5L), "F02 无权不返回");
++
++        // 修订轮 M-7：骨架路径节点字段收窄为 id/instanceCode/instanceName/nodeType/status
++        // ——与详情 403 的不泄露面一致（无权节点连详情都不可看，骨架不应反而更全）
++        assertEquals("F01", f01.getInstanceCode(), "骨架节点保留导航最小字段");
++        assertEquals("实例-F01", f01.getInstanceName());
++        assertEquals(Integer.valueOf(1), f01.getNodeType());
++        assertEquals(1, f01.getStatus());
++        assertNull(f01.getDeptId(), "骨架节点不携带 deptId（数据权限锚点面）");
++        assertNull(f01.getTemplateId(), "骨架节点不携带 templateId（配置面）");
++        assertNull(f01.getAppliedTemplateVersion());
++        assertNull(f01.getLocked());
++        assertNull(f01.getAncestors(), "骨架节点不携带 ancestors（全键面）");
++        assertNull(f01.getParentId());
++        assertNull(f01.getSort());
++        // 可见节点保持全字段（对照面）
++        assertEquals("0,1", ws01.getAncestors(), "夹具 WS01(id=2) ancestors=0,1");
++        assertEquals(Integer.valueOf(0), ws01.getLocked());
++        assertEquals(Integer.valueOf(1), ws01.getSort());
+     }
+ 
+     @Test
+-    @DisplayName("树 - createByOnly 空树（实例树属数据查询语义，ADR-0016 裁决 3/4）且不查库")
++    @DisplayName("树 - 纯仅本人（scope=4）空树：instanceIds 本为空，短路不查库；树不挂 create_by 分支")
+     void testTree_CreateByOnlyEmpty() {
+         when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(), Set.of(), true));
+ 
+         List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
+ 
+-        assertTrue(tree.isEmpty(), "仅本人对数据类=空集");
++        assertTrue(tree.isEmpty(), "纯仅本人用户 instanceIds 本为空 → 空树（修订轮 I-2：短路条件仅看 instanceIds；层级导航视图 scope=4 不贡献树可见性）");
+         verify(baseMapper, never()).selectList(any());
++        verify(baseMapper, never()).selectPage(any(), any());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-2 红转绿 - 混合角色（部门角色+仅本人）：树不被 createByOnly 清空，返回部门可见集+骨架")
++    void testTree_MixedRoleKeepsDeptVisibleSet() {
++        // scope=3（本部门）与 scope=4（仅本人）并存：组件裁决 4 产出 instanceIds={2,4} + createByOnly=true
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), true));
++        when(baseMapper.selectList(any())).thenReturn(fullFixture());
++
++        List<IotInstanceTreeVO> tree = instanceService.selectInstanceTree();
++
++        assertEquals(1, tree.size(), "混合角色用户的部门可见集不得被 createByOnly 清空");
++        assertNotNull(flattenFind(tree, 2L), "部门锚点子树可见");
++        assertNotNull(flattenFind(tree, 4L));
++        assertNull(flattenFind(tree, 3L), "部门可见集之外的节点仍不返回");
++        assertNull(flattenFind(tree, 5L));
+     }
+ 
+     @Test
+@@ -785,16 +823,52 @@ class IotModelInstanceServiceImplTest {
+     }
+ 
+     @Test
+-    @DisplayName("列表 - createByOnly 空集（brief 口径：与树同一数据查询语义）不查库")
+-    void testList_CreateByOnlyEmpty() {
++    @DisplayName("修订轮 I-2 红转绿 - 纯仅本人列表：create_by = me（ADR-0016 裁决 3/4：实例属配置类，行为从空集改为本人实例）")
++    void testList_PureCreateByOnlyQueriesByCreateBy() {
+         when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(), Set.of(), true));
+-        Page<IotModelInstance> page = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
+ 
+-        Page<IotModelInstance> result = instanceService.selectInstanceList(page, new IotModelInstance());
++        instanceService.selectInstanceList(new Page<>(1, 10), new IotModelInstance());
+ 
+-        assertEquals(0, result.getTotal());
+-        assertTrue(result.getRecords().isEmpty());
+-        verify(baseMapper, never()).selectPage(any(), any());
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("create_by"), "纯 scope=4 用户列表走 create_by 过滤（配置类对象）");
++        assertTrue(!sql.contains("id IN"), "可见集为空不发 IN ()");
++    }
++
++    @Test
++    @DisplayName("修订轮 I-2 红转绿 - 混合角色列表：id IN 可见集 OR create_by=me（ADR-0016 裁决 4 OR 分支落地）")
++    void testList_MixedRoleOrCreateBy() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), true));
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
++
++        instanceService.selectInstanceList(new Page<>(1, 10), new IotModelInstance());
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("id IN"), "混合角色保留部门可见集 IN 分支");
++        assertTrue(sql.contains("create_by"), "并存 scope=4 角色追加 create_by=me OR 分支（裁决 4）");
++        assertTrue(sql.indexOf("id IN") < sql.indexOf("create_by"), "OR 分支顺序：先 IN 后 create_by");
++    }
++
++    @Test
++    @DisplayName("列表 - 部门角色（无仅本人角色）：仅 id IN，无 create_by 分支")
++    void testList_DeptOnlyNoCreateByBranch() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectPage(any(), any())).thenReturn(new Page<>(1, 10));
++
++        instanceService.selectInstanceList(new Page<>(1, 10), new IotModelInstance());
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotModelInstance>> captor = ArgumentCaptor.captor();
++        verify(baseMapper).selectPage(any(), captor.capture());
++        String sql = captor.getValue().getSqlSegment();
++        assertTrue(sql.contains("id IN"));
++        assertTrue(!sql.contains("create_by"), "无 scope=4 角色不追加 create_by 分支");
+     }
+ 
+     @Test
+@@ -871,4 +945,122 @@ class IotModelInstanceServiceImplTest {
+         assertTrue(e.getMessage().contains("挪树"), "挂自身子孙=改父，随挪树禁止一并拒绝（防环验收）");
+         verify(baseMapper, never()).updateById(any(IotModelInstance.class));
+     }
++
++    // ---------- 修订轮 I-1：写路径数据权限防线（红转绿） ----------
++
++    @Test
++    @DisplayName("修订轮 I-1 红转绿 - 编辑：受限用户改绑不可见实例的 deptId → 403（写原语不得穿透数据权限）")
++    void testUpdate_InvisibleTarget403() {
++        // 可见集 {2,4}（车间子树）；F02(id=5) 不可见——最 concrete 的升级链：把不可见工厂
++        // 的绑部门改挂到自己部门，经组件步骤 3-4 子树展开后该不可见子树整体变为可见
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectById(5L)).thenReturn(instance(5L, "F02", 0L, "0", 1, 20L, 1, 2));
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(5L);
++        form.setDeptId(11L);
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.updateInstance(form));
++
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertEquals(403, e.getCode());
++        assertTrue(e.getMessage().contains("无权操作"), "文案与详情范式同源");
++        assertTrue(!e.getMessage().contains("F02"), "403 文案不泄露实例标识");
++        // 数据权限防线先于不可变字段/部门校验：不可见目标连存在性细节都不泄露
++        verify(deptMapper, never()).selectById(anyLong());
++        verify(baseMapper, never()).updateById(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 红转绿 - 删除：受限用户删除不可见实例 → 403（批内任一不可见即整批拒）")
++    void testDelete_InvisibleTarget403() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        IotModelInstance f02 = instance(5L, "F02", 0L, "0", 1, 20L, 1, 2);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(f02));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(List.of(5L)));
++
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertEquals(403, e.getCode());
++        assertTrue(!e.getMessage().contains("F02"), "403 文案不泄露实例标识");
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 红转绿 - 创建：受限用户在不可见父下创建 → 403")
++    void testCreate_InvisibleParent403() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectById(5L)).thenReturn(instance(5L, "F02", 0L, "0", 1, 20L, 1, 2));
++        when(deptMapper.selectById(11L)).thenReturn(dept(11L, "一车间", 1));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> instanceService.createInstance(createForm("WS99", 2, 5L, null, 11L)));
++
++        assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
++        assertEquals(403, e.getCode());
++        assertTrue(e.getMessage().contains("无权在该实例下创建"), "文案指向父实例越权且不泄露实例标识");
++        assertTrue(!e.getMessage().contains("F02"));
++        verify(baseMapper, never()).insert(any(IotModelInstance.class));
++        // 数据权限防线先于编码/模板/部门校验
++        verify(instanceCodeMapper, never()).selectOccupiedByCodes(anyLong(), anyCollection());
++        verify(modelTemplateMapper, never()).selectById(anyLong());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 - 顶级实例创建不受限（顶层建厂是运营动作，菜单权限已控）")
++    void testCreate_TopLevelUnrestrictedForRestrictedUser() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(deptMapper.selectById(10L)).thenReturn(dept(10L, "一厂", 1));
++        when(instanceCodeMapper.selectOccupiedByCodes(eq(1L), anyCollection())).thenReturn(Collections.emptyList());
++        when(baseMapper.insert(any(IotModelInstance.class))).thenReturn(1);
++
++        assertTrue(instanceService.createInstance(createForm("F09", 1, null, null, 10L)));
++
++        verify(baseMapper).insert(any(IotModelInstance.class));
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1 - 可见集内实例编辑照常放行（写校验与读裁剪同口径，不误伤）")
++    void testUpdate_VisibleTargetAllowed() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        when(baseMapper.selectById(2L)).thenReturn(instance(2L, "F01.WS01", 1L, "0,1", 2, 11L, 1, 1));
++        when(baseMapper.updateById(any(IotModelInstance.class))).thenReturn(1);
++        IotInstanceUpdateForm form = new IotInstanceUpdateForm();
++        form.setId(2L);
++        form.setInstanceName("改名");
++
++        assertTrue(instanceService.updateInstance(form));
++        verify(baseMapper).updateById(any(IotModelInstance.class));
++    }
++
++    // ---------- 修订轮 M-3：锁定实例禁止删除（红转绿） ----------
++
++    @Test
++    @DisplayName("修订轮 M-3 红转绿 - locked=1 实例禁止删除（REQ-0005 锁定后配置变更受限含删除）")
++    void testDelete_LockedRejected() {
++        IotModelInstance locked = instance(4L, "F01.WS02", 2L, "0,2", 2, 2L, 1, 2);
++        locked.setLocked(1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(locked));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(List.of(4L)));
++
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertEquals("实例已锁定，禁止删除", e.getMessage());
++        verify(baseMapper, never()).deleteByIds(any());
++    }
++
++    @Test
++    @DisplayName("修订轮 I-1×M-3 - 锁定且不可见实例删除 → 403（数据权限防线先于锁定防线，不泄露锁定状态）")
++    void testDelete_LockedAndInvisible403() {
++        when(dataPermService.resolve(1L)).thenReturn(new VisibleScope(false, Set.of(11L), Set.of(2L, 4L), false));
++        IotModelInstance lockedInvisible = instance(5L, "F02", 0L, "0", 1, 20L, 1, 2);
++        lockedInvisible.setLocked(1);
++        when(baseMapper.selectByIds(any())).thenReturn(List.of(lockedInvisible));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> instanceService.deleteInstances(List.of(5L)));
++
++        assertEquals(403, e.getCode(), "无权者仅见数据权限拒绝，不见「已锁定」状态");
++        assertTrue(!e.getMessage().contains("锁定"));
++        assertTrue(!e.getMessage().contains("F02"));
++        verify(baseMapper, never()).deleteByIds(any());
++    }
+ }

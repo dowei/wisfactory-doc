@@ -1,0 +1,2452 @@
+diff --git a/calc/README.md b/calc/README.md
+index 4ccd4f3..273bff7 100644
+--- a/calc/README.md
++++ b/calc/README.md
+@@ -27,6 +27,15 @@ calc/
+ │   ├── runtime/                    # 拉取对账循环（决策矩阵：新图成功才切换/失败保旧+回执）、
+ │   │                               #  GraphHolder（原子引用——切换语义承载）、
+ │   │                               #  ConfigChangedSubscriber（订阅缝占位 TD-0057）
++│   ├── executor/                   # 双触发统一执行器（TASK-0041）：
++│   │                               #  CalcPeriod（周期换算，同 0081 mapCalcPeriod 口径+MONTH/YEAR）、
++│   │                               #  DualTriggerExecutor（两通道同引擎/拓扑序/失败隔离/ResultSink）、
++│   │                               #  PeriodicScheduler（自实现调度线程）、RedisArrivalSubscriber
++│   │                               #  （真订阅 iot:newvalue:{tenant}，RESP2 零依赖客户端）、
++│   │                               #  WindowIdempotencyGuard（同秒合并节流+有界 TTL 幂等）、
++│   │                               #  RollupOperator（SUM/AVG/MAX/MIN+打码 7+开关关闭）、
++│   │                               #  ValueStore/ValueSample/CalcResult/ArithmeticEvaluator、
++│   │                               #  ExecutorRuntime（装配+生命周期+观测）
+ │   └── web/                        # /calc/v1/status 观测口（当前版本/最近对账/计数；
+ │                                   #  FEAT-0015 状态页数据源雏形，刻意不占 /internal/v1/**）
+ └── pom.xml                         # Spring Boot 4.1.0 + Java 21（Jackson 3 tools.jackson，TD-0058）
+@@ -42,6 +51,11 @@ calc/
+ | `CALC_TARGET_ID` | `calc` | 下发回执目标标识（与 backend `ot.publish.target-calc-id` 默认同源） |
+ | `CALC_SNAPSHOT_RECONCILE_SECONDS` | `300` | 快照对账周期（秒；拉取驱动，config.changed 订阅缝归 TD-0057） |
+ | `CALC_HTTP_ADDR` | `:8095` | HTTP 监听（Go 形态；端口纪律：8095 归 calc，启动前探测、用毕即停） |
++| `CALC_EXECUTOR_ENABLED` | `false` | 双触发执行器总开关（TASK-0041；false=0040 既有行为零变化，true=起周期调度+到达订阅） |
++| `CALC_REDIS_ADDR` | `127.0.0.1:6379` | 到达订阅的 Redis 地址（`iot:newvalue:{tenant}`；0029 发射侧真通道） |
++| `CALC_REDIS_PASSWORD` | 空 | Redis 密码（空=无 AUTH） |
++| `CALC_REDIS_DATABASE` | `0` | Redis DB |
++| `CALC_SCHEDULER_TICK_SECONDS` | `1` | 周期调度 tick 粒度（秒；低于所有周期项粒度即可命中整点） |
+ 
+ ## 消费语义（§3.3 p25 逐条对齐）
+ 
+@@ -66,6 +80,18 @@ calc/
+ - **对账驱动**：启动全量拉取 + 可配周期对账（默认 300s）；config.changed 订阅缝占位
+   （通知只作触发信号——真订阅归 TD-0057，NotifySender 真联调归 TD-0056）。
+ 
++## 双触发执行器（TASK-0041）
++
++两通道（周期调度 / 到达驱动）入同一执行器 `DualTriggerExecutor`，按依赖图拓扑序执行：
++
++- **周期调度**：`PeriodicScheduler`（自实现单线程调度， rationale 见 javadoc——快照动态周期无法用静态 @Scheduled 表达）；按数据项 `calc_period` 整点触发，结果时间戳对齐周期窗右边界；`CalcPeriod` 与 backend 0081 `mapCalcPeriod` 同款口径（calc 不依赖 backend）+ MONTH/YEAR。
++- **到达驱动**：`RedisArrivalSubscriber` 真订阅 `iot:newvalue:{tenant}`（0029 发射侧五键 payload），新值到达触发该数据项的下游可达子图重算；RESP2 零依赖客户端，断线指数退避重连。
++- **统一引擎**：`DualTriggerExecutor` 按拓扑序算；单节点失败只影响其下游（质量码 6、不发假 0、不阻塞其他分支）；公式项经 `ArithmeticEvaluator`（DELTA/INTEGRAL 归 0042，越界即单节点隔离失败）；汇总项经 `RollupOperator`（SUM/AVG/MAX/MIN 四法 + quality=7 子级贡献不纳入但保留打标 + 开关关闭不纳入 + 动态子级）。
++- **节流幂等**：`WindowIdempotencyGuard` 进程内有界 TTL 登记（key=数据项全键+周期窗，同窗只算一次、保留最后正确结果）；多实例 Redis 化为演进位。
++- **结果边界**：`ResultSink` 接口 + 内存假实现；执行器不写 TDengine/MySQL 业务表（st_metric_value 归 0045、数据项结果表后续），`CalcResult` 形态锁定 fullKey+来源标记(1/2/3)+统一值样本(value/quality/ts)。
++
++契约测试以 `Contract` 命名（CalcPeriodContractTest / DualTriggerExecutorContractTest / PeriodicSchedulerContractTest / CalcPropertiesTest）；真 Redis Pub/Sub 集成 `RedisArrivalSubscriberLiveTest` 由 `CALC_REDIS_TEST_ADDR` env 门控（未配自动跳过）。
++
+ ## 构建与检查
+ 
+ ```bash
+@@ -79,9 +105,8 @@ JDK HttpServer 假端点）在接线时零改动替换。
+ 
+ ## 边界
+ 
+-- 执行器/算子（TASK-0041/0042）、iot_calc_log/state 写（0041+/0063）、st_metric_value
+-  （0045）、状态判定（0049）不在本工程；本工程交付「快照消费 → 依赖图 → 原子切换 →
+-  ACK 闭环」，依赖图与拓扑序即 0041 的消费面。
++- 执行器双触发/汇总算子（TASK-0041，本工程 executor/ 包）已交付；DELTA/INTEGRAL 算子（0042）、指标聚合（0045）、状态判定（0049）、iot_calc_log/state 写（0063）仍按各自边界归后续道。
++- 本执行器不写 TDengine/MySQL 业务表：st_metric_value 归 0045、数据项结果表/Redis 缓存真实 Sink 归计算引擎后续；`ResultSink` 为实现替换缝，Metric 节点本执行器不计算（0045 边界）。
+ - `/calc/v1/status` 为观测口（无鉴权，内网面）；`/internal/v1/**` 是 §3.3/§3.4 契约
+   命名空间，本工程刻意不占用。
+ - 点位存在性不可校验：计算范围快照不装载点位/通道（派生规则 7）——refType=2 点位引用
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index 4760b04..3027b4c 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -5,6 +5,7 @@ import java.time.Clock;
+ import net.otlab.calc.ack.AckSender;
+ import net.otlab.calc.ack.HttpAckSender;
+ import net.otlab.calc.config.CalcProperties;
++import net.otlab.calc.executor.ExecutorRuntime;
+ import net.otlab.calc.graph.GraphBuilder;
+ import net.otlab.calc.runtime.ConfigChangedSubscriber;
+ import net.otlab.calc.runtime.GraphHolder;
+@@ -90,6 +91,17 @@ public class CalcEngineApplication {
+                 Clock.systemDefaultZone());
+     }
+ 
++    /** 双触发执行器运行时（TASK-0041；未显式启用时不启动后台线程） */
++    @Bean
++    public ExecutorRuntime executorRuntime(GraphHolder holder, CalcProperties properties) {
++        long tick = properties.getSchedulerTickSeconds() == null || properties.getSchedulerTickSeconds() < 1
++                ? 1 : properties.getSchedulerTickSeconds();
++        return new ExecutorRuntime(holder, properties.getTenant(),
++                properties.getRedisAddr(), properties.getRedisPassword(),
++                properties.getRedisDatabase() == null ? 0 : properties.getRedisDatabase(),
++                tick, 5L * 60L * 1000L, 4096);
++    }
++
+     /** config.changed 订阅缝占位（TD-0057 延续登记）：本期拉取驱动，通知不消费 */
+     @Bean
+     public ConfigChangedSubscriber configChangedSubscriber() {
+@@ -106,7 +118,8 @@ public class CalcEngineApplication {
+      * 空白 WARN（服务端 fail-closed 会拒——拉取失败可见，不哑跑）。
+      */
+     @Bean
+-    public ApplicationRunner calcStartupRunner(SnapshotReconciler reconciler, CalcProperties properties) {
++    public ApplicationRunner calcStartupRunner(SnapshotReconciler reconciler, ExecutorRuntime executorRuntime,
++                                               CalcProperties properties) {
+         return (ApplicationArguments args) -> {
+             if (properties.getBackendBaseUrl() == null || properties.getBackendBaseUrl().isBlank()) {
+                 throw new IllegalStateException("CALC_BACKEND_BASE_URL 未配置（计算引擎需要管理系统内部快照端点）");
+@@ -118,6 +131,13 @@ public class CalcEngineApplication {
+                 log.warn("[CALC] CALC_TENANT 未配置——计算 scope（scopeId=0）跨租户歧义时 backend 400 fail-closed");
+             }
+             reconciler.start();
++            if (properties.isExecutorEnabled()) {
++                executorRuntime.start();
++                log.info("[CALC] 双触发执行器已启用（周期调度 + Redis 到达订阅 {}）",
++                        executorRuntime.subscriber().channel());
++            } else {
++                log.info("[CALC] 双触发执行器未启用（calc.executor-enabled=false；0040 既有行为）");
++            }
+         };
+     }
+ }
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index 7ff8bb2..5c32165 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -35,6 +35,21 @@ public class CalcProperties {
+     /** HTTP 监听地址（":8095" / "0.0.0.0:8095" / "8095"） */
+     private String httpAddr = ":8095";
+ 
++    /** 双触发执行器总开关（TASK-0041；默认 false——未显式启用不启动调度/订阅） */
++    private boolean executorEnabled = false;
++
++    /** Redis 地址（到达驱动 Pub/Sub 订阅 iot:newvalue:{tenant}；空则不订阅） */
++    private String redisAddr = "127.0.0.1:6379";
++
++    /** Redis 密码（空=无 AUTH） */
++    private String redisPassword = "";
++
++    /** Redis DB（点位值回源/假实现；默认 0，与 ingest 生产 db0 同键空间） */
++    private Integer redisDatabase = 0;
++
++    /** 周期调度默认周期（秒；低于此值不调度；默认 1s——测试用短周期） */
++    private Integer schedulerTickSeconds = 1;
++
+     public String getBackendBaseUrl() {
+         return backendBaseUrl;
+     }
+@@ -83,6 +98,46 @@ public class CalcProperties {
+         this.httpAddr = httpAddr;
+     }
+ 
++    public boolean isExecutorEnabled() {
++        return executorEnabled;
++    }
++
++    public void setExecutorEnabled(boolean executorEnabled) {
++        this.executorEnabled = executorEnabled;
++    }
++
++    public String getRedisAddr() {
++        return redisAddr;
++    }
++
++    public void setRedisAddr(String redisAddr) {
++        this.redisAddr = redisAddr;
++    }
++
++    public String getRedisPassword() {
++        return redisPassword;
++    }
++
++    public void setRedisPassword(String redisPassword) {
++        this.redisPassword = redisPassword;
++    }
++
++    public Integer getRedisDatabase() {
++        return redisDatabase;
++    }
++
++    public void setRedisDatabase(Integer redisDatabase) {
++        this.redisDatabase = redisDatabase;
++    }
++
++    public Integer getSchedulerTickSeconds() {
++        return schedulerTickSeconds;
++    }
++
++    public void setSchedulerTickSeconds(Integer schedulerTickSeconds) {
++        this.schedulerTickSeconds = schedulerTickSeconds;
++    }
++
+     /**
+      * 解析监听地址中的端口（Go 形态 ":8095"；兼容 "8095" 与 "host:8095"）。
+      *
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+new file mode 100644
+index 0000000..fa43b2d
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/ArithmeticEvaluator.java
+@@ -0,0 +1,241 @@
++package net.otlab.calc.executor;
++
++import java.util.Map;
++import java.util.function.BiFunction;
++
++/**
++ * 轻量表达式求值器（0041 执行器范围内最小口径）：四则运算 + 括号 + 一元负号 +
++ * 标识符引用（fullKey / 点位编码）+ 数值字面量；比较运算 == != > >= < <= 与逻辑
++ * && || !（返回 1.0/0.0）；三元 ?: 。
++ *
++ * <p><b>边界</b>：DELTA/INTEGRAL 等内置算子归 TASK-0042，本求值器不实现——遇到
++ * 函数调用抛 {@link UnsupportedOperationException}，由执行器按「单节点失败隔离」
++ * 处理（质量码 6，不打假 0）。真 Aviator 归 FEAT-0012；本类仅满足 0041 拓扑级联/
++ * 汇总/失败隔离契约测试所需的确定性求值。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class ArithmeticEvaluator {
++
++    /** 标识符解析器（fullKey / 点位编码 → Double；缺失返回 null → 视为无值） */
++    @FunctionalInterface
++    public interface Resolver {
++        Double resolve(String identifier);
++    }
++
++    private final String src;
++    private final Resolver resolver;
++    private int pos;
++
++    private ArithmeticEvaluator(String src, Resolver resolver) {
++        this.src = src;
++        this.resolver = resolver;
++    }
++
++    /** 求值；任何解析/引用失败上抛 RuntimeException（由调用方隔离为单节点失败） */
++    public static double evaluate(String expression, Resolver resolver) {
++        ArithmeticEvaluator e = new ArithmeticEvaluator(expression, resolver);
++        double result = e.parseTernary();
++        e.skipWs();
++        if (e.pos < e.src.length()) {
++            throw new IllegalArgumentException("表达式尾部残留: " + e.src.substring(e.pos));
++        }
++        return result;
++    }
++
++    // ?: (lowest)
++    private double parseTernary() {
++        double cond = parseOr();
++        skipWs();
++        if (consume('?')) {
++            double a = parseTernary();
++            skipWs();
++            expect(':');
++            double b = parseTernary();
++            return cond != 0 ? a : b;
++        }
++        return cond;
++    }
++
++    private double parseOr() {
++        double v = parseAnd();
++        while (true) {
++            skipWs();
++            if (consume("||")) {
++                double r = parseAnd();
++                v = (v != 0 || r != 0) ? 1 : 0;
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseAnd() {
++        double v = parseEquality();
++        while (true) {
++            skipWs();
++            if (consume("&&")) {
++                double r = parseEquality();
++                v = (v != 0 && r != 0) ? 1 : 0;
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseEquality() {
++        double v = parseComparison();
++        while (true) {
++            skipWs();
++            if (consume("==")) {
++                double r = parseComparison();
++                v = r == v ? 1 : 0;
++            } else if (consume("!=")) {
++                double r = parseComparison();
++                v = r != v ? 1 : 0;
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseComparison() {
++        double v = parseAdditive();
++        while (true) {
++            skipWs();
++            if (consume(">=")) {
++                v = parseAdditive() >= v ? 1 : 0;
++            } else if (consume("<=")) {
++                v = parseAdditive() <= v ? 1 : 0;
++            } else if (consume(">")) {
++                double r = parseAdditive();
++                v = v > r ? 1 : 0;
++            } else if (consume("<")) {
++                double r = parseAdditive();
++                v = v < r ? 1 : 0;
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseAdditive() {
++        double v = parseMultiplicative();
++        while (true) {
++            skipWs();
++            if (consume('+')) {
++                v += parseMultiplicative();
++            } else if (consume('-')) {
++                v -= parseMultiplicative();
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseMultiplicative() {
++        double v = parseUnary();
++        while (true) {
++            skipWs();
++            if (consume('*')) {
++                v *= parseUnary();
++            } else if (consume('/')) {
++                double d = parseUnary();
++                if (d == 0) {
++                    throw new ArithmeticException("除零");
++                }
++                v /= d;
++            } else if (consume('%')) {
++                v %= parseUnary();
++            } else {
++                return v;
++            }
++        }
++    }
++
++    private double parseUnary() {
++        skipWs();
++        if (consume('!')) {
++            return parseUnary() == 0 ? 1 : 0;
++        }
++        if (consume('-')) {
++            return -parseUnary();
++        }
++        if (consume('+')) {
++            return parseUnary();
++        }
++        return parseAtom();
++    }
++
++    private double parseAtom() {
++        skipWs();
++        if (pos >= src.length()) {
++            throw new IllegalArgumentException("表达式意外结束");
++        }
++        char c = src.charAt(pos);
++        if (c == '(') {
++            pos++;
++            double v = parseTernary();
++            skipWs();
++            expect(')');
++            return v;
++        }
++        if (Character.isDigit(c) || c == '.') {
++            int start = pos;
++            while (pos < src.length()
++                    && (Character.isDigit(src.charAt(pos)) || src.charAt(pos) == '.')) {
++                pos++;
++            }
++            return Double.parseDouble(src.substring(start, pos));
++        }
++        if (Character.isJavaIdentifierStart(c)) {
++            int start = pos;
++            while (pos < src.length()
++                    && (Character.isJavaIdentifierPart(src.charAt(pos)) || src.charAt(pos) == '.')) {
++                pos++;
++            }
++            String ident = src.substring(start, pos);
++            if (consume('(')) {
++                throw new UnsupportedOperationException("内置算子/函数调用不在 0041 求值范围: " + ident
++                        + "（DELTA/INTEGRAL 归 TASK-0042）");
++            }
++            Double value = resolver.resolve(ident);
++            if (value == null) {
++                throw new IllegalStateException("无值输入: " + ident);
++            }
++            return value;
++        }
++        throw new IllegalArgumentException("非法字符: " + c + " @ " + pos);
++    }
++
++    private void skipWs() {
++        while (pos < src.length() && Character.isWhitespace(src.charAt(pos))) {
++            pos++;
++        }
++    }
++
++    private boolean consume(char c) {
++        skipWs();
++        if (pos < src.length() && src.charAt(pos) == c) {
++            pos++;
++            return true;
++        }
++        return false;
++    }
++
++    private boolean consume(String s) {
++        skipWs();
++        if (src.startsWith(s, pos)) {
++            pos += s.length();
++            return true;
++        }
++        return false;
++    }
++
++    private void expect(char c) {
++        if (!consume(c)) {
++            throw new IllegalArgumentException("期望 '" + c + "' @ " + pos + ": " + src);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java b/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java
+new file mode 100644
+index 0000000..ba3c1fa
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/CalcPeriod.java
+@@ -0,0 +1,124 @@
++package net.otlab.calc.executor;
++
++/**
++ * 计算周期（TASK-0041 brief 决策 1）。
++ *
++ * <p>calc 侧独立实现——与 backend TASK-0081 public 的 {@code mapCalcPeriod} 同款口径
++ * （null/空白→0 到达驱动、纯数字串→秒直取、SECOND/MINUTE/HOUR/DAY 大小写不敏感），
++ * 另按 brief 增加 MONTH/YEAR 日历周期。calc 不依赖 backend 代码。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcPeriod {
++
++    /** 周期种类 */
++    public enum Kind {
++        /** calc_period=0：到达驱动，不参与周期调度 */
++        ARRIVAL,
++        /** 固定秒数周期（SECOND/MINUTE/HOUR/DAY 或秒数值） */
++        FIXED,
++        /** 自然月 */
++        MONTH,
++        /** 自然年 */
++        YEAR
++    }
++
++    /** 周期边界（左闭右开，epoch 毫秒） */
++    public record Boundary(long startMillis, long endMillis) {
++    }
++
++    private final Kind kind;
++    private final long seconds;
++
++    private CalcPeriod(Kind kind, long seconds) {
++        this.kind = kind;
++        this.seconds = seconds;
++    }
++
++    public static CalcPeriod arrival() {
++        return new CalcPeriod(Kind.ARRIVAL, 0);
++    }
++
++    /** long 秒数版本（调度器按 periodMs 反推） */
++    public static CalcPeriod fromSecondsLong(long seconds) {
++        if (seconds <= 0) {
++            return new CalcPeriod(Kind.FIXED, 1);
++        }
++        return new CalcPeriod(Kind.FIXED, seconds);
++    }
++
++    /** 数据项 calc_period（秒 int）→ CalcPeriod；0/null=到达驱动 */
++    public static CalcPeriod fromSeconds(Integer seconds) {
++        if (seconds == null || seconds == 0) {
++            return arrival();
++        }
++        if (seconds < 0) {
++            throw new IllegalArgumentException("calc_period 不可为负: " + seconds);
++        }
++        return new CalcPeriod(Kind.FIXED, seconds);
++    }
++
++    /**
++     * 周期码 → CalcPeriod（与 backend mapCalcPeriod 同款口径 + MONTH/YEAR）。
++     * 未知码 fail-closed（不静默退化为到达驱动）。
++     */
++    public static CalcPeriod fromCode(String code) {
++        if (code == null || code.isBlank()) {
++            return arrival();
++        }
++        String value = code.trim();
++        if (value.matches("\\d+")) {
++            return fromSeconds((int) Long.parseLong(value));
++        }
++        return switch (value.toUpperCase(java.util.Locale.ROOT)) {
++            case "SECOND" -> new CalcPeriod(Kind.FIXED, 1);
++            case "MINUTE" -> new CalcPeriod(Kind.FIXED, 60);
++            case "HOUR" -> new CalcPeriod(Kind.FIXED, 3600);
++            case "DAY" -> new CalcPeriod(Kind.FIXED, 86400);
++            case "MONTH" -> new CalcPeriod(Kind.MONTH, 0);
++            case "YEAR" -> new CalcPeriod(Kind.YEAR, 0);
++            default -> throw new IllegalArgumentException("无法识别的计算周期码: " + code);
++        };
++    }
++
++    public Kind kind() {
++        return kind;
++    }
++
++    public boolean isArrival() {
++        return kind == Kind.ARRIVAL;
++    }
++
++    public long seconds() {
++        return seconds;
++    }
++
++    /** 计算给定时刻所在周期窗（UTC 对齐；固定秒数自 epoch 起算，月/年按日历） */
++    public Boundary boundaryOf(long epochMillis) {
++        if (epochMillis < 0) {
++            throw new IllegalArgumentException("epochMillis 不可为负: " + epochMillis);
++        }
++        java.time.ZonedDateTime t = java.time.Instant.ofEpochMilli(epochMillis)
++                .atZone(java.time.ZoneOffset.UTC);
++        java.time.ZonedDateTime start;
++        java.time.ZonedDateTime end;
++        switch (kind) {
++            case MONTH -> {
++                start = t.withDayOfMonth(1).truncatedTo(java.time.temporal.ChronoUnit.DAYS);
++                end = start.plusMonths(1);
++            }
++            case YEAR -> {
++                start = t.withDayOfYear(1).truncatedTo(java.time.temporal.ChronoUnit.DAYS);
++                end = start.plusYears(1);
++            }
++            case FIXED -> {
++                long span = seconds * 1000L;
++                long bucket = (epochMillis / span) * span;
++                return new Boundary(bucket, bucket + span);
++            }
++            default -> throw new IllegalStateException("到达驱动项无周期边界");
++        }
++        return new Boundary(start.toInstant().toEpochMilli(), end.toInstant().toEpochMilli());
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/CalcResult.java b/calc/src/main/java/net/otlab/calc/executor/CalcResult.java
+new file mode 100644
+index 0000000..6f8c518
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/CalcResult.java
+@@ -0,0 +1,40 @@
++package net.otlab.calc.executor;
++
++import java.util.List;
++import java.util.Objects;
++
++/**
++ * 执行器产出的单节点结果（ResultSink 边界载荷，brief 决策 5）。
++ *
++ * <p>结果形态锁定：fullKey + 来源标记（DIRECT 1 / FORMULA 2 / ROLLUP 3，对齐
++ * iot_data_item.source_type）+ 一个统一值样本（value/quality/ts，与直绑值同构——
++ * REQ-0020 验收 4）。失败节点不产「假 0」（CONV-02：quality=6 计算失败，
++ * CALC_ERR 不落时序行——统一消息码表 CALC_ERR 口径）；失败结果仅经
++ * {@link #error()} 携带原因供日志/iot_calc_log（0063）消费，不写 value。
++ *
++ * @param fullKey   数据项全键
++ * @param sourceType 来源标记 1/2/3
++ * @param sample    统一值样本（成功时非空；quality 随计算结果打标）
++ * @param error     失败原因（成功时 null）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record CalcResult(String fullKey, int sourceType, ValueSample sample, String error) {
++
++    public CalcResult {
++        Objects.requireNonNull(fullKey, "fullKey");
++    }
++
++    public static CalcResult success(String fullKey, int sourceType, ValueSample sample) {
++        return new CalcResult(fullKey, sourceType, Objects.requireNonNull(sample, "sample"), null);
++    }
++
++    /** 失败结果（无样本——不写假值） */
++    public static CalcResult failure(String fullKey, int sourceType, String error) {
++        return new CalcResult(fullKey, sourceType, null, error);
++    }
++
++    public boolean isSuccess() {
++        return sample != null;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+new file mode 100644
+index 0000000..015013c
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/DualTriggerExecutor.java
+@@ -0,0 +1,302 @@
++package net.otlab.calc.executor;
++
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import net.otlab.calc.graph.DependencyGraph;
++import net.otlab.calc.graph.EdgeType;
++import net.otlab.calc.graph.GraphEdge;
++import net.otlab.calc.graph.GraphNode;
++import net.otlab.calc.graph.NodeKind;
++import net.otlab.calc.snapshot.DataItem;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 双触发统一执行引擎（TASK-0041 核心，brief 决策 1/2/3/4/5）。
++ *
++ * <p>两通道（周期调度 / 到达驱动）入同一执行器 {@link #execute(Trigger, DependencyGraph)}：
++ * 按依赖图拓扑序执行；单节点失败只影响其下游（标记失败 + 日志、质量码 6、不发假 0），
++ * 不阻塞其他分支；汇总节点按 rollup 配置动态查找子级，SUM/AVG/MAX/MIN 四法，
++ * 缺失打码 7、开关关闭不纳入；结果经 {@link ResultSink} 落地边界产出（不写 TDengine/
++ * MySQL 业务表）。
++ *
++ * <p>到达通道以触发项的 fullKey 为根，仅重算其下游可达子图（影响面收敛）；周期通道
++ * 执行整图的周期项（calc_period>0 或汇总项），结果时间戳对齐周期边界（右边界）。
++ *
++ * <p>同项同窗口幂等由 {@link WindowIdempotencyGuard} 在执行器入口判定——DUPLICATE
++ * 直接返回空结果集（保留最后一次正确结果，不重复产出）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class DualTriggerExecutor {
++
++    private static final Logger log = LoggerFactory.getLogger(DualTriggerExecutor.class);
++
++    private final ValueStore store;
++    private final WindowIdempotencyGuard guard;
++    private final ResultSink sink;
++    private final RollupOperator rollup;
++    /** 最近一次执行的节点访问序（观测/契约测试断言拓扑顺序） */
++    private volatile List<String> lastVisitOrder = List.of();
++
++    public DualTriggerExecutor(ValueStore store, WindowIdempotencyGuard guard, ResultSink sink) {
++        this(store, guard, sink, new RollupOperator());
++    }
++
++    public DualTriggerExecutor(ValueStore store, WindowIdempotencyGuard guard, ResultSink sink,
++                               RollupOperator rollup) {
++        this.store = store;
++        this.guard = guard;
++        this.sink = sink;
++        this.rollup = rollup;
++    }
++
++    public ValueStore store() {
++        return store;
++    }
++
++    public ResultSink sink() {
++        return sink;
++    }
++
++    public List<String> lastVisitOrder() {
++        return lastVisitOrder;
++    }
++
++    /**
++     * 统一执行入口。
++     *
++     * @return 本次产出的结果（含失败项 sample=null）；幂等重复返回空列表
++     */
++    public List<CalcResult> execute(Trigger trigger, DependencyGraph graph) {
++        String windowKey = trigger.windowKey();
++        if (windowKey != null && guard.tryAcquire(windowKey, trigger.at()) == WindowIdempotencyGuard.Decision.DUPLICATE) {
++            log.info("[CALC-EXEC] 节流/幂等命中（同窗只算一次，保留最后正确结果）window={} trigger={}",
++                    windowKey, trigger.kind());
++            return List.of();
++        }
++        Set<String> targets = selectTargets(trigger, graph);
++        long ts = resultTimestamp(trigger, graph);
++        List<String> visitOrder = new ArrayList<>();
++        Map<String, CalcResult> results = new LinkedHashMap<>();
++        Set<String> failed = new HashSet<>();
++
++        for (String key : graph.getTopoOrder()) {
++            if (!targets.contains(key)) {
++                continue;
++            }
++            GraphNode node = graph.node(key);
++            if (node == null) {
++                continue;
++            }
++            visitOrder.add(key);
++            // 点位节点无计算（其输入由到达事件/外部源写入 store）。缺数不记失败传播——
++            // 它是「无值」（CONV-02 缺失打码、不写假 0），下游公式求值/汇总按无值口径自然
++            // 失败或打码 7，不阻塞其他分支。
++            if (node.kind() == NodeKind.POINT) {
++                continue;
++            }
++            // 上游计算失败（真失败：表达式错误/函数不支持/上游项失败）→ 仅影响下游分支。
++            // 注意：缺数的点位不在 failed 集，故「上游缺数」走下游自身求值口径（失败或打码 7）。
++            // 汇总边例外：子级缺数属「汇总不完整」（quality=7）而非失败传播——按 brief 决策 4。
++            Set<String> deps = hardDependencies(key, graph);
++            if (!disjoint(deps, failed)) {
++                markFailed(key, node, "上游节点失败（依赖链传播）", results, failed, visitOrder);
++                continue;
++            }
++            if (node.kind() == NodeKind.METRIC) {
++                // 指标聚合归 TASK-0045——本执行器不计算指标（登记边界）
++                continue;
++            }
++            DataItem item = node.item();
++            if (item == null) {
++                markFailed(key, node, "节点无数据项定义", results, failed, visitOrder);
++                continue;
++            }
++            if (item.getEnabled() != null && item.getEnabled() == 0) {
++                // 开关关闭：新增项默认不参与（ADR-0008 T1）——不产出
++                continue;
++            }
++            if (!trigger.isArrival() && isArrivalDriven(item)) {
++                // 周期通道只算周期项：calc_period=0/null 的到达驱动项不参与周期计算
++                // （brief 决策 1：周期调度按数据项 calc_period 整点触发）
++                continue;
++            }
++            try {
++                CalcResult result = computeItem(item, node, graph, ts);
++                results.put(key, result);
++                if (result.isSuccess()) {
++                    store.put(key, result.sample());
++                } else {
++                    failed.add(key);
++                }
++            } catch (RuntimeException e) {
++                log.error("[CALC-EXEC] 单节点计算失败（隔离，不阻塞整图）key={} reason={}", key, e.getMessage());
++                markFailed(key, node, e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(),
++                        results, failed, visitOrder);
++            }
++        }
++        lastVisitOrder = List.copyOf(visitOrder);
++        List<CalcResult> out = List.copyOf(results.values());
++        sink.accept(trigger, out);
++        log.info("[CALC-EXEC] 执行完成 trigger={} nodes={} results={} failed={} topo={}",
++                trigger.kind(), visitOrder.size(), out.size(), failed.size(), visitOrder);
++        return out;
++    }
++
++    /** 执行前写入到达新值（到达驱动触发源——0029 事件五键）。供 Subscriber 调用。 */
++    public void acceptNewValue(String key, ValueSample sample) {
++        store.put(key, sample);
++    }
++
++    private CalcResult computeItem(DataItem item, GraphNode node, DependencyGraph graph, long ts) {
++        int sourceType = item.getSourceType() == null ? 1 : item.getSourceType();
++        String key = node.key();
++        return switch (sourceType) {
++            case 1 -> {
++                ValueSample sample = store.get(key);
++                if (sample == null) {
++                    yield CalcResult.failure(key, 1, "直绑项无值");
++                }
++                yield CalcResult.success(key, 1, sample);
++            }
++            case 2 -> {
++                String formula = item.getFormula();
++                if (formula == null || formula.isBlank()) {
++                    throw new IllegalStateException("公式项缺表达式");
++                }
++                double value = ArithmeticEvaluator.evaluate(formula,
++                        id -> {
++                            ValueSample s = store.get(id);
++                            return s == null ? null : s.value();
++                        });
++                yield CalcResult.success(key, 2, ValueSample.of(value, ts));
++            }
++            case 3 -> {
++                RollupOperator.Method method = RollupOperator.Method.parse(item.getRollupMethod());
++                List<RollupOperator.Child> children = childSamples(key, graph);
++                RollupOperator.RollupResult r = rollup.evaluate(method, children, ts);
++                yield CalcResult.success(key, 3, r.sample());
++            }
++            default -> throw new IllegalStateException("未知 sourceType: " + sourceType);
++        };
++    }
++
++    /** 动态查找子级（按 rollup 边，本次求值实时读取 store——新增子级下一周期自动纳入） */
++    private List<RollupOperator.Child> childSamples(String rollupKey, DependencyGraph graph) {
++        List<RollupOperator.Child> children = new ArrayList<>();
++        for (GraphEdge edge : graph.getEdges()) {
++            if (edge.type() == EdgeType.ROLLUP && edge.from().equals(rollupKey)) {
++                GraphNode child = graph.node(edge.to());
++                boolean enabled = child == null || child.item() == null
++                        || child.item().getEnabled() == null || child.item().getEnabled() != 0;
++                children.add(new RollupOperator.Child(edge.to(), store.get(edge.to()), enabled));
++            }
++        }
++        return children;
++    }
++
++    /** 选择本次执行的目标节点集 */
++    private Set<String> selectTargets(Trigger trigger, DependencyGraph graph) {
++        Set<String> all = new LinkedHashSet<>();
++        if (!trigger.isArrival()) {
++            // 周期通道：整图（点位/指标节点在计算中自然跳过）
++            all.addAll(graph.getTopoOrder());
++            return all;
++        }
++        // 到达通道：触发项 + 其下游可达子图（收敛影响面）
++        Set<String> downstream = downstreamOf(trigger.fullKey(), graph);
++        all.addAll(downstream);
++        return all;
++    }
++
++    /** 从根出发，按「from 依赖 to」反向求下游（谁依赖我） */
++    static Set<String> downstreamOf(String root, DependencyGraph graph) {
++        Map<String, Set<String>> dependents = new LinkedHashMap<>();
++        for (GraphEdge edge : graph.getEdges()) {
++            dependents.computeIfAbsent(edge.to(), k -> new LinkedHashSet<>()).add(edge.from());
++        }
++        Set<String> seen = new LinkedHashSet<>();
++        seen.add(root);
++        java.util.Deque<String> queue = new java.util.ArrayDeque<>();
++        queue.add(root);
++        while (!queue.isEmpty()) {
++            String cur = queue.remove();
++            for (String next : dependents.getOrDefault(cur, Set.of())) {
++                if (seen.add(next)) {
++                    queue.add(next);
++                }
++            }
++        }
++        return seen;
++    }
++
++    /** 结果时间戳：周期项=周期窗右边界；到达项=事件 ts（brief 决策 1） */
++    private long resultTimestamp(Trigger trigger, DependencyGraph graph) {
++        if (!trigger.isArrival()) {
++            long periodSec = Math.max(1L, trigger.periodMs() / 1000L);
++            CalcPeriod.Boundary b = CalcPeriod.fromSecondsLong(periodSec).boundaryOf(trigger.at());
++            return b.endMillis();
++        }
++        return trigger.at();
++    }
++
++    private void markFailed(String key, GraphNode node, String reason,
++                            Map<String, CalcResult> results, Set<String> failed, List<String> visitOrder) {
++        int sourceType = node.item() == null || node.item().getSourceType() == null
++                ? 1 : node.item().getSourceType();
++        results.put(key, CalcResult.failure(key, sourceType, reason));
++        failed.add(key);
++        log.error("[CALC-EXEC] 单节点失败（隔离，不发假 0）key={} reason={}", key, reason);
++    }
++
++    /** 到达驱动项（calc_period 0/null）——周期通道跳过 */
++    private static boolean isArrivalDriven(DataItem item) {
++        Long period = item.getCalcPeriod();
++        return period == null || period <= 0;
++    }
++
++    /** 硬依赖（排除汇总边——子级缺数走 quality=7，不算失败传播） */
++    private static Set<String> hardDependencies(String key, DependencyGraph graph) {
++        Set<String> out = new LinkedHashSet<>();
++        for (GraphEdge edge : graph.getEdges()) {
++            if (edge.from().equals(key) && edge.type() != EdgeType.ROLLUP) {
++                out.add(edge.to());
++            }
++        }
++        return out;
++    }
++
++    private static boolean disjoint(Set<String> a, Set<String> b) {
++        for (String x : a) {
++            if (b.contains(x)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    /** 供调度器构造固定秒数周期边界 */
++    public static long boundaryEnd(long periodMs, long atMillis) {
++        if (periodMs <= 0) {
++            throw new IllegalArgumentException("periodMs 须 > 0");
++        }
++        long bucket = (atMillis / periodMs) * periodMs;
++        return bucket + periodMs;
++    }
++
++    /** 供调度器构造固定秒数周期窗键 */
++    public static String windowKey(String fullKey, long periodMs, long atMillis) {
++        return fullKey + "@" + (atMillis / Math.max(1L, periodMs));
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+new file mode 100644
+index 0000000..4edc9d2
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/ExecutorRuntime.java
+@@ -0,0 +1,162 @@
++package net.otlab.calc.executor;
++
++import java.time.Instant;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++import net.otlab.calc.graph.DependencyGraph;
++import net.otlab.calc.runtime.GraphHolder;
++import net.otlab.calc.snapshot.DataItem;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 执行器运行时（TASK-0041 装配面）：持有统一执行器、输入值存储、幂等守卫、结果 Sink、
++ * 周期调度器与到达订阅器，暴露运维观测口数据（供 /calc/v1/status 扩展或 live 断言）。
++ *
++ * <p>生命周期：{@link #start()} 由启动Runner在 executorEnabled 时调用（先起周期调度、
++ * 再起 Redis 订阅）；{@link #stop()} 由 Spring destroy 逆序关闭。executorEnabled=false
++ * 时两者都不启动（默认——未显式配置的部署不引入后台线程，0040 既有行为零变化）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class ExecutorRuntime implements AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(ExecutorRuntime.class);
++
++    private final GraphHolder holder;
++    private final String tenant;
++    private final ValueStore store = new ValueStore();
++    private final WindowIdempotencyGuard guard;
++    private final ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
++    private final DualTriggerExecutor executor;
++    private final PeriodicScheduler scheduler;
++    private final RedisArrivalSubscriber subscriber;
++    private final AtomicLong arrivals = new AtomicLong();
++    private final AtomicLong throttled = new AtomicLong();
++    private final Map<String, Long> lastWindow = new ConcurrentHashMap<>();
++    private volatile boolean started = false;
++
++    public ExecutorRuntime(GraphHolder holder, String tenant, String redisAddr, String redisPassword,
++                           int redisDatabase, long tickSeconds, long guardTtlMillis, int guardMaxEntries) {
++        this.holder = holder;
++        this.tenant = tenant;
++        this.guard = new WindowIdempotencyGuard(guardMaxEntries, guardTtlMillis);
++        this.executor = new DualTriggerExecutor(store, guard, sink);
++        this.scheduler = new PeriodicScheduler(holder, executor, guard, tickSeconds);
++        this.subscriber = new RedisArrivalSubscriber(redisAddr, redisPassword, redisDatabase, tenant,
++                (pointCode, sample) -> {
++                    arrivals.incrementAndGet();
++                    long now = sample.ts();
++                    executor.acceptNewValue(pointCode, sample);
++                    // 同秒合并：key=数据项全键（点位编码）+ 秒窗（brief 决策 2）
++                    String windowKey = DualTriggerExecutor.windowKey(pointCode, 1000L, now);
++                    lastWindow.put(pointCode, now);
++                    net.otlab.calc.runtime.AppliedGraph applied = holder.current();
++                    if (applied == null) {
++                        return;
++                    }
++                    Trigger trigger = Trigger.arrival(pointCode, windowKey, now);
++                    List<net.otlab.calc.executor.CalcResult> out = executor.execute(trigger, applied.graph());
++                    if (out.isEmpty()) {
++                        throttled.incrementAndGet();
++                    }
++                });
++    }
++
++    /** 启动（executorEnabled 时由启动Runner调用） */
++    public synchronized void start() {
++        if (started) {
++            return;
++        }
++        started = true;
++        scheduler.start();
++        subscriber.start();
++        log.info("[CALC-RUNTIME] 双触发执行器已启动 tenant={} channel={} tick={}s",
++                tenant, subscriber.channel(), "配置");
++    }
++
++    public ValueStore store() {
++        return store;
++    }
++
++    public DualTriggerExecutor executor() {
++        return executor;
++    }
++
++    public ResultSink.InMemoryResultSink sink() {
++        return sink;
++    }
++
++    public WindowIdempotencyGuard guard() {
++        return guard;
++    }
++
++    public PeriodicScheduler scheduler() {
++        return scheduler;
++    }
++
++    public RedisArrivalSubscriber subscriber() {
++        return subscriber;
++    }
++
++    public long arrivals() {
++        return arrivals.get();
++    }
++
++    public long throttled() {
++        return throttled.get();
++    }
++
++    /** 观测视图（供状态口/live 断言） */
++    public Map<String, Object> view() {
++        Map<String, Object> v = new ConcurrentHashMap<>();
++        v.put("started", started);
++        v.put("channel", subscriber.channel());
++        v.put("tickSeconds", "see-config");
++        v.put("arrivals", arrivals.get());
++        v.put("throttled", throttled.get());
++        v.put("windowEntries", guard.size());
++        v.put("deliveries", sink.deliveries().size());
++        v.put("lastVisitOrder", executor.lastVisitOrder());
++        v.put("lastWindow", Map.copyOf(lastWindow));
++        // 最近一次交付的结果摘要（live 冒烟/观测用；完整结果面归 ResultSink）
++        java.util.List<Map<String, Object>> results = new java.util.ArrayList<>();
++        java.util.List<ResultSink.InMemoryResultSink.Delivery> ds = sink.deliveries();
++        if (!ds.isEmpty()) {
++            for (CalcResult r : ds.get(ds.size() - 1).results()) {
++                Map<String, Object> rm = new java.util.LinkedHashMap<>();
++                rm.put("fullKey", r.fullKey());
++                rm.put("sourceType", r.sourceType());
++                if (r.sample() != null) {
++                    rm.put("value", r.sample().value());
++                    rm.put("quality", r.sample().quality());
++                    rm.put("ts", r.sample().ts());
++                } else {
++                    rm.put("error", r.error());
++                }
++                results.add(rm);
++            }
++        }
++        v.put("lastResults", results);
++        return v;
++    }
++
++    public synchronized void stop() {
++        if (!started) {
++            return;
++        }
++        subscriber.close();
++        scheduler.stop();
++        started = false;
++        log.info("[CALC-RUNTIME] 双触发执行器已停止");
++    }
++
++    @Override
++    public void close() {
++        stop();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java b/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java
+new file mode 100644
+index 0000000..eb76d76
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/PeriodicScheduler.java
+@@ -0,0 +1,129 @@
++package net.otlab.calc.executor;
++
++import java.time.Instant;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++
++import net.otlab.calc.graph.DependencyGraph;
++import net.otlab.calc.runtime.GraphHolder;
++import net.otlab.calc.snapshot.DataItem;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 周期调度器（brief 决策 1）：按数据项 calc_period（秒；HOUR/DAY/MONTH/YEAR 经
++ * {@link CalcPeriod} 同款口径换算）整点触发；结果时间戳对齐周期边界。
++ *
++ * <p><b>取向</b>：自实现单线程 {@link ScheduledExecutorService}（非 Spring @Scheduled）——
++ * 计算引擎是独立进程，周期项来自运行时快照（动态配置），@Scheduled 的 cron 是编译期
++ * 静态表达式，无法表达「按数据项配置的 N 秒周期 + 运行时换图即时生效」；自实现线程
++ * 与 SnapshotReconciler 同款范式（daemon 线程、fail-soft 异常兜底不终止调度），
++ * 换图后下一次 tick 自然读新图，零重注册。
++ *
++ * <p>调度粒度=tickSeconds（默认 1s；最小粒度小于所有周期项，因此任一整点都能在
++ * 下一个 tick 命中）；命中判据=当前时刻跨过周期边界（at % period == 0 的边界点），
++ * 用 {@link WindowIdempotencyGuard} 保证同一周期窗只触发一次（进程重启后由窗口键
++ * 去重——多实例化登记演进位）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class PeriodicScheduler {
++
++    private static final Logger log = LoggerFactory.getLogger(PeriodicScheduler.class);
++
++    private final GraphHolder holder;
++    private final DualTriggerExecutor executor;
++    private final WindowIdempotencyGuard guard;
++    private final long tickSeconds;
++    private final Map<String, Long> lastFiredBucket = new ConcurrentHashMap<>();
++    private volatile ScheduledExecutorService scheduler;
++
++    public PeriodicScheduler(GraphHolder holder, DualTriggerExecutor executor,
++                             WindowIdempotencyGuard guard, long tickSeconds) {
++        if (tickSeconds < 1) {
++            throw new IllegalArgumentException("tickSeconds 须 >= 1");
++        }
++        this.holder = holder;
++        this.executor = executor;
++        this.guard = guard;
++        this.tickSeconds = tickSeconds;
++    }
++
++    public synchronized void start() {
++        if (scheduler != null) {
++            return;
++        }
++        scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
++            Thread t = new Thread(r, "calc-periodic-scheduler");
++            t.setDaemon(true);
++            return t;
++        });
++        scheduler.scheduleAtFixedRate(this::safeTick, tickSeconds, tickSeconds, TimeUnit.SECONDS);
++        log.info("[CALC-SCHED] 周期调度启动 tick={}s（整点触发 + 窗边界对齐）", tickSeconds);
++    }
++
++    public synchronized void stop() {
++        if (scheduler != null) {
++            scheduler.shutdownNow();
++            scheduler = null;
++            log.info("[CALC-SCHED] 周期调度已停止");
++        }
++    }
++
++    private void safeTick() {
++        try {
++            tick(System.currentTimeMillis());
++        } catch (RuntimeException e) {
++            log.error("[CALC-SCHED] tick 未预期异常（fail-soft，下个 tick 重试）", e);
++        }
++    }
++
++    /** 单次调度扫描（可测试入口）：按当前图的周期项检查是否跨过边界 */
++    public void tick(long nowMillis) {
++        net.otlab.calc.runtime.AppliedGraph applied = holder.current();
++        if (applied == null) {
++            return;
++        }
++        DependencyGraph graph = applied.graph();
++        for (String key : graph.getTopoOrder()) {
++            var node = graph.node(key);
++            if (node == null || node.kind() != net.otlab.calc.graph.NodeKind.ITEM || node.item() == null) {
++                continue;
++            }
++            DataItem item = node.item();
++            if (item.getCalcPeriod() == null || item.getCalcPeriod() <= 0) {
++                continue; // 到达驱动项不参与周期调度
++            }
++            if (item.getEnabled() != null && item.getEnabled() == 0) {
++                continue;
++            }
++            long periodMs = item.getCalcPeriod() * 1000L;
++            long boundary = DualTriggerExecutor.boundaryEnd(periodMs, nowMillis);
++            // 整点触发：当前时刻所在周期窗（bucket）与上次触发窗口不同即触发一次——
++            // tick 粒度保证在新窗开始后的下个 tick 命中；结果时间戳仍由执行器对齐到窗右边界。
++            long bucket = nowMillis / periodMs;
++            Long last = lastFiredBucket.get(key);
++            if (last != null && last == bucket) {
++                continue;
++            }
++            // 幂等由执行器的 WindowIdempotencyGuard 按 windowKey 统一完成（同窗只算一次）；
++            // 此处 bucket 比较只控制「不再重复提交同一窗的触发请求」。
++            lastFiredBucket.put(key, bucket);
++            String windowKey = DualTriggerExecutor.windowKey(key, periodMs, nowMillis);
++            Trigger trigger = Trigger.periodic(windowKey, periodMs, nowMillis);
++            log.info("[CALC-SCHED] 周期触发 key={} period={}ms boundary={} bucket={}",
++                    key, periodMs, boundary, bucket);
++            executor.execute(trigger, graph);
++        }
++    }
++
++    /** 启动后是否已 Running（观测/测试） */
++    public boolean isRunning() {
++        return scheduler != null && !scheduler.isShutdown();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/RedisArrivalSubscriber.java b/calc/src/main/java/net/otlab/calc/executor/RedisArrivalSubscriber.java
+new file mode 100644
+index 0000000..ec2f0a2
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/RedisArrivalSubscriber.java
+@@ -0,0 +1,243 @@
++package net.otlab.calc.executor;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.function.BiConsumer;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import tools.jackson.databind.JsonNode;
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * 到达驱动订阅器（brief 决策 2）：真订阅 Redis Pub/Sub {@code iot:newvalue:{tenant}}
++ * （0029 发射侧真实通道），新值事件到达触发依赖图下游重算；同秒合并节流由
++ * {@link WindowIdempotencyGuard} + 执行器完成（key=数据项全键+周期窗）。
++ *
++ * <p><b>取向</b>：极简 RESP2 客户端（纯 JDK Socket，零新增第三方依赖——ingest 0029
++ * 同款依赖纪律；Redis 3.0.504 实测可连）。订阅单连接独占线程，断线重连（指数退避
++ * 上限 30s），不阻塞主链；事件解析失败 fail-soft（日志 + 跳过，不影响后续消息）。
++ *
++ * <p>事件 payload 逐字对齐 0029 发射侧五键：{tenant, pointCode, ts, value, quality}
++ * （CONV-02 质量码 0-10）。pointCode → 图节点键（与 GraphBuilder 的 POINT 节点同源）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class RedisArrivalSubscriber implements AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(RedisArrivalSubscriber.class);
++    private static final JsonMapper MAPPER = JsonMapper.builder().build();
++
++    private final String host;
++    private final int port;
++    private final String password;
++    private final int database;
++    private final String channel;
++    private final BiConsumer<String, ValueSample> onValue;
++    private final AtomicBoolean running = new AtomicBoolean(false);
++    private volatile Thread worker;
++    private volatile Socket socket;
++
++    public RedisArrivalSubscriber(String addr, String password, int database, String tenant,
++                                  BiConsumer<String, ValueSample> onValue) {
++        String[] parts = addr.split(":");
++        this.host = parts[0];
++        this.port = parts.length > 1 ? Integer.parseInt(parts[1]) : 6379;
++        this.password = password == null ? "" : password;
++        this.database = database;
++        String t = tenant == null || tenant.isBlank() ? "*" : tenant;
++        this.channel = "iot:newvalue:" + t;
++        this.onValue = onValue;
++    }
++
++    public String channel() {
++        return channel;
++    }
++
++    public synchronized void start() {
++        if (!running.compareAndSet(false, true)) {
++            return;
++        }
++        worker = new Thread(this::runLoop, "calc-arrival-subscriber");
++        worker.setDaemon(true);
++        worker.start();
++        log.info("[CALC-ARRIVAL] 新值事件订阅启动 channel={} addr={}:{} db={}",
++                channel, host, port, database);
++    }
++
++    private void runLoop() {
++        long backoffMs = 500;
++        while (running.get()) {
++            try (Socket s = new Socket()) {
++                s.connect(new InetSocketAddress(host, port), 3000);
++                s.setSoTimeout(0);
++                this.socket = s;
++                OutputStream out = s.getOutputStream();
++                RespReader in = new RespReader(s.getInputStream());
++                if (!password.isBlank()) {
++                    send(out, "AUTH", password);
++                    in.readReply();
++                }
++                if (database > 0) {
++                    send(out, "SELECT", String.valueOf(database));
++                    in.readReply();
++                }
++                send(out, "SUBSCRIBE", channel);
++                log.info("[CALC-ARRIVAL] SUBSCRIBE 已发送 channel={}", channel);
++                backoffMs = 500;
++                readMessages(in);
++            } catch (IOException e) {
++                if (!running.get()) {
++                    break;
++                }
++                log.warn("[CALC-ARRIVAL] 订阅断线（{}ms 后重连）: {}", backoffMs, e.getMessage());
++                sleep(backoffMs);
++                backoffMs = Math.min(backoffMs * 2, 30_000);
++            }
++        }
++    }
++
++    /** 读取 Pub/Sub 消息流（RESP2 数组：subscribe 确认 / message 消息） */
++    private void readMessages(RespReader in) throws IOException {
++        while (running.get()) {
++            Object reply = in.readReply();
++            if (!(reply instanceof List<?> parts) || parts.isEmpty()) {
++                continue;
++            }
++            if (parts.size() >= 3 && "message".equals(String.valueOf(parts.get(0)))) {
++                handlePayload(String.valueOf(parts.get(2)));
++            }
++        }
++    }
++
++    /** 解析五键 payload 并回调（fail-soft：坏 JSON 跳过） */
++    private void handlePayload(String payload) {
++        try {
++            JsonNode node = MAPPER.readTree(payload);
++            String pointCode = node.get("pointCode").asString();
++            long ts = node.get("ts").asLong();
++            double value = node.get("value").asDouble();
++            int quality = node.has("quality") ? node.get("quality").asInt() : 0;
++            onValue.accept(pointCode, new ValueSample(value, quality, ts));
++        } catch (RuntimeException e) {
++            log.warn("[CALC-ARRIVAL] 事件解析失败（fail-soft 跳过）payload={}: {}", payload, e.getMessage());
++        }
++    }
++
++    private static void send(OutputStream out, String... args) throws IOException {
++        StringBuilder sb = new StringBuilder();
++        sb.append('*').append(args.length).append("\r\n");
++        for (String arg : args) {
++            byte[] bytes = arg.getBytes(StandardCharsets.UTF_8);
++            sb.append('$').append(bytes.length).append("\r\n").append(arg).append("\r\n");
++        }
++        out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
++        out.flush();
++    }
++
++    private static void sleep(long ms) {
++        try {
++            Thread.sleep(ms);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++        }
++    }
++
++    @Override
++    public synchronized void close() {
++        running.set(false);
++        Socket s = socket;
++        if (s != null) {
++            try {
++                s.close();
++            } catch (IOException ignored) {
++                // best-effort
++            }
++        }
++        if (worker != null) {
++            worker.interrupt();
++        }
++        log.info("[CALC-ARRIVAL] 订阅已停止 channel={}", channel);
++    }
++
++    public boolean isRunning() {
++        return running.get();
++    }
++
++    /** 极简 RESP2 回复读取器（字节级：正确处理 $ 批量串 / : 整数 / + 状态 / 数组嵌套） */
++    private static final class RespReader {
++        private final InputStream in;
++
++        RespReader(InputStream in) {
++            this.in = in;
++        }
++
++        Object readReply() throws IOException {
++            int b = in.read();
++            if (b < 0) {
++                throw new IOException("连接关闭");
++            }
++            return switch (b) {
++                case '+' -> readLine();
++                case '-' -> new IOExceptionReply(readLine());
++                case ':' -> Long.parseLong(readLine());
++                case '$' -> {
++                    int len = Integer.parseInt(readLine());
++                    if (len < 0) {
++                        yield null;
++                    }
++                    byte[] buf = new byte[len];
++                    readFully(buf);
++                    in.read(); // \r
++                    in.read(); // \n
++                    yield new String(buf, StandardCharsets.UTF_8);
++                }
++                case '*' -> {
++                    int count = Integer.parseInt(readLine());
++                    if (count < 0) {
++                        yield null;
++                    }
++                    List<Object> arr = new ArrayList<>(count);
++                    for (int i = 0; i < count; i++) {
++                        arr.add(readReply());
++                    }
++                    yield arr;
++                }
++                default -> throw new IOException("RESP 类型非法: " + (char) b);
++            };
++        }
++
++        private String readLine() throws IOException {
++            java.io.ByteArrayOutputStream bout = new java.io.ByteArrayOutputStream();
++            int c;
++            while ((c = in.read()) >= 0 && c != '\r') {
++                bout.write(c);
++            }
++            in.read(); // \n
++            return bout.toString(StandardCharsets.UTF_8);
++        }
++
++        private void readFully(byte[] buf) throws IOException {
++            int off = 0;
++            while (off < buf.length) {
++                int n = in.read(buf, off, buf.length - off);
++                if (n < 0) {
++                    throw new IOException("RESP 批量串截断");
++                }
++                off += n;
++            }
++        }
++
++        private record IOExceptionReply(String msg) {
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ResultSink.java b/calc/src/main/java/net/otlab/calc/executor/ResultSink.java
+new file mode 100644
+index 0000000..f4beed8
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/ResultSink.java
+@@ -0,0 +1,46 @@
++package net.otlab.calc.executor;
++
++import java.util.List;
++
++/**
++ * 结果落地边界（brief 决策 5）：执行器只把结果交给 ResultSink，不直接写 TDengine/
++ * MySQL 业务表（st_metric_value 归 0045、数据项结果表归计算引擎后续）。
++ *
++ * <p>本任务提供内存假实现 {@link InMemoryResultSink} + 日志；演进位：真实 Sink
++ * （写 st_item_value / Redis 缓存）由后续道零改动替换本接口实现。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface ResultSink {
++
++    /**
++     * 交付一次执行的结果集。
++     *
++     * @param trigger 触发上下文（周期/到达/来源）
++     * @param results 本次执行各节点结果（含失败项——失败项 sample=null）
++     */
++    void accept(Trigger trigger, List<CalcResult> results);
++
++    /** 内存假实现（测试与 live 冒烟观测面：记录最近若干次交付） */
++    final class InMemoryResultSink implements ResultSink {
++        private final java.util.List<Delivery> deliveries = new java.util.concurrent.CopyOnWriteArrayList<>();
++
++        @Override
++        public void accept(Trigger trigger, List<CalcResult> results) {
++            deliveries.add(new Delivery(trigger, List.copyOf(results)));
++        }
++
++        public List<Delivery> deliveries() {
++            return List.copyOf(deliveries);
++        }
++
++        public void clear() {
++            deliveries.clear();
++        }
++
++        /** 一次交付记录 */
++        public record Delivery(Trigger trigger, List<CalcResult> results) {
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/RollupOperator.java b/calc/src/main/java/net/otlab/calc/executor/RollupOperator.java
+new file mode 100644
+index 0000000..6b41161
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/RollupOperator.java
+@@ -0,0 +1,111 @@
++package net.otlab.calc.executor;
++
++import java.util.ArrayList;
++import java.util.EnumMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++
++/**
++ * 汇总算子（brief 决策 4）：动态查找子级（按 rollup 配置）、SUM/AVG/MAX/MIN 四法；
++ * 缺失打码 7（CONV-02 汇总不完整）的子级贡献不纳入但保留打标；关闭/停用的子级不纳入
++ * （ADR-0008 T1 保险：新增项默认不参与汇总，直到显式启用）。
++ *
++ * <p>动态性：子级集合在每次求值时由调用方按当前图动态传入（不缓存快照），新增子级
++ * 下一周期自动纳入。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class RollupOperator {
++
++    /** 汇总方法（对应 iot_data_item.rollup_method；SUM/AVG/MAX/MIN） */
++    public enum Method {
++        SUM, AVG, MAX, MIN;
++
++        public static Method parse(String method) {
++            if (method == null || method.isBlank()) {
++                return SUM;
++            }
++            return valueOf(method.trim().toUpperCase(java.util.Locale.ROOT));
++        }
++    }
++
++    /** 子级输入：值样本 + 是否启用（enabled=0 不纳入） */
++    public record Child(String fullKey, ValueSample sample, boolean enabled) {
++        public Child {
++            Objects.requireNonNull(fullKey, "fullKey");
++        }
++
++        public static Child of(String fullKey, ValueSample sample) {
++            return new Child(fullKey, sample, true);
++        }
++    }
++
++    /** 汇总输出 */
++    public record RollupResult(ValueSample sample, boolean incomplete, int excludedQuality7,
++                               int excludedDisabled, int excludedMissing) {
++        public boolean isIncomplete() {
++            return incomplete;
++        }
++    }
++
++    /**
++     * 汇总求值。
++     *
++     * @param method 汇总方法
++     * @param children 动态子级集（按当前图/rollup 配置查出）
++     * @param ts     结果时间戳（周期窗右边界）
++     */
++    public RollupResult evaluate(Method method, List<Child> children, long ts) {
++        Objects.requireNonNull(method, "method");
++        List<Double> included = new ArrayList<>();
++        int q7 = 0;
++        int disabled = 0;
++        int missing = 0;
++        for (Child c : children) {
++            if (!c.enabled()) {
++                disabled++;
++                continue;
++            }
++            ValueSample s = c.sample();
++            if (s == null || s.quality() == 6) {
++                // 上游缺数/计算失败：无值可用——不纳入；保留打标（incomplete），不写 0
++                missing++;
++                continue;
++            }
++            if (s.quality() == 7) {
++                // 汇总不完整子级：其贡献不纳入但保留打标
++                q7++;
++                continue;
++            }
++            included.add(s.value());
++        }
++        boolean incomplete = q7 > 0 || missing > 0;
++        long maxTs = ts;
++        for (Child c : children) {
++            if (c.enabled() && c.sample() != null) {
++                maxTs = Math.max(maxTs, c.sample().ts());
++            }
++        }
++        ValueSample sample;
++        if (included.isEmpty()) {
++            // 无可用子级：不写 0，quality=7 汇总不完整（CONV-02）
++            sample = new ValueSample(0.0, 7, maxTs);
++        } else {
++            double value = switch (method) {
++                case SUM -> included.stream().mapToDouble(Double::doubleValue).sum();
++                case AVG -> included.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
++                case MAX -> included.stream().mapToDouble(Double::doubleValue).max().orElse(0.0);
++                case MIN -> included.stream().mapToDouble(Double::doubleValue).min().orElse(0.0);
++            };
++            sample = new ValueSample(value, incomplete ? 7 : 0, maxTs);
++        }
++        return new RollupResult(sample, incomplete, q7, disabled, missing);
++    }
++
++    /** quality=7 判定（CONV-02 汇总不完整） */
++    public static boolean isIncompleteQuality(int quality) {
++        return quality == 7;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/Trigger.java b/calc/src/main/java/net/otlab/calc/executor/Trigger.java
+new file mode 100644
+index 0000000..dcb867e
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/Trigger.java
+@@ -0,0 +1,40 @@
++package net.otlab.calc.executor;
++
++import java.util.Objects;
++
++/**
++ * 触发上下文（两通道统一执行器的入参）：周期调度 / 到达驱动（brief 决策 2/3）。
++ *
++ * @param kind     触发类型
++ * @param fullKey  到达驱动的目标数据项全键（周期项为 null）；到达通道按该项找下游
++ * @param periodMs 周期窗长度毫秒（周期项=配置 calc_period 秒×1000；到达项=0）
++ * @param windowKey 同项同窗口幂等键（key=数据项全键+周期窗，brief 决策 2）
++ * @param at       触发时刻（epoch 毫秒）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record Trigger(Kind kind, String fullKey, long periodMs, String windowKey, long at) {
++
++    public enum Kind {
++        /** 周期调度（整点触发，结果时间戳对齐周期边界） */
++        PERIODIC,
++        /** 到达驱动（新值事件触发依赖图下游重算） */
++        ARRIVAL
++    }
++
++    public Trigger {
++        Objects.requireNonNull(kind, "kind");
++    }
++
++    public static Trigger periodic(String windowKey, long periodMs, long at) {
++        return new Trigger(Kind.PERIODIC, null, periodMs, windowKey, at);
++    }
++
++    public static Trigger arrival(String fullKey, String windowKey, long at) {
++        return new Trigger(Kind.ARRIVAL, Objects.requireNonNull(fullKey, "fullKey"), 0, windowKey, at);
++    }
++
++    public boolean isArrival() {
++        return kind == Kind.ARRIVAL;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ValueSample.java b/calc/src/main/java/net/otlab/calc/executor/ValueSample.java
+new file mode 100644
+index 0000000..e86d5e0
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/ValueSample.java
+@@ -0,0 +1,19 @@
++package net.otlab.calc.executor;
++
++/**
++ * 统一值样本（结果/输入同构：value + quality + ts，CONV-02 质量码 0-10）。
++ * 与统一消息模型 {ts, value, quality} 三键同义（CONV-02 / 0029 发射侧事件三键）。
++ *
++ * @param value   数值
++ * @param quality 质量码（CONV-02：0 正常 / 6 计算失败 / 7 汇总不完整 / 9 跨周期）
++ * @param ts      时间戳（epoch 毫秒；计算结果为周期窗右边界）
++ * @author dowei
++ * @date 2026-11-24
++ */
++public record ValueSample(double value, int quality, long ts) {
++
++    /** 正常值快捷构造 */
++    public static ValueSample of(double value, long ts) {
++        return new ValueSample(value, 0, ts);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/ValueStore.java b/calc/src/main/java/net/otlab/calc/executor/ValueStore.java
+new file mode 100644
+index 0000000..a31e8ce
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/ValueStore.java
+@@ -0,0 +1,42 @@
++package net.otlab.calc.executor;
++
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * 输入值存储（进程内假实现——点位/数据项最新值；真实源=Redis 点位缓存
++ * {@code iot:pt:{tenant}:{code}}（0029 发射侧）/ st_item_value，演进位零改动替换）。
++ *
++ * <p>质量码纪律（CONV-02）：存储的是带质量的样本；缺失=无值（null），不以 0 冒充；
++ * 汇总时质量码 7（汇总不完整）的子级贡献不纳入但保留打标。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class ValueStore {
++
++    private final Map<String, ValueSample> values = new HashMap<>();
++
++    /** 节点键 → 最新样本；缺失返回 null（不造假值） */
++    public ValueSample get(String key) {
++        return values.get(key);
++    }
++
++    /** 写入样本（线程安全：synchronized 写 + 读用 volatile 语义的同步块） */
++    public synchronized void put(String key, ValueSample sample) {
++        values.put(key, sample);
++    }
++
++    public synchronized void put(String key, double value, long ts) {
++        values.put(key, ValueSample.of(value, ts));
++    }
++
++    public synchronized Map<String, ValueSample> snapshot() {
++        return Collections.unmodifiableMap(new HashMap<>(values));
++    }
++
++    public synchronized void clear() {
++        values.clear();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java b/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java
+new file mode 100644
+index 0000000..7433263
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/executor/WindowIdempotencyGuard.java
+@@ -0,0 +1,83 @@
++package net.otlab.calc.executor;
++
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * 窗口幂等 + 同秒合并去重的进程内有界 TTL 登记表（brief 决策 2）。
++ *
++ * <p>语义：同一 {@code windowKey}（数据项全键 + 周期窗）只允许第一次触发执行，后续
++ * 到达判为重复（节流合并 + 幂等——只产出一次结果）。登记表有界（FIFO 淘汰最旧）
++ * 且带 TTL（默认 5 分钟），避免长期运行内存无界增长。
++ *
++ * <p>演进位：多实例部署时本表需 Redis 化（SET NX EX windowKey 实现跨实例幂等），
++ * 接口不变、实现可零改动替换；本期为进程内假实现（brief 决策 2 明示）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class WindowIdempotencyGuard {
++
++    /** 触发决策 */
++    public enum Decision {
++        /** 本窗口首次——执行 */
++        FIRST,
++        /** 本窗口已登记——节流合并/幂等跳过（不重复产出） */
++        DUPLICATE
++    }
++
++    private final int maxEntries;
++    private final long ttlMillis;
++    private final LinkedHashMap<String, Long> entries = new LinkedHashMap<>();
++
++    public WindowIdempotencyGuard() {
++        this(4096, 5L * 60L * 1000L);
++    }
++
++    public WindowIdempotencyGuard(int maxEntries, long ttlMillis) {
++        if (maxEntries < 1) {
++            throw new IllegalArgumentException("maxEntries 须 >= 1");
++        }
++        if (ttlMillis < 1) {
++            throw new IllegalArgumentException("ttlMillis 须 >= 1");
++        }
++        this.maxEntries = maxEntries;
++        this.ttlMillis = ttlMillis;
++    }
++
++    /**
++     * 尝试占用窗口键。首次返回 {@link Decision#FIRST}；重复/未过期返回
++     * {@link Decision#DUPLICATE}。过期条目视为新窗口（TTL 到期后可再执行）。
++     */
++    public synchronized Decision tryAcquire(String windowKey, long nowMillis) {
++        Long at = entries.get(windowKey);
++        if (at != null) {
++            if (nowMillis - at < ttlMillis) {
++                return Decision.DUPLICATE;
++            }
++            entries.remove(windowKey);
++        }
++        // 有界：FIFO 淘汰最旧（LinkedHashMap 插入序）
++        while (entries.size() >= maxEntries) {
++            Iterator<String> it = entries.keySet().iterator();
++            it.next();
++            it.remove();
++        }
++        entries.put(windowKey, nowMillis);
++        return Decision.FIRST;
++    }
++
++    /** 当前登记条目数（观测/测试用） */
++    public synchronized int size() {
++        return entries.size();
++    }
++
++    public int maxEntries() {
++        return maxEntries;
++    }
++
++    public long ttlMillis() {
++        return ttlMillis;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+index 174a7a6..f357704 100644
+--- a/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
++++ b/calc/src/main/java/net/otlab/calc/web/CalcStatusController.java
+@@ -3,6 +3,7 @@ package net.otlab.calc.web;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ 
++import net.otlab.calc.executor.ExecutorRuntime;
+ import net.otlab.calc.runtime.GraphHolder;
+ import net.otlab.calc.runtime.SnapshotReconciler;
+ 
+@@ -26,10 +27,13 @@ public class CalcStatusController {
+ 
+     private final GraphHolder holder;
+     private final SnapshotReconciler reconciler;
++    private final ExecutorRuntime executorRuntime;
+ 
+-    public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler) {
++    public CalcStatusController(GraphHolder holder, SnapshotReconciler reconciler,
++                                ExecutorRuntime executorRuntime) {
+         this.holder = holder;
+         this.reconciler = reconciler;
++        this.executorRuntime = executorRuntime;
+     }
+ 
+     @GetMapping("/calc/v1/status")
+@@ -61,6 +65,7 @@ public class CalcStatusController {
+                 "skipped", reconciler.getCounters().getSkipped(),
+                 "ackOk", reconciler.getCounters().getAckOk(),
+                 "ackFail", reconciler.getCounters().getAckFail()));
++        view.put("executor", executorRuntime.view());
+         return view;
+     }
+ 
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index 67b10ee..0e42eed 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -20,3 +20,11 @@ calc:
+   reconcile-seconds: ${CALC_SNAPSHOT_RECONCILE_SECONDS:300}
+   # HTTP 监听地址（Go 形态 ":8095"；端口纪律见上）
+   http-addr: ${CALC_HTTP_ADDR::8095}
++  # 双触发执行器（TASK-0041）：默认关闭，显式启用才起周期调度 + Redis 到达订阅
++  executor-enabled: ${CALC_EXECUTOR_ENABLED:false}
++  # Redis（到达驱动订阅 iot:newvalue:{tenant}；空地址降级为不订阅记录式）
++  redis-addr: ${CALC_REDIS_ADDR:127.0.0.1:6379}
++  redis-password: ${CALC_REDIS_PASSWORD:}
++  redis-database: ${CALC_REDIS_DATABASE:0}
++  # 周期调度 tick 粒度（秒；默认 1s，仅 executor-enabled=true 时生效）
++  scheduler-tick-seconds: ${CALC_SCHEDULER_TICK_SECONDS:1}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index 101405e..861de8b 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -3,6 +3,7 @@ package net.otlab.calc.config;
+ import org.junit.jupiter.api.Test;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ 
+@@ -45,4 +46,14 @@ class CalcPropertiesTest {
+         assertThrows(IllegalArgumentException.class, () -> CalcProperties.parsePort(":99999"));
+         assertThrows(IllegalArgumentException.class, () -> CalcProperties.parsePort(":0"));
+     }
++
++    @Test
++    void executorDefaultsKeep0040Behavior() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isExecutorEnabled(), "执行器默认关闭（0040 既有行为零变化）");
++        assertEquals("127.0.0.1:6379", p.getRedisAddr());
++        assertEquals("", p.getRedisPassword());
++        assertEquals(Integer.valueOf(0), p.getRedisDatabase());
++        assertEquals(Integer.valueOf(1), p.getSchedulerTickSeconds());
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/executor/CalcPeriodContractTest.java b/calc/src/test/java/net/otlab/calc/executor/CalcPeriodContractTest.java
+new file mode 100644
+index 0000000..65aade4
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/CalcPeriodContractTest.java
+@@ -0,0 +1,68 @@
++package net.otlab.calc.executor;
++
++import java.util.List;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 周期换算契约测试（brief 决策 1）：与 backend 0081 mapCalcPeriod 同款口径 +
++ * MONTH/YEAR；结果时间戳对齐周期边界（period_start/period_end）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CalcPeriodContractTest {
++
++    @Test
++    void mapCalcPeriodSameAsBackend0081() {
++        assertTrue(CalcPeriod.fromCode(null).isArrival());
++        assertTrue(CalcPeriod.fromCode("").isArrival());
++        assertTrue(CalcPeriod.fromCode("  ").isArrival());
++        assertEquals(CalcPeriod.Kind.FIXED, CalcPeriod.fromCode("SECOND").kind());
++        assertEquals(1, CalcPeriod.fromCode("SECOND").seconds());
++        assertEquals(60, CalcPeriod.fromCode("MINUTE").seconds());
++        assertEquals(3600, CalcPeriod.fromCode("HOUR").seconds());
++        assertEquals(86400, CalcPeriod.fromCode("DAY").seconds());
++        assertEquals(60, CalcPeriod.fromCode("minute").seconds(), "大小写不敏感");
++        assertEquals(300, CalcPeriod.fromCode("300").seconds(), "纯数字按秒直取");
++        assertThrows(IllegalArgumentException.class, () -> CalcPeriod.fromCode("WEEK"), "未知码 fail-closed");
++    }
++
++    @Test
++    void monthAndYearCodes() {
++        assertEquals(CalcPeriod.Kind.MONTH, CalcPeriod.fromCode("MONTH").kind());
++        assertEquals(CalcPeriod.Kind.YEAR, CalcPeriod.fromCode("YEAR").kind());
++        assertEquals(CalcPeriod.Kind.ARRIVAL, CalcPeriod.fromCode("0").kind());
++    }
++
++    @Test
++    void fixedBoundaryAlignedToEpoch() {
++        CalcPeriod p = CalcPeriod.fromSeconds(3600);
++        // 2026-01-01T01:30:00Z = epoch 1767227400000
++        long at = java.time.Instant.parse("2026-01-01T01:30:00Z").toEpochMilli();
++        CalcPeriod.Boundary b = p.boundaryOf(at);
++        assertEquals(java.time.Instant.parse("2026-01-01T01:00:00Z").toEpochMilli(), b.startMillis());
++        assertEquals(java.time.Instant.parse("2026-01-01T02:00:00Z").toEpochMilli(), b.endMillis());
++    }
++
++    @Test
++    void monthYearBoundaryAlignedToCalendar() {
++        long at = java.time.Instant.parse("2026-02-15T10:20:30Z").toEpochMilli();
++        CalcPeriod.Boundary month = CalcPeriod.fromCode("MONTH").boundaryOf(at);
++        assertEquals(java.time.Instant.parse("2026-02-01T00:00:00Z").toEpochMilli(), month.startMillis());
++        assertEquals(java.time.Instant.parse("2026-03-01T00:00:00Z").toEpochMilli(), month.endMillis());
++        CalcPeriod.Boundary year = CalcPeriod.fromCode("YEAR").boundaryOf(at);
++        assertEquals(java.time.Instant.parse("2026-01-01T00:00:00Z").toEpochMilli(), year.startMillis());
++        assertEquals(java.time.Instant.parse("2027-01-01T00:00:00Z").toEpochMilli(), year.endMillis());
++    }
++
++    @Test
++    void executorBoundaryEndAlignsToPeriodRightEdge() {
++        long periodMs = 60_000L;
++        long at = java.time.Instant.parse("2026-01-01T00:00:30Z").toEpochMilli();
++        long end = DualTriggerExecutor.boundaryEnd(periodMs, at);
++        assertEquals(java.time.Instant.parse("2026-01-01T00:01:00Z").toEpochMilli(), end);
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java b/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java
+new file mode 100644
+index 0000000..55b563f
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/DualTriggerExecutorContractTest.java
+@@ -0,0 +1,278 @@
++package net.otlab.calc.executor;
++
++import java.util.List;
++import java.util.Map;
++
++import net.otlab.calc.graph.DependencyGraph;
++import net.otlab.calc.graph.GraphBuilder;
++import net.otlab.calc.snapshot.DataItem;
++import net.otlab.calc.snapshot.FormulaRef;
++import net.otlab.calc.snapshot.SnapshotBody;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 双触发统一执行器契约测试（brief 测试口径）：
++ * 拓扑顺序 / 同秒合并节流 / 幂等同窗只算一次 / 单节点失败隔离 / 汇总四法 + 打码 7 + 开关关闭。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class DualTriggerExecutorContractTest {
++
++    private static DataItem direct(long id, String key, String code, long inst) {
++        return net.otlab.calc.support.TestSnapshots.directItem(id, key, code, inst);
++    }
++
++    private static DataItem formula(long id, String key, String code, long inst, String expression) {
++        return net.otlab.calc.support.TestSnapshots.formulaItem(id, key, code, inst, expression);
++    }
++
++    private static DataItem rollup(long id, String key, String code, long inst, String method) {
++        return net.otlab.calc.support.TestSnapshots.rollupItem(id, key, code, inst, method);
++    }
++
++    private static FormulaRef ref(long id, long itemId, String target, int type) {
++        return net.otlab.calc.support.TestSnapshots.ref(id, itemId, target, type);
++    }
++
++    private static SnapshotBody body(List<DataItem> items, List<FormulaRef> refs) {
++        return net.otlab.calc.support.TestSnapshots.body(1, items, refs, List.of());
++    }
++
++    private static DependencyGraph graph(SnapshotBody body) {
++        return new GraphBuilder().build(body);
++    }
++
++    // ---------- 拓扑顺序：点位→A→B→C 链 ----------
++
++    @Test
++    void executesInTopologicalOrderChain() {
++        // A=P1*2, B=A+1, C=B+10 —— 需保证 A 先于 B 先于 C
++        DataItem a = formula(1, "EQ1A.V", "V", 10, "P1 * 2");
++        DataItem b = formula(2, "EQ1B.V", "V", 11, "EQ1A.V + 1");
++        DataItem c = formula(3, "EQ1C.V", "V", 12, "EQ1B.V + 10");
++        DependencyGraph g = graph(body(List.of(a, b, c),
++                List.of(ref(1, 1, "P1", 2), ref(2, 2, "EQ1A.V", 1), ref(3, 3, "EQ1B.V", 1))));
++
++        ValueStore store = new ValueStore();
++        store.put("P1", 5.0, 1000L);
++        DualTriggerExecutor ex = newDual(store);
++        Trigger t = Trigger.arrival("P1", "P1@0", 1000L);
++
++        List<CalcResult> out = ex.execute(t, g);
++
++        assertEquals(List.of("P1", "EQ1A.V", "EQ1B.V", "EQ1C.V"), ex.lastVisitOrder());
++        CalcResult cResult = out.stream().filter(r -> r.fullKey().equals("EQ1C.V")).findFirst().orElseThrow();
++        assertEquals(21.0, cResult.sample().value(), 1e-6, "((5*2)+1)+10=21");
++        assertEquals(2, cResult.sourceType());
++    }
++
++    // ---------- 到达驱动：下游影响面收敛 ----------
++
++    @Test
++    void arrivalOnlyRecomputesDownstream() {
++        DataItem a = formula(1, "A.V", "V", 10, "P1 + 1");
++        DataItem unrelated = formula(2, "OTHER.V", "V", 11, "P2 + 1");
++        DependencyGraph g = graph(body(List.of(a, unrelated),
++                List.of(ref(1, 1, "P1", 2), ref(2, 2, "P2", 2))));
++
++        ValueStore store = new ValueStore();
++        store.put("P1", 1.0, 1000L);
++        store.put("P2", 100.0, 1000L);
++        DualTriggerExecutor ex = newDual(store);
++
++        ex.execute(Trigger.arrival("P1", "P1@0", 1000L), g);
++        assertFalse(ex.lastVisitOrder().contains("OTHER.V"), "无关分支不重算");
++        assertTrue(ex.lastVisitOrder().contains("A.V"), "下游重算");
++    }
++
++    // ---------- 同秒合并节流 + 幂等同窗只算一次 ----------
++
++    @Test
++    void throttleSameWindowOnlyComputesOnce() {
++        DataItem a = formula(1, "A.V", "V", 10, "P1 + 1");
++        DependencyGraph g = graph(body(List.of(a), List.of(ref(1, 1, "P1", 2))));
++
++        ValueStore store = new ValueStore();
++        ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
++        DualTriggerExecutor ex = new DualTriggerExecutor(store, new WindowIdempotencyGuard(), sink);
++        store.put("P1", 1.0, 1000L);
++
++        String windowKey = DualTriggerExecutor.windowKey("P1", 1000L, 1000L);
++        List<CalcResult> first = ex.execute(Trigger.arrival("P1", windowKey, 1000L), g);
++        // 同一秒再来 9 条（最后一条值更新）
++        store.put("P1", 9.0, 1000L);
++        int duplicates = 0;
++        for (int i = 0; i < 9; i++) {
++            List<CalcResult> again = ex.execute(Trigger.arrival("P1", windowKey, 1000L), g);
++            if (again.isEmpty()) {
++                duplicates++;
++            }
++        }
++
++        assertEquals(1, first.size(), "首次产出一次");
++        assertEquals(9, duplicates, "同窗 9 次全被节流合并");
++        assertEquals(1, sink.deliveries().size(), "结果只交付一次（保留最后一次正确结果口径由窗口去重保证）");
++    }
++
++    @Test
++    void guardIsBoundedAndExpires() {
++        WindowIdempotencyGuard guard = new WindowIdempotencyGuard(2, 1000L);
++        assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("a", 0));
++        assertEquals(WindowIdempotencyGuard.Decision.DUPLICATE, guard.tryAcquire("a", 500));
++        assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("b", 500));
++        assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("c", 500), "有界 FIFO 淘汰 a");
++        assertEquals(2, guard.size());
++        assertEquals(WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire("b", 1600), "TTL 过期后可重入");
++    }
++
++    // ---------- 单节点失败隔离 ----------
++
++    @Test
++    void failureOnlyAffectsDownstreamNotOtherBranches() {
++        // GOOD = P_GOOD + 1（成功）；BAD = P_BAD + 1（无值失败）；TAIL = BAD + 1（下游失败）
++        DataItem good = formula(1, "GOOD.V", "V", 10, "P_GOOD + 1");
++        DataItem bad = formula(2, "BAD.V", "V", 11, "P_BAD + 1");
++        DataItem tail = formula(3, "TAIL.V", "V", 12, "BAD.V + 1");
++        DependencyGraph g = graph(body(List.of(good, bad, tail), List.of(
++                ref(1, 1, "P_GOOD", 2), ref(2, 2, "P_BAD", 2), ref(3, 3, "BAD.V", 1))));
++
++        ValueStore store = new ValueStore();
++        store.put("P_GOOD", 5.0, 1000L);
++        store.put("P_BAD", 0.0, 1000L);
++        // 让 P_BAD 无值：不 put，改用另一个 store 场景
++        store = new ValueStore();
++        store.put("P_GOOD", 5.0, 1000L);
++        markPeriodic(g);
++        DualTriggerExecutor ex = newDual(store);
++
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++
++        CalcResult goodResult = out.stream().filter(r -> r.fullKey().equals("GOOD.V")).findFirst().orElseThrow();
++        assertTrue(goodResult.isSuccess());
++        assertEquals(6.0, goodResult.sample().value(), 1e-6, "无关分支照常产出");
++        CalcResult badResult = out.stream().filter(r -> r.fullKey().equals("BAD.V")).findFirst().orElseThrow();
++        assertFalse(badResult.isSuccess(), "失败节点无假 0");
++        assertNull(badResult.sample());
++        assertTrue(badResult.error().contains("无值"));
++        CalcResult tailResult = out.stream().filter(r -> r.fullKey().equals("TAIL.V")).findFirst().orElseThrow();
++        assertFalse(tailResult.isSuccess(), "下游被隔离");
++    }
++
++    @Test
++    void formulaFunctionNotSupportedIsIsolatedAsFailure() {
++        DataItem a = formula(1, "A.V", "V", 10, "DELTA(P1)");
++        DependencyGraph g = graph(body(List.of(a), List.of(ref(1, 1, "P1", 2))));
++        ValueStore store = new ValueStore();
++        store.put("P1", 5.0, 1000L);
++        markPeriodic(g);
++        DualTriggerExecutor ex = newDual(store);
++
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++        CalcResult r = out.stream().filter(x -> x.fullKey().equals("A.V")).findFirst().orElseThrow();
++        assertFalse(r.isSuccess(), "算子未实现=单节点失败（不打假 0）");
++        assertTrue(r.error().contains("0042") || r.error().contains("算子"));
++    }
++
++    // ---------- 汇总四法 + 打码 7 + 开关关闭 ----------
++
++    @Test
++    void rollupFourMethods() {
++        // 父 F01.ROLLUP.SUM 有子 F01.01.ROLLUP / F01.02.ROLLUP / F01.03.ROLLUP（值 2/4/8）
++        for (String method : List.of("SUM", "AVG", "MAX", "MIN")) {
++            DependencyGraph g = rollupGraph(method);
++            ValueStore store = new ValueStore();
++            store.put("F01.01.ROLLUP", 2.0, 1000L);
++            store.put("F01.02.ROLLUP", 4.0, 1000L);
++            store.put("F01.03.ROLLUP", 8.0, 1000L);
++        markPeriodic(g);
++            DualTriggerExecutor ex = newDual(store);
++            List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++            CalcResult r = out.stream().filter(x -> x.fullKey().equals("F01.ROLLUP")).findFirst().orElseThrow();
++            double expected = switch (method) {
++                case "SUM" -> 14.0;
++                case "AVG" -> 14.0 / 3;
++                case "MAX" -> 8.0;
++                case "MIN" -> 2.0;
++                default -> throw new IllegalStateException();
++            };
++            assertEquals(expected, r.sample().value(), 1e-6, method);
++            assertEquals(3, r.sourceType(), "ROLLUP 来源标记");
++            assertEquals(0, r.sample().quality(), "全正常子级不打分");
++        }
++    }
++
++    @Test
++    void rollupExcludesQuality7AndDisabledChildrenWithMark() {
++        DependencyGraph g = rollupGraph("SUM");
++        ValueStore store = new ValueStore();
++        store.put("F01.01.ROLLUP", 2.0, 1000L);
++        store.put("F01.02.ROLLUP", new ValueSample(4.0, 7, 1000L)); // quality=7 子级
++        store.put("F01.03.ROLLUP", 8.0, 1000L);
++        markPeriodic(g);
++        DualTriggerExecutor ex = newDual(store);
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++        CalcResult r = out.stream().filter(x -> x.fullKey().equals("F01.ROLLUP")).findFirst().orElseThrow();
++        assertEquals(10.0, r.sample().value(), 1e-6, "q7 子级贡献不纳入（2+8）");
++        assertEquals(7, r.sample().quality(), "保留打码 7");
++    }
++
++    @Test
++    void rollupExcludesDisabledChild() {
++        DependencyGraph g = rollupGraph("SUM");
++        ValueStore store = new ValueStore();
++        store.put("F01.01.ROLLUP", 2.0, 1000L);
++        store.put("F01.02.ROLLUP", 4.0, 1000L);
++        store.put("F01.03.ROLLUP", 8.0, 1000L);
++        // 关闭 F01.02.ROLLUP（enabled=0）
++        DataItem child2 = g.node("F01.02.ROLLUP").item();
++        child2.setEnabled(0);
++        markPeriodic(g);
++        DualTriggerExecutor ex = newDual(store);
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++        CalcResult r = out.stream().filter(x -> x.fullKey().equals("F01.ROLLUP")).findFirst().orElseThrow();
++        assertEquals(10.0, r.sample().value(), 1e-6, "开关关闭的子级不纳入");
++    }
++
++    @Test
++    void rollupAllChildrenMissingOutputsQuality7NotZero() {
++        DependencyGraph g = rollupGraph("SUM");
++        ValueStore store = new ValueStore();
++        markPeriodic(g);
++        DualTriggerExecutor ex = newDual(store);
++        List<CalcResult> out = ex.execute(Trigger.periodic("all@0", 1000L, 1000L), g);
++        CalcResult r = out.stream().filter(x -> x.fullKey().equals("F01.ROLLUP")).findFirst().orElseThrow();
++        assertTrue(r.isSuccess(), "汇总节点本身不失败");
++        assertEquals(7, r.sample().quality(), "全部缺数=汇总不完整打码 7（不写假 0）");
++    }
++
++    // ---------- helpers ----------
++
++
++    /** 将图中所有数据项标为周期项（供周期通道机制测试——真实周期项 calc_period>0） */
++    private static void markPeriodic(DependencyGraph g) {
++        g.getNodes().values().forEach(n -> {
++            if (n.item() != null) {
++                n.item().setCalcPeriod(1L);
++            }
++        });
++    }
++
++    private static DualTriggerExecutor newDual(ValueStore store) {
++        return new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
++                new ResultSink.InMemoryResultSink());
++    }
++
++    /** fullKey=instanceCode+"."+dataCode：父 F01.ROLLUP（dataCode=ROLLUP,instance=F01），子 F01.0x.V 需同 dataCode */
++    private static DependencyGraph rollupGraph(String method) {
++        // 用 dataCode=V 统一：父 F01.ROLLUP 的 fullKey 必须 endswith ".ROLLUP" -> instance="F01", dataCode="ROLLUP";
++        // 子需 dataCode=ROLLUP 且 instanceCode 前缀 F01. => fullKey="F01.01.ROLLUP" 等
++        DataItem parent = rollup(100, "F01.ROLLUP", "ROLLUP", 1, method);
++        DataItem c1 = direct(1, "F01.01.ROLLUP", "ROLLUP", 2);
++        DataItem c2 = direct(2, "F01.02.ROLLUP", "ROLLUP", 3);
++        DataItem c3 = direct(3, "F01.03.ROLLUP", "ROLLUP", 4);
++        return graph(body(List.of(parent, c1, c2, c3), List.of()));
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java b/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java
+new file mode 100644
+index 0000000..447389b
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/PeriodicSchedulerContractTest.java
+@@ -0,0 +1,75 @@
++package net.otlab.calc.executor;
++
++import java.time.Instant;
++import java.util.List;
++
++import net.otlab.calc.graph.GraphBuilder;
++import net.otlab.calc.runtime.AppliedGraph;
++import net.otlab.calc.runtime.GraphHolder;
++import net.otlab.calc.snapshot.DataItem;
++import net.otlab.calc.snapshot.SnapshotBody;
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 周期调度契约测试（brief 决策 1）：整点触发 + 结果时间戳对齐周期边界 + 同窗只触发一次。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class PeriodicSchedulerContractTest {
++
++    @Test
++    void periodicFiresOnlyOnBoundaryAndAlignsTimestamp() {
++        // 周期项 A（60s）+ 到达项 B（calc_period=0）
++        DataItem a = net.otlab.calc.support.TestSnapshots.formulaItem(1, "A.V", "V", 1, "P1 + 1");
++        a.setCalcPeriod(60L);
++        DataItem b = net.otlab.calc.support.TestSnapshots.formulaItem(2, "B.V", "V", 2, "P1 + 2");
++        b.setCalcPeriod(0L);
++        SnapshotBody body = net.otlab.calc.support.TestSnapshots.body(1, List.of(a, b),
++                List.of(net.otlab.calc.support.TestSnapshots.ref(1, 1, "P1", 2),
++                        net.otlab.calc.support.TestSnapshots.ref(2, 2, "P1", 2)),
++                List.of());
++        var graph = new GraphBuilder().build(body);
++        GraphHolder holder = new GraphHolder();
++        holder.switchTo(new AppliedGraph(1, "h", graph, Instant.now()));
++
++        ValueStore store = new ValueStore();
++        store.put("P1", 5.0, 1000L);
++        ResultSink.InMemoryResultSink sink = new ResultSink.InMemoryResultSink();
++        DualTriggerExecutor executor = new DualTriggerExecutor(store, new WindowIdempotencyGuard(), sink);
++        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, new WindowIdempotencyGuard(), 1);
++
++        long onBoundary = Instant.parse("2026-01-01T00:01:00Z").toEpochMilli();
++        scheduler.tick(onBoundary);
++        assertEquals(1, sink.deliveries().size(), "整点触发一次");
++        ResultSink.InMemoryResultSink.Delivery d = sink.deliveries().get(0);
++        assertEquals(Trigger.Kind.PERIODIC, d.trigger().kind());
++        CalcResult aResult = d.results().stream().filter(r -> r.fullKey().equals("A.V")).findFirst().orElseThrow();
++        assertEquals(Instant.parse("2026-01-01T00:02:00Z").toEpochMilli(), aResult.sample().ts(),
++                "周期项结果时间戳=周期窗右边界");
++        assertTrue(d.results().stream().noneMatch(r -> r.fullKey().equals("B.V")),
++                "到达驱动项不参与周期调度");
++
++        // 非整点：不触发
++        long offBoundary = Instant.parse("2026-01-01T00:01:30Z").toEpochMilli();
++        scheduler.tick(offBoundary);
++        assertEquals(1, sink.deliveries().size(), "非整点不触发");
++
++        // 同窗重复 tick：幂等去重
++        scheduler.tick(onBoundary);
++        assertEquals(1, sink.deliveries().size(), "同窗幂等");
++    }
++
++    @Test
++    void schedulerIgnoresBeforeGraphLoaded() {
++        GraphHolder holder = new GraphHolder();
++        ValueStore store = new ValueStore();
++        DualTriggerExecutor executor = new DualTriggerExecutor(store, new WindowIdempotencyGuard(),
++                new ResultSink.InMemoryResultSink());
++        PeriodicScheduler scheduler = new PeriodicScheduler(holder, executor, new WindowIdempotencyGuard(), 1);
++        assertDoesNotThrow(() -> scheduler.tick(System.currentTimeMillis()));
++        assertFalse(scheduler.isRunning(), "未 start 不 running");
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/executor/RedisArrivalSubscriberLiveTest.java b/calc/src/test/java/net/otlab/calc/executor/RedisArrivalSubscriberLiveTest.java
+new file mode 100644
+index 0000000..28f12a3
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/executor/RedisArrivalSubscriberLiveTest.java
+@@ -0,0 +1,79 @@
++package net.otlab.calc.executor;
++
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * 到达驱动真 Redis 集成测试（env {@code CALC_REDIS_TEST_ADDR} 门控；未配自动跳过）。
++ * 真 SUBSCRIBE iot:newvalue:{tenant} → 真 PUBLISH 0029 五键 payload → 断言回调收到逐字段
++ * 一致的值样本。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@EnabledIfEnvironmentVariable(named = "CALC_REDIS_TEST_ADDR", matches = ".+")
++class RedisArrivalSubscriberLiveTest {
++
++    @Test
++    void subscribesChannelAndDeliversNewValueEvent() throws Exception {
++        String addr = System.getenv("CALC_REDIS_TEST_ADDR");
++        String[] hp = addr.split(":");
++        String host = hp[0];
++        int port = hp.length > 1 ? Integer.parseInt(hp[1]) : 6379;
++        String tenant = "t41live" + System.nanoTime();
++        String channel = "iot:newvalue:" + tenant;
++
++        CountDownLatch latch = new CountDownLatch(1);
++        AtomicReference<String> seenKey = new AtomicReference<>();
++        AtomicReference<ValueSample> seen = new AtomicReference<>();
++        RedisArrivalSubscriber sub = new RedisArrivalSubscriber(addr, "", 0, tenant, (key, sample) -> {
++            seenKey.set(key);
++            seen.set(sample);
++            latch.countDown();
++        });
++        assertEquals(channel, sub.channel());
++        sub.start();
++        try {
++            // 等 SUBSCRIBE 生效（真连接建立）——轮询 PUBLISH 直到回调
++            Thread.sleep(500);
++            long ts = 1795211995000L;
++            String payload = "{\"tenant\":\"" + tenant + "\",\"pointCode\":\"P41_LIVE\",\"ts\":"
++                    + ts + ",\"value\":42.5,\"quality\":0}";
++            publish(host, port, channel, payload);
++            assertTrue(latch.await(5, TimeUnit.SECONDS), "收到真 Pub/Sub 事件");
++            assertEquals("P41_LIVE", seenKey.get());
++            assertEquals(42.5, seen.get().value(), 1e-6);
++            assertEquals(0, seen.get().quality());
++            assertEquals(ts, seen.get().ts());
++        } finally {
++            sub.close();
++        }
++    }
++
++    private static void publish(String host, int port, String channel, String payload) throws Exception {
++        try (Socket s = new Socket()) {
++            s.connect(new InetSocketAddress(host, port), 3000);
++            OutputStream out = s.getOutputStream();
++            String[] args = {"PUBLISH", channel, payload};
++            StringBuilder sb = new StringBuilder("*").append(args.length).append("\r\n");
++            for (String a : args) {
++                byte[] b = a.getBytes(StandardCharsets.UTF_8);
++                sb.append("$").append(b.length).append("\r\n").append(a).append("\r\n");
++            }
++            out.write(sb.toString().getBytes(StandardCharsets.UTF_8));
++            out.flush();
++            Thread.sleep(100);
++        }
++    }
++}

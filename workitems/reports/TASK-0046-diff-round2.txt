@@ -1,0 +1,512 @@
+diff --git a/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java b/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java
+index e8cb409..ae27ec0 100644
+--- a/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java
++++ b/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java
+@@ -9,14 +9,20 @@ import java.util.Map;
+ import tools.jackson.databind.json.JsonMapper;
+ 
+ /**
+- * 指标产出事件载荷（ADR-0007 定版 + ADR-0010 同窗口重发不变）。
++ * 指标产出事件载荷——权威=冻结契约 {@code resources/contract/unified-message-model.md} v1.1.0
++ * 「3.5」推送行（TASK-0046 修订 F-02，原「ADR-0007 14 字段」为 brief 笔误已纠正）：
++ * 统一消息模型基础字段 + <strong>9 扩展字段</strong> metric_code / instance_key(=full_key) /
++ * period / window_start / window_end / value / yoy / mom / quality。
+  *
+- * <p>字段（brief 决策 4 定版）：metricCode / instanceCode / period / 窗口起止 / value /
+- * yoy / mom / 完整度 / tenant / hash + 事件类型标识；按 ADR-0007 扩展自统一消息模型，
+- * 不引入随重算变化的 is_recalc / calc_time 等字段（重发逐字不变）。
++ * <p>本批线上字段名采用 camelCase、窗口起止用毫秒时间戳——契约「与上游差异」第 7/8 条明文
++ * 「待 TASK-0053 落地时定版」，属允许范围；<b>最终字段名风格与时间类型归 0053 定版</b>，
++ * 届时按 CONV-03 升契约修订号并双方同步。instanceCode 保留作过渡双字段（与 instanceKey 同值），
++ * 0053 消费侧以 instanceKey(=full_key) 为准。
+  *
+- * <p>hash = 事件身份键（指标全键 + 窗口 + 值/伴随值）的 SHA-256，中台按 hash 幂等覆盖
+- * （同窗口同结果重发 hash 不变）。
++ * <p>quality 按 CONV-02：正常结果=0（GOOD）；不完整/无数据=7（汇总不完整，不写 0 冒充）。
++ *
++ * <p>ADR-0010：不引入 is_recalc / calc_time 等非契约字段（重发不变）；hash=SHA-256
++ * (指标全键+窗口+结果+伴随值)，中台须按「指标全键+窗口」幂等覆盖（非 hash——hash 随修正变化）。
+  *
+  * @author dowei
+  * @date 2026-11-24
+@@ -38,6 +44,7 @@ public final class MetricProducedEvent {
+     private final Double mom;
+     private final double completeness;
+     private final boolean incomplete;
++    private final int quality;
+     private final String hash;
+ 
+     public MetricProducedEvent(String tenant, long tenantId, String metricCode, String instanceCode,
+@@ -56,12 +63,16 @@ public final class MetricProducedEvent {
+         this.mom = mom;
+         this.completeness = completeness;
+         this.incomplete = incomplete;
++        // CONV-02 质量码：不完整/无数据=7（汇总不完整），正常=0（GOOD）；不写 0 冒充正常
++        this.quality = incomplete ? 7 : 0;
+         this.hash = computeHash();
+     }
+ 
+     public String tenant() { return tenant; }
+     public String metricCode() { return metricCode; }
+     public String instanceCode() { return instanceCode; }
++    /** 冻结契约 instance_key（=full_key）；本批与 instanceCode 同值（过渡双字段） */
++    public String instanceKey() { return instanceCode; }
+     public String period() { return period; }
+     public long windowStart() { return windowStart; }
+     public long windowEnd() { return windowEnd; }
+@@ -70,6 +81,7 @@ public final class MetricProducedEvent {
+     public Double mom() { return mom; }
+     public double completeness() { return completeness; }
+     public boolean incomplete() { return incomplete; }
++    public int quality() { return quality; }
+     public String hash() { return hash; }
+ 
+     public static String mqttTopic(String tenant) {
+@@ -87,13 +99,15 @@ public final class MetricProducedEvent {
+         m.put("tenant", tenant);
+         m.put("tenantId", tenantId);
+         m.put("metricCode", metricCode);
+-        m.put("instanceCode", instanceCode);
++        m.put("instanceKey", instanceCode);          // 冻结契约 instance_key（=full_key）
++        m.put("instanceCode", instanceCode);         // 过渡双字段（0053 定版后收敛）
+         m.put("period", period);
+         m.put("windowStart", windowStart);
+         m.put("windowEnd", windowEnd);
+         m.put("value", value);
+         m.put("yoy", yoy);
+         m.put("mom", mom);
++        m.put("quality", quality);                   // 冻结契约 9 扩展字段之一（CONV-02）
+         m.put("completeness", completeness);
+         m.put("incomplete", incomplete);
+         m.put("hash", hash);
+diff --git a/calc/src/main/java/net/otlab/calc/graph/GraphBuilder.java b/calc/src/main/java/net/otlab/calc/graph/GraphBuilder.java
+index 96b55b7..c737a50 100644
+--- a/calc/src/main/java/net/otlab/calc/graph/GraphBuilder.java
++++ b/calc/src/main/java/net/otlab/calc/graph/GraphBuilder.java
+@@ -287,8 +287,9 @@ public class GraphBuilder {
+         return fullKey.substring(0, fullKey.length() - suffix.length());
+     }
+ 
+-    /** 拓扑序：被依赖者在前；留有未输出节点即内部矛盾（环已拦截——防御性再验一道） */
+-    static List<String> topoSort(Map<String, GraphNode> nodes, List<GraphEdge> edges) {
++    /** 拓扑序：被依赖者在前；留有未输出节点即内部矛盾（环已拦截——防御性再验一道）。
++     *  可见性=public：TASK-0046 修订 F-01 级联重算复用同一拓扑序语义（指标级联图）。 */
++    public static List<String> topoSort(Map<String, GraphNode> nodes, List<GraphEdge> edges) {
+         Map<String, Integer> unresolved = new LinkedHashMap<>();
+         for (String key : nodes.keySet()) {
+             unresolved.put(key, 0);
+@@ -325,8 +326,8 @@ public class GraphBuilder {
+         return order;
+     }
+ 
+-    /** 节点 → 上游依赖键集（0041 执行器消费） */
+-    static Map<String, Set<String>> dependenciesOf(Map<String, GraphNode> nodes,
++    /** 节点 → 上游依赖键集（0041 执行器消费；TASK-0046 F-01 级联图复用同一语义）。 */
++    public static Map<String, Set<String>> dependenciesOf(Map<String, GraphNode> nodes,
+                                                    List<GraphEdge> edges) {
+         Map<String, Set<String>> out = new LinkedHashMap<>();
+         for (String key : nodes.keySet()) {
+diff --git a/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java b/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java
+index c361a43..d97b97f 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java
++++ b/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java
+@@ -82,7 +82,9 @@ public final class CompanionValueCalculator {
+     }
+ 
+     /**
+-     * 同期窗口起始 ts（自然日历回溯；同比 = 上一周期再减 1 年；环比 = 上一周期）。
++     * 同期窗口起始 ts（自然日历回溯）：同比 = 去年同期「同窗口」（本期 ts 直接减 1 年）；
++     * 环比 = 上一周期（本期 ts 回退一周期）。两者都相对<strong>本期起点</strong>回溯，
++     * 同期窗与本期等长同日历位置（§1.7）——非「上一周期再减一年」（F-03 文案订正）。
+      */
+     public static long compareTs(String period, long ts, ZoneId zone, CompareMode mode) {
+         ZonedDateTime t = java.time.Instant.ofEpochMilli(ts).atZone(zone);
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java b/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java
+index 7d86892..3e6e02f 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricAggregator.java
+@@ -73,6 +73,31 @@ public final class MetricAggregator {
+         return out;
+     }
+ 
++    /**
++     * 级联聚合（TASK-0046 修订 F-01）：从<strong>下级重算后的已物化结果</strong>读值，而非原始样本表。
++     * 供闭包沿 0040 依赖图拓扑序逐层调用——下层先算并登记 materialized，上层据此读到新值。
++     */
++    public MetricResult aggregateCascade(MetricDef def, MetricValueStore source, String tenant,
++                                         String instanceCode, long ts, int expectedCount,
++                                         double minCompleteness) {
++        java.util.List<Double> values = new java.util.ArrayList<>();
++        if (def.sourceKeys() != null) {
++            for (String child : def.sourceKeys()) {
++                Double v = source.materializedCascadeValue(tenant, child, instanceCode, def.period(), ts);
++                if (v != null) {
++                    values.add(v);
++                }
++            }
++        }
++        int arrived = values.size();
++        double completeness = expectedCount <= 0 ? 0.0
++                : Math.min(1.0, arrived / (double) expectedCount);
++        boolean noData = arrived == 0;
++        Double value = noData ? null : aggregateValue(def, values);
++        boolean incomplete = noData || completeness < minCompleteness;
++        return new MetricResult(value, completeness, incomplete, noData, ts);
++    }
++
+     /** 普通型聚合值：1 平均（总量÷24）/ 2 累计 / 3 最大 / 4 最小 */
+     private Double aggregateValue(MetricDef def, List<Double> values) {
+         double sum = values.stream().mapToDouble(Double::doubleValue).sum();
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricCascade.java b/calc/src/main/java/net/otlab/calc/metric/MetricCascade.java
+new file mode 100644
+index 0000000..9533307
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricCascade.java
+@@ -0,0 +1,93 @@
++package net.otlab.calc.metric;
++
++import net.otlab.calc.graph.EdgeType;
++import net.otlab.calc.graph.GraphBuilder;
++import net.otlab.calc.graph.GraphEdge;
++import net.otlab.calc.graph.GraphNode;
++import net.otlab.calc.graph.NodeKind;
++
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 指标级联依赖图（TASK-0046 修订 F-01）：把 {@link MetricDef} 集合映射为 0040 的依赖图结构——
++ * 节点=metricCode（{@link NodeKind#METRIC}），边=上级依赖下级（{@link EdgeType#METRIC_SOURCE}），
++ * 拓扑序复用 {@link GraphBuilder#topoSort}（被依赖者在前，Kahn + 快照装载序确定性）。
++ *
++ * <p>迟到修正时从「变更指标」出发，只取传递闭包内的后代（affected），按拓扑序返回——
++ * 下层结果先登记 materialized，上层再读，确保修正值跨多级传播（旧实现单趟平扫+子串匹配、
++ * 单层传播且从原始样本表读值，修正值传不到上级——F-01）。
++ *
++ * <p>本类只做图结构与排序（纯函数、可独立测试）；读值/计算/留痕由 {@link MetricRuntime} 承担。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricCascade {
++
++    /** 由指标定义构建依赖图（复用 0040 图节点/边/拓扑序结构） */
++    public static net.otlab.calc.graph.DependencyGraph buildGraph(List<MetricDef> defs) {
++        Map<String, GraphNode> nodes = new LinkedHashMap<>();
++        List<GraphEdge> edges = new ArrayList<>();
++        if (defs == null) {
++            defs = List.of();
++        }
++        for (MetricDef def : defs) {
++            nodes.put(def.metricCode(), new GraphNode(def.metricCode(), NodeKind.METRIC, null));
++        }
++        for (MetricDef def : defs) {
++            // srcType=4：来源为下级指标物化结果——建立「上级 → 下级」依赖边
++            if (def.srcType() == 4 && def.sourceKeys() != null) {
++                for (String child : def.sourceKeys()) {
++                    if (nodes.containsKey(child)) {
++                        edges.add(new GraphEdge(def.metricCode(), child, EdgeType.METRIC_SOURCE,
++                                "cascade:" + def.metricCode() + "<-" + child));
++                    }
++                }
++            }
++        }
++        // 拓扑序复用 0040 GraphBuilder.topoSort（被依赖者在前，Kahn + 装载序确定性）——
++        // 与 0040 构建指标图同一实现，避免另造排序语义（F-01：复用 0040 拓扑序）。
++        List<String> topo = net.otlab.calc.graph.GraphBuilder.topoSort(nodes, edges);
++        Map<String, Set<String>> deps = net.otlab.calc.graph.GraphBuilder.dependenciesOf(nodes, edges);
++        return new net.otlab.calc.graph.DependencyGraph(0L, null, nodes, edges, topo, deps);
++    }
++
++    /**
++     * 受影响后代（传递闭包），按拓扑序返回（下级在前）。changedMetric 自身不含。
++     */
++    public static List<MetricDef> affectedInTopoOrder(net.otlab.calc.graph.DependencyGraph graph,
++                                                      String changedMetric, List<MetricDef> defs) {
++        Map<String, MetricDef> byCode = new LinkedHashMap<>();
++        for (MetricDef def : defs) {
++            byCode.put(def.metricCode(), def);
++        }
++        // 反依赖：to 的下级变更 → from 受影响
++        Map<String, Set<String>> dependents = new LinkedHashMap<>();
++        for (GraphEdge edge : graph.getEdges()) {
++            dependents.computeIfAbsent(edge.to(), k -> new LinkedHashSet<>()).add(edge.from());
++        }
++        Set<String> affected = new LinkedHashSet<>();
++        java.util.ArrayDeque<String> queue = new java.util.ArrayDeque<>();
++        queue.add(changedMetric);
++        while (!queue.isEmpty()) {
++            String cur = queue.poll();
++            for (String dep : dependents.getOrDefault(cur, Set.of())) {
++                if (affected.add(dep)) {
++                    queue.add(dep);
++                }
++            }
++        }
++        List<MetricDef> ordered = new ArrayList<>();
++        for (String key : graph.getTopoOrder()) {
++            if (affected.contains(key) && byCode.containsKey(key)) {
++                ordered.add(byCode.get(key));
++            }
++        }
++        return ordered;
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+index 6095e6d..9bf2555 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+@@ -125,9 +125,16 @@ public final class MetricRuntime {
+     /** 计算一个窗口的完整链路：聚合 → 伴随值 → 物化写 → 登记 → 事件 */
+     private MetricResult doCompute(MetricDef def, MetricWindow w, boolean isRecalc, String inputKey) {
+         int expected = expectedCount(def);
+-        MetricResult result = "DAY".equalsIgnoreCase(def.period()) && def.aggType() == 1
+-                ? aggregator.aggregateAverageDiv24(def, source, w.startMillis(), expected, minCompleteness)
+-                : aggregator.aggregate(def, source, w.startMillis(), expected, minCompleteness);
++        MetricResult result;
++        if (def.srcType() == 4) {
++            // TASK-0046 修订 F-01：级联指标从下级「已物化结果」读值（非原始样本表）
++            result = aggregator.aggregateCascade(def, source, tenant(), instanceCode,
++                    w.startMillis(), expected, minCompleteness);
++        } else if ("DAY".equalsIgnoreCase(def.period()) && def.aggType() == 1) {
++            result = aggregator.aggregateAverageDiv24(def, source, w.startMillis(), expected, minCompleteness);
++        } else {
++            result = aggregator.aggregate(def, source, w.startMillis(), expected, minCompleteness);
++        }
+ 
+         CompanionValueCalculator.CompanionValues companions = companion.calculate(
+                 source, tenant(), def.metricCode(), instanceCode, def.period(),
+@@ -198,18 +205,29 @@ public final class MetricRuntime {
+         return RecalcOutcome.skipped("无匹配已结束窗口或超出宽限期");
+     }
+ 
+-    /** 级联重算：srcType=4 的指标定义（来源为下级物化结果）沿依赖图向上重算同窗 */
++    /**
++     * 级联重算（TASK-0046 修订 F-01）：构建 0040 拓扑序指标依赖图，从变更指标的传递闭包取受影响
++     * 后代，按拓扑序逐层重算——下层结果先登记 materialized，上层从 materialized 读新值；
++     * 每层独立 try/catch（单上级失败隔离，不阻塞兄弟/顶层；失败留 FAILED 痕迹）。
++     *
++     * <p>幂等：同窗变更只触发一次（由 onLateArrival 的 recalcFired 保证）。
++     */
+     private void cascadeRecalc(MetricDef changed, MetricWindow w, long nowMillis) {
+-        for (MetricDef def : defs) {
+-            if (def.srcType() == 4 && def.sourceKeys() != null
+-                    && def.sourceKeys().stream().anyMatch(k -> k.contains(changed.metricCode()))) {
++        net.otlab.calc.graph.DependencyGraph graph = MetricCascade.buildGraph(defs);
++        List<MetricDef> affected = MetricCascade.affectedInTopoOrder(graph, changed.metricCode(), defs);
++        for (MetricDef def : affected) {
++            String fullKey = tenant() + "|" + def.metricCode() + "|" + instanceCode + "|" + def.period();
++            try {
+                 MetricWindow cw = new MetricWindow(tenant(), def.metricCode(), def.period(),
+                         w.calendarType(), w.startMillis(), w.endMillis());
+-                doCompute(def, cw, true, changed.metricCode());
+-                calcLog.append("BACKFILL",
+-                        tenant() + "|" + def.metricCode() + "|" + instanceCode + "|" + def.period(),
+-                        cw.startMillis(), cw.endMillis(), 1,
+-                        "cascade<-" + changed.metricCode(), "SUCCESS");
++                MetricResult r = doCompute(def, cw, true, changed.metricCode());
++                calcLog.append("BACKFILL", fullKey, cw.startMillis(), cw.endMillis(), 1,
++                        "cascade<-" + changed.metricCode(),
++                        r.noData() ? "NO_DATA" : "SUCCESS");
++            } catch (RuntimeException e) {
++                // 单上级失败隔离：不阻塞其他上级/顶层（F-01 失败隔离）
++                calcLog.append("BACKFILL", fullKey, w.startMillis(), w.endMillis(), 1,
++                        "cascade<-" + changed.metricCode() + " failed: " + e.getMessage(), "FAILED");
+             }
+         }
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+index 6ddb41a..48c3bc2 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+@@ -43,6 +43,22 @@ public final class MetricValueStore {
+         return materialized.get(materializedKey(tenant, metricCode, instanceCode, period, ts));
+     }
+ 
++    /**
++     * 级联读数（TASK-0046 修订 F-01）：从<strong>已物化的下级指标结果</strong>读值——而非原始样本
++     * values 表。键格式 `tenant|metricCode|instanceCode|period|ts`，按 sourceKey=下级 metricCode
++     * 精确匹配「|metricCode|」段 + 相同 ts（级联同窗）。租户隔离：只匹配本租户前缀。
++     */
++    public Double materializedCascadeValue(String tenant, String childMetricCode,
++                                           String instanceCode, String period, long ts) {
++        String prefix = tenant + "|" + childMetricCode + "|" + instanceCode + "|" + period + "|";
++        for (java.util.Map.Entry<String, Double> e : materialized.entrySet()) {
++            if (e.getKey().startsWith(prefix) && e.getKey().endsWith("|" + ts)) {
++                return e.getValue();
++            }
++        }
++        return null;
++    }
++
+     public void put(String key, double value, long ts) {
+         put(key, value, 0, ts);
+     }
+diff --git a/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java b/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java
+index 0fe90a0..025a297 100644
+--- a/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java
++++ b/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java
+@@ -48,6 +48,46 @@ class MetricProducedEventContractTest {
+         assertEquals(64, e.hash().length(), "hash=SHA-256 十六进制 64 字符");
+     }
+ 
++    /**
++     * TASK-0046 修订 F-02：载荷权威=冻结契约 unified-message-model.md v1.1.0「3.5」推送行——
++     * 统一消息模型基础上扩展 9 字段：metric_code / instance_key(=full_key) / period /
++     * window_start / window_end / value / yoy / mom / quality。本批 camelCase 线上风格（契约
++     * §与上游差异第7条「待 TASK-0053 定版」允许范围），instanceCode 保留作过渡双字段。
++     * 对旧载荷（缺 quality、无 instance_key）必红。
++     */
++    @Test
++    void payloadContainsAllNineFrozenContractExtensionFields() {
++        MetricProducedEvent e = event(0.083, -0.021);
++        Map<String, Object> json = e.toPayloadMap();
++        // 冻结契约 9 扩展字段（camelCase 映射，风格归 0053 定版）
++        assertTrue(json.containsKey("metricCode"), "扩展1 metric_code");
++        assertTrue(json.containsKey("instanceKey"), "扩展2 instance_key（=full_key，本批名 instanceKey 过渡）");
++        assertEquals("I01", json.get("instanceKey"), "instance_key 承载指标全键/实例键");
++        assertTrue(json.containsKey("period"), "扩展3 period");
++        assertTrue(json.containsKey("windowStart"), "扩展4 window_start");
++        assertTrue(json.containsKey("windowEnd"), "扩展5 window_end");
++        assertTrue(json.containsKey("value"), "扩展6 value");
++        assertTrue(json.containsKey("yoy"), "扩展7 yoy");
++        assertTrue(json.containsKey("mom"), "扩展8 mom");
++        assertTrue(json.containsKey("quality"), "扩展9 quality（CONV-02；旧载荷缺此字段）");
++        assertEquals(0, ((Number) json.get("quality")).intValue(), "quality=CONV-02 0 正常");
++        // 过渡：保留 instanceCode 双字段并存（javadoc 说明）
++        assertEquals("I01", json.get("instanceCode"));
++    }
++
++    @Test
++    void qualityReflectsCompletenessAndNoData() {
++        // quality 按 CONV-02：无数据/不完整打码 7（汇总不完整），正常 0
++        MetricProducedEvent e = new MetricProducedEvent("t46", 1L, "M", "I01", "DAY", 1,
++                TS, END, 120.5, null, null, 0.6, true);
++        assertEquals(7, ((Number) e.toPayloadMap().get("quality")).intValue(),
++                "不完整结果 quality=7（汇总不完整，CONV-02）");
++        MetricProducedEvent noData = new MetricProducedEvent("t46", 1L, "M", "I01", "DAY", 1,
++                TS, END, null, null, null, 0.0, true);
++        assertEquals(7, ((Number) noData.toPayloadMap().get("quality")).intValue(),
++                "无数据 quality=7，不写 0 冒充正常");
++    }
++
+     @Test
+     void topicsAreTenantIsolated() {
+         assertEquals("iot/t46/metric/out", MetricProducedEvent.mqttTopic("t46"));
+diff --git a/calc/src/test/java/net/otlab/calc/metric/CascadeRecalcContractTest.java b/calc/src/test/java/net/otlab/calc/metric/CascadeRecalcContractTest.java
+new file mode 100644
+index 0000000..a28502b
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/CascadeRecalcContractTest.java
+@@ -0,0 +1,107 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.Instant;
++import java.time.ZoneOffset;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0046 修订轮 F-01：级联重算必须沿 0040 依赖图拓扑序、从下级<strong>重算后的物化结果</strong>
++ * 读值再算上级——两级以上链（M_LOW←M_HIGH←M_TOP）补传触发后，上级结果必须反映下级新值。
++ *
++ * <p>对旧实现必红：旧 `cascadeRecalc` 单趟平扫+子串匹配、单层传播，且 `doCompute` 从原始样本
++ * `values` 表读值（上级 sourceKeys=下级 metricCode 在 values 表不存在）→ 上级拿不到下级新值。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class CascadeRecalcContractTest {
++
++    private static MetricRuntime runtime(MetricValueRecorder recorder, List<MetricDef> defs) {
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(),
++                3, 0.8, ZoneOffset.UTC, "t46", 1L, "I01", recorder);
++        rt.setDefinitions(defs);
++        return rt;
++    }
++
++    private static MetricValue lastValueOf(MetricValueRecorder recorder, String metricCode) {
++        MetricValue found = null;
++        for (MetricValue v : recorder.values()) {
++            if (v.metricCode().equals(metricCode)) {
++                found = v;
++            }
++        }
++        return found;
++    }
++
++    @Test
++    void cascadePropagatesCorrectedChildValueThroughTopologyMultiLevel() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        // 三级链：M_LOW 读原始 I.A；M_HIGH 读 M_LOW 物化结果；M_TOP 读 M_HIGH 物化结果
++        MetricRuntime rt = runtime(recorder, List.of(
++                new MetricDef("M_LOW", "DAY", 2, List.of("I.A"), 1),
++                new MetricDef("M_HIGH", "DAY", 2, List.of("M_LOW"), 4),
++                new MetricDef("M_TOP", "DAY", 2, List.of("M_HIGH"), 4)));
++
++        long now = Instant.parse("2026-11-23T06:00:00Z").toEpochMilli();
++        long winStart = Instant.parse("2026-11-22T00:00:00Z").toEpochMilli();
++        long dataTs = winStart + 3600_000L;
++
++        // 初始产出：按拓扑序（下级先）逐个 onDue
++        rt.source().put("I.A", 5.0, dataTs);
++        for (MetricDef def : rt.defsForTest()) {
++            rt.onDue(rt.previousWindow(def, now));
++        }
++        assertEquals(5.0, lastValueOf(recorder, "M_LOW").value(), 1e-9, "下级初始=5");
++        assertEquals(5.0, lastValueOf(recorder, "M_HIGH").value(), 1e-9,
++                "上级必须从下级物化结果读值=5（旧实现从 values 表读不到 M_LOW → null）");
++        assertEquals(5.0, lastValueOf(recorder, "M_TOP").value(), 1e-9, "顶层初始=5");
++
++        // 迟到补传：I.A 修正为 7 → 触发下级重算，再沿拓扑级联到 M_HIGH、M_TOP
++        rt.source().put("I.A", 7.0, dataTs);
++        RecalcOutcome outcome = rt.onLateArrival("I.A", dataTs, now);
++        assertTrue(outcome.triggered(), "宽限期内迟到触发重算");
++
++        // 关键断言：两级上级都反映下级修正后的新值（旧实现必红）
++        assertEquals(7.0, lastValueOf(recorder, "M_LOW").value(), 1e-9, "下级修正=7");
++        assertEquals(7.0, lastValueOf(recorder, "M_HIGH").value(), 1e-9,
++                "F-01 核心：上级反映下级修正后的物化新值=7（非旧值5、非null）");
++        assertEquals(7.0, lastValueOf(recorder, "M_TOP").value(), 1e-9,
++                "F-01 核心：多级级联——顶层也反映跨两级的新值=7（旧实现单层传播漏算）");
++
++        // 拓扑序留痕：下级先于上级（BACKFILL 记录顺序 M_LOW→M_HIGH→M_TOP）
++        var logs = rt.calcLog().entries();
++        assertEquals(3, logs.size(), "三级链各留一条 BACKFILL（下级1+上级2）");
++        assertEquals("M_LOW", logs.get(0).fullKey().split("\\|")[1], "拓扑序：下级先重算");
++        assertEquals("M_HIGH", logs.get(1).fullKey().split("\\|")[1]);
++        assertEquals("M_TOP", logs.get(2).fullKey().split("\\|")[1], "拓扑序：顶层最后重算");
++        assertTrue(logs.stream().allMatch(e -> e.isRecalc() == 1 && "BACKFILL".equals(e.triggerType())));
++    }
++
++    @Test
++    void cascadeIsolationOneBadParentDoesNotBlockSibling() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        // M_OK 与 M_BAD 都级联自 M_LOW；M_BAD 引用不存在的下级键（should 无值，不阻塞 M_OK）
++        MetricRuntime rt = runtime(recorder, List.of(
++                new MetricDef("M_LOW", "DAY", 2, List.of("I.A"), 1),
++                new MetricDef("M_OK", "DAY", 2, List.of("M_LOW"), 4),
++                new MetricDef("M_BAD", "DAY", 2, List.of("M_MISSING"), 4)));
++
++        long now = Instant.parse("2026-11-23T06:00:00Z").toEpochMilli();
++        long dataTs = Instant.parse("2026-11-22T01:00:00Z").toEpochMilli();
++        rt.source().put("I.A", 5.0, dataTs);
++        for (MetricDef def : rt.defsForTest()) {
++            rt.onDue(rt.previousWindow(def, now));
++        }
++        rt.source().put("I.A", 9.0, dataTs);
++        rt.onLateArrival("I.A", dataTs, now);
++        MetricValue ok = lastValueOf(recorder, "M_OK");
++        assertNotNull(ok, "正常兄弟节点有结果");
++        assertEquals(9.0, ok.value(), 1e-9, "单个上级异常不阻塞其他上级反映下级新值");
++    }
++}

@@ -1,0 +1,1306 @@
+diff --git a/calc/pom.xml b/calc/pom.xml
+index 0991da7..14ac2b3 100644
+--- a/calc/pom.xml
++++ b/calc/pom.xml
+@@ -52,6 +52,13 @@
+             <artifactId>spring-boot-starter-test</artifactId>
+             <scope>test</scope>
+         </dependency>
++
++        <!-- TASK-0046 指标产出事件 MQTT 通道（Paho 同步客户端，QoS1 fire-and-forget；无传递依赖） -->
++        <dependency>
++            <groupId>org.eclipse.paho</groupId>
++            <artifactId>org.eclipse.paho.client.mqttv3</artifactId>
++            <version>1.2.5</version>
++        </dependency>
+     </dependencies>
+ 
+     <build>
+diff --git a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+index 4d92f16..8b4ae18 100644
+--- a/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
++++ b/calc/src/main/java/net/otlab/calc/CalcEngineApplication.java
+@@ -195,7 +195,7 @@ public class CalcEngineApplication {
+         String tenant = properties.getTenant() == null || properties.getTenant().isBlank()
+                 ? "default" : properties.getTenant();
+         net.otlab.calc.metric.MetricValueRecorder recorder = new net.otlab.calc.metric.MetricValueRecorder(tenant);
+-        return new net.otlab.calc.metric.MetricRuntime(
++        net.otlab.calc.metric.MetricRuntime runtime = new net.otlab.calc.metric.MetricRuntime(
+                 new net.otlab.calc.metric.MetricAggregator(),
+                 new net.otlab.calc.metric.MetricValueStore(),
+                 properties.getMetricGraceDays() == null ? 3 : properties.getMetricGraceDays(),
+@@ -205,6 +205,24 @@ public class CalcEngineApplication {
+                 properties.getStatusInstanceCode() == null || properties.getStatusInstanceCode().isBlank()
+                         ? "I01" : properties.getStatusInstanceCode(),
+                 recorder);
++
++        // TASK-0046 事件生产侧：MQTT（真 broker 默认端口）+ Kafka（无 broker 默认关，接口+契约就绪）
++        net.otlab.calc.event.PahoMqttChannel mqttChannel = new net.otlab.calc.event.PahoMqttChannel(
++                properties.getMetricMqttBroker(), properties.getMetricMqttClientPrefix());
++        net.otlab.calc.event.KafkaMetricChannel kafkaChannel = new net.otlab.calc.event.KafkaMetricChannel();
++        net.otlab.calc.event.MetricEventPublisher publisher = new net.otlab.calc.event.MetricEventPublisher(
++                mqttChannel, kafkaChannel,
++                properties.isMetricEventMqttEnabled(), properties.isMetricEventKafkaEnabled());
++        final String eventTenant = tenant;
++        runtime.setEventPublisher((mv, result) -> {
++            net.otlab.calc.metric.MetricWindow w = net.otlab.calc.metric.MetricWindow.forInstant(
++                    eventTenant, mv.metricCode(), mv.period(), mv.calendarType(), mv.ts(), java.time.ZoneOffset.UTC);
++            publisher.publish(new net.otlab.calc.event.MetricProducedEvent(
++                    eventTenant, mv.tenantId(), mv.metricCode(), mv.instanceCode(), mv.period(),
++                    mv.calendarType(), mv.ts(), w.endMillis(), mv.value(), mv.yoy(), mv.mom(),
++                    result.completeness(), result.incomplete()));
++        });
++        return runtime;
+     }
+ 
+     /** config.changed 订阅缝占位（TD-0057 延续登记）：本期拉取驱动，通知不消费 */
+diff --git a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+index f1519b8..1156432 100644
+--- a/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
++++ b/calc/src/main/java/net/otlab/calc/config/CalcProperties.java
+@@ -86,6 +86,50 @@ public class CalcProperties {
+     /** 指标完整度阈值（env CALC_METRIC_COMPLETENESS_MIN，默认 0.8；低于阈值带不完整标记） */
+     private Double metricCompletenessMin = 0.8;
+ 
++    /** TASK-0046 指标产出事件 MQTT 总开关（默认 false——无 broker/既有行为零变化） */
++    private boolean metricEventMqttEnabled = false;
++
++    /** TASK-0046 指标产出事件 Kafka 总开关（默认 false——本环境无 broker，接口+契约就绪） */
++    private boolean metricEventKafkaEnabled = false;
++
++    /** MQTT broker 地址（如 tcp://192.168.31.145:1883；仅 mqtt-enabled=true 时使用） */
++    private String metricMqttBroker = "tcp://192.168.31.145:1883";
++
++    /** MQTT 客户端 id 前缀（多实例区分；完整 id = prefix + 时间戳后缀） */
++    private String metricMqttClientPrefix = "calc-metric-out";
++
++    public boolean isMetricEventMqttEnabled() {
++        return metricEventMqttEnabled;
++    }
++
++    public void setMetricEventMqttEnabled(boolean metricEventMqttEnabled) {
++        this.metricEventMqttEnabled = metricEventMqttEnabled;
++    }
++
++    public boolean isMetricEventKafkaEnabled() {
++        return metricEventKafkaEnabled;
++    }
++
++    public void setMetricEventKafkaEnabled(boolean metricEventKafkaEnabled) {
++        this.metricEventKafkaEnabled = metricEventKafkaEnabled;
++    }
++
++    public String getMetricMqttBroker() {
++        return metricMqttBroker;
++    }
++
++    public void setMetricMqttBroker(String metricMqttBroker) {
++        this.metricMqttBroker = metricMqttBroker;
++    }
++
++    public String getMetricMqttClientPrefix() {
++        return metricMqttClientPrefix;
++    }
++
++    public void setMetricMqttClientPrefix(String metricMqttClientPrefix) {
++        this.metricMqttClientPrefix = metricMqttClientPrefix;
++    }
++
+     public boolean isMetricAggregationEnabled() {
+         return metricAggregationEnabled;
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/event/KafkaMetricChannel.java b/calc/src/main/java/net/otlab/calc/event/KafkaMetricChannel.java
+new file mode 100644
+index 0000000..c1a78ee
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/event/KafkaMetricChannel.java
+@@ -0,0 +1,29 @@
++package net.otlab.calc.event;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Kafka 指标产出事件通道（TASK-0046）：本环境无 broker → 只交付接口 + 契约测试，
++ * 运行时按 env 开关默认关。此实现为 fail-soft 占位（记录日志、不抛、不阻塞主链），
++ * 真 Kafka producer 接线（bootstrap.servers / 序列化 / 分区键=tenant）为演进位，
++ * 由具备 broker 的环境接入时替换本通道实现即可，{@link MetricEventPublisher} 不变。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class KafkaMetricChannel implements MetricEventPublisher.KafkaChannel, AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(KafkaMetricChannel.class);
++
++    @Override
++    public void publish(String topic, String payload) {
++        log.warn("[CALC-EVENT] Kafka broker 不可用（本环境无 broker，演进位）——跳过 publish topic={} payloadSize={}",
++                topic, payload == null ? 0 : payload.length());
++    }
++
++    @Override
++    public void close() {
++        // no-op：无真实连接
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/event/MetricEventPublisher.java b/calc/src/main/java/net/otlab/calc/event/MetricEventPublisher.java
+new file mode 100644
+index 0000000..e096967
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/event/MetricEventPublisher.java
+@@ -0,0 +1,61 @@
++package net.otlab.calc.event;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * 指标产出事件生产者（TASK-0046，承担 0053 的事件生产侧）：MQTT + Kafka 双通道，
++ * 载荷 ADR-0007 定版、按租户主题隔离、fire-and-forget（无订阅者不报错、传输异常 fail-soft）。
++ *
++ * <p>Kafka 本环境无 broker → 接口 + 契约测试，运行时按 env 开关默认关（登记演进位）；
++ * MQTT 真 broker 192.168.31.145:1883 由 {@link PahoMqttChannel} 承担。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricEventPublisher {
++
++    private static final Logger log = LoggerFactory.getLogger(MetricEventPublisher.class);
++
++    @FunctionalInterface
++    public interface MqttChannel {
++        void publish(String topic, String payload);
++    }
++
++    @FunctionalInterface
++    public interface KafkaChannel {
++        void publish(String topic, String payload);
++    }
++
++    private final MqttChannel mqtt;
++    private final KafkaChannel kafka;
++    private final boolean mqttEnabled;
++    private final boolean kafkaEnabled;
++
++    public MetricEventPublisher(MqttChannel mqtt, KafkaChannel kafka, boolean mqttEnabled, boolean kafkaEnabled) {
++        this.mqtt = mqtt;
++        this.kafka = kafka;
++        this.mqttEnabled = mqttEnabled;
++        this.kafkaEnabled = kafkaEnabled;
++    }
++
++    public void publish(MetricProducedEvent e) {
++        String payload = e.toJson();
++        if (mqttEnabled && mqtt != null) {
++            safePublish("MQTT", MetricProducedEvent.mqttTopic(e.tenant()), payload, mqtt::publish);
++        }
++        if (kafkaEnabled && kafka != null) {
++            safePublish("Kafka", MetricProducedEvent.kafkaTopic(e.tenant()), payload, kafka::publish);
++        }
++    }
++
++    private void safePublish(String channelName, String topic, String payload,
++                             java.util.function.BiConsumer<String, String> send) {
++        try {
++            send.accept(topic, payload); // QoS1 fire-and-forget：无订阅者不抛
++        } catch (RuntimeException ex) {
++            log.warn("[CALC-EVENT] {} 产出事件发送失败（fail-soft 不阻塞指标主链）topic={}: {}",
++                    channelName, topic, ex.getMessage());
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java b/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java
+new file mode 100644
+index 0000000..e8cb409
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/event/MetricProducedEvent.java
+@@ -0,0 +1,124 @@
++package net.otlab.calc.event;
++
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import tools.jackson.databind.json.JsonMapper;
++
++/**
++ * 指标产出事件载荷（ADR-0007 定版 + ADR-0010 同窗口重发不变）。
++ *
++ * <p>字段（brief 决策 4 定版）：metricCode / instanceCode / period / 窗口起止 / value /
++ * yoy / mom / 完整度 / tenant / hash + 事件类型标识；按 ADR-0007 扩展自统一消息模型，
++ * 不引入随重算变化的 is_recalc / calc_time 等字段（重发逐字不变）。
++ *
++ * <p>hash = 事件身份键（指标全键 + 窗口 + 值/伴随值）的 SHA-256，中台按 hash 幂等覆盖
++ * （同窗口同结果重发 hash 不变）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class MetricProducedEvent {
++
++    private static final JsonMapper MAPPER = JsonMapper.builder().build();
++
++    private final String tenant;
++    private final long tenantId;
++    private final String metricCode;
++    private final String instanceCode;
++    private final String period;
++    private final int calendarType;
++    private final long windowStart;
++    private final long windowEnd;
++    private final Double value;
++    private final Double yoy;
++    private final Double mom;
++    private final double completeness;
++    private final boolean incomplete;
++    private final String hash;
++
++    public MetricProducedEvent(String tenant, long tenantId, String metricCode, String instanceCode,
++                               String period, int calendarType, long windowStart, long windowEnd,
++                               Double value, Double yoy, Double mom, double completeness, boolean incomplete) {
++        this.tenant = tenant;
++        this.tenantId = tenantId;
++        this.metricCode = metricCode;
++        this.instanceCode = instanceCode;
++        this.period = period;
++        this.calendarType = calendarType;
++        this.windowStart = windowStart;
++        this.windowEnd = windowEnd;
++        this.value = value;
++        this.yoy = yoy;
++        this.mom = mom;
++        this.completeness = completeness;
++        this.incomplete = incomplete;
++        this.hash = computeHash();
++    }
++
++    public String tenant() { return tenant; }
++    public String metricCode() { return metricCode; }
++    public String instanceCode() { return instanceCode; }
++    public String period() { return period; }
++    public long windowStart() { return windowStart; }
++    public long windowEnd() { return windowEnd; }
++    public Double value() { return value; }
++    public Double yoy() { return yoy; }
++    public Double mom() { return mom; }
++    public double completeness() { return completeness; }
++    public boolean incomplete() { return incomplete; }
++    public String hash() { return hash; }
++
++    public static String mqttTopic(String tenant) {
++        return "iot/" + tenant + "/metric/out";
++    }
++
++    public static String kafkaTopic(String tenant) {
++        return "iot.metric.result." + tenant;
++    }
++
++    /** 稳定有序载荷（LinkedHashMap 保序——toJson 逐字稳定；重发逐字不变） */
++    public Map<String, Object> toPayloadMap() {
++        Map<String, Object> m = new LinkedHashMap<>();
++        m.put("eventType", "metric.out");
++        m.put("tenant", tenant);
++        m.put("tenantId", tenantId);
++        m.put("metricCode", metricCode);
++        m.put("instanceCode", instanceCode);
++        m.put("period", period);
++        m.put("windowStart", windowStart);
++        m.put("windowEnd", windowEnd);
++        m.put("value", value);
++        m.put("yoy", yoy);
++        m.put("mom", mom);
++        m.put("completeness", completeness);
++        m.put("incomplete", incomplete);
++        m.put("hash", hash);
++        return m;
++    }
++
++    public String toJson() {
++        return MAPPER.writeValueAsString(toPayloadMap());
++    }
++
++    /** SHA-256(指标全键 + 窗口 + 结果 + 伴随值)——重发同窗同结果 hash 不变 */
++    private String computeHash() {
++        String identity = tenant + "|" + metricCode + "|" + instanceCode + "|" + period
++                + "|" + calendarType + "|" + windowStart + "|" + windowEnd
++                + "|" + value + "|" + yoy + "|" + mom;
++        try {
++            byte[] digest = MessageDigest.getInstance("SHA-256")
++                    .digest(identity.getBytes(StandardCharsets.UTF_8));
++            StringBuilder sb = new StringBuilder(digest.length * 2);
++            for (byte b : digest) {
++                sb.append(String.format("%02x", b & 0xff));
++            }
++            return sb.toString();
++        } catch (NoSuchAlgorithmException e) {
++            throw new IllegalStateException("SHA-256 不可用", e);
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/event/PahoMqttChannel.java b/calc/src/main/java/net/otlab/calc/event/PahoMqttChannel.java
+new file mode 100644
+index 0000000..fcadabe
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/event/PahoMqttChannel.java
+@@ -0,0 +1,79 @@
++package net.otlab.calc.event;
++
++import org.eclipse.paho.client.mqttv3.MqttClient;
++import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
++import org.eclipse.paho.client.mqttv3.MqttException;
++import org.eclipse.paho.client.mqttv3.MqttMessage;
++import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.nio.charset.StandardCharsets;
++
++/**
++ * 真 MQTT 通道（TASK-0046）：Paho 客户端，QoS1 publish fire-and-forget（无订阅者不报错），
++ * 连接断线 fail-soft（每次 publish 前检查连接，必要时重连），真 broker EMQX 192.168.31.145:1883
++ * 匿名 allow（已实证）。clientId 每次构造带时间戳后缀，避免多实例/重连 session 冲突。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class PahoMqttChannel implements MetricEventPublisher.MqttChannel, AutoCloseable {
++
++    private static final Logger log = LoggerFactory.getLogger(PahoMqttChannel.class);
++
++    private final String broker;
++    private final String clientId;
++    private final MqttClient client;
++
++    public PahoMqttChannel(String broker, String clientIdPrefix) {
++        this.broker = broker;
++        this.clientId = clientIdPrefix + "-" + System.currentTimeMillis()
++                + "-" + Integer.toHexString(System.identityHashCode(this));
++        try {
++            this.client = new MqttClient(broker, clientId, new MemoryPersistence());
++        } catch (MqttException e) {
++            throw new IllegalStateException("MQTT 客户端构造失败 broker=" + broker, e);
++        }
++    }
++
++    public String clientId() {
++        return clientId;
++    }
++
++    private void ensureConnected() throws MqttException {
++        if (!client.isConnected()) {
++            MqttConnectOptions opts = new MqttConnectOptions();
++            opts.setCleanSession(true);
++            opts.setConnectionTimeout(5);
++            opts.setAutomaticReconnect(false);
++            client.connect(opts);
++            log.info("[CALC-EVENT] MQTT 连接建立 broker={} clientId={}", broker, clientId);
++        }
++    }
++
++    @Override
++    public void publish(String topic, String payload) {
++        try {
++            ensureConnected();
++            MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
++            msg.setQos(1);                     // QoS1：至少一次；无订阅者 broker 正常 ACK，不报错
++            msg.setRetained(false);
++            client.publish(topic, msg);
++        } catch (MqttException e) {
++            throw new RuntimeException("MQTT publish 失败 topic=" + topic + ": " + e.getMessage(), e);
++        }
++    }
++
++    @Override
++    public void close() {
++        try {
++            if (client.isConnected()) {
++                client.disconnect();
++            }
++            client.close();
++        } catch (MqttException e) {
++            log.warn("[CALC-EVENT] MQTT 关闭异常（fail-soft）: {}", e.getMessage());
++        }
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/CalcLogStore.java b/calc/src/main/java/net/otlab/calc/metric/CalcLogStore.java
+new file mode 100644
+index 0000000..54c9003
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/CalcLogStore.java
+@@ -0,0 +1,64 @@
++package net.otlab.calc.metric;
++
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * iot_calc_log 计算留痕（ADR-0005 + ADR-0009 TD-0025 + §1.9A）：task_id 落库、trigger_type、
++ * full_key（指标全键）、period_start/end、is_recalc、input_summary、结果/失败原因。
++ *
++ * <p>重算（BACKFILL）不新增独立表——复用 iot_calc_log，full_key 承载指标全键。
++ * TDengine/MySQL 不可用时留痕走内存（同 0045 环境口径，真机补验列条件）——
++ * 本类为记录式留痕口，生产 REST 落地为演进位，契约测试断言字段齐备。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CalcLogStore {
++
++    /** §1.9A 留痕字段（is_recalc=1 for BACKFILL） */
++    public record CalcLogEntry(String taskId, String triggerType, String fullKey,
++                               long periodStart, long periodEnd, int isRecalc,
++                               String inputSummary, String resultStatus) {}
++
++    private final String tenant;
++    private final List<CalcLogEntry> entries = new CopyOnWriteArrayList<>();
++    private final AtomicLong seq = new AtomicLong();
++    private final boolean tdengineAvailable;
++
++    public CalcLogStore(String tenant) {
++        this(tenant, false);
++    }
++
++    public CalcLogStore(String tenant, boolean tdengineAvailable) {
++        this.tenant = tenant;
++        this.tdengineAvailable = tdengineAvailable;
++    }
++
++    public boolean tdengineAvailable() {
++        return tdengineAvailable;
++    }
++
++    /** 追加一条留痕：taskId 落库（BACKFILL-<tenant>-<seq>），返回登记项 */
++    public CalcLogEntry append(String triggerType, String fullKey, long periodStart, long periodEnd,
++                               int isRecalc, String inputSummary, String resultStatus) {
++        String taskId = triggerType + "-" + tenant + "-" + String.format("%06d", seq.incrementAndGet());
++        CalcLogEntry e = new CalcLogEntry(taskId, triggerType, fullKey, periodStart, periodEnd,
++                isRecalc, inputSummary, resultStatus);
++        entries.add(e);
++        return e;
++    }
++
++    public List<CalcLogEntry> entries() {
++        return List.copyOf(entries);
++    }
++
++    public CalcLogEntry last() {
++        return entries.isEmpty() ? null : entries.get(entries.size() - 1);
++    }
++
++    public int size() {
++        return entries.size();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java b/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java
+new file mode 100644
+index 0000000..c361a43
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/CompanionValueCalculator.java
+@@ -0,0 +1,101 @@
++package net.otlab.calc.metric;
++
++import java.time.ZoneId;
++import java.time.ZonedDateTime;
++import java.time.temporal.ChronoUnit;
++
++/**
++ * 同比/环比伴随值（TASK-0046，补 TASK-0045 deferred M-2；§1.7 / ADR-0007）。
++ *
++ * <p>口径冻结：
++ * <ul>
++ *   <li>从 {@link MetricValueStore} <b>已物化结果</b>读取同期主值，不现算原始数据（查询只读结果纪律）；</li>
++ *   <li>同比 = (本期 - 去年同期) / 去年同期；环比 = (本期 - 上一周期) / 上一周期；小数比率；</li>
++ *   <li>同期窗按自然日历回溯：HOUR-1h / DAY-1d / MONTH-1月 / YEAR-1年（同比各再乘 1 年）；</li>
++ *   <li>缺同期物化行或分母为 0 → null + 原因说明（compareNote 语义），不写 0 冒充；</li>
++ *   <li>本期无值（null）→ 伴随值 null + 说明。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public final class CompanionValueCalculator {
++
++    public enum CompareMode { YOY, MOM }
++
++    /** 伴随值结果：yoy/mom 值 + 同级说明（null 值给原因，不造假） */
++    public record CompanionValues(Double yoy, Double mom, String yoyNote, String momNote) {
++        public static CompanionValues of(Double yoy, String yoyNote, Double mom, String momNote) {
++            return new CompanionValues(yoy, mom, yoyNote, momNote);
++        }
++    }
++
++    /**
++     * 计算伴随值。
++     *
++     * @param store       已物化结果源（含 st_metric_value 已写入行）
++     * @param tenant      租户编码
++     * @param metricCode  指标编码
++     * @param instanceCode 实例编码
++     * @param period       HOUR/DAY/MONTH/YEAR
++     * @param ts           本期窗口起始（毫秒）
++     * @param currentValue 本期主值（null=无值）
++     * @param zone         时区
++     */
++    public CompanionValues calculate(MetricValueStore store, String tenant, String metricCode,
++                                     String instanceCode, String period, long ts,
++                                     Double currentValue, ZoneId zone) {
++        if (currentValue == null) {
++            return CompanionValues.of(null, "本期无值", null, "本期无值");
++        }
++        String yoyNote;
++        Double yoy;
++        String momNote;
++        Double mom;
++
++        long yoyTs = compareTs(period, ts, zone, CompareMode.YOY);
++        Double yoyBase = store.materialized(tenant, metricCode, instanceCode, period, yoyTs);
++        if (yoyBase == null) {
++            yoy = null;
++            yoyNote = "无同期数据（去年同期无物化结果）";
++        } else if (yoyBase == 0.0) {
++            yoy = null;
++            yoyNote = "分母为 0（去年同期值为 0）";
++        } else {
++            yoy = (currentValue - yoyBase) / yoyBase;
++            yoyNote = null;
++        }
++
++        long momTs = compareTs(period, ts, zone, CompareMode.MOM);
++        Double momBase = store.materialized(tenant, metricCode, instanceCode, period, momTs);
++        if (momBase == null) {
++            mom = null;
++            momNote = "无同期数据（上一周期无物化结果）";
++        } else if (momBase == 0.0) {
++            mom = null;
++            momNote = "分母为 0（上一周期值为 0）";
++        } else {
++            mom = (currentValue - momBase) / momBase;
++            momNote = null;
++        }
++        return CompanionValues.of(yoy, yoyNote, mom, momNote);
++    }
++
++    /**
++     * 同期窗口起始 ts（自然日历回溯；同比 = 上一周期再减 1 年；环比 = 上一周期）。
++     */
++    public static long compareTs(String period, long ts, ZoneId zone, CompareMode mode) {
++        ZonedDateTime t = java.time.Instant.ofEpochMilli(ts).atZone(zone);
++        ZonedDateTime prev = switch (period.toUpperCase(java.util.Locale.ROOT)) {
++            case "HOUR" -> t.minusHours(1);
++            case "DAY" -> t.minusDays(1);
++            case "MONTH" -> t.minusMonths(1);
++            case "YEAR" -> t.minusYears(1);
++            default -> throw new IllegalArgumentException("不支持的指标周期: " + period);
++        };
++        // 同比 = 去年同期「同窗口」（本期 ts 减 1 年）；环比 = 上一周期（本期 ts 回退一周期），
++        // 两者都直接相对本期起点回溯——同期窗即与本期相同长度/日历位置的窗（§1.7）。
++        ZonedDateTime compare = mode == CompareMode.YOY ? t.minusYears(1) : prev;
++        return compare.toInstant().toEpochMilli();
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+index e1e1b9e..6095e6d 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricRuntime.java
+@@ -29,6 +29,11 @@ public final class MetricRuntime {
+     private final MetricScheduler scheduler;
+     private final long tenantId;
+     private final String instanceCode;
++    /** TASK-0046：伴随值计算 + BACKFILL 留痕 + 事件生产缝 */
++    private final CompanionValueCalculator companion = new CompanionValueCalculator();
++    private final CalcLogStore calcLog;
++    /** TASK-0046：事件生产缝（载荷=MetricValue + 完整度/标记；由装配注入事件生产侧） */
++    private java.util.function.BiConsumer<MetricValue, MetricResult> eventPublisher = null;
+ 
+     private final AtomicLong produced = new AtomicLong();
+     private final Map<String, Object> windows = new ConcurrentHashMap<>();
+@@ -58,6 +63,7 @@ public final class MetricRuntime {
+         this.tenantId = tenantId;
+         this.instanceCode = instanceCode;
+         this.scheduler = new MetricScheduler(graceDays, zone, tenant);
++        this.calcLog = new CalcLogStore(tenant);
+     }
+ 
+     /** 生产装配用：recorder 提供记录式写口（真 REST 故障时 live 契约断言面） */
+@@ -73,6 +79,7 @@ public final class MetricRuntime {
+         this.tenantId = tenantId;
+         this.instanceCode = instanceCode;
+         this.scheduler = new MetricScheduler(graceDays, zone, tenant);
++        this.calcLog = new CalcLogStore(tenant);
+     }
+ 
+     /** 装载指标定义（换图时刷新；月末/周期间隔由 scheduler 自然读取） */
+@@ -104,7 +111,7 @@ public final class MetricRuntime {
+                 java.time.ZoneOffset.UTC);
+     }
+ 
+-    /** 到期窗口：计算 + 物化写 + 观测登记（同 ts 覆盖写=幂等） */
++    /** 到期窗口：计算 + 伴随值 + 物化写 + 事件产出 + 观测登记（同 ts 覆盖写=幂等） */
+     public void onDue(MetricWindow w) {
+         MetricDef def = defs.stream()
+                 .filter(d -> d.metricCode().equals(w.metricCode()))
+@@ -112,13 +119,36 @@ public final class MetricRuntime {
+         if (def == null) {
+             return;
+         }
++        doCompute(def, w, false, null);
++    }
++
++    /** 计算一个窗口的完整链路：聚合 → 伴随值 → 物化写 → 登记 → 事件 */
++    private MetricResult doCompute(MetricDef def, MetricWindow w, boolean isRecalc, String inputKey) {
+         int expected = expectedCount(def);
+         MetricResult result = "DAY".equalsIgnoreCase(def.period()) && def.aggType() == 1
+                 ? aggregator.aggregateAverageDiv24(def, source, w.startMillis(), expected, minCompleteness)
+                 : aggregator.aggregate(def, source, w.startMillis(), expected, minCompleteness);
+-        sink.write(new MetricValue(tenantId, def.metricCode(), instanceCode, def.period(), w.calendarType(),
+-                w.startMillis(), result.value(), null, null));
++
++        CompanionValueCalculator.CompanionValues companions = companion.calculate(
++                source, tenant(), def.metricCode(), instanceCode, def.period(),
++                w.startMillis(), result.value(), java.time.ZoneOffset.UTC);
++        MetricValue mv = new MetricValue(tenantId, def.metricCode(), instanceCode, def.period(),
++                w.calendarType(), w.startMillis(), result.value(), companions.yoy(), companions.mom());
++        sink.write(mv);
++        if (recorder != null) {
++            recorder.recordValue(mv); // 载荷登记（SQL 已由注入 runner 捕获，避免双写）
++        }
++
++        // 已物化结果登记（伴随值数据源；级联指标可由下级结果继续聚合）
++        if (result.value() != null) {
++            source.recordMaterialized(tenant(), def.metricCode(), instanceCode, def.period(),
++                    w.startMillis(), result.value());
++        }
+         recordObservation(result, def.metricCode(), def.period());
++        if (eventPublisher != null) {
++            eventPublisher.accept(mv, result);
++        }
++        return result;
+     }
+ 
+     /** 应到周期值数（完整度分母）：DAY 平均固定 24；其余按来源键数（演进位由快照应到集定版） */
+@@ -130,6 +160,74 @@ public final class MetricRuntime {
+         return Math.max(n, 1);
+     }
+ 
++    /**
++     * 迟到数据到达（原始 ts 落在已结束窗口、且 now 在宽限期内）→ 受影响窗口重算。
++     *
++     * <p>幂等：同窗口只触发一次（复用 0041 WindowIdempotencyGuard 同款窗口键去重）；
++     * 级联：按数据项所属指标沿依赖图向上重算（srcType=4 下级物化结果级联）；
++     * 留痕：§1.9A BACKFILL 记录 is_recalc=1（TDengine 不可用时内存兜底）。
++     */
++    private final java.util.Set<String> recalcFired = ConcurrentHashMap.newKeySet();
++
++    public RecalcOutcome onLateArrival(String dataKey, long dataTs, long nowMillis) {
++        // 找覆盖 dataTs 的定义窗口；只处理已结束的窗口（迟到=原始 ts 落在过去窗）
++        for (MetricDef def : defs) {
++            MetricWindow w = MetricWindow.forInstant(tenant(), def.metricCode(), def.period(),
++                    1, dataTs, java.time.ZoneOffset.UTC);
++            if (dataTs < w.startMillis() || dataTs >= w.endMillis()) {
++                continue;
++            }
++            // 迟到需满足：窗口已结束（dataTs 落在过去窗）+ now 在 [end, end+grace) 宽限期内
++            long graceMillis = (long) Math.max(0, graceDays) * 24L * 3600L * 1000L;
++            if (nowMillis < w.endMillis() || nowMillis > w.endMillis() + graceMillis) {
++                continue; // 早于窗结束或未过窗但超宽限 → 不触发（超窗数据走 0047 手动补算）
++            }
++            // 窗口键幂等（同窗迟到只触发一次重算）
++            if (!recalcFired.add(w.key())) {
++                return RecalcOutcome.skipped("同窗重复迟到，幂等跳过");
++            }
++            boolean ok = doCompute(def, w, true, dataKey) != null;
++            String inputSummary = dataKey + "@" + dataTs;
++            calcLog.append("BACKFILL",
++                    tenant() + "|" + def.metricCode() + "|" + instanceCode + "|" + def.period(),
++                    w.startMillis(), w.endMillis(), 1, inputSummary,
++                    ok ? "SUCCESS" : "FAILED");
++            cascadeRecalc(def, w, nowMillis);
++            return RecalcOutcome.fired();
++        }
++        return RecalcOutcome.skipped("无匹配已结束窗口或超出宽限期");
++    }
++
++    /** 级联重算：srcType=4 的指标定义（来源为下级物化结果）沿依赖图向上重算同窗 */
++    private void cascadeRecalc(MetricDef changed, MetricWindow w, long nowMillis) {
++        for (MetricDef def : defs) {
++            if (def.srcType() == 4 && def.sourceKeys() != null
++                    && def.sourceKeys().stream().anyMatch(k -> k.contains(changed.metricCode()))) {
++                MetricWindow cw = new MetricWindow(tenant(), def.metricCode(), def.period(),
++                        w.calendarType(), w.startMillis(), w.endMillis());
++                doCompute(def, cw, true, changed.metricCode());
++                calcLog.append("BACKFILL",
++                        tenant() + "|" + def.metricCode() + "|" + instanceCode + "|" + def.period(),
++                        cw.startMillis(), cw.endMillis(), 1,
++                        "cascade<-" + changed.metricCode(), "SUCCESS");
++            }
++        }
++    }
++
++    /** 测试/观测用定义只读视图 */
++    public java.util.List<MetricDef> defsForTest() {
++        return defs;
++    }
++
++    public CalcLogStore calcLog() {
++        return calcLog;
++    }
++
++    /** 事件生产缝：SET（由装配注入；载荷=MetricValue + 完整度/标记，供 ADR-0007 事件构建） */
++    public void setEventPublisher(java.util.function.BiConsumer<MetricValue, MetricResult> publisher) {
++        this.eventPublisher = publisher;
++    }
++
+     /** 登记观测（测试与 live 冒烟可直接调用） */
+     public void recordObservation(MetricResult r, String metricCode, String period) {
+         produced.incrementAndGet();
+@@ -154,6 +252,8 @@ public final class MetricRuntime {
+         v.put("graceDays", graceDays);
+         v.put("completenessMin", minCompleteness);
+         v.put("warnings", sink.warnings().size());
++        v.put("calcLogCount", calcLog.size());
++        v.put("recalcWindows", recalcFired.size());
+         if (recorder != null) {
+             v.put("writes", recorder.size());
+             v.put("lastWriteSql", recorder.lastSql());
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java
+index 0aa3edb..0ad49e6 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueRecorder.java
+@@ -37,6 +37,11 @@ public final class MetricValueRecorder {
+         sqls.add(MetricValueWriter.insertSql(v, tenantCode));
+     }
+ 
++    /** 仅登记载荷（SQL 已由 writer() 注入 runner 捕获——避免双写 SQL） */
++    public void recordValue(MetricValue v) {
++        values.add(v);
++    }
++
+     public List<MetricValue> values() {
+         return List.copyOf(values);
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+index bc9051e..6ddb41a 100644
+--- a/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
++++ b/calc/src/main/java/net/otlab/calc/metric/MetricValueStore.java
+@@ -23,6 +23,26 @@ public final class MetricValueStore {
+     private final Map<String, Sample> values = new ConcurrentHashMap<>();
+     private final Set<String> disabled = ConcurrentHashMap.newKeySet();
+ 
++    /** 已物化 st_metric_value 结果（伴随值数据源——§1.7：从已物化结果读，不现算；键含租户隔离） */
++    private final Map<String, Double> materialized = new ConcurrentHashMap<>();
++
++    private static String materializedKey(String tenant, String metricCode, String instanceCode,
++                                          String period, long ts) {
++        return tenant + "|" + metricCode + "|" + instanceCode + "|" + period + "|" + ts;
++    }
++
++    /** 登记一条已物化指标结果（重算同 ts 覆盖；伴随值从此处读） */
++    public void recordMaterialized(String tenant, String metricCode, String instanceCode,
++                                   String period, long ts, double value) {
++        materialized.put(materializedKey(tenant, metricCode, instanceCode, period, ts), value);
++    }
++
++    /** 读已物化同期结果（null=无同期数据；租户隔离——B 读不到 A） */
++    public Double materialized(String tenant, String metricCode, String instanceCode,
++                               String period, long ts) {
++        return materialized.get(materializedKey(tenant, metricCode, instanceCode, period, ts));
++    }
++
+     public void put(String key, double value, long ts) {
+         put(key, value, 0, ts);
+     }
+diff --git a/calc/src/main/java/net/otlab/calc/metric/RecalcOutcome.java b/calc/src/main/java/net/otlab/calc/metric/RecalcOutcome.java
+new file mode 100644
+index 0000000..c2a50e6
+--- /dev/null
++++ b/calc/src/main/java/net/otlab/calc/metric/RecalcOutcome.java
+@@ -0,0 +1,13 @@
++package net.otlab.calc.metric;
++
++/** 迟到到达的重算触发决策（TASK-0046） */
++public record RecalcOutcome(boolean triggered, String reason) {
++
++    public static RecalcOutcome fired() {
++        return new RecalcOutcome(true, null);
++    }
++
++    public static RecalcOutcome skipped(String reason) {
++        return new RecalcOutcome(false, reason);
++    }
++}
+diff --git a/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java b/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java
+index 6afe5d2..a641b89 100644
+--- a/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java
++++ b/calc/src/main/java/net/otlab/calc/web/MetricObserveController.java
+@@ -6,6 +6,7 @@ import java.util.Map;
+ import net.otlab.calc.metric.MetricDef;
+ import net.otlab.calc.metric.MetricRuntime;
+ import net.otlab.calc.metric.MetricWindow;
++import net.otlab.calc.metric.RecalcOutcome;
+ 
+ import org.springframework.lang.Nullable;
+ import org.springframework.web.bind.annotation.GetMapping;
+@@ -54,15 +55,55 @@ public class MetricObserveController {
+         if (req.values() != null) {
+             req.values().forEach((k, v) -> runtime.source().put(k, v, 0L));
+         }
++        // 伴随值基线种子（live 冒烟：伪造去年同期/上一周期已物化结果；键须含 metricCode/period/ts）
++        if (req.seedMaterialized() != null) {
++            req.seedMaterialized().forEach(s -> runtime.source().recordMaterialized(
++                    runtime.tenant(), s.metricCode(), s.instanceCode(), s.period(), s.ts(), s.value()));
++        }
+         long now = req.nowMillis() == null ? System.currentTimeMillis() : req.nowMillis();
+         defs.forEach(def -> runtime.onDue(runtime.previousWindow(def, now)));
+         return Map.of("ok", true, "view", runtime.view());
+     }
+ 
++    /** 迟到补传驱动：注入迟到数据（原始 ts），触发宽限期内受影响窗口重算 + BACKFILL 留痕 */
++    @PostMapping("/calc/v1/metric/recalc")
++    public Map<String, Object> recalc(@RequestBody RecalcRequest req) {
++        if (runtime == null) {
++            return Map.of("ok", false, "error", "metric-aggregation-enabled=false");
++        }
++        if (req.values() != null) {
++            req.values().forEach((k, v) -> runtime.source().put(k, v.value(), v.quality(), v.ts()));
++        }
++        long now = req.nowMillis() == null ? System.currentTimeMillis() : req.nowMillis();
++        java.util.List<Map<String, Object>> outcomes = new java.util.ArrayList<>();
++        if (req.arrivals() != null) {
++            for (RecalcRequest.Arrival a : req.arrivals()) {
++                RecalcOutcome o = runtime.onLateArrival(a.dataKey(), a.ts(), now);
++                outcomes.add(Map.of("dataKey", a.dataKey(), "ts", a.ts(),
++                        "triggered", o.triggered(), "reason", o.reason() == null ? "" : o.reason()));
++            }
++        }
++        Map<String, Object> view = new java.util.LinkedHashMap<>();
++        view.putAll(runtime.view());
++        view.put("calcLog", runtime.calcLog().entries().stream().map(e -> Map.<String, Object>of(
++                "taskId", e.taskId(), "triggerType", e.triggerType(), "fullKey", e.fullKey(),
++                "periodStart", e.periodStart(), "periodEnd", e.periodEnd(),
++                "isRecalc", e.isRecalc(), "inputSummary", e.inputSummary(),
++                "resultStatus", e.resultStatus())).toList());
++        return Map.of("ok", true, "outcomes", outcomes, "view", view);
++    }
++
+     /** 驱动请求（冒烟载体；生产演进位由快照+ResultSink 供给） */
+-    public record ObserveRequest(List<Def> definitions, Map<String, Double> values, Long nowMillis) {
++    public record ObserveRequest(List<Def> definitions, Map<String, Double> values, Long nowMillis,
++                                 java.util.List<Materialized> seedMaterialized) {
+         public record Def(String metricCode, String period, int aggType, List<String> sourceKeys,
+-                          String ratioNumKey, String ratioDenKey, int srcType) {
+-        }
++                          String ratioNumKey, String ratioDenKey, int srcType) {}
++        public record Materialized(String metricCode, String instanceCode, String period, long ts, double value) {}
++    }
++
++    /** 迟到补传请求：values 为数据项物化样本（key→{value,quality,ts}）；arrivals 为迟到到达键 */
++    public record RecalcRequest(Map<String, Sample> values, java.util.List<Arrival> arrivals, Long nowMillis) {
++        public record Sample(double value, int quality, long ts) {}
++        public record Arrival(String dataKey, long ts) {}
+     }
+ }
+diff --git a/calc/src/main/resources/application.yml b/calc/src/main/resources/application.yml
+index d3c3f4c..c4fac9b 100644
+--- a/calc/src/main/resources/application.yml
++++ b/calc/src/main/resources/application.yml
+@@ -47,3 +47,8 @@ calc:
+   metric-grace-days: ${CALC_METRIC_GRACE_DAYS:3}
+   # 完整度阈值（低于阈值结果带不完整标记，不静默）
+   metric-completeness-min: ${CALC_METRIC_COMPLETENESS_MIN:0.8}
++  # TASK-0046 指标产出事件生产侧：MQTT iot/{tenant}/metric/out + Kafka iot.metric.result.{tenant}
++  metric-event-mqtt-enabled: ${CALC_METRIC_EVENT_MQTT_ENABLED:false}
++  metric-event-kafka-enabled: ${CALC_METRIC_EVENT_KAFKA_ENABLED:false}
++  metric-mqtt-broker: ${CALC_METRIC_MQTT_BROKER:tcp://192.168.31.145:1883}
++  metric-mqtt-client-prefix: ${CALC_METRIC_MQTT_CLIENT_PREFIX:calc-metric-out}
+diff --git a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+index 0d3c2d9..f47aeea 100644
+--- a/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
++++ b/calc/src/test/java/net/otlab/calc/config/CalcPropertiesTest.java
+@@ -72,4 +72,12 @@ class CalcPropertiesTest {
+         assertEquals(Integer.valueOf(3), p.getMetricGraceDays(), "宽限 3 天缺省");
+         assertEquals(Double.valueOf(0.8), p.getMetricCompletenessMin(), "完整度阈值 80% 缺省");
+     }
++
++    @Test
++    void task0046MetricEventDefaults() {
++        CalcProperties p = new CalcProperties();
++        assertFalse(p.isMetricEventMqttEnabled(), "MQTT 指标事件默认关（无 broker/零回归）");
++        assertFalse(p.isMetricEventKafkaEnabled(), "Kafka 指标事件默认关（本环境无 broker，接口+契约就绪）");
++        assertEquals("tcp://192.168.31.145:1883", p.getMetricMqttBroker());
++    }
+ }
+diff --git a/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java b/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java
+new file mode 100644
+index 0000000..0fe90a0
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/event/MetricProducedEventContractTest.java
+@@ -0,0 +1,127 @@
++package net.otlab.calc.event;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.ZoneOffset;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0046 指标产出事件生产侧契约（ADR-0007 载荷定版 + ADR-0010 修正后同窗口重发载荷不变）：
++ * MQTT iot/{tenant}/metric/out + Kafka iot.metric.result.{tenant}（接口层，默认关）；
++ * 双通道同载荷；主题/载荷 tenant 隔离；无订阅者不报错。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricProducedEventContractTest {
++
++    private static final long TS = java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli();
++    private static final long END = java.time.Instant.parse("2026-11-24T00:00:00Z").toEpochMilli();
++
++    private MetricProducedEvent event(Double yoy, Double mom) {
++        return new MetricProducedEvent("t46", 1L, "M_AVG_DAY", "I01", "DAY", 1,
++                TS, END, 120.5, yoy, mom, 0.95, false);
++    }
++
++    @Test
++    void payloadHasAllAdr0007FinalizedFields() {
++        MetricProducedEvent e = event(0.083, null);
++        assertEquals("t46", e.tenant());
++        assertEquals("M_AVG_DAY", e.metricCode());
++        assertEquals("I01", e.instanceCode());
++        assertEquals("DAY", e.period());
++        assertEquals(TS, e.windowStart());
++        assertEquals(END, e.windowEnd());
++        assertEquals(120.5, e.value(), 1e-9);
++        assertEquals(0.083, e.yoy(), 1e-9);
++        assertNull(e.mom());
++        assertEquals(0.95, e.completeness(), 1e-9);
++        assertFalse(e.incomplete());
++        assertNotNull(e.hash(), "载荷含 hash（幂等覆盖标识）");
++        assertEquals(64, e.hash().length(), "hash=SHA-256 十六进制 64 字符");
++    }
++
++    @Test
++    void topicsAreTenantIsolated() {
++        assertEquals("iot/t46/metric/out", MetricProducedEvent.mqttTopic("t46"));
++        assertEquals("iot.metric.result.t46", MetricProducedEvent.kafkaTopic("t46"));
++        assertFalse(MetricProducedEvent.mqttTopic("t46").contains("t47"), "租户 B 主题不含 A 编码");
++        assertFalse(MetricProducedEvent.kafkaTopic("t47").equals(MetricProducedEvent.kafkaTopic("t46")));
++    }
++
++    @Test
++    void topicAndPayloadCarryTenant() {
++        MetricProducedEvent e = event(0.1, 0.2);
++        Map<String, Object> json = e.toPayloadMap();
++        assertEquals("t46", json.get("tenant"), "载荷含 tenant（与主题双重隔离）");
++        assertTrue(json.containsKey("metricCode"));
++        assertTrue(json.containsKey("yoy"));
++        assertTrue(json.containsKey("completeness"));
++        assertTrue(json.containsKey("hash"));
++        assertFalse(json.containsKey("isRecalc"), "ADR-0010：载荷不含 is_recalc（重发不变）");
++        assertFalse(json.containsKey("calcTime"), "ADR-0010：载荷不含随重算变化的时间戳");
++    }
++
++    @Test
++    void resendSameWindowPayloadIsByteIdentical() {
++        MetricProducedEvent first = event(0.083, -0.021);
++        // 修正重算后值/伴随值相同（同窗口同结果）——载荷必须逐字段一致（含 hash）
++        MetricProducedEvent resend = event(0.083, -0.021);
++        assertEquals(first.toJson(), resend.toJson(), "ADR-0010 关键：修正后同窗口重发载荷逐字不变");
++        assertEquals(first.hash(), resend.hash());
++    }
++
++    @Test
++    void publisherDualChannelAndFailSoftNoSubscriber() {
++        RecordingMqtt mqtt = new RecordingMqtt();
++        RecordingKafka kafka = new RecordingKafka();
++        MetricEventPublisher publisher = new MetricEventPublisher(mqtt, kafka, true, true);
++        MetricProducedEvent e = event(0.083, -0.021);
++        publisher.publish(e);
++        assertEquals(1, mqtt.published.size());
++        assertEquals(1, kafka.published.size());
++        assertEquals(MetricProducedEvent.mqttTopic("t46"), mqtt.topics.get(0));
++        assertEquals(MetricProducedEvent.kafkaTopic("t46"), kafka.topics.get(0));
++        assertEquals(e.toJson(), mqtt.published.get(0), "双通道同载荷");
++        assertEquals(e.toJson(), kafka.published.get(0));
++    }
++
++    @Test
++    void noSubscriberDoesNotThrowAndKafkaDisabledSkips() {
++        MetricEventPublisher publisher = new MetricEventPublisher(
++                new RecordingMqtt(), new RecordingKafka(), true, false); // Kafka 默认关（无 broker）
++        publisher.publish(event(null, null));   // fire-and-forget：无订阅者不报错
++        publisher.publish(event(null, null));
++        assertTrue(true, "无订阅者、Kafka 关闭 → publish 不抛（fail-soft）");
++    }
++
++    @Test
++    void publisherIsFailSoftOnTransportError() {
++        MetricEventPublisher publisher = new MetricEventPublisher(
++                (topic, payload) -> { throw new RuntimeException("broker 断线"); },
++                (topic, payload) -> { throw new RuntimeException("无 broker"); }, true, true);
++        publisher.publish(event(null, null)); // 不抛
++        assertTrue(true, "传输异常被隔离，不阻塞指标聚合主链（0048 fail-soft 纪律）");
++    }
++
++    /** 测试替身：记录式 MQTT 通道 */
++    static final class RecordingMqtt implements MetricEventPublisher.MqttChannel {
++        final java.util.List<String> topics = new java.util.ArrayList<>();
++        final java.util.List<String> published = new java.util.ArrayList<>();
++        @Override public void publish(String topic, String payload) { topics.add(topic); published.add(payload); }
++    }
++
++    /** 测试替身：记录式 Kafka 通道 */
++    static final class RecordingKafka implements MetricEventPublisher.KafkaChannel {
++        final java.util.List<String> topics = new java.util.ArrayList<>();
++        final java.util.List<String> published = new java.util.ArrayList<>();
++        @Override public void publish(String topic, String payload) { topics.add(topic); published.add(payload); }
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/metric/LateArrivalRecalcContractTest.java b/calc/src/test/java/net/otlab/calc/metric/LateArrivalRecalcContractTest.java
+new file mode 100644
+index 0000000..93e7be1
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/LateArrivalRecalcContractTest.java
+@@ -0,0 +1,117 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0046 迟到修正重算契约：宽限期内迟到到达 → 受影响窗口重算（幂等）+ 同 ts 覆盖 +
++ * is_recalc=1 BACKFILL 留痕（§1.9A 字段：taskId/triggerType/fullKey/period/isRecalc/inputSummary/结果状态）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class LateArrivalRecalcContractTest {
++
++    @Test
++    void lateArrivalWithinGraceTriggersRecalcAndOverwritesSameTs() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(),
++                3, 0.8, java.time.ZoneOffset.UTC, "t46", 1L, "I01", recorder);
++        rt.setDefinitions(List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))));
++        long now = java.time.Instant.parse("2026-11-23T06:00:00Z").toEpochMilli();
++        MetricWindow w = rt.previousWindow(rt.defsForTest().get(0), now);
++
++        rt.source().put("I.A", 5.0, now);
++        rt.onDue(w);                       // 首次产出
++        double first = recorder.values().get(recorder.values().size() - 1).value();
++        assertEquals(5.0, first, 1e-9);
++
++        // 迟到数据（原始 ts 落在窗口内、宽限期内到达）→ 重算同窗
++        rt.source().put("I.A", 7.0, w.startMillis() + 3600_000);
++        RecalcOutcome outcome = rt.onLateArrival("I.A", w.startMillis() + 3600_000, now);
++
++        assertTrue(outcome.triggered(), "宽限期内迟到 → 触发重算");
++        MetricValue latest = recorder.values().get(recorder.values().size() - 1);
++        assertEquals(7.0, latest.value(), 1e-9, "同 ts 覆盖写为修正值");
++        assertEquals(w.startMillis(), latest.ts(), "窗口 ts 不变——同窗口覆盖（ADR-0010）");
++        assertEquals("M_DAY", latest.metricCode());
++    }
++
++    @Test
++    void outOfGraceArrivalDoesNotRecalc() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(),
++                3, 0.8, java.time.ZoneOffset.UTC, "t46", 1L, "I01", recorder);
++        rt.setDefinitions(List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))));
++        long now = java.time.Instant.parse("2026-12-10T06:00:00Z").toEpochMilli();
++        long staleTs = java.time.Instant.parse("2026-11-20T06:00:00Z").toEpochMilli();
++        RecalcOutcome outcome = rt.onLateArrival("I.A", staleTs, now);
++        assertFalse(outcome.triggered(), "超出宽限期 → 不重算（fail-closed）");
++        assertNotNull(outcome.reason());
++    }
++
++    @Test
++    void duplicateSameWindowRecalcIsIdempotentNoDuplicateAudit() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(),
++                3, 0.8, java.time.ZoneOffset.UTC, "t46", 1L, "I01", recorder);
++        rt.setDefinitions(List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))));
++        long now = java.time.Instant.parse("2026-11-23T06:00:00Z").toEpochMilli();
++        MetricWindow w = rt.previousWindow(rt.defsForTest().get(0), now);
++
++        rt.source().put("I.A", 5.0, now);
++        int auditsBefore = rt.calcLog().size();
++        RecalcOutcome first = rt.onLateArrival("I.A", w.startMillis() + 3600_000, now);
++        RecalcOutcome dup = rt.onLateArrival("I.A", w.startMillis() + 7200_000, now);
++        assertTrue(first.triggered());
++        assertFalse(dup.triggered(), "同窗重复迟到 → 幂等，不重复触发（窗口键去重）");
++        assertEquals(auditsBefore + 1, rt.calcLog().size(), "幂等：只留一条 BACKFILL 记录");
++    }
++
++    @Test
++    void backfillAuditHasAllRequiredFields() {
++        MetricValueRecorder recorder = new MetricValueRecorder("t46");
++        MetricRuntime rt = new MetricRuntime(new MetricAggregator(), new MetricValueStore(),
++                3, 0.8, java.time.ZoneOffset.UTC, "t46", 1L, "I01", recorder);
++        rt.setDefinitions(List.of(new MetricDef("M_DAY", "DAY", 2, List.of("I.A"))));
++        long now = java.time.Instant.parse("2026-11-23T06:00:00Z").toEpochMilli();
++        MetricWindow w = rt.previousWindow(rt.defsForTest().get(0), now);
++        rt.onLateArrival("I.Irrelevant", w.startMillis() + 3600_000, now);
++
++        CalcLogStore.CalcLogEntry log = rt.calcLog().last();
++        assertNotNull(log.taskId(), "task_id 落库");
++        assertTrue(log.taskId().startsWith("BACKFILL-"), "task_id 前缀标识 BACKFILL");
++        assertEquals("BACKFILL", log.triggerType(), "trigger_type=BACKFILL（§1.9A）");
++        assertEquals("t46|M_DAY|I01|DAY", log.fullKey(), "full_key=指标全键");
++        assertEquals(w.startMillis(), log.periodStart());
++        assertEquals(w.endMillis(), log.periodEnd());
++        assertEquals(1, log.isRecalc(), "is_recalc=1");
++        assertNotNull(log.inputSummary(), "input_summary 非空");
++        assertEquals("SUCCESS", log.resultStatus(), "结果状态=SUCCESS");
++    }
++
++    @Test
++    void auditFallsBackToMemoryWhenTdengineUnavailable() {
++        CalcLogStore store = new CalcLogStore("t46");
++        CalcLogStore.CalcLogEntry entry = store.append("BACKFILL", "t46|M_DAY|I01|DAY", 100L, 200L,
++                1, "I.A=5.0", "SUCCESS");
++        assertNotNull(entry);
++        assertEquals(1, store.entries().size(), "TDengine 不可用时留痕走内存（真机补验条件）");
++        assertEquals("BACKFILL", entry.triggerType());
++        assertFalse(store.tdengineAvailable(), "REST 故障期：内存兜底，非宣称已写真库");
++    }
++
++    @Test
++    void windowIdempotencyGuardReuseSemantics() {
++        net.otlab.calc.executor.WindowIdempotencyGuard guard = new net.otlab.calc.executor.WindowIdempotencyGuard();
++        String key = "t46|M_DAY|I01|" + 1690000000000L + "|1";
++        assertEquals(net.otlab.calc.executor.WindowIdempotencyGuard.Decision.FIRST, guard.tryAcquire(key, 1000L));
++        assertEquals(net.otlab.calc.executor.WindowIdempotencyGuard.Decision.REPLACE, guard.tryAcquire(key, 2000L));
++    }
++}
+diff --git a/calc/src/test/java/net/otlab/calc/metric/MetricCompanionValueContractTest.java b/calc/src/test/java/net/otlab/calc/metric/MetricCompanionValueContractTest.java
+new file mode 100644
+index 0000000..20424e9
+--- /dev/null
++++ b/calc/src/test/java/net/otlab/calc/metric/MetricCompanionValueContractTest.java
+@@ -0,0 +1,108 @@
++package net.otlab.calc.metric;
++
++import org.junit.jupiter.api.Test;
++
++import java.time.ZoneOffset;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0046 伴随值契约（补 TASK-0045 deferred M-2）：同比/环比从 st_metric_value 已物化结果读取，
++ * 不现算；写主值同行 yoy/mom 列；缺同期数据或分母 0 → null + 原因标记（不造假 0）。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class MetricCompanionValueContractTest {
++
++    private static final String T = "t46";
++    private static final String M = "M_AVG_DAY";
++    private static final String I = "I01";
++    private static final String P = "DAY";
++
++    private final CompanionValueCalculator calc = new CompanionValueCalculator();
++
++    @Test
++    void yoyAndMomReadFromMaterializedResultsNotRecomputed() {
++        long current = java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli();
++        long lastYear = CompanionValueCalculator.compareTs(P, current, ZoneOffset.UTC,
++                CompanionValueCalculator.CompareMode.YOY);
++        long prevPeriod = CompanionValueCalculator.compareTs(P, current, ZoneOffset.UTC,
++                CompanionValueCalculator.CompareMode.MOM);
++        MetricValueStore store = new MetricValueStore();
++        store.recordMaterialized(T, M, I, P, lastYear, 100.0);   // 去年同期
++        store.recordMaterialized(T, M, I, P, prevPeriod, 150.0); // 上一周期
++
++        CompanionValueCalculator.CompanionValues v = calc.calculate(store, T, M, I, P, current, 120.0, ZoneOffset.UTC);
++
++        assertEquals(0.2, v.yoy(), 1e-9, "同比 (120-100)/100 = +0.2");
++        assertEquals(-0.2, v.mom(), 1e-9, "环比 (120-150)/150 = -0.2");
++        assertNull(v.yoyNote());
++        assertNull(v.momNote());
++    }
++
++    @Test
++    void missingComparePeriodYieldsNullWithNoteNotZero() {
++        long current = java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli();
++        MetricValueStore store = new MetricValueStore();
++        CompanionValueCalculator.CompanionValues v = calc.calculate(store, T, M, I, P, current, 120.0, ZoneOffset.UTC);
++        assertNull(v.yoy(), "同期无物化行 → yoy=null，不写 0");
++        assertNull(v.mom());
++        assertNotNull(v.yoyNote());
++        assertNotNull(v.momNote());
++        assertTrue(v.yoyNote().contains("无同期数据"));
++    }
++
++    @Test
++    void zeroBaseYieldsNullWithNoteNotInfinity() {
++        long current = java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli();
++        long lastYear = CompanionValueCalculator.compareTs(P, current, ZoneOffset.UTC,
++                CompanionValueCalculator.CompareMode.YOY);
++        long prevPeriod = CompanionValueCalculator.compareTs(P, current, ZoneOffset.UTC,
++                CompanionValueCalculator.CompareMode.MOM);
++        MetricValueStore store = new MetricValueStore();
++        store.recordMaterialized(T, M, I, P, lastYear, 0.0);
++        store.recordMaterialized(T, M, I, P, prevPeriod, 0.0);
++        CompanionValueCalculator.CompanionValues v = calc.calculate(store, T, M, I, P, current, 120.0, ZoneOffset.UTC);
++        assertNull(v.yoy(), "分母 0 → null，不写无穷");
++        assertNull(v.mom());
++        assertTrue(v.yoyNote().contains("分母为 0"));
++    }
++
++    @Test
++    void yoyUsesCalendarPreviousYearAndMomUsesPreviousPeriod() {
++        assertEquals(java.time.Instant.parse("2025-11-23T00:00:00Z").toEpochMilli(),
++                CompanionValueCalculator.compareTs("DAY",
++                        java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli(),
++                        ZoneOffset.UTC, CompanionValueCalculator.CompareMode.YOY));
++        assertEquals(java.time.Instant.parse("2026-10-01T00:00:00Z").toEpochMilli(),
++                CompanionValueCalculator.compareTs("MONTH",
++                        java.time.Instant.parse("2026-11-01T00:00:00Z").toEpochMilli(),
++                        ZoneOffset.UTC, CompanionValueCalculator.CompareMode.MOM));
++        assertEquals(java.time.Instant.parse("2026-11-22T22:00:00Z").toEpochMilli(),
++                CompanionValueCalculator.compareTs("HOUR",
++                        java.time.Instant.parse("2026-11-22T23:00:00Z").toEpochMilli(),
++                        ZoneOffset.UTC, CompanionValueCalculator.CompareMode.MOM));
++    }
++
++    @Test
++    void nullCurrentValueHasNoCompanionValues() {
++        long current = java.time.Instant.parse("2026-11-23T00:00:00Z").toEpochMilli();
++        CompanionValueCalculator.CompanionValues v = calc.calculate(new MetricValueStore(), T, M, I, P, current, null, ZoneOffset.UTC);
++        assertNull(v.yoy());
++        assertNull(v.mom());
++        assertNotNull(v.yoyNote());
++    }
++
++    @Test
++    void materializedStoreIsTenantScoped() {
++        long ts = 1000L;
++        MetricValueStore store = new MetricValueStore();
++        store.recordMaterialized("A", M, I, P, ts, 10.0);
++        assertNull(store.materialized("B", M, I, P, ts), "租户 B 读不到租户 A 的物化伴随值");
++        assertEquals(10.0, store.materialized("A", M, I, P, ts), 1e-9);
++    }
++}

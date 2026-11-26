@@ -1,0 +1,3915 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
+index 6adac81..65bece7 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/controller/IotPointController.java
+@@ -1,18 +1,35 @@
+ package net.otlab.admin.module.iot.point.controller;
+ 
+ import cn.dev33.satoken.annotation.SaCheckPermission;
++import cn.hutool.poi.excel.ExcelUtil;
++import cn.hutool.poi.excel.ExcelWriter;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletResponse;
+ import jakarta.validation.Valid;
+-import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
++import net.otlab.admin.module.iot.point.dto.IotPointCurveVO;
++import net.otlab.admin.module.iot.point.dto.IotPointDetailVO;
++import net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO;
+ import net.otlab.admin.module.iot.point.dto.IotPointStatusForm;
++import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
+ import net.otlab.admin.module.iot.point.dto.IotPointUpdateForm;
++import net.otlab.admin.module.iot.point.dto.PointExportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportReceipt;
++import net.otlab.admin.module.iot.point.dto.PointImportRejectException;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportRowLimitException;
++import net.otlab.admin.module.iot.point.dto.PointImportRowResult;
++import net.otlab.admin.module.iot.point.dto.PointReferenceVO;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ import net.otlab.admin.module.iot.point.service.IotPointService;
++import net.otlab.admin.module.iot.point.service.support.PointImportExcelSaxParser;
+ import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.annotation.RepeatSubmit;
+ import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.Result;
++import net.otlab.core.result.ResultCode;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.web.bind.annotation.DeleteMapping;
+ import org.springframework.web.bind.annotation.GetMapping;
+@@ -23,22 +40,39 @@ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
++import org.springframework.web.multipart.MultipartFile;
+ 
++import java.io.IOException;
++import java.net.URLEncoder;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.List;
+ 
+ /**
+- * 点位控制器（TASK-0021，管理面 CRUD——详细设计 §3.1 p21 点位段逐行）
++ * 点位控制器（TASK-0021 六接口 + TASK-0022 导入导出 + TASK-0023 反查/曲线/启停响应，
++ * 管理面——详细设计 §3.1 p21 点位段全行交付）
+  *
+  * <p>路径命名空间 /iot/point（iot 域控制器统一 /iot/&lt;resource&gt; 范式）；权限前缀
+- * iot:point:*（sys_menu 4053-4057，点位管理页 4011 之下）。§3.1 p21 点位段八行中本批交付
+- * 六行（list/detail/add/edit/changeStatus/remove——changeStatus 为 §3.1 独立行故独立端点
+- * 承载批量启停，权限 iot:point:edit 与 §3.1 权限列一致）；import/export 归 TASK-0022、
+- * 详情反查与发布联动归 TASK-0023（权限行随其自身任务登记）。
++ * iot:point:*（sys_menu 4053-4057，点位管理页 4011 之下——本批新增端点全部复用既有五权限码，
++ * 不新增菜单种子：import 三接口共用 iot:point:add、export 复用 iot:point:list、
++ * references/curve 复用 iot:point:query、批量启停复用 iot:point:edit，TASK-0022/0023 brief 授权）。
++ *
++ * <p>导入三接口（TASK-0022，共用 iot:point:add）：GET /import/template（模板下载）、
++ * POST /import（multipart Excel，单批 ≤10000 行，整批原子 + 逐行回执——照 0018 字典导入
++ * 范式：SAX 流式解析物理行号保真/缺格 null 保真/超限 fail fast；失败整批拒绝 body code=400
++ * + data 携带逐行回执，4002 留单点语义）、POST /import/error-report（错误行清单下载，
++ * 无状态回传渲染 xlsx）。GET /export 按查询条件导出 xlsx（与模板列同构，数据权限裁剪照
++ * list 同条件——裁剪后的可见集导出）。
+  *
+  * <p>列表接数据权限裁剪（F5 裁决：dept_id IN 部门集 OR bound_instance_id IN 可见集，NULL
+- * 不特判 fail-closed）；详情越权 403（SCOPE_FORBIDDEN）。删除为软删且被数据项绑定时拒绝；
+- * 编码删除归档不复用（uk 不含 deleted，逻辑删行永久占用编码）。启停对接入生效走配置发布
+- * （TASK-0023 联动，界面明示）；建档启用发 PointEnabledEvent 触发建子表（写入方 TASK-0029）。
++ * 不特判 fail-closed）；详情/反查/曲线三读越权 403（SCOPE_FORBIDDEN，服务层同一闸）。删除为
++ * 软删且被数据项绑定时拒绝；编码删除归档不复用（uk 不含 deleted，逻辑删行永久占用编码）。
++ *
++ * <p>批量启停（TASK-0023 响应体）：响应携带受影响数据项计数（停用侧，前端二次确认语义）+
++ * 「变更已保存，重新发布后对接入生效」明示——变更生效走 FEAT-0008 发布链（0024 未交付，
++ * 本期保存≠生效，REQ-0010 同款口径）。路由主路径 /changeStatus 为 §3.1 独立行（0021 已交付），
++ * /status 为本批 brief 字面路径别名（同 handler 双路由，不新增重复端点）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -62,13 +96,30 @@ public class IotPointController {
+         return Result.success(pointService.selectPointList(page, query));
+     }
+ 
+-    @Operation(summary = "点位详情（越权 403——SCOPE_FORBIDDEN；含被引用数据项列表的反查归 TASK-0023）")
++    @Operation(summary = "点位详情聚合（TASK-0023：档案字段 + referenceCount 反向引用计数 + curve24h "
++            + "近 24h 曲线占位；越权 403——SCOPE_FORBIDDEN）")
+     @GetMapping("/{id}")
+     @SaCheckPermission("iot:point:query")
+-    public Result<IotPoint> detail(@PathVariable("id") Long id) {
++    public Result<IotPointDetailVO> detail(@PathVariable("id") Long id) {
+         return Result.success(pointService.getPointDetail(id));
+     }
+ 
++    @Operation(summary = "点位反向引用数据项清单（TASK-0023：idx_tenant_point 反查——full_key/实例编码/"
++            + "数据项名，仅可见实例的数据项，返回空=无引用）")
++    @GetMapping("/{id}/references")
++    @SaCheckPermission("iot:point:query")
++    public Result<List<PointReferenceVO>> references(@PathVariable("id") Long id) {
++        return Result.success(pointService.selectPointReferences(id));
++    }
++
++    @Operation(summary = "点位近 24h 曲线（TASK-0023：TDengine st_point_num 全限定名查询，"
++            + "本期 fail-soft 空集占位——查询失败/无数据返回空数组不报错；真实数据归 0029 写库后联调）")
++    @GetMapping("/{id}/curve")
++    @SaCheckPermission("iot:point:query")
++    public Result<IotPointCurveVO> curve(@PathVariable("id") Long id) {
++        return Result.success(pointService.getPointCurve24h(id));
++    }
++
+     @OperateLog(title = "采集点位", businessType = BusinessType.INSERT)
+     @Operation(summary = "新增点位（配额强控 4003 接线即生效、编码租户内唯一双道闸 4002、min<=max、"
+             + "unit 强制单位字典校验——TD-0045；建档启用发 PointEnabledEvent 触发建子表）")
+@@ -91,12 +142,12 @@ public class IotPointController {
+ 
+     @OperateLog(title = "采集点位", businessType = BusinessType.UPDATE)
+     @Operation(summary = "批量启停点位（§3.1 独立行 changeStatus；整批 fail-closed；置 1 逐点位发 "
+-            + "PointEnabledEvent；停用须走配置发布才对接入生效——TASK-0023 联动，界面明示）")
+-    @PutMapping("/changeStatus")
++            + "PointEnabledEvent；停用响应携带受影响数据项计数 + 「重新发布后对接入生效」明示——TASK-0023；"
++            + "/status 为 brief 字面路径别名）")
++    @PutMapping({"/changeStatus", "/status"})
+     @SaCheckPermission("iot:point:edit")
+-    public Result<Void> changeStatus(@Valid @RequestBody IotPointStatusForm form) {
+-        pointService.changePointStatus(form);
+-        return Result.success();
++    public Result<IotPointStatusChangeVO> changeStatus(@Valid @RequestBody IotPointStatusForm form) {
++        return Result.success(pointService.changePointStatus(form));
+     }
+ 
+     @OperateLog(title = "采集点位", businessType = BusinessType.DELETE)
+@@ -107,4 +158,129 @@ public class IotPointController {
+         pointService.deletePoints(ids);
+         return Result.success();
+     }
++
++    // ---------- 批量导入导出（TASK-0022，照 0018 字典导入范式，共用 iot:point:add / iot:point:list） ----------
++
++    /**
++     * 批量导入（整批原子 + 逐行回执）：控制器只做 Excel 单元格→字符串的机械提取（SAX 流式，
++     * 照 0009/0018 修订轮范式），导入语义全归服务层。整批拒绝口径（TASK-0022 brief 裁决 3）：
++     * 全部成功 body code=200；任一行校验失败整批拒绝，body code=PARAM_ERROR(400) 且 data
++     * 携带完整逐行回执清单（4002 语义留给单点接口——0019/0021 已确立先例）。
++     */
++    @OperateLog(title = "采集点位", businessType = BusinessType.IMPORT)
++    @Operation(summary = "批量导入点位（Excel，单批≤10000 行，整批原子；失败整批拒绝并返回逐行回执；"
++            + "配额联动不豁免——校验通过行数+当前计数超 quota 整批拒 4003）")
++    @RepeatSubmit(interval = 3000)
++    @PostMapping("/import")
++    @SaCheckPermission("iot:point:add")
++    public Result<PointImportReceipt> importPoints(@RequestParam("file") MultipartFile file) throws IOException {
++        List<PointImportRow> rows = parseImportRows(file);
++        try {
++            return Result.success(pointService.importPoints(rows));
++        } catch (PointImportRejectException e) {
++            Result<PointImportReceipt> result = Result.error(ResultCode.PARAM_ERROR.getCode(), e.getMessage());
++            result.setData(e.getReceipt());
++            return result;
++        }
++    }
++
++    /**
++     * 模板下载：单 sheet 表头十三列 + 示例行 + 说明行（值域口径写入说明行文案，说明行首列带
++     * 「说明：」前缀——导入解析时自动跳过，模板→填写→导入闭环无死行）。
++     */
++    @Operation(summary = "下载点位导入模板（表头+示例行+说明行；权限复用 iot:point:add）")
++    @GetMapping("/import/template")
++    @SaCheckPermission("iot:point:add")
++    public void importTemplate(HttpServletResponse response) throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("pointCode", "pointName", "dataType", "valueType", "unit", "channelCode",
++                "boundInstanceId", "deptId", "minValue", "maxValue", "samplePeriod", "deadband", "remark"));
++        rows.add(Arrays.asList("F01_WS01_EQ001_M01", "一号空压机主轴温度（示例行，导入前请删除或替换）",
++                "1", "DOUBLE", "℃", "CH_MAIN", null, null, "0", "120", "30", null, null));
++        rows.add(Arrays.asList(TEMPLATE_NOTE, null, null, null, null, null, null, null, null, null, null, null, null));
++        writeExcel(response, "采集点位导入模板", rows);
++    }
++
++    /** 模板说明行文案（首列以 {@link PointImportRow#NOTE_ROW_PREFIX} 开头，导入时自动跳过） */
++    static final String TEMPLATE_NOTE = PointImportRow.NOTE_ROW_PREFIX
++            + "pointCode/pointName/dataType/valueType 必填；dataType 仅允许 1 瞬时/2 累计/3 状态/4 开关；"
++            + "valueType 仅允许 DOUBLE/INT/BOOL/ENUM；pointCode 仅允许字母/数字/下划线/点且长度 ≤96，"
++            + "租户内唯一且删除归档不复用（重导已存在编码整批拒绝）；unit 须在单位字典（iot_unit）内、"
++            + "禁手填（归口平台运营方维护）；channelCode 须能唯一解析到本租户通道（不存在/歧义拒绝）；"
++            + "min/max 双给时须 min<=max；samplePeriod 1-86400 秒；boundInstanceId/deptId/unit/"
++            + "channelCode/min/max/samplePeriod/deadband/remark 可空；长度上限 pointName 100、unit 32、"
++            + "remark 500；单批上限 " + IotPointService.IMPORT_MAX_ROWS + " 行；示例行导入前请删除或替换；"
++            + "本说明行导入时自动跳过。";
++
++    /**
++     * 错误行清单下载：前端把导入回执 POST 回来，失败行渲染 xlsx（复用同一 Excel 组件）——
++     * 无状态设计，服务端不持久化回执；无失败行时返回仅含表头的清单。
++     */
++    @Operation(summary = "下载导入错误行清单（回执失败行 → xlsx，复用模板同款组件）")
++    @PostMapping("/import/error-report")
++    @SaCheckPermission("iot:point:add")
++    public void importErrorReport(@RequestBody PointImportReceipt receipt, HttpServletResponse response) throws IOException {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(List.of("行号", "点位编码", "原因码", "说明"));
++        if (receipt != null && receipt.getRows() != null) {
++            for (PointImportRowResult rr : receipt.getRows()) {
++                if (!Boolean.TRUE.equals(rr.getSuccess())) {
++                    rows.add(Arrays.asList(rr.getRowIndex(), rr.getPointCode(), rr.getReasonCode(), rr.getMessage()));
++                }
++            }
++        }
++        writeExcel(response, "导入错误行清单", rows);
++    }
++
++    /**
++     * 按查询条件导出（TASK-0022 brief 裁决 5）：与模板列同构 xlsx；行集为数据权限裁剪后的
++     * 可见集（服务层与 list 同条件裁剪）；过滤参数同 /list（pointCode/pointName/dataType/
++     * valueType/status/channelId/deptId/boundInstanceId）。
++     */
++    @Operation(summary = "按查询条件导出点位 xlsx（与模板列同构；数据权限裁剪照 list 同条件——"
++            + "裁剪后的可见集导出；权限复用 iot:point:list）")
++    @GetMapping("/export")
++    @SaCheckPermission("iot:point:list")
++    public void export(IotPoint query, HttpServletResponse response) throws IOException {
++        List<PointExportRow> rows = pointService.selectExportRows(query);
++        List<List<Object>> cells = new ArrayList<>(rows.size() + 1);
++        cells.add(List.of("pointCode", "pointName", "dataType", "valueType", "unit", "channelCode",
++                "boundInstanceId", "deptId", "minValue", "maxValue", "samplePeriod", "deadband", "remark"));
++        for (PointExportRow row : rows) {
++            cells.add(Arrays.asList(row.getPointCode(), row.getPointName(), row.getDataType(), row.getValueType(),
++                    row.getUnit(), row.getChannelCode(), row.getBoundInstanceId(), row.getDeptId(),
++                    row.getMinValue(), row.getMaxValue(), row.getSamplePeriod(), row.getDeadband(), row.getRemark()));
++        }
++        writeExcel(response, "采集点位导出", cells);
++    }
++
++    /**
++     * Excel 流式解析（照 0018 修订轮 I-1/I-2/I-3 三要点）：行号=Excel 物理行号（r 属性保真）、
++     * 缺格保持 null（无 alias 列名字母填充）、数据行超 {@link IotPointService#IMPORT_MAX_ROWS}
++     * 在流式中途整批拒绝（fail fast）；说明行/空行条目原样透传（服务层统一裁剪）。
++     */
++    private List<PointImportRow> parseImportRows(MultipartFile file) throws IOException {
++        try {
++            return PointImportExcelSaxParser.parse(file.getInputStream(), IotPointService.IMPORT_MAX_ROWS);
++        } catch (PointImportRowLimitException e) {
++            // 上限在解析中途触发（fail fast）：整批拒绝（PARAM_ERROR），与批级拒绝同口径
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                    "单批导入上限 " + IotPointService.IMPORT_MAX_ROWS + " 行，当前 " + e.getCount() + " 行");
++        }
++    }
++
++    /** xlsx 下载出口（模板/错误清单/导出共用，照 0018 SysUserController.export 范式） */
++    private void writeExcel(HttpServletResponse response, String fileName, List<List<Object>> rows) throws IOException {
++        response.setContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
++        response.setCharacterEncoding("utf-8");
++        String encoded = URLEncoder.encode(fileName, StandardCharsets.UTF_8).replace("+", "%20");
++        response.setHeader("Content-Disposition", "attachment;filename=" + encoded + ".xlsx");
++        ExcelWriter writer = ExcelUtil.getBigWriter();
++        try {
++            writer.write(rows);
++            writer.flush(response.getOutputStream());
++        } finally {
++            writer.close();
++        }
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointCurveVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointCurveVO.java
+new file mode 100644
+index 0000000..54deea1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointCurveVO.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 点位近 24h 曲线响应（TASK-0023，brief 裁决 3）
++ *
++ * <p>数据源 TDengine st_point_num 全限定名查询（{@code iot_<tenant_code>.st_point_num}），
++ * 走 0003 HttpTdengineAdmin 形态（base-url 配置 {@code ot.tdengine.base-url}）；查询失败/
++ * 无数据一律返回空 dataPoints 不报错（fail-soft 空集占位）——曲线端点契约本期就位，
++ * 真实数据归 TASK-0029 写库后联调（TASK-0068 环境联调闭合）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "点位近 24h 曲线（TASK-0023——本期 fail-soft 空集占位）")
++public class IotPointCurveVO {
++
++    @Schema(description = "点位 ID")
++    private Long pointId;
++
++    @Schema(description = "点位编码")
++    private String pointCode;
++
++    @Schema(description = "曲线窗口（小时）——固定 24")
++    private Integer windowHours;
++
++    @Schema(description = "数据点序列（查询失败/无数据/无子表均为空数组，fail-soft 不报错）")
++    private List<PointCurvePointVO> dataPoints;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointDetailVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointDetailVO.java
+new file mode 100644
+index 0000000..3331266
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointDetailVO.java
+@@ -0,0 +1,34 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++
++import java.util.List;
++
++/**
++ * 点位详情聚合响应（TASK-0023，brief 裁决 2）
++ *
++ * <p>继承 {@link IotPoint} 全量档案字段，聚合两块详情页增量：
++ * {@link #referenceCount} 反向引用数据项计数（被哪些数据项引用——改前看影响面，REQ-0008
++ * 业务能力；计数与 {@code GET /iot/point/{id}/references} 清单同裁剪口径，仅统计可见实例的
++ * 引用），{@link #curve24h} 近 24h 曲线占位字段（fail-soft 空集占位——查询失败/无数据为
++ * 空数组不报错，真实数据归 TASK-0029 写库后联调）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@EqualsAndHashCode(callSuper = true)
++@Schema(description = "点位详情聚合（TASK-0023——档案字段 + 反向引用计数 + 近 24h 曲线占位）")
++public class IotPointDetailVO extends IotPoint {
++
++    @Schema(description = "反向引用数据项计数（仅可见实例的引用——与 references 清单同裁剪口径；"
++            + "0=无引用或引用不可见）")
++    private Long referenceCount;
++
++    @Schema(description = "近 24h 曲线数据点（TDengine st_point_num fail-soft 空集占位——"
++            + "查询失败/无数据为空数组不报错；真实数据归 TASK-0029 写库后联调）")
++    private List<PointCurvePointVO> curve24h;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointStatusChangeVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointStatusChangeVO.java
+new file mode 100644
+index 0000000..e35e127
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/IotPointStatusChangeVO.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++/**
++ * 点位批量启停响应（TASK-0023）
++ *
++ * <p>停用响应携带受影响数据项计数（idx_tenant_point 引用计数——前端二次确认语义由该计数
++ * 承载，TASK-0023 brief 裁决 4）；启用侧计数恒 0。启停均属「影响接入的变更」——变更生效
++ * 走 FEAT-0008 配置发布链路（TASK-0024 未交付），本期变更即时落库但不产生接入生效，
++ * {@link #effectNote} 明示「变更已保存，重新发布后对接入生效」（REQ-0010 保存≠生效同款口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "点位批量启停响应（TASK-0023——停用携带受影响数据项计数 + 发布生效明示）")
++public class IotPointStatusChangeVO {
++
++    @Schema(description = "目标状态 0 禁用 1 启用")
++    private Integer targetStatus;
++
++    @Schema(description = "本次实际发生状态变更的点位数（原状态≠目标状态的行数；同态 no-op 不计）")
++    private Integer changedCount;
++
++    @Schema(description = "受影响数据项计数（iot_data_item.point_id 引用计数，idx_tenant_point 口径；"
++            + "status=0 停用时携带供前端二次确认，status=1 启用时恒 0）")
++    private Long affectedDataItemCount;
++
++    @Schema(description = "接入生效口径明示：变更已保存，重新发布后对接入生效（FEAT-0008 发布链，"
++            + "TASK-0024 未交付——本期保存≠生效）")
++    private String effectNote;
++
++    /** 发布生效明示常量（REQ-0010 保存≠生效同款口径，TASK-0023 brief 裁决 4 原文） */
++    public static final String EFFECT_NOTE_PUBLISH_REQUIRED = "变更已保存，重新发布后对接入生效";
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointCurvePointVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointCurvePointVO.java
+new file mode 100644
+index 0000000..f1d450f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointCurvePointVO.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++/**
++ * 点位近 24h 曲线数据点（TASK-0023，brief 裁决 3——本期 TDengine fail-soft 空集占位）
++ *
++ * <p>ts 为 taosAdapter REST 应答原文透传（TDengine 3.x REST 默认 ISO8601 字符串形态；
++ * 真实环境应答形态适配归 TASK-0068 联调），value/quality 对应 st_point_num 的
++ * value DOUBLE / quality INT 列。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "点位曲线数据点（TASK-0023）")
++public class PointCurvePointVO {
++
++    @Schema(description = "时间戳（taosAdapter REST 应答原文透传；形态适配归 TASK-0068 联调）")
++    private String ts;
++
++    @Schema(description = "采集值（st_point_num.value）")
++    private Double value;
++
++    @Schema(description = "质量码（st_point_num.quality，0 正常——TD-0021 枚举 0-9）")
++    private Integer quality;
++
++    public PointCurvePointVO() {
++    }
++
++    public PointCurvePointVO(String ts, Double value, Integer quality) {
++        this.ts = ts;
++        this.value = value;
++        this.quality = quality;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointExportRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointExportRow.java
+new file mode 100644
+index 0000000..8058643
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointExportRow.java
+@@ -0,0 +1,48 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Data;
++
++import java.math.BigDecimal;
++
++/**
++ * 点位导出行（TASK-0022）——与导入模板十三列同构（brief 裁决 5「按查询条件导出 xlsx
++ * （与模板列同构）」），通道列回填 channelCode（channelId→code 解析，通道已删/缺失留空）。
++ *
++ * <p>行集为数据权限裁剪后的可见集（与 list 同条件裁剪——brief 裁决 5「裁剪后的可见集导出」）；
++ * 数据行不携带 status/deleted/审计字段（导出语义=档案清单，回填导入闭环）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class PointExportRow {
++
++    private String pointCode;
++
++    private String pointName;
++
++    private Integer dataType;
++
++    private String valueType;
++
++    private String unit;
++
++    /** 来源通道编码（channelId→code 解析回填，与导入列对齐；通道缺失/已删为 null） */
++    private String channelCode;
++
++    /** 冗余归属实例 id（可空，与导入列对齐） */
++    private Long boundInstanceId;
++
++    /** 绑定部门 id（可空，与导入列对齐） */
++    private Long deptId;
++
++    private BigDecimal minValue;
++
++    private BigDecimal maxValue;
++
++    private Integer samplePeriod;
++
++    private BigDecimal deadband;
++
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportReceipt.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportReceipt.java
+new file mode 100644
+index 0000000..82c8bc5
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportReceipt.java
+@@ -0,0 +1,35 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Data;
++
++import java.util.List;
++
++/**
++ * 点位批量导入回执（TASK-0022，照 0018 字典导入回执结构同源）
++ *
++ * <p>成败计数 + 逐行清单。整批原子口径：{@link #persisted}=true 时 successCount 行已落库；
++ * false 时（整批拒绝，body code=PARAM_ERROR(400)）任何行都未落库，successCount 仅表示
++ * 「校验通过行数」——回执给用户看修正，落库原子性照旧整批（TASK-0022 brief 裁决 2
++ * 「整批不半落库」）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class PointImportReceipt {
++
++    /** 参与校验的数据行数（模板说明行/空行不计） */
++    private Integer totalCount;
++
++    /** 校验通过行数（persisted=true 时即实际落库行数；配额即按此行数联动，brief 裁决 4） */
++    private Integer successCount;
++
++    /** 校验失败行数 */
++    private Integer failCount;
++
++    /** 整批是否已落库：true=全部成功入库；false=整批拒绝（任何行未入库） */
++    private Boolean persisted;
++
++    /** 逐行回执清单（按导入顺序） */
++    private List<PointImportRowResult> rows;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRejectException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRejectException.java
+new file mode 100644
+index 0000000..0949cc9
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRejectException.java
+@@ -0,0 +1,30 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Getter;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++
++/**
++ * 点位批量导入整批拒绝异常（TASK-0022，照 0018 {@code DictImportRejectException} 同构）
++ *
++ * <p>任一行校验失败即抛出（@Transactional 整批回滚，不半落库）；body code 取
++ * PARAM_ERROR(400)（TASK-0022 brief 裁决 3：批量拒绝 body code=400 + data 逐行回执，
++ * 4002 语义留给单点接口——0019/0021 已确立先例）。控制器捕获本异常后把回执装配进
++ * {@code Result.data}——BusinessException 本体不携带数据体，故由此特化承载。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Getter
++public class PointImportRejectException extends BusinessException {
++
++    private static final long serialVersionUID = 1L;
++
++    /** 完整逐行回执（含失败行与校验通过行，供用户下载修正） */
++    private final transient PointImportReceipt receipt;
++
++    public PointImportRejectException(String message, PointImportReceipt receipt) {
++        super(ResultCode.PARAM_ERROR.getCode(), message);
++        this.receipt = receipt;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRow.java
+new file mode 100644
+index 0000000..adabfa8
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRow.java
+@@ -0,0 +1,87 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Data;
++
++/**
++ * 点位批量导入行（Excel 单行 → 服务层的原始输入，TASK-0022，照 0018 字典导入范式）
++ *
++ * <p>控制器只做机械的「单元格 → 字符串」提取（照 0009/0018 修订轮 SAX 解析范式），
++ * 一切导入语义（说明行/空行裁剪、必填/超长/编码合规/枚举/数值解析/字典与通道校验、
++ * 行号回执）归服务层——行号携带 Excel 物理行号（表头占第 1 行，数据自第 2 行起），
++ * 回执按此标注。
++ *
++ * <p>模板列（与导出同构，TASK-0022 brief 裁决 1）：pointCode/pointName/dataType/valueType/
++ * unit/channelCode/boundInstanceId/deptId/minValue/maxValue/samplePeriod/deadband/remark
++ * 十三列——通道列用 channelCode（brief 裁决 2「channelCode→id 解析，不存在拒」），
++ * boundInstanceId/deptId 为可空数值列（brief 裁决 1 原文「可空」）。
++ *
++ * <p>DTO 只含业务列 + 行号：不存在 status/deleted/id/审计字段/configVersion 的注入通道
++ * （mass assignment 在导入侧结构性不可能，落库实体仍由服务层白名单构建）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class PointImportRow {
++
++    /** 模板说明行识别前缀（首列以「说明：」开头的行导入时自动跳过，与字典导入同一约定） */
++    public static final String NOTE_ROW_PREFIX = "说明：";
++
++    /** Excel 物理行号（表头=1，数据自 2 起），回执与错误清单按此标注（r 属性保真，空行不前移） */
++    private Integer rowIndex;
++
++    /** pointCode 列原始值（已 trim；必填） */
++    private String pointCode;
++
++    /** pointName 列原始值（已 trim；必填） */
++    private String pointName;
++
++    /** dataType 列原始值（已 trim；必填，1 瞬时 2 累计 3 状态 4 开关） */
++    private String dataType;
++
++    /** valueType 列原始值（已 trim；必填，DOUBLE/INT/BOOL/ENUM） */
++    private String valueType;
++
++    /** unit 列原始值（已 trim，可空；非空时须在 sys_dict iot_unit 字典内） */
++    private String unit;
++
++    /** channelCode 列原始值（已 trim，可空；非空时按编码解析为通道 id，不存在/歧义拒） */
++    private String channelCode;
++
++    /** boundInstanceId 列原始值（已 trim，可空；冗余归属实例 id 数值） */
++    private String boundInstanceId;
++
++    /** deptId 列原始值（已 trim，可空；绑定部门 id 数值） */
++    private String deptId;
++
++    /** minValue 列原始值（已 trim，可空；数值） */
++    private String minValue;
++
++    /** maxValue 列原始值（已 trim，可空；数值） */
++    private String maxValue;
++
++    /** samplePeriod 列原始值（已 trim，可空；1-86400 秒） */
++    private String samplePeriod;
++
++    /** deadband 列原始值（已 trim，可空；数值——一期不启用，字段保留） */
++    private String deadband;
++
++    /** remark 列原始值（已 trim，可空） */
++    private String remark;
++
++    /**
++     * 是否为可跳过行（与 {@link net.otlab.admin.module.iot.entity.dto.DictImportRow#isSkippable()}
++     * 同一口径）：全空行（分隔空行，无任何意图值）或模板说明行（首列「说明：」前缀）。
++     * 控制器流式计数与服务层裁剪共用本判定。
++     */
++    public boolean isSkippable() {
++        boolean hasAnyValue = pointCode != null || pointName != null || dataType != null
++                || valueType != null || unit != null || channelCode != null
++                || boundInstanceId != null || deptId != null || minValue != null
++                || maxValue != null || samplePeriod != null || deadband != null || remark != null;
++        if (!hasAnyValue) {
++            return true;
++        }
++        return pointCode != null && pointCode.startsWith(NOTE_ROW_PREFIX);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowLimitException.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowLimitException.java
+new file mode 100644
+index 0000000..e392e26
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowLimitException.java
+@@ -0,0 +1,27 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Getter;
++
++/**
++ * 点位批量导入行数上限流式中止异常（TASK-0022，照 0018 修订轮 I-3 同款 fail fast 口径）
++ *
++ * <p>在 SAX 流式解析的逐行回调中抛出：数据行超过上限（10000 行，TASK-0022 任务正文
++ * 单批上限）立即中止解析（fail fast、内存有界——不构造全量行清单、不全量 DOM 放大）。
++ * 控制器从异常链中识别本类型后映射 PARAM_ERROR(400) 整批拒绝。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Getter
++public class PointImportRowLimitException extends RuntimeException {
++
++    private static final long serialVersionUID = 1L;
++
++    /** 中止时已解析的数据行数（= 上限 + 1） */
++    private final int count;
++
++    public PointImportRowLimitException(int count) {
++        super("单批导入行数超过上限，中止解析于第 " + count + " 数据行");
++        this.count = count;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java
+new file mode 100644
+index 0000000..0d48d27
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java
+@@ -0,0 +1,71 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import lombok.Data;
++
++/**
++ * 点位批量导入逐行回执结果（TASK-0022，照 0018 字典导入范式结构同源、原因码按点位域语义）
++ *
++ * <p>失败原因分类（TASK-0022 brief 裁决 2 校验项）：
++ * {@link #REASON_MISSING_REQUIRED} 必填缺失 / {@link #REASON_TOO_LONG} 超长 /
++ * {@link #REASON_INVALID_CODE} 编码不合规（[A-Za-z0-9_.] 与 ≤96） /
++ * {@link #REASON_INVALID_DATA_TYPE} 数据种类非法 / {@link #REASON_INVALID_VALUE_TYPE} 值类型非法 /
++ * {@link #REASON_INVALID_NUMBER} 数值列非法（min/max/deadband/samplePeriod/boundInstanceId/deptId）/
++ * {@link #REASON_INVALID_RANGE} min&gt;max / {@link #REASON_UNIT_NOT_IN_DICT} 单位不在字典 /
++ * {@link #REASON_CHANNEL_NOT_FOUND} 通道编码不存在 / {@link #REASON_CHANNEL_AMBIGUOUS} 通道编码歧义 /
++ * {@link #REASON_DUPLICATE_CODE} 重复编码（批内互撞、库内活跃行占用与已删行占用同口径均报此码）。
++ * 成功行 reasonCode 为 null。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class PointImportRowResult {
++
++    /** 必填缺失（pointCode/pointName/dataType/valueType） */
++    public static final String REASON_MISSING_REQUIRED = "MISSING_REQUIRED";
++
++    /** 超长（varchar 限长口径：pointCode 96 / pointName 100 / unit 32 / remark 500） */
++    public static final String REASON_TOO_LONG = "TOO_LONG";
++
++    /** 编码不合规（仅允许字母/数字/下划线/点，长度 ≤96——TASK-0022 brief 裁决 2） */
++    public static final String REASON_INVALID_CODE = "INVALID_CODE";
++
++    /** 数据种类非法（1 瞬时 2 累计 3 状态 4 开关四值字典外） */
++    public static final String REASON_INVALID_DATA_TYPE = "INVALID_DATA_TYPE";
++
++    /** 值类型非法（DOUBLE/INT/BOOL/ENUM 四值字典外） */
++    public static final String REASON_INVALID_VALUE_TYPE = "INVALID_VALUE_TYPE";
++
++    /** 数值列非法（minValue/maxValue/deadband 非数值；samplePeriod 出 1-86400；boundInstanceId/deptId 非整数） */
++    public static final String REASON_INVALID_NUMBER = "INVALID_NUMBER";
++
++    /** 量程非法（双给时 min>max） */
++    public static final String REASON_INVALID_RANGE = "INVALID_RANGE";
++
++    /** 单位不在 sys_dict iot_unit 字典（TD-0045 单位从字典选取禁手填，归口平台运营方维护） */
++    public static final String REASON_UNIT_NOT_IN_DICT = "UNIT_NOT_IN_DICT";
++
++    /** 通道编码不存在（channelCode→id 解析无命中，含已删行） */
++    public static final String REASON_CHANNEL_NOT_FOUND = "CHANNEL_NOT_FOUND";
++
++    /** 通道编码歧义（同码命中多个通道——uk 为 (gateway_id, channel_code)，租户内同码跨网关可并存） */
++    public static final String REASON_CHANNEL_AMBIGUOUS = "CHANNEL_AMBIGUOUS";
++
++    /** 重复编码（批内互撞、库内活跃行占用与已删行占用同口径，均报此码） */
++    public static final String REASON_DUPLICATE_CODE = "DUPLICATE_CODE";
++
++    /** Excel 物理行号（表头=1，数据自 2 起） */
++    private Integer rowIndex;
++
++    /** 原始 pointCode（未修正的导入值，便于用户定位行） */
++    private String pointCode;
++
++    /** 该行校验是否通过（整批被拒时 persisted=false，true 仅代表「校验通过、本可入库」） */
++    private Boolean success;
++
++    /** 失败原因码（成功行为 null） */
++    private String reasonCode;
++
++    /** 人读文案（失败原因明细或成功确认） */
++    private String message;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointReferenceVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointReferenceVO.java
+new file mode 100644
+index 0000000..38bcd56
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointReferenceVO.java
+@@ -0,0 +1,32 @@
++package net.otlab.admin.module.iot.point.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++/**
++ * 点位反向引用数据项清单行（TASK-0023，brief 裁决 1）
++ *
++ * <p>查 iot_data_item.idx_tenant_point（point_id），返回绑定该点位的数据项清单——
++ * full_key / 所属实例编码 / 数据项名三要素（brief 原文），另附 itemId 行锚。
++ * 联表裁剪数据权限：仅可见实例的数据项返回（时序类口径 instance_id IN 可见集——
++ * ADR-0016 裁决 4/TD-0044）；返回空=无引用。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "点位反向引用数据项（TASK-0023）")
++public class PointReferenceVO {
++
++    @Schema(description = "数据项 ID（iot_data_item.id，行锚）")
++    private Long itemId;
++
++    @Schema(description = "全键 = instance_code + \".\" + data_code（TDengine 标签/公式引用锚）")
++    private String fullKey;
++
++    @Schema(description = "所属实例编码")
++    private String instanceCode;
++
++    @Schema(description = "数据项名称")
++    private String dataName;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/IotPointService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/IotPointService.java
+index 554f99a..1566f03 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/IotPointService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/IotPointService.java
+@@ -2,22 +2,34 @@ package net.otlab.admin.module.iot.point.service;
+ 
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
++import net.otlab.admin.module.iot.point.dto.IotPointCurveVO;
++import net.otlab.admin.module.iot.point.dto.IotPointDetailVO;
++import net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO;
+ import net.otlab.admin.module.iot.point.dto.IotPointStatusForm;
+ import net.otlab.admin.module.iot.point.dto.IotPointUpdateForm;
++import net.otlab.admin.module.iot.point.dto.PointExportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportReceipt;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointReferenceVO;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ 
++import java.util.List;
++
+ /**
+- * 点位服务接口（TASK-0021，详细设计 §3.1 p21 点位段）
++ * 点位服务接口（TASK-0021 六接口 + TASK-0022 导入导出 + TASK-0023 反查/曲线/启停响应）
+  *
+- * <p>本批六接口：list / detail / add / edit / changeStatus（批量启停，§3.1 独立行）/
+- * remove（批量软删）。§3.1 点位段其余行：import/export 归 TASK-0022、详情反查与发布
+- * 联动归 TASK-0023。
++ * <p>本批（0022/0023）增量：importPoints / selectExportRows（0022 模板列同构导入导出）、
++ * selectPointReferences / getPointCurve24h / 详情聚合与批量启停响应体（0023）。
++ * §3.1 点位段八行接口（list/detail/add/edit/remove/import/export/changeStatus）至此全行交付。
+  *
+  * @author dowei
+  * @date 2026-11-22
+  */
+ public interface IotPointService {
+ 
++    /** 点位导入单批上限（TASK-0022 任务正文：单批 10000 行，超限整批拒绝 fail fast） */
++    int IMPORT_MAX_ROWS = 10000;
++
+     /**
+      * 点位分页列表：过滤 pointCode/pointName/dataType/valueType/status/channelId/deptId/
+      * boundInstanceId + 数据权限裁剪接线（F5 裁决：dept_id IN 部门集 OR bound_instance_id
+@@ -26,9 +38,11 @@ public interface IotPointService {
+     Page<IotPoint> selectPointList(Page<IotPoint> page, IotPoint query);
+ 
+     /**
+-     * 点位详情：存在性 → 数据权限 403（SCOPE_FORBIDDEN——单对象形态，ADR-0016 裁决 2）
++     * 点位详情聚合：存在性 → 数据权限 403（SCOPE_FORBIDDEN——单对象形态，ADR-0016 裁决 2）
++     * → 档案字段 + referenceCount（反向引用计数，仅可见实例口径）+ curve24h（近 24h 曲线
++     * fail-soft 空集占位）（TASK-0023 聚合契约）
+      */
+-    IotPoint getPointDetail(Long id);
++    IotPointDetailVO getPointDetail(Long id);
+ 
+     /**
+      * 新增点位：配额强控（checkPointQuota 接线即生效，超限 4003）→ 编码租户内唯一双道闸
+@@ -42,12 +56,52 @@ public interface IotPointService {
+     boolean updatePoint(IotPointUpdateForm form);
+ 
+     /**
+-     * 批量启停（§3.1 独立行）：整批 fail-closed；置 1 逐点位发 {@code PointEnabledEvent}
++     * 批量启停（§3.1 独立行）：整批 fail-closed（每条过数据权限防线，批内任一不可见即整批
++     * 403 不半批落库）；置 1 逐点位发 {@code PointEnabledEvent}；停用响应携带受影响数据项
++     * 计数（idx_tenant_point 引用计数）+「变更已保存，重新发布后对接入生效」明示（TASK-0023：
++     * 变更生效走 FEAT-0008 发布链——0024 未交付，本期保存≠生效）
+      */
+-    boolean changePointStatus(IotPointStatusForm form);
++    IotPointStatusChangeVO changePointStatus(IotPointStatusForm form);
+ 
+     /**
+      * 批量软删除：整批 fail-closed；被数据项绑定时拒绝；编码删除归档不复用（逻辑删占用 uk）
+      */
+     boolean deletePoints(java.util.List<Long> ids);
++
++    // ---------- 批量导入导出（TASK-0022，照 0018 字典导入范式） ----------
++
++    /**
++     * 批量导入点位（整批原子 + 逐行回执）：逐行校验（必填/超长/编码合规 [A-Za-z0-9_.] ≤96/
++     * dataType/valueType 枚举/数值列/min&lt;=max/unit 字典/channelCode 解析/批内撞码/库内占用）
++     * 任一行失败整批拒绝不半落库（PARAM_ERROR + data 携带回执，{@code PointImportRejectException}
++     * 承载）；按编码幂等——重导已存在活跃行整批 DUPLICATE_CODE 类拒绝；配额联动不豁免——
++     * 校验通过行数 + 当前计数 &gt; quota 整批拒 4003；单批上限 {@link #IMPORT_MAX_ROWS} 行；
++     * 导入落库的启用点位<b>不发</b> {@code PointEnabledEvent}（批量导入视为配置迁移，
++     * TASK-0022 brief 裁决 6，建子表由重生成/启用动作触发）
++     */
++    PointImportReceipt importPoints(List<PointImportRow> rows);
++
++    /**
++     * 导出行集：按查询条件（与 list 同过滤参数）+ 数据权限同条件裁剪（裁剪后的可见集导出，
++     * TASK-0022 brief 裁决 5），列与导入模板同构（通道列回填 channelCode）
++     */
++    List<PointExportRow> selectExportRows(IotPoint query);
++
++    // ---------- 反查 / 曲线（TASK-0023） ----------
++
++    /**
++     * 点位反向引用数据项清单（GET /iot/point/{id}/references）：查
++     * iot_data_item.idx_tenant_point（point_id），full_key/instance 编码/数据项名三要素；
++     * 联表裁剪数据权限——仅可见实例的数据项返回（时序类口径 instance_id IN 可见集）；
++     * 返回空=无引用；点位越权同详情 403 口径
++     */
++    List<PointReferenceVO> selectPointReferences(Long id);
++
++    /**
++     * 点位近 24h 曲线（GET /iot/point/{id}/curve）：TDengine st_point_num 全限定名查询
++     * （0003 HttpTdengineAdmin 形态，base-url 配置 {@code ot.tdengine.base-url}）；
++     * 查询失败/无数据返回空 dataPoints 不报错（fail-soft 空集占位——真实数据归 TASK-0029
++     * 写库后联调）；点位越权同详情 403 口径
++     */
++    IotPointCurveVO getPointCurve24h(Long id);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+index 28afd9b..a73a481 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+@@ -12,15 +12,28 @@ import net.otlab.admin.module.iot.dataperm.DataPermConditionAssembler;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
++import net.otlab.admin.module.iot.point.dto.IotPointCurveVO;
++import net.otlab.admin.module.iot.point.dto.IotPointDetailVO;
++import net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO;
+ import net.otlab.admin.module.iot.point.dto.IotPointStatusForm;
+ import net.otlab.admin.module.iot.point.dto.IotPointUpdateForm;
++import net.otlab.admin.module.iot.point.dto.PointCurvePointVO;
++import net.otlab.admin.module.iot.point.dto.PointExportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportReceipt;
++import net.otlab.admin.module.iot.point.dto.PointImportRejectException;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportRowResult;
++import net.otlab.admin.module.iot.point.dto.PointReferenceVO;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ import net.otlab.admin.module.iot.point.event.PointEnabledEvent;
+ import net.otlab.admin.module.iot.point.mapper.IotPointCodeMapper;
+ import net.otlab.admin.module.iot.point.mapper.IotPointCodeRow;
+ import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
+ import net.otlab.admin.module.iot.point.service.IotPointService;
++import net.otlab.admin.module.iot.point.service.support.PointCurveQueryClient;
++import net.otlab.admin.module.iot.quota.PointQuotaCounter;
+ import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.entity.SysTenant;
+ import net.otlab.admin.module.iot.template.entity.IotModelInstance;
+ import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
+ import net.otlab.admin.module.system.entity.SysDept;
+@@ -41,11 +54,15 @@ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Function;
++import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ 
+ /**
+@@ -92,6 +109,29 @@ import java.util.stream.Collectors;
+  * DDL DEFAULT '1' 同值，编辑不承载启停）、tenant_id 会话覆盖、审计字段由 MetaObjectHandler
+  * 回填、configVersion 配置发布链路专属、deleted 不可经 API 注入，杜绝 mass assignment。
+  *
++ * <p><b>批量导入导出（TASK-0022，照 0018 字典导入范式）</b>：importPoints 整批原子 + 逐行
++ * 回执——任一行校验失败整批拒绝不半落库（{@code PointImportRejectException} → PARAM_ERROR(400)
++ * + data 携带回执，4002 留单点语义）；逐行校验项按点位域语义（编码合规 [A-Za-z0-9_.] ≤96、
++ * dataType/valueType 枚举、unit 单位字典、channelCode→id 解析（歧义拒）、min&lt;=max、数值列）；
++ * 库内级校验批内一次 IN（unit 字典批查/通道解析/编码占用旁路预检）；<b>按编码幂等</b>——重导
++ * 已存在活跃行整批 DUPLICATE_CODE 类拒绝（brief 裁决 3）；<b>配额联动不豁免</b>（brief 裁决 4
++ * ——豁免会造成「界面 99/100 拒、导入塞 1000 行」绕过）：校验通过行数 + 当前计数 &gt; quota
++ * 整批拒 4003，计数走真实计数源 {@link PointQuotaCounter}；单批上限 {@link #IMPORT_MAX_ROWS}
++ * 行；导入落库的启用点位<b>不发</b> {@code PointEnabledEvent}（brief 裁决 6——批量导入视为
++ * 配置迁移，建子表由重生成/启用动作触发）。selectExportRows 与列表同源过滤 + 数据权限同条件
++ * 裁剪（裁剪后的可见集导出，brief 裁决 5），列与模板同构（channelCode 回填）。
++ *
++ * <p><b>反查/曲线/启停响应（TASK-0023）</b>：selectPointReferences 查 iot_data_item
++ * .idx_tenant_point（point_id），仅可见实例的数据项返回（时序类口径，TD-0044 无 create_by
++ * 分支），返回空=无引用；详情聚合 {@code IotPointDetailVO}（referenceCount 与清单同裁剪口径 +
++ * curve24h 近 24h 曲线占位）；getPointCurve24h 走 {@link PointCurveQueryClient}（0003
++ * HttpTdengineAdmin 形态，base-url 配置 {@code ot.tdengine.base-url}）——st_point_num 全限定名
++ * 查询 fail-soft 空集占位（查询失败/无数据返回空数组不报错，真实数据归 0029 写库后联调）；
++ * changePointStatus 响应携带受影响数据项计数（停用侧，idx_tenant_point 引用计数——前端二次
++ * 确认语义）与「变更已保存，重新发布后对接入生效」明示（FEAT-0008 发布链归 0024，本期保存
++ * ≠生效，REQ-0010 同款口径）；三读原语（详情/反查/曲线）经 {@link #requireReadablePoint}
++ * 共用同一数据权限闸。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -99,9 +139,11 @@ import java.util.stream.Collectors;
+ @Service
+ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> implements IotPointService {
+ 
+-    /** varchar 限长口径（与 iot_point DDL 一致） */
++    /** varchar 限长口径（与 iot_point DDL 一致；unit/remark 与表单 @Size 一致） */
+     private static final int MAX_LEN_POINT_CODE = 96;
+     private static final int MAX_LEN_POINT_NAME = 100;
++    private static final int MAX_LEN_UNIT = 32;
++    private static final int MAX_LEN_REMARK = 500;
+ 
+     /** data_type 值域（1 瞬时 2 累计 3 状态 4 开关） */
+     private static final Set<Integer> DATA_TYPE_VALUES = Set.of(1, 2, 3, 4);
+@@ -118,6 +160,13 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+     /** 单位字典类型编码（TD-0045——sys_dict 全局清单，归口平台运营方维护） */
+     private static final String UNIT_DICT_CODE = "iot_unit";
+ 
++    /** 点位导入编码合规白名单（TASK-0022 brief 裁决 2：[A-Za-z0-9_.] 与长度 96） */
++    private static final Pattern POINT_CODE_PATTERN = Pattern.compile("[A-Za-z0-9_.]+");
++
++    /** sample_period 值域（与 IotPointCreateForm @Min/@Max 一致：1-86400 秒） */
++    private static final int MIN_SAMPLE_PERIOD = 1;
++    private static final int MAX_SAMPLE_PERIOD = 86400;
++
+     @Autowired
+     private IotPointCodeMapper pointCodeMapper;
+ 
+@@ -142,6 +191,12 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+     @Autowired
+     private SysTenantService tenantService;
+ 
++    @Autowired
++    private PointQuotaCounter pointQuotaCounter;
++
++    @Autowired
++    private PointCurveQueryClient pointCurveQueryClient;
++
+     @Autowired
+     private DataPermService dataPermService;
+ 
+@@ -156,6 +211,17 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+     @Override
+     public Page<IotPoint> selectPointList(Page<IotPoint> page, IotPoint query) {
+         // 多租户条件由插件注入（会话链路）；deleted 由 @TableLogic 运行时过滤
++        LambdaQueryWrapper<IotPoint> wrapper = buildListWrapper(query);
++        wrapper.orderByAsc(IotPoint::getId);
++        return this.page(page, wrapper);
++    }
++
++    /**
++     * 列表/导出共用的查询装配：过滤条件（pointCode/pointName LIKE + 其余 eq）+ F5 数据权限
++     * 裁剪条件（同源同条件——TASK-0022 brief 裁决 5「数据权限裁剪照 list 同条件，裁剪后的
++     * 可见集导出」，两读路径任何一侧漏拼即偏）。
++     */
++    private LambdaQueryWrapper<IotPoint> buildListWrapper(IotPoint query) {
+         LambdaQueryWrapper<IotPoint> wrapper = new LambdaQueryWrapper<>();
+         if (query != null) {
+             if (query.getPointCode() != null) {
+@@ -192,12 +258,29 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         if (condition != null) {
+             wrapper.apply(condition);
+         }
+-        wrapper.orderByAsc(IotPoint::getId);
+-        return this.page(page, wrapper);
++        return wrapper;
+     }
+ 
+     @Override
+-    public IotPoint getPointDetail(Long id) {
++    public IotPointDetailVO getPointDetail(Long id) {
++        IotPoint existing = requireReadablePoint(id);
++        // TASK-0023 详情聚合（brief 裁决 2）：referenceCount 与 references 清单同裁剪口径
++        // （仅可见实例的引用），curve24h 走同一 fail-soft 曲线查询（查询失败/无数据为空数组
++        // 不报错——详情读路径不因 TDengine 故障炸穿）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        IotPointDetailVO vo = new IotPointDetailVO();
++        org.springframework.beans.BeanUtils.copyProperties(existing, vo);
++        vo.setReferenceCount(countVisibleReferences(existing.getId(), scope));
++        vo.setCurve24h(queryCurve24h(existing));
++        return vo;
++    }
++
++    /**
++     * 单对象读公共闸（详情/反查/曲线三读共用——TASK-0023 同口径接线）：存在性 → 数据权限
++     * 403（SCOPE_FORBIDDEN——单对象形态，ADR-0016 裁决 2；文案不泄露点位标识）。
++     * 可见性判定与列表条件同源同口径（双条件 OR，NULL 不特判 fail-closed；create_by 分支不适用）
++     */
++    private IotPoint requireReadablePoint(Long id) {
+         if (id == null) {
+             throw paramError("请选择要查询的点位");
+         }
+@@ -205,8 +288,6 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         if (existing == null) {
+             throw paramError("点位不存在或已删除");
+         }
+-        // 数据权限 403（SCOPE_FORBIDDEN——单对象形态，ADR-0016 裁决 2；文案不泄露点位标识）。
+-        // 可见性判定与列表条件同源同口径（双条件 OR，NULL 不特判 fail-closed；create_by 分支不适用）
+         VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
+         if (!scope.allTenant() && !isPointReadableByUser(scope, existing)) {
+             throw new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该点位（数据权限不命中）");
+@@ -214,6 +295,20 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         return existing;
+     }
+ 
++    /**
++     * 可见引用计数（TASK-0023 详情聚合）：point_id 命中的活跃数据项中 instance_id ∈ 可见集
++     * 的行数（时序类口径——TD-0044 无 create_by 分支）；一次取 id/instance_id 两列内存计数。
++     */
++    private long countVisibleReferences(Long pointId, VisibleScope scope) {
++        List<IotDataItem> items = dataItemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
++                .select(IotDataItem::getId, IotDataItem::getInstanceId)
++                .eq(IotDataItem::getPointId, pointId));
++        return items.stream()
++                .filter(item -> item.getInstanceId() != null
++                        && (scope.allTenant() || scope.instanceIds().contains(item.getInstanceId())))
++                .count();
++    }
++
+     /** 点位单对象可见性判定（列表 SQL 条件的内存等价形态；NULL 行 fail-closed） */
+     private boolean isPointReadableByUser(VisibleScope scope, IotPoint point) {
+         return (point.getDeptId() != null && scope.deptIds().contains(point.getDeptId()))
+@@ -380,7 +475,7 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+ 
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+-    public boolean changePointStatus(IotPointStatusForm form) {
++    public IotPointStatusChangeVO changePointStatus(IotPointStatusForm form) {
+         if (form.getStatus() == null || !STATUS_VALUES.contains(form.getStatus())) {
+             throw paramError("点位状态仅允许 0 禁用 / 1 启用");
+         }
+@@ -397,14 +492,24 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+             throw paramError("点位不存在或已删除: " + missing);
+         }
+ 
+-        // 写路径数据权限防线（修订轮评审 I-2）：批内任一不可见即整批拒绝（fail-closed 不半批
+-        // 落库，照 0012 修订轮删除防线范式——403 文案不泄露点位标识）；可见口径与列表裁剪同条件
++        // 写路径数据权限防线（修订轮评审 I-2；TASK-0023 brief 裁决 4「每条过数据权限防线」）：
++        // 批内任一不可见即整批拒绝（fail-closed 不半批落库，照 0012 修订轮删除防线范式——403
++        // 文案不泄露点位标识）；可见口径与列表裁剪同条件。防线先于影响计数（不向无权者泄露
++        // 引用绑定面，照 0021 删除「防线先于绑定校验」同型顺序）
+         requireWritePerm(existingList);
+ 
++        // TASK-0023 停用影响清单（brief 裁决 4）：status=0 时响应携带受影响数据项计数
++        // （iot_data_item.point_id 引用计数，idx_tenant_point 口径——活跃数据项，@TableLogic
++        // 过滤已删行、租户条件由插件注入）——前端二次确认语义由该计数承载；启用侧恒 0
++        long affectedDataItemCount = 0L;
++        if (form.getStatus() == 0) {
++            affectedDataItemCount = countBoundDataItems(ids);
++        }
++
+         // 批量启停：只更新状态字段（不夹带其他业务字段）；置 1（启停操作启用）逐点位发
+-        // PointEnabledEvent（brief 裁决 4「启停操作置 1」——写入方 TASK-0029 建子表，
++        // PointEnabledEvent（0021 brief 裁决 4「启停操作置 1」——写入方 TASK-0029 建子表，
+         // 重复置 1 的重复事件由消费方幂等承接）；置 0（停用）不发事件——停用须走配置发布
+-        // 才对接入生效（§3.1 口径，发布联动归 TASK-0023，界面明示）
++        // 才对接入生效（§3.1 口径）
+         IotPoint upd = new IotPoint();
+         upd.setStatus(form.getStatus());
+         for (Long id : ids) {
+@@ -414,7 +519,27 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         if (form.getStatus() == 1) {
+             existingList.forEach(this::publishPointEnabledEvent);
+         }
+-        return true;
++
++        // TASK-0023 响应体（brief 裁决 4）：changedCount=实际发生状态变更的行数（同态 no-op
++        // 不计）；effectNote 明示「变更已保存，重新发布后对接入生效」——启停均属「影响接入的
++        // 变更」，变更生效走 FEAT-0008 发布链（0024 未交付，本期保存≠生效，REQ-0010 同款口径）
++        IotPointStatusChangeVO vo = new IotPointStatusChangeVO();
++        vo.setTargetStatus(form.getStatus());
++        long changed = existingList.stream()
++                .filter(p -> p.getStatus() == null || !p.getStatus().equals(form.getStatus()))
++                .count();
++        vo.setChangedCount((int) changed);
++        vo.setAffectedDataItemCount(affectedDataItemCount);
++        vo.setEffectNote(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED);
++        return vo;
++    }
++
++    /** 绑定数据项计数（idx_tenant_point 引用口径）：活跃数据项按 point_id IN 批量计数 */
++    private long countBoundDataItems(List<Long> pointIds) {
++        Long count = dataItemMapper.selectCount(new LambdaQueryWrapper<IotDataItem>()
++                .isNotNull(IotDataItem::getPointId)
++                .in(IotDataItem::getPointId, pointIds));
++        return count != null ? count : 0L;
+     }
+ 
+     // ---------- 批量删除 ----------
+@@ -460,6 +585,536 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         return this.removeByIds(ids);
+     }
+ 
++    // ---------- 批量导入导出（TASK-0022，照 0018 字典导入范式） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public PointImportReceipt importPoints(List<PointImportRow> rows) {
++        // 批级前置拒绝（无回执——无可逐行标注的对象）：空文件/模板原样上传、超 10000 行
++        // （任务正文单批上限；解析层 fail fast 拦截在先，此处为服务层直调的双保险）
++        if (rows == null || rows.isEmpty()) {
++            throw paramError("导入文件无数据行");
++        }
++        List<PointImportRow> dataRows = new ArrayList<>();
++        for (PointImportRow row : rows) {
++            if (row.isSkippable()) {
++                continue;
++            }
++            dataRows.add(row);
++        }
++        if (dataRows.isEmpty()) {
++            throw paramError("导入文件无数据行（模板说明行与空行不计入）");
++        }
++        if (dataRows.size() > IMPORT_MAX_ROWS) {
++            throw paramError("单批导入上限 " + IMPORT_MAX_ROWS + " 行，当前 " + dataRows.size() + " 行");
++        }
++        Long tenantId = TenantContext.getTenantId();
++
++        // 第一遍：字段级校验（必填→超长→编码合规→枚举→数值列→量程）+ 批内撞码判定（先于落库）
++        Map<String, Integer> firstSeenRow = new HashMap<>();
++        List<PointImportRowResult> rowResults = new ArrayList<>(dataRows.size());
++        List<PointImportRow> validRows = new ArrayList<>(dataRows.size());
++        for (PointImportRow row : dataRows) {
++            PointImportRowResult rr = new PointImportRowResult();
++            rr.setRowIndex(row.getRowIndex());
++            rr.setPointCode(row.getPointCode());
++            String[] fieldReason = validateImportFields(row);
++            if (fieldReason != null) {
++                rr.setSuccess(false);
++                rr.setReasonCode(fieldReason[0]);
++                rr.setMessage(fieldReason[1]);
++            } else {
++                Integer firstRow = firstSeenRow.get(row.getPointCode());
++                if (firstRow != null) {
++                    rr.setSuccess(false);
++                    rr.setReasonCode(PointImportRowResult.REASON_DUPLICATE_CODE);
++                    rr.setMessage("批内重复（与第 " + firstRow + " 行撞码）");
++                } else {
++                    firstSeenRow.put(row.getPointCode(), row.getRowIndex());
++                    rr.setSuccess(true);
++                    rr.setMessage("校验通过");
++                    validRows.add(row);
++                }
++            }
++            rowResults.add(rr);
++        }
++
++        // 第二遍：库内级校验（一次 IN 查询，避免逐行往返的 10000 次放大）——
++        // ① unit 单位字典（TD-0045，携带 unit 的行批内一次查全）；② channelCode→id 解析
++        // （不存在拒、租户内同码命中多通道歧义拒——uk 为 (gateway_id, channel_code)，
++        // 同码跨网关可并存，静默取首个会把点位挂错通道）；③ 编码占用预检（活跃行「已存在」
++        // 与已删行「已被删除记录占用，不可复用」同口径拒绝——uk_tenant_point_code 不含
++        // deleted 列，编码删除归档不复用；重导同文件整批 DUPLICATE_CODE 类拒绝即幂等口径，
++        // TASK-0022 brief 裁决 3）
++        Map<String, Long> channelIdByCode = Map.of();
++        if (!validRows.isEmpty()) {
++            markUnitViolations(rowResults, validRows);
++            channelIdByCode = markChannelViolations(rowResults, validRows);
++            markOccupiedCodes(tenantId, rowResults, validRows);
++            validRows = validRows.stream()
++                    .filter(row -> Boolean.TRUE.equals(rowResultOf(rowResults, row).getSuccess()))
++                    .collect(Collectors.toList());
++        }
++
++        // 回执汇总：成功行数=校验通过行数；persisted 标记整批是否真正落库
++        long failCount = rowResults.stream().filter(rr -> !Boolean.TRUE.equals(rr.getSuccess())).count();
++        PointImportReceipt receipt = new PointImportReceipt();
++        receipt.setTotalCount(dataRows.size());
++        receipt.setSuccessCount((int) (dataRows.size() - failCount));
++        receipt.setFailCount((int) failCount);
++        receipt.setRows(rowResults);
++
++        if (failCount > 0) {
++            // 整批拒绝：PARAM_ERROR(400) + data 携带完整回执清单（brief 裁决 3）；事务内未执行
++            // 任何 INSERT，rollbackFor 兜底回滚任何残留状态，语义与「整批不半落库」一致
++            receipt.setPersisted(false);
++            throw new PointImportRejectException(
++                    "导入校验未通过，整批未入库（校验通过 " + receipt.getSuccessCount()
++                            + " 行 / 失败 " + receipt.getFailCount() + " 行），请按回执修正后重新导入",
++                    receipt);
++        }
++
++        // 配额联动不豁免（TASK-0022 brief 裁决 4：豁免会造成「界面 99/100 拒、导入塞 1000 行」
++        // 绕过）：校验通过行数 + 当前计数 > quota → 整批拒 4003 并提示配额上限。quota 空/0=不限；
++        // 计数走真实计数源 PointQuotaCounter（与单点 createPoint 的 checkPointQuota 同一计数口径，
++        // 活跃行 COUNT、tenant_id 显式条件）——导入成功落库行配额计入
++        SysTenant tenant = tenantService.getById(tenantId);
++        Integer quota = tenant != null ? tenant.getPointQuota() : null;
++        if (quota != null && quota > 0) {
++            int current = pointQuotaCounter.countPoints(tenantId);
++            if (current + validRows.size() > quota) {
++                throw new BusinessException(ResultCode.QUOTA_EXCEEDED.getCode(),
++                        "点位配额不足（上限 " + quota + "，当前 " + current + "，本次导入 "
++                                + validRows.size() + " 行超限），请清理或扩容配额后重试");
++            }
++        }
++
++        // 全部通过：白名单构建实体逐行落库（照 createPoint 范式——status=1/tenant_id 会话覆盖/
++        // 无 id 审计 configVersion；导入行 DTO 结构性不含 status/deleted/id 字段，mass assignment
++        // 无注入通道）。导入落库的启用点位不发 PointEnabledEvent（brief 裁决 6——批量导入视为
++        // 配置迁移，建子表由重生成/启用动作触发，0029 消费方联调对齐）
++        try {
++            for (PointImportRow row : validRows) {
++                this.save(buildImportEntity(row, tenantId, channelIdByCode));
++            }
++        } catch (DuplicateKeyException e) {
++            // 兜底：预检与落库之间的并发撞码窗口（物理唯一索引 uk_tenant_point_code），
++            // rollbackFor=Exception 整批回滚——批量口径统一 PARAM_ERROR（brief 裁决 3，不用 4002）
++            throw paramError("导入失败：编码并发冲突，整批未入库，请重试");
++        }
++        receipt.setPersisted(true);
++        return receipt;
++    }
++
++    /** 字段级校验：必填缺失 → 超长 → 编码合规 → 枚举 → 数值列 → 量程（逐行首个命中即返回）。
++     *
++     * @return null=通过；否则 [原因码, 文案]
++     */
++    private String[] validateImportFields(PointImportRow row) {
++        List<String> missing = new ArrayList<>(4);
++        if (isBlank(row.getPointCode())) {
++            missing.add("pointCode");
++        }
++        if (isBlank(row.getPointName())) {
++            missing.add("pointName");
++        }
++        if (isBlank(row.getDataType())) {
++            missing.add("dataType");
++        }
++        if (isBlank(row.getValueType())) {
++            missing.add("valueType");
++        }
++        if (!missing.isEmpty()) {
++            return new String[]{PointImportRowResult.REASON_MISSING_REQUIRED,
++                    "必填字段缺失: " + String.join(", ", missing)};
++        }
++        List<String> tooLong = new ArrayList<>(4);
++        if (row.getPointCode().length() > MAX_LEN_POINT_CODE) {
++            tooLong.add("pointCode(" + row.getPointCode().length() + ">" + MAX_LEN_POINT_CODE + ")");
++        }
++        if (row.getPointName().length() > MAX_LEN_POINT_NAME) {
++            tooLong.add("pointName(" + row.getPointName().length() + ">" + MAX_LEN_POINT_NAME + ")");
++        }
++        if (row.getUnit() != null && row.getUnit().length() > MAX_LEN_UNIT) {
++            tooLong.add("unit(" + row.getUnit().length() + ">" + MAX_LEN_UNIT + ")");
++        }
++        if (row.getRemark() != null && row.getRemark().length() > MAX_LEN_REMARK) {
++            tooLong.add("remark(" + row.getRemark().length() + ">" + MAX_LEN_REMARK + ")");
++        }
++        if (!tooLong.isEmpty()) {
++            return new String[]{PointImportRowResult.REASON_TOO_LONG, "字段超长: " + String.join(", ", tooLong)};
++        }
++        if (!POINT_CODE_PATTERN.matcher(row.getPointCode()).matches()) {
++            return new String[]{PointImportRowResult.REASON_INVALID_CODE,
++                    "点位编码不合规: " + row.getPointCode() + "（仅允许字母/数字/下划线/点，长度 ≤96）"};
++        }
++        if (parseDataType(row.getDataType()) == null) {
++            return new String[]{PointImportRowResult.REASON_INVALID_DATA_TYPE,
++                    "数据种类非法: " + row.getDataType() + "（仅允许 1 瞬时 / 2 累计 / 3 状态 / 4 开关）"};
++        }
++        if (!VALUE_TYPE_VALUES.contains(row.getValueType())) {
++            return new String[]{PointImportRowResult.REASON_INVALID_VALUE_TYPE,
++                    "值类型非法: " + row.getValueType() + "（仅允许 DOUBLE/INT/BOOL/ENUM）"};
++        }
++        List<String> invalidNumbers = new ArrayList<>(6);
++        // 可空数值列：仅「携带但非法」判 INVALID_NUMBER——空白=未携带放行（DDL 可空，与单点建档一致）
++        if (!isBlank(row.getMinValue()) && parseDecimal(row.getMinValue()) == UNPARSEABLE) {
++            invalidNumbers.add("minValue");
++        }
++        if (!isBlank(row.getMaxValue()) && parseDecimal(row.getMaxValue()) == UNPARSEABLE) {
++            invalidNumbers.add("maxValue");
++        }
++        if (!isBlank(row.getDeadband()) && parseDecimal(row.getDeadband()) == UNPARSEABLE) {
++            invalidNumbers.add("deadband");
++        }
++        if (!isBlank(row.getSamplePeriod()) && parseSamplePeriod(row.getSamplePeriod()) == null) {
++            invalidNumbers.add("samplePeriod");
++        }
++        if (!isBlank(row.getBoundInstanceId()) && parseLong(row.getBoundInstanceId()) == null) {
++            invalidNumbers.add("boundInstanceId");
++        }
++        if (!isBlank(row.getDeptId()) && parseLong(row.getDeptId()) == null) {
++            invalidNumbers.add("deptId");
++        }
++        if (!invalidNumbers.isEmpty()) {
++            return new String[]{PointImportRowResult.REASON_INVALID_NUMBER,
++                    "数值列非法: " + String.join(", ", invalidNumbers)
++                            + "（min/max/deadband 须为数值；samplePeriod 须为 1-86400 秒整数；"
++                            + "boundInstanceId/deptId 须为整数 id）"};
++        }
++        // min<=max（双给时校验——与单点 createPoint 同口径，单边不判）
++        BigDecimal min = decimalOrNull(row.getMinValue());
++        BigDecimal max = decimalOrNull(row.getMaxValue());
++        if (min != null && max != null && min.compareTo(max) > 0) {
++            return new String[]{PointImportRowResult.REASON_INVALID_RANGE,
++                    "有效范围下限不能大于上限（min<=max）: " + min + ">" + max};
++        }
++        return null;
++    }
++
++    /** 单位字典批内校验（TD-0045）：携带 unit 的行——字典类型未登记或条目不存在/停用即标失败。 */
++    private void markUnitViolations(List<PointImportRowResult> rowResults, List<PointImportRow> validRows) {
++        Set<String> units = validRows.stream()
++                .map(PointImportRow::getUnit)
++                .filter(u -> u != null && !u.isBlank())
++                .collect(Collectors.toCollection(HashSet::new));
++        if (units.isEmpty()) {
++            return;
++        }
++        Set<String> usable = new HashSet<>();
++        SysDict dict = dictMapper.selectOne(new LambdaQueryWrapper<SysDict>()
++                .eq(SysDict::getDictCode, UNIT_DICT_CODE));
++        if (dict != null) {
++            for (SysDictData data : dictDataMapper.selectList(new LambdaQueryWrapper<SysDictData>()
++                    .eq(SysDictData::getDictId, dict.getId())
++                    .in(SysDictData::getDictValue, units)
++                    .eq(SysDictData::getStatus, 1))) {
++                usable.add(data.getDictValue());
++            }
++        }
++        for (PointImportRow row : validRows) {
++            if (row.getUnit() == null || row.getUnit().isBlank() || usable.contains(row.getUnit())) {
++                continue;
++            }
++            failRow(rowResults, row, PointImportRowResult.REASON_UNIT_NOT_IN_DICT,
++                    "单位「" + row.getUnit() + "」不在单位字典（iot_unit）中：单位从字典选取禁手填，"
++                            + "请联系平台运营方在系统字典维护该单位后重试");
++        }
++    }
++
++    /**
++     * 通道批内解析（channelCode→id，TASK-0022 brief 裁决 2）：不存在拒（含已删行——@TableLogic
++     * 过滤后无命中）；租户内同码命中多通道歧义拒（uk 为 (gateway_id, channel_code)，同码跨
++     * 网关可并存——静默取首个会把点位挂错通道）。
++     *
++     * @return 解析结果映射（code→唯一通道 id，仅无歧义命中码；落库时取用避免逐行二次查询）
++     */
++    private Map<String, Long> markChannelViolations(List<PointImportRowResult> rowResults,
++                                                    List<PointImportRow> validRows) {
++        Set<String> codes = validRows.stream()
++                .map(PointImportRow::getChannelCode)
++                .filter(c -> c != null && !c.isBlank())
++                .collect(Collectors.toCollection(HashSet::new));
++        if (codes.isEmpty()) {
++            return Map.of();
++        }
++        Map<String, List<Long>> idsByCode = new HashMap<>();
++        for (IotChannel channel : channelMapper.selectList(new LambdaQueryWrapper<IotChannel>()
++                .select(IotChannel::getId, IotChannel::getChannelCode)
++                .in(IotChannel::getChannelCode, codes))) {
++            idsByCode.computeIfAbsent(channel.getChannelCode(), k -> new ArrayList<>()).add(channel.getId());
++        }
++        Map<String, Long> resolved = new HashMap<>();
++        for (Map.Entry<String, List<Long>> entry : idsByCode.entrySet()) {
++            if (entry.getValue().size() == 1) {
++                resolved.put(entry.getKey(), entry.getValue().get(0));
++            }
++        }
++        for (PointImportRow row : validRows) {
++            if (row.getChannelCode() == null || row.getChannelCode().isBlank()) {
++                continue;
++            }
++            List<Long> ids = idsByCode.get(row.getChannelCode());
++            if (ids == null || ids.isEmpty()) {
++                failRow(rowResults, row, PointImportRowResult.REASON_CHANNEL_NOT_FOUND,
++                        "来源通道不存在或已删除: " + row.getChannelCode());
++            } else if (ids.size() > 1) {
++                failRow(rowResults, row, PointImportRowResult.REASON_CHANNEL_AMBIGUOUS,
++                        "通道编码歧义: " + row.getChannelCode() + "（租户内命中 " + ids.size()
++                                + " 个通道——channelCode 须能唯一解析，请换用唯一编码或改人工建档）");
++            }
++        }
++        return resolved;
++    }
++
++    /** 编码占用预检（含已删行旁路）：占用行标 DUPLICATE_CODE，文案区分活跃行/已删行（0021 口径）。 */
++    private void markOccupiedCodes(Long tenantId, List<PointImportRowResult> rowResults,
++                                   List<PointImportRow> validRows) {
++        Set<String> codes = validRows.stream()
++                .map(PointImportRow::getPointCode)
++                .collect(Collectors.toCollection(HashSet::new));
++        if (codes.isEmpty()) {
++            return;
++        }
++        Map<String, IotPointCodeRow> occupiedByCode = new HashMap<>();
++        for (IotPointCodeRow row : pointCodeMapper.selectOccupiedByCodes(tenantId, codes)) {
++            occupiedByCode.putIfAbsent(row.getPointCode(), row);
++        }
++        if (occupiedByCode.isEmpty()) {
++            return;
++        }
++        for (PointImportRow importRow : validRows) {
++            IotPointCodeRow occupied = occupiedByCode.get(importRow.getPointCode());
++            if (occupied == null) {
++                continue;
++            }
++            failRow(rowResults, importRow, PointImportRowResult.REASON_DUPLICATE_CODE,
++                    occupied.getDeleted() != null && occupied.getDeleted() == 1
++                            ? "点位编码已被删除记录占用，不可复用: " + occupied.getPointCode()
++                            : "库内已存在同编码点位（编码租户内唯一且删除归档不复用）");
++        }
++    }
++
++    /** 按导入行定位回执行并标失败（首个命中即标——批内同码行已在前置撞码判定中收敛） */
++    private void failRow(List<PointImportRowResult> rowResults, PointImportRow row, String reason, String message) {
++        for (PointImportRowResult rr : rowResults) {
++            if (rr.getRowIndex().equals(row.getRowIndex())) {
++                rr.setSuccess(false);
++                rr.setReasonCode(reason);
++                rr.setMessage(message);
++                return;
++            }
++        }
++    }
++
++    private PointImportRowResult rowResultOf(List<PointImportRowResult> rowResults, PointImportRow row) {
++        for (PointImportRowResult rr : rowResults) {
++            if (rr.getRowIndex().equals(row.getRowIndex())) {
++                return rr;
++            }
++        }
++        throw new IllegalStateException("回执行缺失: " + row.getRowIndex());
++    }
++
++    /** 导入行 → 落库实体（白名单构建，照 createPoint 范式；status 恒 1 启用起步；
++     * channelId 取批内解析映射——校验通过的行必然单命中或空） */
++    private IotPoint buildImportEntity(PointImportRow row, Long tenantId, Map<String, Long> channelIdByCode) {
++        IotPoint entity = new IotPoint();
++        entity.setTenantId(tenantId);
++        entity.setPointCode(row.getPointCode());
++        entity.setPointName(row.getPointName());
++        entity.setDataType(parseDataType(row.getDataType()));
++        entity.setValueType(row.getValueType());
++        entity.setUnit(row.getUnit());
++        entity.setMinValue(decimalOrNull(row.getMinValue()));
++        entity.setMaxValue(decimalOrNull(row.getMaxValue()));
++        entity.setSamplePeriod(parseSamplePeriod(row.getSamplePeriod()));
++        entity.setDeadband(decimalOrNull(row.getDeadband()));
++        entity.setChannelId(row.getChannelCode() == null || row.getChannelCode().isBlank()
++                ? null : channelIdByCode.get(row.getChannelCode()));
++        entity.setBoundInstanceId(parseLong(row.getBoundInstanceId()));
++        entity.setDeptId(parseLong(row.getDeptId()));
++        entity.setStatus(DEFAULT_STATUS);
++        entity.setRemark(row.getRemark());
++        return entity;
++    }
++
++    private boolean isBlank(String value) {
++        return value == null || value.isBlank();
++    }
++
++    /** dataType 解析：∈ 1-4 字典返回 Integer，否则 null（含非数值） */
++    private Integer parseDataType(String value) {
++        Integer parsed = parseInt(value);
++        return parsed != null && DATA_TYPE_VALUES.contains(parsed) ? parsed : null;
++    }
++
++    /** samplePeriod 解析：1-86400 秒返回 Integer，否则 null（含非数值） */
++    private Integer parseSamplePeriod(String value) {
++        Integer parsed = parseInt(value);
++        return parsed != null && parsed >= MIN_SAMPLE_PERIOD && parsed <= MAX_SAMPLE_PERIOD ? parsed : null;
++    }
++
++    private Integer parseInt(String value) {
++        if (value == null || value.isBlank()) {
++            return null;
++        }
++        try {
++            return Integer.valueOf(value.trim());
++        } catch (NumberFormatException e) {
++            return null;
++        }
++    }
++
++    private Long parseLong(String value) {
++        if (value == null || value.isBlank()) {
++            return null;
++        }
++        try {
++            return Long.valueOf(value.trim());
++        } catch (NumberFormatException e) {
++            return null;
++        }
++    }
++
++    /** 数值列哨兵：parseDecimal 返回 UNPARSEABLE 表示「携带但不可解析」（空白=未携带=可空放行） */
++    private static final BigDecimal UNPARSEABLE = new BigDecimal("0E-2147483647");
++
++    private BigDecimal parseDecimal(String value) {
++        if (value == null || value.isBlank()) {
++            return null;
++        }
++        try {
++            return new BigDecimal(value.trim());
++        } catch (NumberFormatException e) {
++            return UNPARSEABLE;
++        }
++    }
++
++    private BigDecimal decimalOrNull(String value) {
++        BigDecimal parsed = parseDecimal(value);
++        return parsed == UNPARSEABLE ? null : parsed;
++    }
++
++    @Override
++    public List<PointExportRow> selectExportRows(IotPoint query) {
++        // 与列表完全同源的过滤 + 数据权限裁剪（TASK-0022 brief 裁决 5：裁剪后的可见集导出）
++        LambdaQueryWrapper<IotPoint> wrapper = buildListWrapper(query);
++        wrapper.orderByAsc(IotPoint::getId);
++        List<IotPoint> rows = this.list(wrapper);
++        if (rows.isEmpty()) {
++            return List.of();
++        }
++        // channelCode 回填：channelId→code 解析（通道已删/缺失留空——导出档案清单不虚构）
++        Set<Long> channelIds = rows.stream()
++                .map(IotPoint::getChannelId)
++                .filter(java.util.Objects::nonNull)
++                .collect(Collectors.toCollection(HashSet::new));
++        Map<Long, String> codeByChannelId = channelIds.isEmpty() ? Map.of()
++                : channelMapper.selectList(new LambdaQueryWrapper<IotChannel>()
++                        .select(IotChannel::getId, IotChannel::getChannelCode)
++                        .in(IotChannel::getId, channelIds))
++                .stream()
++                .collect(Collectors.toMap(IotChannel::getId, IotChannel::getChannelCode, (a, b) -> a));
++        List<PointExportRow> exportRows = new ArrayList<>(rows.size());
++        for (IotPoint p : rows) {
++            PointExportRow out = new PointExportRow();
++            out.setPointCode(p.getPointCode());
++            out.setPointName(p.getPointName());
++            out.setDataType(p.getDataType());
++            out.setValueType(p.getValueType());
++            out.setUnit(p.getUnit());
++            out.setChannelCode(p.getChannelId() != null ? codeByChannelId.get(p.getChannelId()) : null);
++            out.setBoundInstanceId(p.getBoundInstanceId());
++            out.setDeptId(p.getDeptId());
++            out.setMinValue(p.getMinValue());
++            out.setMaxValue(p.getMaxValue());
++            out.setSamplePeriod(p.getSamplePeriod());
++            out.setDeadband(p.getDeadband());
++            out.setRemark(p.getRemark());
++            exportRows.add(out);
++        }
++        return exportRows;
++    }
++
++    // ---------- 反查 / 曲线（TASK-0023） ----------
++
++    @Override
++    public List<PointReferenceVO> selectPointReferences(Long id) {
++        IotPoint existing = requireReadablePoint(id);
++        // 反查（brief 裁决 1）：idx_tenant_point（point_id）→ 绑定数据项清单；联表裁剪数据权限
++        // ——仅可见实例的数据项（时序类口径 instance_id IN 可见集，TD-0044 无 create_by 分支）；
++        // 返回空=无引用（集合类语义，不报错）
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        List<IotDataItem> items = dataItemMapper.selectList(new LambdaQueryWrapper<IotDataItem>()
++                .select(IotDataItem::getId, IotDataItem::getFullKey, IotDataItem::getInstanceId,
++                        IotDataItem::getDataName)
++                .eq(IotDataItem::getPointId, existing.getId()));
++        Map<Long, String> codeByInstanceId = instanceCodesFor(items, scope);
++        List<PointReferenceVO> refs = new ArrayList<>();
++        for (IotDataItem item : items) {
++            if (item.getInstanceId() == null || !codeByInstanceId.containsKey(item.getInstanceId())) {
++                continue;
++            }
++            PointReferenceVO vo = new PointReferenceVO();
++            vo.setItemId(item.getId());
++            vo.setFullKey(item.getFullKey());
++            vo.setInstanceCode(codeByInstanceId.get(item.getInstanceId()));
++            vo.setDataName(item.getDataName());
++            refs.add(vo);
++        }
++        return refs;
++    }
++
++    /** 可见实例编码映射（一次 IN 取实例编码；allTenant 直取全部命中实例） */
++    private Map<Long, String> instanceCodesFor(List<IotDataItem> items, VisibleScope scope) {
++        Set<Long> instanceIds = items.stream()
++                .map(IotDataItem::getInstanceId)
++                .filter(java.util.Objects::nonNull)
++                .filter(iid -> scope.allTenant() || scope.instanceIds().contains(iid))
++                .collect(Collectors.toCollection(HashSet::new));
++        if (instanceIds.isEmpty()) {
++            return Map.of();
++        }
++        Map<Long, String> codes = new LinkedHashMap<>();
++        for (IotModelInstance instance : instanceMapper.selectByIds(instanceIds)) {
++            codes.put(instance.getId(), instance.getInstanceCode());
++        }
++        return codes;
++    }
++
++    @Override
++    public IotPointCurveVO getPointCurve24h(Long id) {
++        IotPoint existing = requireReadablePoint(id);
++        IotPointCurveVO vo = new IotPointCurveVO();
++        vo.setPointId(existing.getId());
++        vo.setPointCode(existing.getPointCode());
++        vo.setWindowHours(PointCurveQueryClient.WINDOW_HOURS);
++        vo.setDataPoints(queryCurve24h(existing));
++        return vo;
++    }
++
++    /**
++     * 近 24h 曲线查询（fail-soft 空集占位——brief 裁决 3）：租户编码缺失/租户未登记均空集；
++     * 客户端自身 fail-soft（一切查询失败返回空集），此处再兜一层防异常炸穿详情/曲线读路径。
++     */
++    private List<PointCurvePointVO> queryCurve24h(IotPoint point) {
++        Long tenantId = TenantContext.getTenantId();
++        SysTenant tenant = tenantService.getById(tenantId);
++        if (tenant == null || tenant.getTenantCode() == null || tenant.getTenantCode().isBlank()) {
++            log.warn("[POINT-CURVE] fail-soft 空集：会话租户（{}）缺失或未登记租户编码，跳过 TDengine 查询", tenantId);
++            return List.of();
++        }
++        try {
++            return pointCurveQueryClient.query24h(tenantId, tenant.getTenantCode(), point.getPointCode());
++        } catch (Exception e) {
++            // 双保险：客户端契约即 fail-soft，此处兜底防未预期异常炸穿读路径
++            log.warn("[POINT-CURVE] fail-soft 空集：曲线查询客户端异常（{}）",
++                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
++            return List.of();
++        }
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 编码校验：非空、长度 ≤96（表单 @Size 之外的服务层双保险；DB varchar(96)） */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClient.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClient.java
+new file mode 100644
+index 0000000..5662253
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClient.java
+@@ -0,0 +1,170 @@
++package net.otlab.admin.module.iot.point.service.support;
++
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.point.dto.PointCurvePointVO;
++import net.otlab.admin.module.iot.tdengine.TdengineAdmin;
++import net.otlab.admin.module.iot.tdengine.TdengineProperties;
++import org.springframework.stereotype.Component;
++
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.List;
++import java.util.regex.Pattern;
++
++/**
++ * 点位近 24h 曲线查询客户端（TASK-0023，brief 裁决 3——0003 HttpTdengineAdmin 形态）
++ *
++ * <p>数据源 TDengine {@code st_point_num} 全限定名查询：{@code iot_<tenant_code>.st_point_num}
++ * （库名派生唯一入口 {@link TdengineAdmin#databaseName}——只由 tenant_code 派生，禁外部传库名；
++ * 编码经其标识符安全校验，派生结果拼进查询语句不给注入留口）。通道形态与 0003
++ * {@code HttpTdengineAdmin} 一致：{@code POST {base}/rest/sql}（REST 全限定名自带库上下文，
++ * 无需 /rest/sql/&lt;db&gt;），Basic 认证，配置复用 {@link TdengineProperties}
++ * （{@code ot.tdengine.base-url} 等——只读注入不修改 0003 组件）。
++ *
++ * <p><b>为何独立于 HttpTdengineAdmin</b>：0003 的 REST execute 为私有且其抽象
++ * {@link TdengineAdmin} 只承载管理面操作（建库/判存/磁盘用量），曲线查询属读面新能力——
++ * 扩展 0003 文件超出本批声明改动范围（brief 范围：point/**），故按其形态在点位域内自含
++ * 实现；0003 抽象扩面（管理/读面拆分）可留后续任务统一裁决。
++ *
++ * <p><b>fail-soft 空集占位</b>（brief 裁决 3 原文「查询失败/无数据返回空数组不报错」）：
++ * REST 不可达/超时/非 0 code/应答不可解析/租户缺失/编码不安全——任何失败一律 WARN 留痕
++ * 并返回空列表，不抛异常不炸穿详情/曲线读路径；曲线端点契约本期就位，真实数据归
++ * TASK-0029 写库后联调（TASK-0068 环境联调 192.168.31.145 闭合）。
++ *
++ * <p><b>安全口径</b>：point_code 拼接前经 [A-Za-z0-9_.] 白名单校验（导入链同款编码合规
++ * 正则；手工建档行出现字典外字符时曲线 fail-soft 空集并 WARN——不拼不可信字面量进 SQL）；
++ * tenant_id 为 Long 参数直接拼接（无注入面）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class PointCurveQueryClient {
++
++    /** 曲线查询窗口（小时）——brief 裁决 3「近 24h」 */
++    public static final int WINDOW_HOURS = 24;
++
++    /** 单次查询行数保护上限（1s 采样点位 24h 理论 86400 行——窗口下采样策略归 0068 联调裁决，
++     * 本期以 LIMIT 防全量放大，超出部分截断不报错） */
++    static final int ROW_LIMIT = 5000;
++
++    /** point_code 拼接白名单（与导入编码合规正则同款：字母/数字/下划线/点） */
++    private static final Pattern SAFE_POINT_CODE = Pattern.compile("[A-Za-z0-9_.]+");
++
++    /** st_point_num 全限定名 24h 查询（%s: 库名 / %d: tenant_id / %s: point_code / 行数上限） */
++    private static final String CURVE_SQL =
++            "SELECT ts, value, quality FROM %s.st_point_num"
++                    + " WHERE tenant_id = %d AND point_code = '%s'"
++                    + " AND ts >= NOW() - %dh ORDER BY ts ASC LIMIT %d";
++
++    private final TdengineProperties props;
++    private final ObjectMapper objectMapper = new ObjectMapper();
++    private final HttpClient httpClient;
++
++    public PointCurveQueryClient(TdengineProperties props) {
++        this.props = props;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofMillis(props.getConnectTimeoutMs()))
++                .build();
++    }
++
++    /**
++     * 近 24h 曲线查询（fail-soft）：一切失败返回空列表并 WARN，不抛异常。
++     *
++     * @param tenantId   租户 id（st_point_num.tenant_id 标签过滤；ADR-0002 双保险）
++     * @param tenantCode 租户编码（库名派生输入，取自 sys_tenant.tenant_code）
++     * @param pointCode  点位编码（st_point_num.point_code 标签过滤）
++     * @return 数据点序列（按 ts 升序）；查询失败/无数据/无子表均为空列表
++     */
++    public List<PointCurvePointVO> query24h(Long tenantId, String tenantCode, String pointCode) {
++        if (tenantId == null || tenantCode == null || tenantCode.isBlank()
++                || pointCode == null || pointCode.isBlank()) {
++            return List.of();
++        }
++        if (!SAFE_POINT_CODE.matcher(pointCode).matches()) {
++            log.warn("[POINT-CURVE] fail-soft 空集：point_code 含白名单外字符，不拼接进查询（pointId 相关编码脱敏）");
++            return List.of();
++        }
++        final String db;
++        try {
++            db = TdengineAdmin.databaseName(tenantCode);
++        } catch (IllegalArgumentException e) {
++            log.warn("[POINT-CURVE] fail-soft 空集：{}", e.getMessage());
++            return List.of();
++        }
++        String sql = String.format(CURVE_SQL, db, tenantId, pointCode, WINDOW_HOURS, ROW_LIMIT);
++        JsonNode rows;
++        try {
++            rows = execute(sql);
++        } catch (Exception e) {
++            // fail-soft（brief 裁决 3）：摘要取首行防长堆栈刷屏；不重试、不炸穿读路径
++            log.warn("[POINT-CURVE] fail-soft 空集：st_point_num 查询失败（{}）", summarize(e.getMessage()));
++            return List.of();
++        }
++        List<PointCurvePointVO> points = new ArrayList<>();
++        if (rows == null || !rows.isArray()) {
++            return List.of();
++        }
++        for (JsonNode row : rows) {
++            if (!row.isArray() || row.isEmpty()) {
++                continue;
++            }
++            // [ts, value, quality] 列序（SELECT 列序）；NULL 单元格按空值跳过
++            String ts = row.get(0).isNull() ? null : row.get(0).asText();
++            Double value = (row.get(1).isNull()) ? null : row.get(1).asDouble();
++            Integer quality = (row.get(2).isNull()) ? null : row.get(2).asInt();
++            points.add(new PointCurvePointVO(ts, value, quality));
++        }
++        return points;
++    }
++
++    /**
++     * 执行一条 REST SQL（0003 HttpTdengineAdmin 形态）：失败抛 {@link IllegalStateException}
++     * 由 {@link #query24h} 捕获转 fail-soft——本方法自身不吞错。
++     */
++    private JsonNode execute(String sql) throws Exception {
++        String url = props.getBaseUrl() + "/rest/sql";
++        HttpRequest request = HttpRequest.newBuilder()
++                .uri(URI.create(url))
++                .timeout(Duration.ofMillis(props.getReadTimeoutMs()))
++                .header("Authorization", basicAuth(props.getUsername(), props.getPassword()))
++                .header("Content-Type", "text/plain")
++                .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        if (response.statusCode() >= 400) {
++            throw new IllegalStateException("TDengine REST HTTP " + response.statusCode()
++                    + "（" + summarize(response.body()) + "）");
++        }
++        JsonNode root = objectMapper.readTree(response.body());
++        int code = root.path("code").asInt(-1);
++        if (code != 0) {
++            throw new IllegalStateException("TDengine 错误码 " + code
++                    + "（" + summarize(root.path("desc").asText("")) + "）");
++        }
++        return root.path("data");
++    }
++
++    private static String basicAuth(String user, String password) {
++        return "Basic " + Base64.getEncoder()
++                .encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8));
++    }
++
++    /** 异常摘要收敛：首行、截断（照 0003 HttpTdengineAdmin 同款口径） */
++    private static String summarize(String message) {
++        if (message == null) {
++            return "";
++        }
++        String firstLine = message.split("\\R", 2)[0];
++        return firstLine.length() > 200 ? firstLine.substring(0, 200) : firstLine;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointImportExcelSaxParser.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointImportExcelSaxParser.java
+new file mode 100644
+index 0000000..d254bf1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/support/PointImportExcelSaxParser.java
+@@ -0,0 +1,353 @@
++package net.otlab.admin.module.iot.point.service.support;
++
++import cn.hutool.core.io.IORuntimeException;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportRowLimitException;
++import org.apache.poi.openxml4j.opc.OPCPackage;
++import org.apache.poi.openxml4j.opc.PackagePart;
++import org.apache.poi.openxml4j.opc.PackageRelationship;
++import org.apache.poi.openxml4j.opc.PackageRelationshipTypes;
++import org.apache.poi.util.XMLHelper;
++import org.apache.poi.xssf.eventusermodel.XSSFReader;
++import org.xml.sax.Attributes;
++import org.xml.sax.InputSource;
++import org.xml.sax.SAXException;
++import org.xml.sax.XMLReader;
++import org.xml.sax.helpers.DefaultHandler;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++
++/**
++ * 点位导入 Excel(.xlsx) SAX 流式解析器（TASK-0022，照 0018 字典导入范式
++ * {@code DictImportExcelSaxParser} 结构同源、十三列点位域映射）
++ *
++ * <p><b>为何独立实现而非复用字典解析器</b>：字典解析器固定五列字典域映射（finishRow 直配
++ * {@code DictImportRow}），列集与本批十三列不同；泛化改造字典域文件超出本批声明改动范围
++ * （brief 范围：point/**——本解析器置于点位域内自含）。三项评审要点（0009 修订轮
++ * I-1/I-2/I-3）随结构同源继承：
++ * <ul>
++ * <li>I-1 物理行号保真：rowIndex 取自 {@code <row r="N">} 的 r 属性（1-based Excel 物理行号），
++ *     XML 中缺失的空行不产出条目、存在于 XML 的空行（如 {@code <row r="3"/>} 占位）产出可跳过
++ *     条目（{@link PointImportRow#isSkippable()}）——两种情况均不产生行号前移；</li>
++ * <li>I-2 原始 null 保真：SAX 逐单元格取值，无 DOM read(1) 的 aliasFirstLine 列名字母填充，
++ *     首数据行缺格同样保持 null → 服务层 MISSING_REQUIRED 对首行有效；</li>
++ * <li>I-3 fail fast：逐行回调维护数据行计数（排除可跳过行），超过 maxDataRows 立即抛
++ *     {@link PointImportRowLimitException} 中止解析（TASK-0022 单批上限 10000 行）——
++ *     不构造全量行清单、不全量 DOM 放大，内存 O(共享字符串文本 + 单行)。</li>
++ * </ul>
++ *
++ * <p><b>共享字符串</b>：sharedStrings.xml 部件以 SAX 展平为纯 {@code List<String>}；
++ * <b>数值单元格归一</b>：整数值（含 "1002.0" 形态）转十进制整数字符串；<b>范围口径</b>：
++ * 仅解析首个 sheet、表头固定为物理第 1 行——与字典解析器同口径。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public final class PointImportExcelSaxParser {
++
++    private PointImportExcelSaxParser() {
++    }
++
++    /**
++     * 流式解析导入文件为原始行清单（含说明行/空行透传条目，行号为 Excel 物理行号）。
++     *
++     * @param xlsxInput   .xlsx 文件输入流（方法内消费并随 OPCPackage 关闭）
++     * @param maxDataRows 数据行（非可跳过行）上限，超过立即中止解析
++     * @return 行清单（按物理行顺序；空表/无行返回空清单，由服务层拒绝）
++     * @throws PointImportRowLimitException 数据行超过 maxDataRows（fail fast 中止）
++     * @throws IORuntimeException           文件损坏/非 xlsx 等解析失败（由全局异常处理器兜底）
++     */
++    public static List<PointImportRow> parse(InputStream xlsxInput, int maxDataRows) {
++        try (OPCPackage pkg = OPCPackage.open(xlsxInput)) {
++            List<String> sharedStrings = loadSharedStrings(pkg);
++            XSSFReader xssf = new XSSFReader(pkg);
++            Iterator<InputStream> sheets = xssf.getSheetsData();
++            if (!sheets.hasNext()) {
++                return new ArrayList<>();
++            }
++            try (InputStream sheet = sheets.next()) {
++                SheetRowHandler handler = new SheetRowHandler(sharedStrings, maxDataRows);
++                XMLReader xmlReader = XMLHelper.newXMLReader();
++                xmlReader.setContentHandler(handler);
++                xmlReader.parse(new InputSource(sheet));
++                return handler.rows;
++            }
++        } catch (PointImportRowLimitException e) {
++            throw e;
++        } catch (SAXException | IOException | javax.xml.parsers.ParserConfigurationException
++                | org.apache.poi.openxml4j.exceptions.OpenXML4JException e) {
++            throw new IORuntimeException("导入 Excel 解析失败: " + e.getMessage(), e);
++        }
++    }
++
++    /** ECMA-376 sharedStrings 关系类型（POI 5.2.5 的 PackageRelationshipTypes 无此常量） */
++    private static final String SHARED_STRINGS_REL =
++            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
++
++    /**
++     * sharedStrings.xml 部件 SAX 展平（纯文本清单，无 JAXB 元素树）；部件缺失返回空清单。
++     * 关系挂载层与字典解析器同口径（sharedStrings 关系挂在 workbook 部件上而非包根）。
++     */
++    private static List<String> loadSharedStrings(OPCPackage pkg) throws SAXException, IOException,
++            javax.xml.parsers.ParserConfigurationException,
++            org.apache.poi.openxml4j.exceptions.InvalidFormatException {
++        List<String> list = new ArrayList<>();
++        PackagePart workbookPart = null;
++        for (PackageRelationship rel : pkg.getRelationshipsByType(PackageRelationshipTypes.CORE_DOCUMENT)) {
++            workbookPart = pkg.getPart(rel);
++            break;
++        }
++        if (workbookPart == null) {
++            return list;
++        }
++        for (PackageRelationship rel : workbookPart.getRelationshipsByType(SHARED_STRINGS_REL)) {
++            PackagePart part = workbookPart.getRelatedPart(rel);
++            if (part == null) {
++                continue;
++            }
++            try (InputStream in = part.getInputStream()) {
++                SharedStringsHandler handler = new SharedStringsHandler(list);
++                XMLReader xmlReader = XMLHelper.newXMLReader();
++                xmlReader.setContentHandler(handler);
++                xmlReader.parse(new InputSource(in));
++            }
++        }
++        return list;
++    }
++
++    /** {@code <si>} 内全部 {@code <t>} 文本拼接（富文本 run 合并为整串）。 */
++    private static final class SharedStringsHandler extends DefaultHandler {
++        private final List<String> list;
++        private final StringBuilder buf = new StringBuilder();
++        private boolean inSi = false;
++        private boolean inT = false;
++
++        SharedStringsHandler(List<String> list) {
++            this.list = list;
++        }
++
++        @Override
++        public void startElement(String uri, String localName, String qName, Attributes attributes) {
++            if ("si".equals(localName)) {
++                inSi = true;
++                buf.setLength(0);
++            } else if ("t".equals(localName) && inSi) {
++                inT = true;
++            }
++        }
++
++        @Override
++        public void characters(char[] ch, int start, int length) {
++            if (inT) {
++                buf.append(ch, start, length);
++            }
++        }
++
++        @Override
++        public void endElement(String uri, String localName, String qName) {
++            if ("t".equals(localName) && inT) {
++                inT = false;
++            } else if ("si".equals(localName) && inSi) {
++                inSi = false;
++                list.add(buf.toString());
++            }
++        }
++    }
++
++    /** 首个 sheet 的行级 ContentHandler：物理行号取 r 属性，逐行产出 {@link PointImportRow}。 */
++    private static final class SheetRowHandler extends DefaultHandler {
++        private final List<String> sharedStrings;
++        private final int maxDataRows;
++        private final List<PointImportRow> rows = new ArrayList<>();
++        private int dataCount = 0;
++
++        private long rowNumber = 0;          // 当前物理行号（r 属性，1-based；缺省时上一行 + 1）
++        private int cellColumn = -1;         // 当前单元格列号（r 属性推导，0-based）
++        private String cellType = null;      // 当前单元格 t 类型（null = "n" 数值）
++        private boolean inValue = false;     // 位于 <v> 内
++        private boolean inInlineText = false; // 位于 inlineStr 的 <is> 内
++        private final StringBuilder buf = new StringBuilder();
++        private List<String> cells = new ArrayList<>(); // 当前行按列位存放（稀疏补 null）
++        private int maxCol = -1;
++
++        SheetRowHandler(List<String> sharedStrings, int maxDataRows) {
++            this.sharedStrings = sharedStrings;
++            this.maxDataRows = maxDataRows;
++        }
++
++        @Override
++        public void startElement(String uri, String localName, String qName, Attributes attributes) {
++            switch (localName) {
++                case "row":
++                    String r = attributes.getValue("r");
++                    rowNumber = r != null ? Long.parseLong(r) : rowNumber + 1;
++                    cells = new ArrayList<>();
++                    maxCol = -1;
++                    break;
++                case "c":
++                    cellColumn = colIndex(attributes.getValue("r"));
++                    cellType = attributes.getValue("t");
++                    buf.setLength(0);
++                    break;
++                case "v":
++                    inValue = true;
++                    buf.setLength(0);
++                    break;
++                case "is":
++                    inInlineText = true;
++                    break;
++                case "t":
++                    if (inInlineText) {
++                        buf.setLength(0);
++                    }
++                    break;
++                default:
++                    break;
++            }
++        }
++
++        @Override
++        public void characters(char[] ch, int start, int length) {
++            if (inValue || inInlineText) {
++                buf.append(ch, start, length);
++            }
++        }
++
++        @Override
++        public void endElement(String uri, String localName, String qName) {
++            switch (localName) {
++                case "v":
++                    setCell(cellValue(cellType, buf.toString()));
++                    inValue = false;
++                    break;
++                case "t":
++                    if (inInlineText) {
++                        setCell(buf.toString());
++                    }
++                    break;
++                case "c":
++                    cellType = null;
++                    inValue = false;
++                    break;
++                case "is":
++                    inInlineText = false;
++                    break;
++                case "row":
++                    finishRow();
++                    break;
++                default:
++                    break;
++            }
++        }
++
++        private void setCell(String value) {
++            if (cellColumn < 0) {
++                return;
++            }
++            // 空串归一 null：与字典解析器同口径——「显式空串」与「缺格」在导入语义上等价
++            // （十三列均无空串合法值），统一为 null 后 isSkippable（全空行）与必填缺失判定
++            // 对两种编码口径行为一致
++            if (value != null && value.isEmpty()) {
++                value = null;
++            }
++            while (cells.size() <= cellColumn) {
++                cells.add(null);
++            }
++            cells.set(cellColumn, value);
++            if (cellColumn > maxCol) {
++                maxCol = cellColumn;
++            }
++        }
++
++        private String cellValue(String type, String v) {
++            if (v == null || v.isEmpty()) {
++                return null;
++            }
++            if ("s".equals(type)) {
++                // 共享字符串：v 为索引
++                int idx;
++                try {
++                    idx = Integer.parseInt(v.trim());
++                } catch (NumberFormatException e) {
++                    return null;
++                }
++                return idx >= 0 && idx < sharedStrings.size() ? sharedStrings.get(idx) : null;
++            }
++            if ("b".equals(type)) {
++                return "1".equals(v.trim()) ? "true" : "false";
++            }
++            if ("str".equals(type) || "e".equals(type)) {
++                return v; // 公式缓存字符串 / 错误值原样
++            }
++            return numericValue(v); // "n"（缺省类型）
++        }
++
++        /** 整数值（含 1002.0 形态）转十进制整数字符串；非整数保留原文；非法数值原样兜底。 */
++        private static String numericValue(String v) {
++            try {
++                double d = Double.parseDouble(v.trim());
++                if (Double.isFinite(d) && d == Math.rint(d) && Math.abs(d) < 9.0E15) {
++                    return String.valueOf((long) d);
++                }
++                return v;
++            } catch (NumberFormatException e) {
++                return v;
++            }
++        }
++
++        /** Excel 单元格引用（如 M12）→ 0-based 列号；无引用返回 -1。 */
++        private static int colIndex(String ref) {
++            if (ref == null || ref.isEmpty()) {
++                return -1;
++            }
++            int idx = 0;
++            for (int i = 0; i < ref.length(); i++) {
++                char ch = ref.charAt(i);
++                if (ch >= 'A' && ch <= 'Z') {
++                    idx = idx * 26 + (ch - 'A' + 1);
++                } else if (ch >= 'a' && ch <= 'z') {
++                    idx = idx * 26 + (ch - 'a' + 1);
++                } else {
++                    break; // 行号数字段开始，列字母段结束
++                }
++            }
++            return idx - 1; // A → 0
++        }
++
++        private void finishRow() {
++            long physical = rowNumber; // 无 r 属性的行已在 startElement 按「上一行 + 1」递增
++            if (physical <= 1) {
++                return; // 物理第 1 行 = 表头
++            }
++            PointImportRow row = new PointImportRow();
++            row.setRowIndex((int) physical);
++            row.setPointCode(trim(cells, 0));
++            row.setPointName(trim(cells, 1));
++            row.setDataType(trim(cells, 2));
++            row.setValueType(trim(cells, 3));
++            row.setUnit(trim(cells, 4));
++            row.setChannelCode(trim(cells, 5));
++            row.setBoundInstanceId(trim(cells, 6));
++            row.setDeptId(trim(cells, 7));
++            row.setMinValue(trim(cells, 8));
++            row.setMaxValue(trim(cells, 9));
++            row.setSamplePeriod(trim(cells, 10));
++            row.setDeadband(trim(cells, 11));
++            row.setRemark(trim(cells, 12));
++            rows.add(row);
++            if (!row.isSkippable() && ++dataCount > maxDataRows) {
++                // I-3 fail fast：RuntimeException 经 JAXP XMLReader.parse 原样透传出 parse()
++                throw new PointImportRowLimitException(dataCount);
++            }
++        }
++
++        private static String trim(List<String> cells, int index) {
++            String value = index < cells.size() ? cells.get(index) : null;
++            return value == null ? null : value.trim();
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointControllerTest.java
+index 0209232..d875e6e 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointControllerTest.java
+@@ -4,6 +4,8 @@ import cn.dev33.satoken.annotation.SaCheckPermission;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
++import net.otlab.admin.module.iot.point.dto.IotPointDetailVO;
++import net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO;
+ import net.otlab.admin.module.iot.point.dto.IotPointStatusForm;
+ import net.otlab.admin.module.iot.point.dto.IotPointUpdateForm;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+@@ -142,13 +144,19 @@ class IotPointControllerTest {
+     }
+ 
+     @Test
+-    @DisplayName("detail - GET /iot/point/{id}；越权 403 透传（SCOPE_FORBIDDEN——服务层裁决）")
++    @DisplayName("detail - GET /iot/point/{id} 聚合 VO（TASK-0023 referenceCount/curve24h）；越权 403 透传")
+     void testDetail() throws Exception {
+-        when(pointService.getPointDetail(300L)).thenReturn(testPoint());
++        IotPointDetailVO vo = new IotPointDetailVO();
++        org.springframework.beans.BeanUtils.copyProperties(testPoint(), vo);
++        vo.setReferenceCount(2L);
++        vo.setCurve24h(java.util.List.of());
++        when(pointService.getPointDetail(300L)).thenReturn(vo);
+         mockMvc.perform(get("/iot/point/300"))
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.code").value(200))
+-                .andExpect(jsonPath("$.data.id").value(300));
++                .andExpect(jsonPath("$.data.id").value(300))
++                .andExpect(jsonPath("$.data.referenceCount").value(2))
++                .andExpect(jsonPath("$.data.curve24h").isArray());
+ 
+         doThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该点位（数据权限不命中）"))
+                 .when(pointService).getPointDetail(301L);
+@@ -202,14 +210,31 @@ class IotPointControllerTest {
+     }
+ 
+     @Test
+-    @DisplayName("changeStatus - PUT /iot/point/changeStatus（§3.1 独立行）；批量 ids + status 必填")
++    @DisplayName("changeStatus - PUT /iot/point/changeStatus（§3.1 独立行；/status 为 TASK-0023 brief 字面"
++        + "路径别名——双路由同 handler）；响应携带影响计数与生效明示")
+     void testChangeStatus() throws Exception {
++        IotPointStatusChangeVO vo = new IotPointStatusChangeVO();
++        vo.setTargetStatus(0);
++        vo.setChangedCount(2);
++        vo.setAffectedDataItemCount(3L);
++        vo.setEffectNote(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED);
++        when(pointService.changePointStatus(any(IotPointStatusForm.class))).thenReturn(vo);
++
+         mockMvc.perform(put("/iot/point/changeStatus").contentType(MediaType.APPLICATION_JSON)
+-                        .content("{\"ids\":[300,301],\"status\":1}"))
++                        .content("{\"ids\":[300,301],\"status\":0}"))
+                 .andExpect(status().isOk())
+-                .andExpect(jsonPath("$.code").value(200));
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.affectedDataItemCount").value(3))
++                .andExpect(jsonPath("$.data.effectNote").value(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED));
+         verify(pointService).changePointStatus(any(IotPointStatusForm.class));
+ 
++        // brief 字面路径别名（TASK-0023 brief 裁决 4 原文 PUT /iot/point/status）
++        mockMvc.perform(put("/iot/point/status").contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"ids\":[300],\"status\":0}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(pointService, org.mockito.Mockito.times(2)).changePointStatus(any(IotPointStatusForm.class));
++
+         mockMvc.perform(put("/iot/point/changeStatus").contentType(MediaType.APPLICATION_JSON)
+                         .content("{\"status\":1}"))
+                 .andExpect(status().isOk())
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointImportExportControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointImportExportControllerTest.java
+new file mode 100644
+index 0000000..dcb45f5
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/controller/IotPointImportExportControllerTest.java
+@@ -0,0 +1,364 @@
++package net.otlab.admin.module.iot.point.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import cn.hutool.poi.excel.ExcelReader;
++import cn.hutool.poi.excel.ExcelUtil;
++import cn.hutool.poi.excel.ExcelWriter;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import net.otlab.admin.module.iot.point.dto.PointExportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportReceipt;
++import net.otlab.admin.module.iot.point.dto.PointImportRejectException;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportRowResult;
++import net.otlab.admin.module.iot.point.service.IotPointService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.mock.web.MockMultipartFile;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.MvcResult;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 点位批量导入导出控制器测试（TASK-0022 接口层，照 0018 字典导入控制器测试范式）
++ *
++ * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），Excel 解析/渲染用真实 Hutool
++ * 组件在内存中构造 .xlsx；权限注解以反射断言（import 三接口共用 iot:point:add、export
++ * 复用 iot:point:list——TASK-0022 brief 裁决 1/5，不新增菜单种子）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPointImportExportControllerTest {
++
++    private static final String XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
++
++    private MockMvc mockMvc;
++    private final ObjectMapper objectMapper = new ObjectMapper();
++
++    @Mock
++    private IotPointService pointService;
++
++    private IotPointController pointController;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        pointController = new IotPointController();
++        ReflectionTestUtils.setField(pointController, "pointService", pointService);
++        mockMvc = MockMvcBuilders.standaloneSetup(pointController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .build();
++    }
++
++    /** 用框架同款 Hutool 组件在内存构造 .xlsx（导入文件测试夹具） */
++    private byte[] buildExcel(List<List<Object>> rows) throws IOException {
++        ExcelWriter writer = ExcelUtil.getBigWriter();
++        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
++            writer.write(rows);
++            writer.flush(out);
++            return out.toByteArray();
++        } finally {
++            writer.close();
++        }
++    }
++
++    private MockMultipartFile excelFile(byte[] bytes) {
++        return new MockMultipartFile("file", "point.xlsx", MediaType.APPLICATION_OCTET_STREAM_VALUE, bytes);
++    }
++
++    // ---------- 权限与注解 ----------
++
++    @Test
++    @DisplayName("权限注解 - import/template/error-report 共用 iot:point:add、export 复用 iot:point:list"
++        + "（TASK-0022 brief 裁决 1/5——不新增菜单种子）")
++    void testPermissionAnnotations() throws Exception {
++        assertEquals("iot:point:add", IotPointController.class
++                .getMethod("importPoints", org.springframework.web.multipart.MultipartFile.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:point:add", IotPointController.class
++                .getMethod("importTemplate", jakarta.servlet.http.HttpServletResponse.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:point:add", IotPointController.class
++                .getMethod("importErrorReport", PointImportReceipt.class, jakarta.servlet.http.HttpServletResponse.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:point:list", IotPointController.class
++                .getMethod("export", net.otlab.admin.module.iot.point.entity.IotPoint.class,
++                        jakarta.servlet.http.HttpServletResponse.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
++    @Test
++    @DisplayName("操作日志注解 - 导入接口 @OperateLog businessType=IMPORT")
++    void testOperateLogAnnotation() throws Exception {
++        OperateLog log = IotPointController.class
++                .getMethod("importPoints", org.springframework.web.multipart.MultipartFile.class)
++                .getAnnotation(OperateLog.class);
++        assertNotNull(log);
++        assertEquals(BusinessType.IMPORT, log.businessType());
++    }
++
++    // ---------- POST /iot/point/import ----------
++
++    @Test
++    @DisplayName("导入 - 真实 xlsx 解析：十三列映射 + 物理行号保真（空行后数据行 rowIndex=4）+ 说明行透传")
++    void testImport_ParsesExcelRows_PhysicalAlignment() throws Exception {
++        byte[] bytes = buildExcel(Arrays.asList(
++                Arrays.asList("pointCode", "pointName", "dataType", "valueType", "unit", "channelCode",
++                        "boundInstanceId", "deptId", "minValue", "maxValue", "samplePeriod", "deadband", "remark"),
++                Arrays.asList("F01_WS01_EQ001_M01", "一号空压机主轴温度", "1", "DOUBLE", "℃", "CH_MAIN",
++                        null, null, "0", "120", "30", null, "备注A"),
++                Arrays.asList(null, null, null, null, null, null, null, null, null, null, null, null, null),
++                Arrays.asList("F01_WS01_EQ001_M02", "二号空压机主轴温度", "3", "BOOL", null, "CH_SUB",
++                        null, null, null, null, null, null, null)));
++        when(pointService.importPoints(anyList())).thenReturn(receiptOf(2, 0, true));
++
++        mockMvc.perform(multipart("/iot/point/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.successCount").value(2));
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<List<PointImportRow>> captor = ArgumentCaptor.forClass((Class) List.class);
++        verify(pointService).importPoints(captor.capture());
++        List<PointImportRow> parsed = captor.getValue();
++        List<PointImportRow> data = parsed.stream().filter(r -> !r.isSkippable())
++                .collect(java.util.stream.Collectors.toList());
++        assertEquals(2, data.size(), "只有两个数据行（空行不算）");
++        PointImportRow first = data.get(0);
++        assertEquals(2, first.getRowIndex(), "首个数据行=物理第 2 行");
++        assertEquals("F01_WS01_EQ001_M01", first.getPointCode());
++        assertEquals("一号空压机主轴温度", first.getPointName());
++        assertEquals("1", first.getDataType());
++        assertEquals("DOUBLE", first.getValueType());
++        assertEquals("℃", first.getUnit());
++        assertEquals("CH_MAIN", first.getChannelCode());
++        assertEquals("0", first.getMinValue());
++        assertEquals("120", first.getMaxValue());
++        assertEquals("30", first.getSamplePeriod());
++        assertEquals("备注A", first.getRemark());
++        PointImportRow second = data.get(1);
++        assertEquals(4, second.getRowIndex(), "空行后数据行仍=物理第 4 行（I-1：行号不得整体前移）");
++        assertEquals("3", second.getDataType());
++        assertEquals("BOOL", second.getValueType());
++        assertNull(second.getUnit(), "首数据行缺格保持 null（I-2：无 alias 列名字母填充）");
++    }
++
++    @Test
++    @DisplayName("导入 - 整批拒绝透传：body code=400（PARAM_ERROR）且 data 携带完整逐行回执清单（brief 裁决 3）")
++    void testImport_BatchRejectBody400WithReceipt() throws Exception {
++        byte[] bytes = buildExcel(List.of(Arrays.asList("F01.P1", "点位1", "1", "TEXT", null, null,
++                null, null, null, null, null, null, null)));
++        PointImportReceipt receipt = receiptOf(0, 1, false);
++        PointImportRowResult fail = receipt.getRows().get(0);
++        fail.setReasonCode(PointImportRowResult.REASON_INVALID_VALUE_TYPE);
++        fail.setMessage("值类型非法: TEXT");
++        when(pointService.importPoints(anyList()))
++                .thenThrow(new PointImportRejectException("导入校验未通过，整批未入库（成功 0 行 / 失败 1 行）", receipt));
++
++        mockMvc.perform(multipart("/iot/point/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.data.persisted").value(false))
++                .andExpect(jsonPath("$.data.failCount").value(1))
++                .andExpect(jsonPath("$.data.rows[0].reasonCode").value(PointImportRowResult.REASON_INVALID_VALUE_TYPE));
++    }
++
++    @Test
++    @DisplayName("导入 - 超上限（10000+1 数据行）SAX 流式中途整批拒绝（fail fast，服务层零调用）")
++    void testImport_OverLimit_AbortParsingFast() throws Exception {
++        List<List<Object>> rows = new ArrayList<>();
++        rows.add(Arrays.asList("pointCode", "pointName", "dataType", "valueType", "unit", "channelCode",
++                "boundInstanceId", "deptId", "minValue", "maxValue", "samplePeriod", "deadband", "remark"));
++        for (int i = 2; i <= 10002; i++) { // 10001 条数据行
++            rows.add(Arrays.asList("F01.P" + i, "点位" + i, "1", "DOUBLE", null, null,
++                    null, null, null, null, null, null, null));
++        }
++        byte[] bytes = buildExcel(rows);
++
++        mockMvc.perform(multipart("/iot/point/import").file(excelFile(bytes)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("单批导入上限 10000 行，当前 10001 行"));
++
++        verify(pointService, never()).importPoints(anyList());
++    }
++
++    // ---------- GET /iot/point/import/template ----------
++
++    @Test
++    @DisplayName("模板下载 - HTTP 200 + xlsx 文件头；表头十三列、示例行与说明行齐备")
++    void testTemplate_Download() throws Exception {
++        MvcResult result = mockMvc.perform(get("/iot/point/import/template"))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        String contentType = result.getResponse().getContentType();
++        assertNotNull(contentType);
++        assertTrue(contentType.contains("spreadsheetml"), "xlsx MIME：实际 " + contentType);
++        String disposition = result.getResponse().getHeader("Content-Disposition");
++        assertTrue(disposition != null && disposition.endsWith(".xlsx"), "附件文件名以 .xlsx 结尾：" + disposition);
++
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(3, rows.size(), "模板=表头+示例行+说明行");
++            assertEquals(Arrays.asList("pointCode", "pointName", "dataType", "valueType", "unit", "channelCode",
++                    "boundInstanceId", "deptId", "minValue", "maxValue", "samplePeriod", "deadband", "remark"),
++                    rows.get(0), "表头十三列与导出同构");
++            assertEquals("F01_WS01_EQ001_M01", rows.get(1).get(0), "第 2 行为示例数据行");
++            assertTrue(String.valueOf(rows.get(2).get(0)).startsWith("说明："), "第 3 行为说明行（导入时自动跳过）");
++            assertTrue(String.valueOf(rows.get(2).get(0)).contains("DOUBLE/INT/BOOL/ENUM"), "说明行含值域口径");
++            assertTrue(String.valueOf(rows.get(2).get(0)).contains("10000"), "说明行含单批上限");
++        }
++    }
++
++    // ---------- POST /iot/point/import/error-report ----------
++
++    @Test
++    @DisplayName("错误清单下载 - 回执失败行渲染为 xlsx（成功行不进清单），HTTP 200")
++    void testErrorReport_DownloadFailRowsOnly() throws Exception {
++        PointImportReceipt receipt = receiptOf(0, 2, false);
++        PointImportRowResult f1 = receipt.getRows().get(0);
++        f1.setRowIndex(4);
++        f1.setPointCode("F01.BAD");
++        f1.setReasonCode(PointImportRowResult.REASON_INVALID_CODE);
++        f1.setMessage("点位编码不合规: F01 BAD");
++        PointImportRowResult f2 = receipt.getRows().get(1);
++        f2.setRowIndex(6);
++        f2.setPointCode("F01.RANGE");
++        f2.setReasonCode(PointImportRowResult.REASON_INVALID_RANGE);
++        f2.setMessage("有效范围下限不能大于上限（min<=max）");
++
++        MvcResult result = mockMvc.perform(post("/iot/point/import/error-report")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(objectMapper.writeValueAsString(receipt)))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        assertTrue(result.getResponse().getContentType().contains("spreadsheetml"));
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(3, rows.size(), "表头 + 2 条失败行（成功行不进清单）");
++            assertEquals("行号", rows.get(0).get(0));
++            assertEquals(4, ((Number) rows.get(1).get(0)).intValue());
++            assertEquals("F01.BAD", rows.get(1).get(1));
++            assertEquals(PointImportRowResult.REASON_INVALID_CODE, rows.get(1).get(2));
++            assertEquals(6, ((Number) rows.get(2).get(0)).intValue());
++            assertEquals(PointImportRowResult.REASON_INVALID_RANGE, rows.get(2).get(2));
++        }
++    }
++
++    @Test
++    @DisplayName("错误清单下载 - 无失败行（null 回执）时返回仅含表头的 xlsx")
++    void testErrorReport_EmptyReceiptHeaderOnly() throws Exception {
++        MvcResult result = mockMvc.perform(post("/iot/point/import/error-report")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{}"))
++                .andExpect(status().isOk())
++                .andReturn();
++
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(1, rows.size(), "仅表头一行");
++            assertEquals("行号", rows.get(0).get(0));
++        }
++    }
++
++    // ---------- GET /iot/point/export ----------
++
++    @Test
++    @DisplayName("导出 - 查询参数透传服务层；响应 xlsx 与模板表头同构、数据行齐备")
++    void testExport_RendersTemplateIsomorphicXlsx() throws Exception {
++        PointExportRow row = new PointExportRow();
++        row.setPointCode("F01_WS01_EQ001_M01");
++        row.setPointName("一号空压机主轴温度");
++        row.setDataType(1);
++        row.setValueType("DOUBLE");
++        row.setUnit("℃");
++        row.setChannelCode("CH_MAIN");
++        row.setBoundInstanceId(66L);
++        row.setDeptId(77L);
++        row.setMinValue(new BigDecimal("0"));
++        row.setMaxValue(new BigDecimal("120"));
++        row.setSamplePeriod(30);
++        row.setRemark("导出备注");
++        when(pointService.selectExportRows(any(net.otlab.admin.module.iot.point.entity.IotPoint.class)))
++                .thenReturn(List.of(row));
++
++        MvcResult result = mockMvc.perform(get("/iot/point/export")
++                        .param("pointCode", "F01").param("dataType", "1"))
++                .andExpect(status().isOk())
++                .andReturn();
++        assertTrue(result.getResponse().getContentType().contains("spreadsheetml"));
++
++        verify(pointService).selectExportRows(any(net.otlab.admin.module.iot.point.entity.IotPoint.class));
++        byte[] body = result.getResponse().getContentAsByteArray();
++        try (ExcelReader reader = ExcelUtil.getReader(new ByteArrayInputStream(body))) {
++            List<List<Object>> rows = reader.read(0);
++            assertEquals(2, rows.size(), "表头 + 1 条数据行");
++            assertEquals("pointCode", rows.get(0).get(0), "与模板表头同构（导入→修正→导出闭环）");
++            assertEquals("channelCode", rows.get(0).get(5));
++            assertEquals("F01_WS01_EQ001_M01", rows.get(1).get(0));
++            assertEquals("CH_MAIN", rows.get(1).get(5), "通道列回填 channelCode");
++            assertEquals(30, ((Number) rows.get(1).get(10)).intValue(), "samplePeriod 数值列回填");
++            assertEquals("导出备注", rows.get(1).get(12));
++        }
++    }
++
++    // ---------- 夹具 ----------
++
++    private PointImportReceipt receiptOf(int successCount, int failCount, boolean persisted) {
++        PointImportReceipt receipt = new PointImportReceipt();
++        receipt.setTotalCount(successCount + failCount);
++        receipt.setSuccessCount(successCount);
++        receipt.setFailCount(failCount);
++        receipt.setPersisted(persisted);
++        List<PointImportRowResult> rows = new ArrayList<>();
++        for (int i = 0; i < successCount + failCount; i++) {
++            PointImportRowResult rr = new PointImportRowResult();
++            rr.setRowIndex(2 + i);
++            rr.setPointCode("F01.P" + i);
++            rr.setSuccess(i < successCount);
++            rr.setMessage(i < successCount ? "校验通过" : "失败");
++            rows.add(rr);
++        }
++        receipt.setRows(rows);
++        return receipt;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java
+new file mode 100644
+index 0000000..f81c429
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java
+@@ -0,0 +1,595 @@
++package net.otlab.admin.module.iot.point.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.channel.entity.IotChannel;
++import net.otlab.admin.module.iot.channel.mapper.IotChannelMapper;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataperm.DataPermConditionAssembler;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.entity.SysTenant;
++import net.otlab.admin.module.iot.point.dto.PointImportReceipt;
++import net.otlab.admin.module.iot.point.dto.PointImportRejectException;
++import net.otlab.admin.module.iot.point.dto.PointImportRow;
++import net.otlab.admin.module.iot.point.dto.PointImportRowResult;
++import net.otlab.admin.module.iot.point.entity.IotPoint;
++import net.otlab.admin.module.iot.point.event.PointEnabledEvent;
++import net.otlab.admin.module.iot.point.mapper.IotPointCodeMapper;
++import net.otlab.admin.module.iot.point.mapper.IotPointCodeRow;
++import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.point.service.IotPointService;
++import net.otlab.admin.module.iot.quota.PointQuotaCounter;
++import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.admin.module.system.entity.SysDict;
++import net.otlab.admin.module.system.entity.SysDictData;
++import net.otlab.admin.module.system.mapper.SysDeptMapper;
++import net.otlab.admin.module.system.mapper.SysDictDataMapper;
++import net.otlab.admin.module.system.mapper.SysDictMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.stream.Collectors;
++import java.util.stream.IntStream;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.verifyNoInteractions;
++import static org.mockito.Mockito.when;
++
++/**
++ * 点位批量导入服务单元测试（TASK-0022，照 0018 字典导入测试范式）
++ *
++ * <p>核心契约（TASK-0022 brief）：① 逐行回执与整批原子性并存——任一行校验失败整批拒绝不半落库
++ * （{@code PointImportRejectException} → PARAM_ERROR(400) + data 携带回执，4002 留单点语义）；
++ * ② 校验项按点位域语义——编码合规 [A-Za-z0-9_.] ≤96、dataType/valueType 枚举、unit 单位字典
++ * （TD-0045）、channelCode→id 解析（不存在/歧义拒）、min&lt;=max、数值列；③ 批内撞码先于落库判定；
++ * ④ 按编码幂等——库内活跃行占用与已删行占用同口径 DUPLICATE_CODE，重导同文件整批拒绝；
++ * ⑤ 配额联动不豁免——校验通过行数 + 当前计数 &gt; quota 整批拒 4003（防「界面 99/100 拒、
++ * 导入塞 1000 行」绕过）；⑥ 单批上限 10000 行；⑦ 导入落库不发 PointEnabledEvent（配置迁移）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPointImportServiceTest {
++
++    private static final long TENANT = 1L;
++    private static final long USER = 10L;
++
++    @Mock
++    private IotPointMapper baseMapper;
++
++    @Mock
++    private IotPointCodeMapper pointCodeMapper;
++
++    @Mock
++    private IotChannelMapper channelMapper;
++
++    @Mock
++    private IotModelInstanceMapper instanceMapper;
++
++    @Mock
++    private SysDeptMapper deptMapper;
++
++    @Mock
++    private SysDictMapper dictMapper;
++
++    @Mock
++    private SysDictDataMapper dictDataMapper;
++
++    @Mock
++    private IotDataItemMapper dataItemMapper;
++
++    @Mock
++    private SysTenantService tenantService;
++
++    @Mock
++    private PointQuotaCounter pointQuotaCounter;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private ApplicationEventPublisher eventPublisher;
++
++    private IotPointServiceImpl pointService;
++
++    private org.mockito.MockedStatic<TenantContext> tenantContext;
++    private org.mockito.MockedStatic<net.otlab.core.utils.SecurityUtils> securityUtils;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotPoint.class);
++        TableInfoHelper.initTableInfo(assistant, IotChannel.class);
++        TableInfoHelper.initTableInfo(assistant, SysDict.class);
++        TableInfoHelper.initTableInfo(assistant, SysDictData.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.iot.dataitem.entity.IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.iot.template.entity.IotModelInstance.class);
++        TableInfoHelper.initTableInfo(assistant, net.otlab.admin.module.system.entity.SysDept.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = org.mockito.Mockito.mockStatic(net.otlab.core.utils.SecurityUtils.class);
++        securityUtils.when(net.otlab.core.utils.SecurityUtils::getUserId).thenReturn(USER);
++
++        pointService = new IotPointServiceImpl();
++        ReflectionTestUtils.setField(pointService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(pointService, "pointCodeMapper", pointCodeMapper);
++        ReflectionTestUtils.setField(pointService, "channelMapper", channelMapper);
++        ReflectionTestUtils.setField(pointService, "instanceMapper", instanceMapper);
++        ReflectionTestUtils.setField(pointService, "deptMapper", deptMapper);
++        ReflectionTestUtils.setField(pointService, "dictMapper", dictMapper);
++        ReflectionTestUtils.setField(pointService, "dictDataMapper", dictDataMapper);
++        ReflectionTestUtils.setField(pointService, "dataItemMapper", dataItemMapper);
++        ReflectionTestUtils.setField(pointService, "tenantService", tenantService);
++        ReflectionTestUtils.setField(pointService, "pointQuotaCounter", pointQuotaCounter);
++        ReflectionTestUtils.setField(pointService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(pointService, "dataPermConditionAssembler", new DataPermConditionAssembler());
++        ReflectionTestUtils.setField(pointService, "eventPublisher", eventPublisher);
++
++        SysTenant tenant = new SysTenant();
++        tenant.setId(TENANT);
++        tenant.setTenantCode("default");
++        when(tenantService.getById(TENANT)).thenReturn(tenant);
++        // 默认编码占用预检空命中（幂等占用用例逐用例覆盖）
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private PointImportRow row(int excelRow, String code, String name, String dataType, String valueType,
++                               String unit, String channelCode) {
++        PointImportRow r = new PointImportRow();
++        r.setRowIndex(excelRow);
++        r.setPointCode(code);
++        r.setPointName(name);
++        r.setDataType(dataType);
++        r.setValueType(valueType);
++        r.setUnit(unit);
++        r.setChannelCode(channelCode);
++        return r;
++    }
++
++    private PointImportRow validRow(int excelRow, String code) {
++        return row(excelRow, code, "点位-" + code, "1", "DOUBLE", null, null);
++    }
++
++    /** 单位字典就绪（iot_unit 类型 + 命中条目返回） */
++    private void dictReady() {
++        SysDict dict = new SysDict();
++        dict.setId(99L);
++        dict.setDictCode("iot_unit");
++        when(dictMapper.selectOne(any())).thenReturn(dict);
++        when(dictDataMapper.selectList(any())).thenReturn(List.of());
++    }
++
++    /** 单条行断言辅助：取回执中该行结果 */
++    private PointImportRowResult rowOf(PointImportReceipt receipt, int rowIndex) {
++        return receipt.getRows().stream()
++                .filter(rr -> rr.getRowIndex() != null && rr.getRowIndex() == rowIndex)
++                .findFirst().orElseThrow();
++    }
++
++    private PointImportReceipt rejected(PointImportRejectException e) {
++        assertNotNull(e.getReceipt(), "整批拒绝异常携带完整回执");
++        return e.getReceipt();
++    }
++
++    // ---------- 正常导入 ----------
++
++    @Test
++    @DisplayName("导入 - 全部有效行：逐行落库（status=1/tenantId 会话覆盖/无 id 审计），回执 successCount=N、persisted=true")
++    void testImport_Success_AllValidRows() {
++        List<PointImportRow> rows = List.of(
++                validRow(2, "F01_WS01_EQ001_M01"), validRow(3, "F01_WS01_EQ001_M02"));
++        PointImportReceipt receipt = pointService.importPoints(rows);
++
++        assertEquals(2, receipt.getTotalCount());
++        assertEquals(2, receipt.getSuccessCount());
++        assertEquals(0, receipt.getFailCount());
++        assertTrue(receipt.getPersisted(), "全部通过即整批落库");
++        ArgumentCaptor<IotPoint> captor = ArgumentCaptor.forClass(IotPoint.class);
++        verify(baseMapper, times(2)).insert(captor.capture());
++        IotPoint first = captor.getAllValues().get(0);
++        assertEquals(TENANT, first.getTenantId(), "tenant_id 会话覆盖");
++        assertEquals("F01_WS01_EQ001_M01", first.getPointCode());
++        assertEquals(1, first.getDataType());
++        assertEquals("DOUBLE", first.getValueType());
++        assertEquals(1, first.getStatus(), "导入新增恒启用（brief 裁决 6「导入落库的启用点位」）");
++        assertNull(first.getId(), "id 由框架自增");
++        assertNull(first.getConfigVersion(), "configVersion 配置发布链路专属不落请求值");
++        verifyNoInteractions(eventPublisher);
++    }
++
++    @Test
++    @DisplayName("导入 - 归属列解析落库：channelCode→id 解析回填 channelId；boundInstanceId/deptId 数值回填；"
++        + "min/max/samplePeriod/deadband/remark 回填")
++    void testImport_FieldsMappedAndChannelResolved() {
++        List<PointImportRow> rows = List.of(row(2, "F01.P1", "一号点位", "2", "INT", "kWh", "CH_MAIN"));
++        rows.get(0).setBoundInstanceId("66");
++        rows.get(0).setDeptId("77");
++        rows.get(0).setMinValue("0.5");
++        rows.get(0).setMaxValue("120");
++        rows.get(0).setSamplePeriod("30");
++        rows.get(0).setDeadband("1.5");
++        rows.get(0).setRemark("导入备注");
++        dictReady();
++        when(dictDataMapper.selectList(any())).thenReturn(List.of(dictData("kWh")));
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel(55L, "CH_MAIN")));
++
++        PointImportReceipt receipt = pointService.importPoints(rows);
++
++        assertTrue(receipt.getPersisted());
++        ArgumentCaptor<IotPoint> captor = ArgumentCaptor.forClass(IotPoint.class);
++        verify(baseMapper).insert(captor.capture());
++        IotPoint saved = captor.getValue();
++        assertEquals(55L, saved.getChannelId(), "channelCode→id 解析回填");
++        assertEquals(66L, saved.getBoundInstanceId());
++        assertEquals(77L, saved.getDeptId());
++        assertEquals(new BigDecimal("0.5"), saved.getMinValue());
++        assertEquals(new BigDecimal("120"), saved.getMaxValue());
++        assertEquals(30, saved.getSamplePeriod());
++        assertEquals(new BigDecimal("1.5"), saved.getDeadband());
++        assertEquals("导入备注", saved.getRemark());
++    }
++
++    // ---------- 字段级校验（逐行首个命中） ----------
++
++    @Test
++    @DisplayName("导入 - 必填缺失逐行回执 MISSING_REQUIRED，整批拒绝不半落库（persisted=false）")
++    void testImport_MissingRequired() {
++        List<PointImportRow> rows = List.of(
++                validRow(2, "F01.P1"),
++                row(3, null, "缺编码", "1", "DOUBLE", null, null));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(rows)));
++
++        assertEquals(2, receipt.getTotalCount());
++        assertEquals(1, receipt.getFailCount());
++        assertEquals(1, receipt.getSuccessCount(), "失败行之外的行仅代表「校验通过、本可入库」");
++        assertEquals(false, receipt.getPersisted(), "整批拒绝不半落库");
++        PointImportRowResult fail = rowOf(receipt, 3);
++        assertEquals(PointImportRowResult.REASON_MISSING_REQUIRED, fail.getReasonCode());
++        assertTrue(fail.getMessage().contains("pointCode"));
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 编码合规校验：中文/特殊字符 INVALID_CODE；超 96 字符 TOO_LONG（brief 裁决 2）")
++    void testImport_CodeRules() {
++        List<PointImportRow> rows = List.of(
++                row(2, "F01 编号", "中文编码", "1", "DOUBLE", null, null),
++                row(3, "F".repeat(97), "超长编码", "1", "DOUBLE", null, null));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(rows)));
++
++        assertEquals(PointImportRowResult.REASON_INVALID_CODE, rowOf(receipt, 2).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_TOO_LONG, rowOf(receipt, 3).getReasonCode());
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 枚举校验：dataType 出 1-4 或非数值 INVALID_DATA_TYPE；valueType 字典外 INVALID_VALUE_TYPE")
++    void testImport_EnumRules() {
++        List<PointImportRow> rows = List.of(
++                row(2, "F01.P1", "点位1", "9", "DOUBLE", null, null),
++                row(3, "F01.P2", "点位2", "瞬时", "DOUBLE", null, null),
++                row(4, "F01.P3", "点位3", "1", "STRING", null, null));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(rows)));
++
++        assertEquals(PointImportRowResult.REASON_INVALID_DATA_TYPE, rowOf(receipt, 2).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_INVALID_DATA_TYPE, rowOf(receipt, 3).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_INVALID_VALUE_TYPE, rowOf(receipt, 4).getReasonCode());
++    }
++
++    @Test
++    @DisplayName("导入 - 数值列与量程：samplePeriod 0/86401/非数值 INVALID_NUMBER；boundInstanceId 非整数 INVALID_NUMBER；"
++        + "min>max INVALID_RANGE（单边不判）")
++    void testImport_NumericAndRangeRules() {
++        PointImportRow badPeriod = validRow(2, "F01.P1");
++        badPeriod.setSamplePeriod("86401");
++        PointImportRow badPeriodText = validRow(3, "F01.P2");
++        badPeriodText.setSamplePeriod("三十秒");
++        PointImportRow badInstance = validRow(4, "F01.P3");
++        badInstance.setBoundInstanceId("实例甲");
++        PointImportRow badRange = validRow(5, "F01.P4");
++        badRange.setMinValue("130");
++        badRange.setMaxValue("120");
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(badPeriod, badPeriodText, badInstance, badRange))));
++
++        assertEquals(PointImportRowResult.REASON_INVALID_NUMBER, rowOf(receipt, 2).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_INVALID_NUMBER, rowOf(receipt, 3).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_INVALID_NUMBER, rowOf(receipt, 4).getReasonCode());
++        assertEquals(PointImportRowResult.REASON_INVALID_RANGE, rowOf(receipt, 5).getReasonCode());
++        assertTrue(rowOf(receipt, 5).getMessage().contains("min<=max"));
++    }
++
++    // ---------- 库内级校验（批内一次 IN） ----------
++
++    @Test
++    @DisplayName("导入 - unit 强制单位字典校验（TD-0045）：字典外值 UNIT_NOT_IN_DICT 并提示归口运营方；"
++        + "字典类型未登记同口径；空白视为未携带放行")
++    void testImport_UnitDictRules() {
++        PointImportRow badUnit = validRow(2, "F01.P1");
++        badUnit.setUnit("MPaguess");
++        PointImportRow blankUnit = validRow(3, "F01.P2");
++        blankUnit.setUnit("  ");
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(badUnit, blankUnit))));
++
++        assertEquals(PointImportRowResult.REASON_UNIT_NOT_IN_DICT, rowOf(receipt, 2).getReasonCode());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("平台运营方"), "归口运营方提示（TD-0045 附条件口径）");
++        assertNull(rowOf(receipt, 3).getReasonCode(), "空白 unit 视为未携带放行");
++        assertTrue(rowOf(receipt, 3).getSuccess(), "空白 unit 行校验通过（本可入库）");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 单位批内一次 IN 查（1000 行携带同一 unit 不放大为逐行字典往返）")
++    void testImport_UnitBatchQueryOnce() {
++        List<PointImportRow> rows = IntStream.rangeClosed(2, 301)
++                .mapToObj(i -> {
++                    PointImportRow r = validRow(i, "F01.P" + i);
++                    r.setUnit("kPa");
++                    return r;
++                }).collect(Collectors.toList());
++        when(dictMapper.selectOne(any())).thenReturn(new SysDict());
++        when(dictDataMapper.selectList(any())).thenReturn(List.of(dictData("kPa")));
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++
++        PointImportReceipt receipt = pointService.importPoints(rows);
++
++        assertTrue(receipt.getPersisted());
++        assertEquals(300, receipt.getSuccessCount());
++        verify(dictDataMapper, times(1)).selectList(any());
++    }
++
++    @Test
++    @DisplayName("导入 - 通道校验：channelCode 不存在 CHANNEL_NOT_FOUND（含已删行）；解析命中回填 channelId")
++    void testImport_ChannelRules() {
++        PointImportRow badChannel = validRow(2, "F01.P1");
++        badChannel.setChannelCode("CH_GONE");
++        PointImportRow okChannel = validRow(3, "F01.P2");
++        okChannel.setChannelCode("CH_MAIN");
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel(55L, "CH_MAIN")));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(badChannel, okChannel))));
++
++        assertEquals(PointImportRowResult.REASON_CHANNEL_NOT_FOUND, rowOf(receipt, 2).getReasonCode());
++        assertNull(rowOf(receipt, 3).getReasonCode(), "命中通道行校验通过（本可入库）");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 通道歧义：租户内同码命中多通道（uk 为 gateway_id+channel_code 跨网关可并存）"
++        + "CHANNEL_AMBIGUOUS 拒绝——不静默挂错通道")
++    void testImport_ChannelAmbiguous() {
++        PointImportRow row = validRow(2, "F01.P1");
++        row.setChannelCode("CH_DUP");
++        when(channelMapper.selectList(any())).thenReturn(List.of(channel(55L, "CH_DUP"), channel(56L, "CH_DUP")));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(row))));
++
++        assertEquals(PointImportRowResult.REASON_CHANNEL_AMBIGUOUS, rowOf(receipt, 2).getReasonCode());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("歧义"));
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 批内撞码先于落库判定（DUPLICATE_CODE 与首撞行号标注；首撞行自身放行进入占用预检）")
++    void testImport_IntraBatchCollision() {
++        List<PointImportRow> rows = List.of(validRow(2, "F01.P1"), validRow(3, "F01.P1"));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(rows)));
++
++        assertEquals(PointImportRowResult.REASON_DUPLICATE_CODE, rowOf(receipt, 3).getReasonCode());
++        assertTrue(rowOf(receipt, 3).getMessage().contains("第 2 行"), "批内互撞标注首撞行");
++        assertNull(rowOf(receipt, 2).getReasonCode(), "首撞行自身字段合法（占用预检可命中——并发兜底保留）");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 按编码幂等（brief 裁决 3）：重导已存在活跃行整批 DUPLICATE_CODE 类拒绝；"
++        + "已删占用同口径拒绝且文案区分「已被删除记录占用，不可复用」")
++    void testImport_IdempotentReimportRejected() {
++        PointImportRow reimported = validRow(2, "F01_WS01_EQ001_M01");
++        PointImportRow deletedOccupied = validRow(3, "F01.P_GONE");
++        IotPointCodeRow active = new IotPointCodeRow();
++        active.setId(900L);
++        active.setPointCode("F01_WS01_EQ001_M01");
++        active.setDeleted(0);
++        IotPointCodeRow deleted = new IotPointCodeRow();
++        deleted.setId(901L);
++        deleted.setPointCode("F01.P_GONE");
++        deleted.setDeleted(1);
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection()))
++                .thenReturn(List.of(active, deleted));
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(reimported, deletedOccupied))));
++
++        assertEquals(PointImportRowResult.REASON_DUPLICATE_CODE, rowOf(receipt, 2).getReasonCode());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("已存在"));
++        assertEquals(PointImportRowResult.REASON_DUPLICATE_CODE, rowOf(receipt, 3).getReasonCode());
++        assertTrue(rowOf(receipt, 3).getMessage().contains("已被删除记录占用，不可复用"),
++                "已删行占用同口径拒绝（编码删除归档不复用）");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    // ---------- 批级前置 / 并发兜底 ----------
++
++    @Test
++    @DisplayName("导入 - 批级前置：空文件与仅说明行/空行文件 PARAM_ERROR 无回执；说明行不计入数据行")
++    void testImport_BatchLevelPreconditions() {
++        BusinessException empty = assertThrows(BusinessException.class, () -> pointService.importPoints(null));
++        assertTrue(empty.getDefaultMessage().contains("无数据行"));
++
++        PointImportRow note = new PointImportRow();
++        note.setRowIndex(2);
++        note.setPointCode("说明：这是模板说明行");
++        BusinessException noteOnly = assertThrows(BusinessException.class,
++                () -> pointService.importPoints(List.of(note)));
++        assertTrue(noteOnly.getDefaultMessage().contains("说明行与空行不计入"));
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 单批上限 10000 行（任务正文）：10001 行整批 PARAM_ERROR，服务层零落库")
++    void testImport_Over10000RowsRejected() {
++        List<PointImportRow> rows = new ArrayList<>();
++        for (int i = 2; i <= 10002; i++) {
++            rows.add(validRow(i, "F01.P" + i));
++        }
++        BusinessException e = assertThrows(BusinessException.class, () -> pointService.importPoints(rows));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        assertTrue(e.getDefaultMessage().contains("10000"));
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 10000 行整批放行（上限边界不误伤）")
++    void testImport_Exactly10000RowsAccepted() {
++        List<PointImportRow> rows = IntStream.rangeClosed(2, 10001)
++                .mapToObj(i -> validRow(i, "F01.P" + i))
++                .collect(Collectors.toList());
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++
++        PointImportReceipt receipt = pointService.importPoints(rows);
++        assertTrue(receipt.getPersisted());
++        assertEquals(10000, receipt.getSuccessCount());
++        verify(baseMapper, times(10000)).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 并发兜底：预检通过后落库撞物理唯一索引 → DuplicateKeyException 映射整批 PARAM_ERROR 回滚")
++    void testImport_DuplicateKeyFallback() {
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++        when(baseMapper.insert(any(IotPoint.class))).thenThrow(new DuplicateKeyException("uk_tenant_point_code"));
++
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> pointService.importPoints(List.of(validRow(2, "F01.P1"))));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode(), "批量口径统一 400（brief 裁决 3，不用 4002）");
++        assertTrue(e.getDefaultMessage().contains("并发冲突"));
++    }
++
++    // ---------- 配额联动（不豁免） ----------
++
++    @Test
++    @DisplayName("导入 - 配额联动（brief 裁决 4）：校验通过行数 + 当前计数 > quota → 整批拒 4003 不落库"
++        + "（防「界面 99/100 拒、导入塞 1000 行」绕过）")
++    void testImport_QuotaExceededWholeBatchRejected() {
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++        when(pointQuotaCounter.countPoints(TENANT)).thenReturn(100);
++        SysTenant tenant = new SysTenant();
++        tenant.setId(TENANT);
++        tenant.setPointQuota(200);
++        when(tenantService.getById(TENANT)).thenReturn(tenant);
++
++        List<PointImportRow> rows = IntStream.rangeClosed(2, 201)
++                .mapToObj(i -> validRow(i, "F01.P" + i))
++                .collect(Collectors.toList());
++
++        BusinessException e = assertThrows(BusinessException.class, () -> pointService.importPoints(rows));
++
++        assertEquals(ResultCode.QUOTA_EXCEEDED.getCode(), e.getCode(), "整批拒并提示配额上限（4003）");
++        assertTrue(e.getDefaultMessage().contains("点位配额不足"));
++        assertTrue(e.getDefaultMessage().contains("200"), "提示配额上限数值");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 配额联动边界：current + K <= quota 放行落库；quota 空/0=不限不触达计数器")
++    void testImport_QuotaBoundaryAndUnlimited() {
++        when(pointCodeMapper.selectOccupiedByCodes(anyLong(), anyCollection())).thenReturn(List.of());
++        when(pointQuotaCounter.countPoints(TENANT)).thenReturn(95);
++        SysTenant quota200 = new SysTenant();
++        quota200.setId(TENANT);
++        quota200.setPointQuota(200);
++        when(tenantService.getById(TENANT)).thenReturn(quota200);
++
++        List<PointImportRow> rows = IntStream.rangeClosed(2, 101)
++                .mapToObj(i -> validRow(i, "F01.P" + i))
++                .collect(Collectors.toList());
++        assertTrue(pointService.importPoints(rows).getPersisted(), "95 + 100 <= 200 放行");
++        verify(pointQuotaCounter, times(1)).countPoints(TENANT);
++        verify(baseMapper, times(100)).insert(any(IotPoint.class));
++
++        SysTenant unlimited = new SysTenant();
++        unlimited.setId(TENANT);
++        unlimited.setPointQuota(null);
++        when(tenantService.getById(TENANT)).thenReturn(unlimited);
++        when(baseMapper.insert(any(IotPoint.class))).thenReturn(1);
++        assertTrue(pointService.importPoints(List.of(validRow(2, "F01.PX1"))).getPersisted(),
++                "quota 空=不限（REQ-0001 点位配额可空）");
++    }
++
++    // ---------- 夹具辅助 ----------
++
++    private IotChannel channel(long id, String code) {
++        IotChannel channel = new IotChannel();
++        channel.setId(id);
++        channel.setTenantId(TENANT);
++        channel.setChannelCode(code);
++        channel.setChannelName("通道-" + code);
++        return channel;
++    }
++
++    private SysDictData dictData(String value) {
++        SysDictData data = new SysDictData();
++        data.setDictId(99L);
++        data.setDictValue(value);
++        data.setStatus(1);
++        return data;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
+index dda9d74..bfcb799 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImplTest.java
+@@ -13,14 +13,23 @@ import net.otlab.admin.module.iot.dataperm.DataPermConditionAssembler;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+ import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.point.dto.IotPointCreateForm;
++import net.otlab.admin.module.iot.point.dto.IotPointCurveVO;
++import net.otlab.admin.module.iot.point.dto.IotPointDetailVO;
++import net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO;
+ import net.otlab.admin.module.iot.point.dto.IotPointStatusForm;
+ import net.otlab.admin.module.iot.point.dto.IotPointUpdateForm;
++import net.otlab.admin.module.iot.point.dto.PointCurvePointVO;
++import net.otlab.admin.module.iot.point.dto.PointExportRow;
++import net.otlab.admin.module.iot.point.dto.PointReferenceVO;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ import net.otlab.admin.module.iot.point.event.PointEnabledEvent;
+ import net.otlab.admin.module.iot.point.mapper.IotPointCodeMapper;
+ import net.otlab.admin.module.iot.point.mapper.IotPointCodeRow;
+ import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
++import net.otlab.admin.module.iot.point.service.support.PointCurveQueryClient;
++import net.otlab.admin.module.iot.quota.PointQuotaCounter;
+ import net.otlab.admin.module.iot.service.SysTenantService;
++import net.otlab.admin.module.iot.entity.SysTenant;
+ import net.otlab.admin.module.iot.template.entity.IotModelInstance;
+ import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
+ import net.otlab.admin.module.system.entity.SysDept;
+@@ -54,6 +63,7 @@ import java.util.stream.Collectors;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -114,6 +124,12 @@ class IotPointServiceImplTest {
+     @Mock
+     private SysTenantService tenantService;
+ 
++    @Mock
++    private PointQuotaCounter pointQuotaCounter;
++
++    @Mock
++    private PointCurveQueryClient pointCurveQueryClient;
++
+     @Mock
+     private DataPermService dataPermService;
+ 
+@@ -157,11 +173,22 @@ class IotPointServiceImplTest {
+         ReflectionTestUtils.setField(pointService, "dictDataMapper", dictDataMapper);
+         ReflectionTestUtils.setField(pointService, "dataItemMapper", dataItemMapper);
+         ReflectionTestUtils.setField(pointService, "tenantService", tenantService);
++        ReflectionTestUtils.setField(pointService, "pointQuotaCounter", pointQuotaCounter);
++        ReflectionTestUtils.setField(pointService, "pointCurveQueryClient", pointCurveQueryClient);
+         ReflectionTestUtils.setField(pointService, "dataPermService", dataPermService);
+         ReflectionTestUtils.setField(pointService, "dataPermConditionAssembler", new DataPermConditionAssembler());
+         ReflectionTestUtils.setField(pointService, "eventPublisher", eventPublisher);
+         // 默认全租户（scope=1）；裁剪用例逐用例覆盖
+         when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        // 默认曲线 fail-soft 空集（曲线契约用例逐用例覆盖）
++        when(pointCurveQueryClient.query24h(any(), any(), any())).thenReturn(List.of());
++        // 默认无绑定数据项（详情聚合/反查用例逐用例覆盖）
++        when(dataItemMapper.selectList(any())).thenReturn(List.of());
++        // 默认租户登记（详情聚合曲线链路取 tenantCode）；无租户配额
++        SysTenant tenant = new SysTenant();
++        tenant.setId(TENANT);
++        tenant.setTenantCode("default");
++        when(tenantService.getById(TENANT)).thenReturn(tenant);
+     }
+ 
+     @AfterEach
+@@ -521,17 +548,26 @@ class IotPointServiceImplTest {
+     // ---------- 批量启停 ----------
+ 
+     @Test
+-    @DisplayName("批量启停 - 置 1 逐点位发 PointEnabledEvent；置 0 不发事件（停用走配置发布归 TASK-0023）")
++    @DisplayName("批量启停 - 置 1 逐点位发 PointEnabledEvent；置 0 不发事件（TASK-0023 响应体：目标状态/"
++        + "实际变更数/effectNote 齐备）")
+     void testChangeStatus_EventsOnlyWhenEnabled() {
+         IotPoint p1 = point(300L, "F01_WS01_EQ001_M01");
+         IotPoint p2 = point(301L, "F01_WS01_EQ001_M02");
++        p1.setStatus(0);
++        p2.setStatus(0);
+         when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(p1, p2));
+         when(baseMapper.updateById(any(IotPoint.class))).thenReturn(1);
+ 
+         IotPointStatusForm enable = new IotPointStatusForm();
+         enable.setIds(List.of(300L, 301L));
+         enable.setStatus(1);
+-        assertTrue(pointService.changePointStatus(enable));
++        IotPointStatusChangeVO vo = pointService.changePointStatus(enable);
++        assertNotNull(vo);
++        assertEquals(1, vo.getTargetStatus());
++        assertEquals(2, vo.getChangedCount(), "两行 0→1 均为实际变更");
++        assertEquals(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED, vo.getEffectNote(),
++            "「重新发布后对接入生效」明示（0024 发布链未交付，保存≠生效）");
++        assertEquals(0L, vo.getAffectedDataItemCount(), "启用侧影响计数恒 0");
+ 
+         ArgumentCaptor<PointEnabledEvent> captor = ArgumentCaptor.forClass(PointEnabledEvent.class);
+         verify(eventPublisher, times(2)).publishEvent(captor.capture());
+@@ -540,13 +576,63 @@ class IotPointServiceImplTest {
+         verify(baseMapper, times(2)).updateById(any(IotPoint.class));
+ 
+         org.mockito.Mockito.clearInvocations(eventPublisher);
++        p1.setStatus(1);
+         IotPointStatusForm disable = new IotPointStatusForm();
+         disable.setIds(List.of(300L));
+         disable.setStatus(0);
+-        assertTrue(pointService.changePointStatus(disable));
++        IotPointStatusChangeVO disableVo = pointService.changePointStatus(disable);
++        assertEquals(1, disableVo.getChangedCount());
++        assertEquals(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED, disableVo.getEffectNote());
+         verify(eventPublisher, never()).publishEvent(any(PointEnabledEvent.class));
+     }
+ 
++    @Test
++    @DisplayName("批量停用 - TASK-0023 停用影响清单：响应携带受影响数据项计数（idx_tenant_point 引用计数）；"
++        + "同态 no-op 不计 changedCount")
++    void testChangeStatus_AffectedDataItemCount() {
++        IotPoint enabled = point(300L, "F01_WS01_EQ001_M01");
++        enabled.setStatus(1);
++        IotPoint alreadyDisabled = point(301L, "F01_WS01_EQ001_M02");
++        alreadyDisabled.setStatus(0);
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(enabled, alreadyDisabled));
++        when(dataItemMapper.selectCount(any())).thenReturn(3L);
++        when(baseMapper.updateById(any(IotPoint.class))).thenReturn(1);
++
++        IotPointStatusForm disable = new IotPointStatusForm();
++        disable.setIds(List.of(300L, 301L));
++        disable.setStatus(0);
++        IotPointStatusChangeVO vo = pointService.changePointStatus(disable);
++
++        assertEquals(0, vo.getTargetStatus());
++        assertEquals(1, vo.getChangedCount(), "已停用行 no-op 不计实际变更");
++        assertEquals(3L, vo.getAffectedDataItemCount(), "受影响数据项计数（前端二次确认语义）");
++        assertEquals(IotPointStatusChangeVO.EFFECT_NOTE_PUBLISH_REQUIRED, vo.getEffectNote());
++
++        // 计数查询条件形态：point_id 非空 + IN 批（idx_tenant_point 引用口径）
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotDataItem>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(dataItemMapper).selectCount(wrapperCaptor.capture());
++        String segment = wrapperCaptor.getValue().getSqlSegment();
++        assertTrue(segment.contains("point_id IN"), "point_id IN 引用条件: " + segment);
++        assertTrue(segment.contains("IS NOT NULL"), "排除无绑定行: " + segment);
++    }
++
++    @Test
++    @DisplayName("批量启停 - 启用侧不发计数查询（affectedDataItemCount 恒 0，不触达 dataItemMapper.selectCount）")
++    void testChangeStatus_EnableSkipsCount() {
++        when(baseMapper.selectByIds(anyCollection())).thenReturn(List.of(point(300L, "F01_WS01_EQ001_M01")));
++        when(baseMapper.updateById(any(IotPoint.class))).thenReturn(1);
++        when(dataItemMapper.selectCount(any())).thenReturn(3L);
++
++        IotPointStatusForm enable = new IotPointStatusForm();
++        enable.setIds(List.of(300L));
++        enable.setStatus(1);
++        IotPointStatusChangeVO vo = pointService.changePointStatus(enable);
++
++        assertEquals(0L, vo.getAffectedDataItemCount(), "启用侧不携带停用影响计数");
++        verify(dataItemMapper, never()).selectCount(any());
++    }
++
+     @Test
+     @DisplayName("批量启停 - 整批 fail-closed：任一 id 不存在即整批拒绝不半批落库；status 越界拒绝")
+     void testChangeStatus_FailClosed() {
+@@ -678,7 +764,8 @@ class IotPointServiceImplTest {
+         IotPointStatusForm allVisible = new IotPointStatusForm();
+         allVisible.setIds(List.of(300L));
+         allVisible.setStatus(0);
+-        assertTrue(pointService.changePointStatus(allVisible));
++        IotPointStatusChangeVO vo = pointService.changePointStatus(allVisible);
++        assertNotNull(vo, "全可见批次放行并返回响应体");
+         verify(baseMapper).updateById(any(IotPoint.class));
+         verify(eventPublisher, never()).publishEvent(any(PointEnabledEvent.class));
+     }
+@@ -784,4 +871,201 @@ class IotPointServiceImplTest {
+         when(baseMapper.selectById(300L)).thenReturn(p);
+         assertNotNull(pointService.getPointDetail(300L), "scope=1 未绑部门行可见（ADR-0016 裁决 6）");
+     }
++
++    // ---------- TASK-0023：反查 / 详情聚合 / 曲线 ----------
++
++    private IotDataItem boundItem(long id, long instanceId, String fullKey, String dataName) {
++        IotDataItem item = new IotDataItem();
++        item.setId(id);
++        item.setTenantId(TENANT);
++        item.setInstanceId(instanceId);
++        item.setFullKey(fullKey);
++        item.setDataName(dataName);
++        item.setSourceType(1);
++        return item;
++    }
++
++    private IotModelInstance instance(long id, String code) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setTenantId(TENANT);
++        inst.setInstanceCode(code);
++        inst.setInstanceName("实例-" + code);
++        return inst;
++    }
++
++    @Test
++    @DisplayName("反查 - allTenant 返回全部绑定数据项（fullKey/instanceCode/dataName 三要素齐备）")
++    void testReferences_AllTenant() {
++        when(baseMapper.selectById(300L)).thenReturn(point(300L, "F01_WS01_EQ001_M01"));
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(
++                boundItem(400L, 3L, "FA.WS01.EQ001.pressure", "主轴压力"),
++                boundItem(401L, 10L, "FB.WS01.EQ001.temp", "出口温度")));
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(
++                instance(3L, "FA.WS01.EQ001"), instance(10L, "FB.WS01.EQ001")));
++
++        List<PointReferenceVO> refs = pointService.selectPointReferences(300L);
++
++        assertEquals(2, refs.size());
++        assertEquals("FA.WS01.EQ001.pressure", refs.get(0).getFullKey());
++        assertEquals("FA.WS01.EQ001", refs.get(0).getInstanceCode(), "实例编码联表解析");
++        assertEquals("主轴压力", refs.get(0).getDataName());
++        assertEquals(400L, refs.get(0).getItemId());
++        assertEquals("FB.WS01.EQ001.temp", refs.get(1).getFullKey());
++        // 反查查询条件形态：point_id eq（idx_tenant_point 口径）
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<Wrapper<IotDataItem>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(dataItemMapper).selectList(captor.capture());
++        assertTrue(captor.getValue().getSqlSegment().contains("point_id ="), "point_id 反查条件");
++    }
++
++    @Test
++    @DisplayName("反查 - 受限用户仅见可见实例的数据项（时序类裁剪口径——不可见实例引用不返回不泄露）")
++    void testReferences_RestrictedTrimsByVisibleInstances() {
++        IotPoint readable = point(300L, "F01_WS01_EQ001_M01");
++        readable.setDeptId(101L);
++        when(baseMapper.selectById(300L)).thenReturn(readable);
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(
++                boundItem(400L, 8L, "FB.pressure", "可见实例引用"),
++                boundItem(401L, 9L, "FB2.temp", "不可见实例引用")));
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instance(8L, "FB")));
++        when(dataPermService.resolve(USER)).thenReturn(new VisibleScope(false, Set.of(101L), Set.of(8L), false));
++
++        List<PointReferenceVO> refs = pointService.selectPointReferences(300L);
++
++        assertEquals(1, refs.size(), "仅可见实例（8）的数据项返回");
++        assertEquals("FB.pressure", refs.get(0).getFullKey());
++        assertTrue(refs.stream().noneMatch(r -> "FB2.temp".equals(r.getFullKey())),
++                "不可见实例（9）引用不返回（fail-closed 不泄露）");
++    }
++
++    @Test
++    @DisplayName("反查 - 无引用返回空表；点位不存在/越权与详情同口径（参数错误/403）")
++    void testReferences_EmptyAndGuards() {
++        when(baseMapper.selectById(300L)).thenReturn(point(300L, "P_NO_REF"));
++        assertTrue(pointService.selectPointReferences(300L).isEmpty(), "返回空=无引用");
++
++        when(baseMapper.selectById(999L)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class, () -> pointService.selectPointReferences(999L));
++        assertTrue(missing.getDefaultMessage().contains("不存在"));
++
++        IotPoint invisible = point(301L, "P_B");
++        invisible.setDeptId(201L);
++        when(baseMapper.selectById(301L)).thenReturn(invisible);
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++        BusinessException forbidden = assertThrows(BusinessException.class, () -> pointService.selectPointReferences(301L));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), forbidden.getCode(), "越权反查 403（同详情闸）");
++        assertTrue(!forbidden.getDefaultMessage().contains("P_B"), "403 文案不泄露点位编码");
++    }
++
++    @Test
++    @DisplayName("详情聚合 - referenceCount（与清单同裁剪口径）+ curve24h（曲线数据齐备）聚合进 VO")
++    void testDetailAggregation_ReferenceCountAndCurve() {
++        IotPoint visible = point(300L, "F01_WS01_EQ001_M01");
++        visible.setDeptId(101L);
++        when(baseMapper.selectById(300L)).thenReturn(visible);
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(
++                boundItem(400L, 8L, "FB.pressure", "可见引用"),
++                boundItem(401L, 9L, "FB2.temp", "不可见引用")));
++        when(dataPermService.resolve(USER)).thenReturn(RESTRICTED);
++        when(pointCurveQueryClient.query24h(TENANT, "default", "F01_WS01_EQ001_M01"))
++                .thenReturn(List.of(new PointCurvePointVO("2026-11-22T10:00:00", 3.14, 0)));
++
++        IotPointDetailVO vo = pointService.getPointDetail(300L);
++
++        assertEquals("F01_WS01_EQ001_M01", vo.getPointCode(), "档案字段齐备");
++        assertEquals(1L, vo.getReferenceCount(), "引用计数仅计可见实例（与清单同口径）");
++        assertEquals(1, vo.getCurve24h().size(), "近 24h 曲线占位字段聚合");
++        assertEquals(3.14, vo.getCurve24h().get(0).getValue());
++    }
++
++    @Test
++    @DisplayName("曲线 - VO 组装（pointId/pointCode/windowHours=24/dataPoints 透传客户端结果）")
++    void testCurve_VoAssembly() {
++        when(baseMapper.selectById(300L)).thenReturn(point(300L, "F01_WS01_EQ001_M01"));
++        when(pointCurveQueryClient.query24h(TENANT, "default", "F01_WS01_EQ001_M01"))
++                .thenReturn(List.of(new PointCurvePointVO("2026-11-22T10:00:00", 1.0, 0),
++                        new PointCurvePointVO("2026-11-22T10:01:00", 2.0, 0)));
++
++        IotPointCurveVO vo = pointService.getPointCurve24h(300L);
++
++        assertEquals(300L, vo.getPointId());
++        assertEquals("F01_WS01_EQ001_M01", vo.getPointCode());
++        assertEquals(24, vo.getWindowHours(), "近 24h 窗口");
++        assertEquals(2, vo.getDataPoints().size());
++        verify(pointCurveQueryClient).query24h(TENANT, "default", "F01_WS01_EQ001_M01");
++    }
++
++    @Test
++    @DisplayName("曲线 - fail-soft：客户端异常不炸读路径返回空 dataPoints；租户缺失不触达客户端")
++    void testCurve_FailSoft() {
++        when(baseMapper.selectById(300L)).thenReturn(point(300L, "F01_WS01_EQ001_M01"));
++        when(pointCurveQueryClient.query24h(any(), any(), any()))
++                .thenThrow(new RuntimeException("TDengine REST 不可达"));
++
++        IotPointCurveVO vo = pointService.getPointCurve24h(300L);
++        assertNotNull(vo);
++        assertTrue(vo.getDataPoints().isEmpty(), "查询失败 fail-soft 空集不报错（brief 裁决 3）");
++
++        // 租户缺失（无租户编码）路径短路：不触达客户端，fail-soft 空集
++        when(tenantService.getById(TENANT)).thenReturn(null);
++        IotPointCurveVO noTenant = pointService.getPointCurve24h(300L);
++        assertTrue(noTenant.getDataPoints().isEmpty(), "租户缺失 fail-soft 空集");
++        verify(pointCurveQueryClient, org.mockito.Mockito.times(1)).query24h(any(), any(), any());
++    }
++
++    // ---------- TASK-0022：导出（与 list 同条件裁剪，模板列同构） ----------
++
++    @Test
++    @DisplayName("导出 - 受限用户裁剪条件与 list 同源（dept_id IN OR bound_instance_id IN 进 wrapper）；"
++        + "channelCode 解析回填、模板列同构字段齐备")
++    void testExportRows_TrimParityAndChannelBackfill() {
++        when(dataPermService.resolve(USER))
++                .thenReturn(new VisibleScope(false, Set.of(101L), Set.of(8L), false));
++        IotPoint visible = point(300L, "F01_WS01_EQ001_M01");
++        visible.setChannelId(55L);
++        visible.setMinValue(new BigDecimal("0"));
++        visible.setMaxValue(new BigDecimal("120"));
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(visible));
++        when(channelMapper.selectList(any())).thenReturn(List.of(channelRow(55L, "CH_MAIN")));
++
++        List<PointExportRow> rows = pointService.selectExportRows(new IotPoint());
++
++        assertEquals(1, rows.size());
++        PointExportRow out = rows.get(0);
++        assertEquals("F01_WS01_EQ001_M01", out.getPointCode());
++        assertEquals("CH_MAIN", out.getChannelCode(), "channelId→code 解析回填（与导入列对齐）");
++        assertEquals(new BigDecimal("0"), out.getMinValue());
++        ArgumentCaptor<Wrapper<IotPoint>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectList(captor.capture());
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("dept_id IN"), "与 list 同条件裁剪（F5 双条件）: " + segment);
++        assertTrue(segment.contains("bound_instance_id IN"), ": " + segment);
++        assertTrue(segment.contains(" OR "), "双条件 OR: " + segment);
++    }
++
++    @Test
++    @DisplayName("导出 - 空可见集导出空行集；通道缺失/已删（channelId 无命中）channelCode 留空不虚构")
++    void testExportRows_EmptyAndMissingChannel() {
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.denied());
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of());
++        assertTrue(pointService.selectExportRows(new IotPoint()).isEmpty(), "可见集空导出空行集");
++
++        IotPoint orphan = point(301L, "F01.ORPHAN");
++        orphan.setChannelId(99L);
++        when(dataPermService.resolve(USER)).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.selectList(any(Wrapper.class))).thenReturn(List.of(orphan));
++        when(channelMapper.selectList(any())).thenReturn(List.of());
++
++        List<PointExportRow> rows = pointService.selectExportRows(new IotPoint());
++        assertEquals(1, rows.size());
++        assertNull(rows.get(0).getChannelCode(), "通道缺失 channelCode 留空（导出不虚构）");
++    }
++
++    private IotChannel channelRow(long id, String code) {
++        IotChannel channel = new IotChannel();
++        channel.setId(id);
++        channel.setChannelCode(code);
++        return channel;
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClientTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClientTest.java
+new file mode 100644
+index 0000000..4d92af7
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/support/PointCurveQueryClientTest.java
+@@ -0,0 +1,140 @@
++package net.otlab.admin.module.iot.point.service.support;
++
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpServer;
++import net.otlab.admin.module.iot.point.dto.PointCurvePointVO;
++import net.otlab.admin.module.iot.tdengine.TdengineProperties;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++
++/**
++ * 点位近 24h 曲线查询客户端单元测试（TASK-0023，brief 裁决 3）
++ *
++ * <p>0003 HttpTdengineAdmin 同款验收口径（TDengine 本机可用性不可假设——接口抽象 + 内存
++ * HttpServer 桩单测验收，真实环境 192.168.31.145 联调归 TASK-0068）：JDK 内置 HttpServer
++ * 模拟 taosAdapter REST 通道，断言 ① 请求 SQL 为 st_point_num 全限定名（iot_&lt;code&gt;
++ * .st_point_num）+ tenant_id/point_code 标签过滤；② 应答 [ts,value,quality] 列序解析；
++ * ③ 非 0 code / HTTP 错误 / 连接拒绝 / 编码白名单外——一律 fail-soft 空集不抛异常。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class PointCurveQueryClientTest {
++
++    private HttpServer server;
++    private TdengineProperties props;
++    private PointCurveQueryClient client;
++
++    /** 捕获最近一次请求体（SQL 文本）与 Basic 认证头 */
++    private final AtomicReference<String> lastSql = new AtomicReference<>();
++    private final AtomicReference<String> lastAuth = new AtomicReference<>();
++
++    @BeforeEach
++    void setUp() throws IOException {
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/rest/sql", exchange -> {
++            byte[] body = exchange.getRequestBody().readAllBytes();
++            lastSql.set(new String(body, StandardCharsets.UTF_8));
++            lastAuth.set(exchange.getRequestHeaders().getFirst("Authorization"));
++            byte[] resp = ("{\"code\":0,\"desc\":\"\",\"data\":[[\"2026-11-22T10:00:00.000+08:00\",\"3.5\",0],"
++                    + "[\"2026-11-22T10:01:00.000+08:00\",\"4.0\",null]],\"rows\":2}")
++                    .getBytes(StandardCharsets.UTF_8);
++            exchange.getResponseHeaders().add("Content-Type", "application/json");
++            exchange.sendResponseHeaders(200, resp.length);
++            try (OutputStream os = exchange.getResponseBody()) {
++                os.write(resp);
++            }
++        });
++        server.start();
++        props = new TdengineProperties();
++        props.setBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
++        client = new PointCurveQueryClient(props);
++    }
++
++    @AfterEach
++    void tearDown() {
++        server.stop(0);
++    }
++
++    @Test
++    @DisplayName("查询 - st_point_num 全限定名 SQL（iot_<tenant_code>.st_point_num + tenant_id/point_code 标签过滤）"
++        + "与 [ts,value,quality] 列序解析")
++    void testQuery_AssemblesQualifiedSqlAndParsesRows() {
++        List<PointCurvePointVO> points = client.query24h(1L, "t0017", "F01_WS01_EQ001_M01");
++
++        assertEquals(2, points.size(), "两行数据点");
++        assertEquals("2026-11-22T10:00:00.000+08:00", points.get(0).getTs(), "ts 原文透传（形态适配归 0068 联调）");
++        assertEquals(3.5, points.get(0).getValue());
++        assertEquals(0, points.get(0).getQuality());
++        assertEquals(4.0, points.get(1).getValue());
++        assertNull(points.get(1).getQuality(), "NULL 单元格按空值透传");
++
++        String sql = lastSql.get();
++        assertNotNull(sql);
++        assertTrue(sql.contains("iot_t0017.st_point_num"), "全限定名（库名由 tenant_code 派生）: " + sql);
++        assertTrue(sql.contains("tenant_id = 1"), "tenant_id 标签过滤（ADR-0002 双保险）: " + sql);
++        assertTrue(sql.contains("point_code = 'F01_WS01_EQ001_M01'"), "point_code 标签过滤: " + sql);
++        assertTrue(sql.contains("NOW() - 24h"), "近 24h 窗口: " + sql);
++        assertTrue(sql.contains("LIMIT"), "行数保护上限: " + sql);
++        assertNotNull(lastAuth.get(), "Basic 认证头（0003 形态）");
++        assertTrue(lastAuth.get().startsWith("Basic "));
++    }
++
++    @Test
++    @DisplayName("fail-soft - TDengine 非 0 code：空集不报错（brief 裁决 3）")
++    void testQuery_NonZeroCodeFailSoft() throws IOException {
++        server.removeContext("/rest/sql");
++        server.createContext("/rest/sql", exchange -> respond(exchange, 200,
++                "{\"code\":1052,\"desc\":\"Table does not exist\",\"data\":null,\"rows\":0}"));
++
++        List<PointCurvePointVO> points = client.query24h(1L, "t0017", "F01_NO_STABLE");
++
++        assertTrue(points.isEmpty(), "无子表/错误码一律空集（fail-soft 占位）");
++    }
++
++    @Test
++    @DisplayName("fail-soft - taosAdapter 不可达（连接拒绝）：空集不抛异常")
++    void testQuery_ConnectionRefusedFailSoft() {
++        props.setBaseUrl("http://127.0.0.1:1"); // 无人监听端口——连接立即拒绝
++        PointCurveQueryClient unreachable = new PointCurveQueryClient(props);
++
++        List<PointCurvePointVO> points = unreachable.query24h(1L, "t0017", "F01_WS01_EQ001_M01");
++
++        assertTrue(points.isEmpty(), "REST 不可达 fail-soft 空集");
++    }
++
++    @Test
++    @DisplayName("fail-soft - point_code 白名单外（含引号等拼接危险字符）不发请求直接空集；"
++        + "空参数与非法租户编码同口径")
++    void testQuery_UnsafeCodeShortCircuits() {
++        List<PointCurvePointVO> quoted = client.query24h(1L, "t0017", "F01'; DROP TABLE x--");
++        assertTrue(quoted.isEmpty(), "白名单外编码不拼接进 SQL（注入面收口）");
++        assertNull(lastSql.get(), "危险编码不触达 REST 通道");
++
++        assertTrue(client.query24h(null, "t0017", "F01").isEmpty(), "tenantId 缺失空集");
++        assertTrue(client.query24h(1L, "不 合 法 !", "F01").isEmpty(), "租户编码不合规（库名派生拒绝）空集");
++    }
++
++    private static void respond(HttpExchange exchange, int status, String body) throws IOException {
++        byte[] resp = body.getBytes(StandardCharsets.UTF_8);
++        exchange.getResponseHeaders().add("Content-Type", "application/json");
++        exchange.sendResponseHeaders(status, resp.length);
++        try (OutputStream os = exchange.getResponseBody()) {
++            os.write(resp);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
+index bed51cc..6444eed 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/PointRedlineTest.java
+@@ -228,12 +228,16 @@ class PointRedlineTest {
+         assertEquals(ResultCode.FORBIDDEN.getCode(), e.getCode());
+         org.mockito.Mockito.verify(fx.pointMapper(), never()).updateById(any(IotPoint.class));
+ 
+-        // 可见点位启停回归正常（status=0 禁用不发事件——夹具事件总线仅分发缓存失效事件）
++        // 可见点位启停回归正常（status=0 禁用不发事件——夹具事件总线仅分发缓存失效事件；
++        // TASK-0023 响应体携带实际变更数与生效明示）
+         net.otlab.admin.module.iot.point.dto.IotPointStatusForm visibleForm =
+                 new net.otlab.admin.module.iot.point.dto.IotPointStatusForm();
+         visibleForm.setIds(List.of(RedlineFixture.POINT_A_FACTORY));
+         visibleForm.setStatus(0);
+-        assertTrue(fx.pointService.changePointStatus(visibleForm));
++        net.otlab.admin.module.iot.point.dto.IotPointStatusChangeVO vo = fx.pointService.changePointStatus(visibleForm);
++        assertNotNull(vo);
++        assertEquals(1, vo.getChangedCount());
++        assertEquals("变更已保存，重新发布后对接入生效", vo.getEffectNote());
+         org.mockito.Mockito.verify(fx.pointMapper()).updateById(any(IotPoint.class));
+     }
+ 
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+index fb2b4bf..638fcab 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/redline/RedlineFixture.java
+@@ -196,6 +196,10 @@ class RedlineFixture implements AutoCloseable {
+     private final GatewayOfflineEventPublisher offlineEventPublisher = mock(GatewayOfflineEventPublisher.class);
+     private final SysTenantMapper tenantMapper = mock(SysTenantMapper.class);
+     private final SysTenantService tenantService = mock(SysTenantService.class);
++    private final net.otlab.admin.module.iot.quota.PointQuotaCounter pointQuotaCounter =
++            mock(net.otlab.admin.module.iot.quota.PointQuotaCounter.class);
++    private final net.otlab.admin.module.iot.point.service.support.PointCurveQueryClient pointCurveQueryClient =
++            mock(net.otlab.admin.module.iot.point.service.support.PointCurveQueryClient.class);
+ 
+     // ---------- 内存数据（自建，用毕随夹具丢弃） ----------
+     private final List<IotModelInstance> instanceRows = new ArrayList<>();
+@@ -278,7 +282,9 @@ class RedlineFixture implements AutoCloseable {
+         ReflectionTestUtils.setField(instanceService, "dataPermCacheEvictPublisher", cacheEvictPublisher);
+         ReflectionTestUtils.setField(instanceService, "dataItemService", dataItemService);
+ 
+-        // 点位服务（TASK-0021 F5 裁剪接线消费方；写路径依赖 mock 不触达——红线用例只走读裁剪）
++        // 点位服务（TASK-0021 F5 裁剪接线消费方；写路径依赖 mock 不触达——红线用例只走读裁剪。
++        // TASK-0023 聚合接线：曲线客户端 fail-soft 桩（空集）+ 租户登记桩——详情聚合不因
++        // 夹具缺 bean 炸穿；引用计数/反查走 itemMapper 真实内存行模拟）
+         pointService = new IotPointServiceImpl();
+         ReflectionTestUtils.setField(pointService, "baseMapper", pointMapper);
+         ReflectionTestUtils.setField(pointService, "pointCodeMapper", pointCodeMapper);
+@@ -289,6 +295,8 @@ class RedlineFixture implements AutoCloseable {
+         ReflectionTestUtils.setField(pointService, "dictDataMapper", dictDataMapper);
+         ReflectionTestUtils.setField(pointService, "dataItemMapper", itemMapper);
+         ReflectionTestUtils.setField(pointService, "tenantService", tenantService);
++        ReflectionTestUtils.setField(pointService, "pointQuotaCounter", pointQuotaCounter);
++        ReflectionTestUtils.setField(pointService, "pointCurveQueryClient", pointCurveQueryClient);
+         ReflectionTestUtils.setField(pointService, "dataPermService", dataPermService);
+         ReflectionTestUtils.setField(pointService, "dataPermConditionAssembler", new DataPermConditionAssembler());
+         ReflectionTestUtils.setField(pointService, "eventPublisher", directBus);
+@@ -568,6 +576,9 @@ class RedlineFixture implements AutoCloseable {
+                 .filter(i -> i.getId().equals(inv.getArgument(0, Long.class)))
+                 .findFirst().orElse(null));
+         when(itemMapper.selectList(any())).thenAnswer(this::emulateItemList);
++        // TASK-0023 详情聚合/停用影响计数的引用计数入口（Mockito 默认 null Long 会 NPE，
++        // 按无引用语义桩 0；引用计数用例按需重桩）
++        when(itemMapper.selectCount(any())).thenReturn(0L);
+     }
+ 
+     private void seedPoints() {
+@@ -752,9 +763,20 @@ class RedlineFixture implements AutoCloseable {
+         }
+         // MP 3.5.17 条件参数惰性物化（渲染 SQL 片段时才写入 paramNameValuePairs）——先渲染再取参
+         String sql = aw.getSqlSegment() == null ? "" : aw.getSqlSegment();
++        // TASK-0023 反查/详情聚合：point_id 条件（idx_tenant_point 引用口径）同样内存求值
++        if (sql.contains("point_id")) {
++            Set<Long> pointParams = wrapperLongParams(aw);
++            if (pointParams.isEmpty()) {
++                throw new IllegalStateException(
++                        "夹具无法解析 point_id 条件参数值（反查条件形态变更）——请核对主代码与夹具口径");
++            }
++            return itemRows.stream()
++                    .filter(i -> i.getPointId() != null && pointParams.contains(i.getPointId()))
++                    .collect(Collectors.toList());
++        }
+         if (!sql.contains("instance_id")) {
+             throw new IllegalStateException(
+-                    "夹具仅支持带 eq/in(instance_id) 条件的数据项清单查询（形态变更请核对主代码）");
++                    "夹具仅支持带 eq/in(instance_id) 或 eq(point_id) 条件的数据项清单查询（形态变更请核对主代码）");
+         }
+         Set<Long> params = wrapperLongParams(aw);
+         if (params.isEmpty()) {

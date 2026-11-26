@@ -1,0 +1,1239 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/IotDisplayReadService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/IotDisplayReadService.java
+new file mode 100644
+index 0000000..46f0550
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/IotDisplayReadService.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.displayread;
++
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * 管理面展示端只读服务（TASK-0087）。
++ *
++ * <p>四个端点复用 HMAC 侧同一份查询核心（OpenApiQueryService 的显式 scope 重载），差异只在
++ * 「身份→scope」翻译：管理面走登录会话 {@code DataPermService.resolve(userId)}，HMAC 侧走
++ * resolveClientScope。本服务只做翻译与租户收敛，不复制任何查询逻辑。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public interface IotDisplayReadService {
++
++    /** 实例数据项实时值（批量 fullKey → v/q/ts；scope 外键静默裁剪） */
++    Map<String, OpenApiRealtimeItemVO> itemsRealtime(Long instanceId, List<String> fullKeys);
++
++    /** 数据项历史曲线（fullKey + 时间窗 + 降采样/聚合；scope 外实例 403；截断标记继承 HMAC 口径） */
++    OpenApiPage<OpenApiHistoryPointVO> itemHistory(String fullKey, Long start, Long end, String interval, String agg);
++
++    /** 指标值（metricCodes + period + 时间窗；value/yoy/mom 同源展示不现算；scope 外键裁剪） */
++    List<MetricValueVO> metricValues(List<String> metricCodes, String period, Long start, Long end);
++
++    /** 指标完整度（无源诚实空集：available=false + reason，绝不返回伪造 0/1） */
++    MetricCompletenessVO metricCompleteness(List<String> metricCodes, String period);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricCompletenessVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricCompletenessVO.java
+new file mode 100644
+index 0000000..1c01526
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricCompletenessVO.java
+@@ -0,0 +1,113 @@
++package net.otlab.admin.module.iot.displayread;
++
++import com.fasterxml.jackson.annotation.JsonInclude;
++
++import java.util.List;
++
++/**
++ * 指标完整度响应（TASK-0087，D1#4）。
++ *
++ * <p><b>诚实空态纪律（REQ-0016 不造假）</b>：无数据来源时 {@code available=false} + {@code reason}
++ * 明确说明，{@code rows} 为空——绝不返回伪造的 0/1 完整度，也不静默判定「已完整」。
++ * 有源时每行 {@code completeness} 为 0..1 到达率、{@code incomplete} 为低于阈值标记。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@JsonInclude(JsonInclude.Include.NON_NULL)
++public class MetricCompletenessVO {
++
++    /** 是否有可用完整度来源 */
++    private boolean available;
++    /** 无源原因（available=false 时输出；有源时为 null 不输出） */
++    private String reason;
++    /** 完整度行（无源时为空集，不伪造 0/1） */
++    private List<Row> rows;
++
++    public MetricCompletenessVO() {
++        this.rows = List.of();
++    }
++
++    public MetricCompletenessVO(boolean available, String reason, List<Row> rows) {
++        this.available = available;
++        this.reason = reason;
++        this.rows = rows == null ? List.of() : List.copyOf(rows);
++    }
++
++    /** 无源诚实空态工厂 */
++    public static MetricCompletenessVO unavailable(String reason) {
++        return new MetricCompletenessVO(false, reason, List.of());
++    }
++
++    /** 有源映射工厂 */
++    public static MetricCompletenessVO available(List<Row> rows) {
++        return new MetricCompletenessVO(true, null, rows);
++    }
++
++    public boolean isAvailable() {
++        return available;
++    }
++
++    public void setAvailable(boolean available) {
++        this.available = available;
++    }
++
++    public String getReason() {
++        return reason;
++    }
++
++    public void setReason(String reason) {
++        this.reason = reason;
++    }
++
++    public List<Row> getRows() {
++        return rows;
++    }
++
++    public void setRows(List<Row> rows) {
++        this.rows = rows;
++    }
++
++    /** 单行完整度（metricCode 归属由管理面会话数据权限裁剪） */
++    @JsonInclude(JsonInclude.Include.NON_NULL)
++    public static class Row {
++        private String metricCode;
++        /** 0..1 到达率；null=源行无完整度值（不伪造 0/1） */
++        private Double completeness;
++        /** 低于阈值标记；null=源行无该标记 */
++        private Boolean incomplete;
++
++        public Row() {
++        }
++
++        public Row(String metricCode, Double completeness, Boolean incomplete) {
++            this.metricCode = metricCode;
++            this.completeness = completeness;
++            this.incomplete = incomplete;
++        }
++
++        public String getMetricCode() {
++            return metricCode;
++        }
++
++        public void setMetricCode(String metricCode) {
++            this.metricCode = metricCode;
++        }
++
++        public Double getCompleteness() {
++            return completeness;
++        }
++
++        public void setCompleteness(Double completeness) {
++            this.completeness = completeness;
++        }
++
++        public Boolean getIncomplete() {
++            return incomplete;
++        }
++
++        public void setIncomplete(Boolean incomplete) {
++            this.incomplete = incomplete;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricValueVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricValueVO.java
+new file mode 100644
+index 0000000..14a1b91
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/MetricValueVO.java
+@@ -0,0 +1,118 @@
++package net.otlab.admin.module.iot.displayread;
++
++/**
++ * 展示端指标值行（TASK-0087）。
++ *
++ * <p>字段对齐 frontend/src/api/display/display-api.ts::MetricValueRow 与 st_metric_value
++ * 冻结契约（ts 窗口起始 / value / yoy / mom 同源展示不现算）。由 HMAC 侧 OpenApiMetricVO
++ * 映射而来：windowStart（yyyy-MM-dd HH:mm:ss Asia/Shanghai）转 epoch 毫秒 ts；period 由查询入参回填。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++public class MetricValueVO {
++
++    private String metricCode;
++    private String instanceCode;
++    private String period;
++    /** 窗口起始 epoch 毫秒（ts 列） */
++    private Long ts;
++    /** 本期值（null=无值，不写 0 冒充） */
++    private Double value;
++    /** 同比（小数比率；null=上期无值/分母 0，不冒充 0） */
++    private Double yoy;
++    /** 环比（同上） */
++    private Double mom;
++    /** 单位（来自指标定义/伴随读口，非 st_metric_value 物理列） */
++    private String unit;
++    /** 伴随值缺失原因（yoy/mom 为 null 时输出） */
++    private String compareNote;
++
++    public MetricValueVO() {
++    }
++
++    public MetricValueVO(String metricCode, String instanceCode, String period, Long ts,
++                         Double value, Double yoy, Double mom, String unit, String compareNote) {
++        this.metricCode = metricCode;
++        this.instanceCode = instanceCode;
++        this.period = period;
++        this.ts = ts;
++        this.value = value;
++        this.yoy = yoy;
++        this.mom = mom;
++        this.unit = unit;
++        this.compareNote = compareNote;
++    }
++
++    public String getMetricCode() {
++        return metricCode;
++    }
++
++    public void setMetricCode(String metricCode) {
++        this.metricCode = metricCode;
++    }
++
++    public String getInstanceCode() {
++        return instanceCode;
++    }
++
++    public void setInstanceCode(String instanceCode) {
++        this.instanceCode = instanceCode;
++    }
++
++    public String getPeriod() {
++        return period;
++    }
++
++    public void setPeriod(String period) {
++        this.period = period;
++    }
++
++    public Long getTs() {
++        return ts;
++    }
++
++    public void setTs(Long ts) {
++        this.ts = ts;
++    }
++
++    public Double getValue() {
++        return value;
++    }
++
++    public void setValue(Double value) {
++        this.value = value;
++    }
++
++    public Double getYoy() {
++        return yoy;
++    }
++
++    public void setYoy(Double yoy) {
++        this.yoy = yoy;
++    }
++
++    public Double getMom() {
++        return mom;
++    }
++
++    public void setMom(Double mom) {
++        this.mom = mom;
++    }
++
++    public String getUnit() {
++        return unit;
++    }
++
++    public void setUnit(String unit) {
++        this.unit = unit;
++    }
++
++    public String getCompareNote() {
++        return compareNote;
++    }
++
++    public void setCompareNote(String compareNote) {
++        this.compareNote = compareNote;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadController.java
+new file mode 100644
+index 0000000..6e3add6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadController.java
+@@ -0,0 +1,110 @@
++package net.otlab.admin.module.iot.displayread.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletResponse;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.displayread.MetricCompletenessVO;
++import net.otlab.admin.module.iot.displayread.MetricValueVO;
++import net.otlab.admin.module.openapi.OpenApiCodes;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.core.result.Result;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.util.Arrays;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * 管理面展示端数据项与指标值只读端点（TASK-0087，补 FEAT-0019 缺口）。
++ *
++ * <p>四个 GET 走登录态（SaToken 拦截器已有 StpUtil.checkLogin）+ {@code @SaCheckPermission}
++ * 沿用 iot:instance:query；读不审（0079 范式——不挂 @OperateLog）。数据权限由服务层
++ * {@code DataPermService.resolve(userId)} 会话口径裁剪（不是 HMAC 的 resolveClientScope），
++ * 跨租户由多租户插件 + 会话 tenant_id 隔离。
++ *
++ * <p><b>与 HMAC 严格分离</b>：绝不引入 appKey/secret，不复用 requireIdentity，不写 /openapi/v1/**。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Tag(name = "展示端数据项与指标值读口")
++@RestController
++public class IotDisplayReadController {
++
++    private final IotDisplayReadService displayReadService;
++
++    public IotDisplayReadController(IotDisplayReadService displayReadService) {
++        this.displayReadService = displayReadService;
++    }
++
++    @Operation(summary = "实例数据项实时值（批量 fullKey≤200，返回 v/q/ts；scope 外实例 403/外键静默裁剪）")
++    @GetMapping("/iot/instance/{instanceId}/items/realtime")
++    @SaCheckPermission("iot:instance:query")
++    public Result<Map<String, OpenApiRealtimeItemVO>> itemsRealtime(
++            @PathVariable("instanceId") Long instanceId,
++            @RequestParam(value = "fullKeys", required = false) String fullKeys) {
++        return Result.success(displayReadService.itemsRealtime(instanceId, split(fullKeys)));
++    }
++
++    @Operation(summary = "数据项历史曲线（fullKey + 时间窗 + 降采样/聚合；scope 外 403；超行上限响应头 X-Truncated: true）")
++    @GetMapping("/iot/item/history")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<OpenApiHistoryPointVO>> itemHistory(
++            @RequestParam("fullKey") String fullKey,
++            @RequestParam("start") Long start,
++            @RequestParam("end") Long end,
++            @RequestParam(value = "interval", required = false) String interval,
++            @RequestParam(value = "agg", required = false) String agg,
++            HttpServletResponse response) {
++        OpenApiPage<OpenApiHistoryPointVO> page =
++                displayReadService.itemHistory(fullKey, start, end, interval, agg);
++        if (page != null && page.truncated()) {
++            response.setHeader(OpenApiCodes.HEADER_TRUNCATED, "true");
++        }
++        return Result.success(page == null ? List.of() : page.rows());
++    }
++
++    @Operation(summary = "指标值（metricCodes + period + 时间窗；value/yoy/mom 同源展示不现算，null 伴随值不冒充 0）")
++    @GetMapping("/iot/metric/values")
++    @SaCheckPermission("iot:instance:query")
++    public Result<List<MetricValueVO>> metricValues(
++            @RequestParam(value = "metricCodes", required = false) String metricCodes,
++            @RequestParam("period") String period,
++            @RequestParam("start") Long start,
++            @RequestParam("end") Long end) {
++        return Result.success(displayReadService.metricValues(split(metricCodes), period, start, end));
++    }
++
++    @Operation(summary = "指标完整度（无源诚实空集：available=false + reason，绝不伪造 0/1 或静默判完整）")
++    @GetMapping("/iot/metric/completeness")
++    @SaCheckPermission("iot:instance:query")
++    public Result<MetricCompletenessVO> metricCompleteness(
++            @RequestParam(value = "metricCodes", required = false) String metricCodes,
++            @RequestParam("period") String period) {
++        return Result.success(displayReadService.metricCompleteness(split(metricCodes), period));
++    }
++
++    /** 逗号分隔批量参数拆分：trim + 去空 + 去重保序（归一化语义与 HMAC split 同款，核心再做上限校验） */
++    private List<String> split(String value) {
++        if (value == null || value.isBlank()) {
++            return List.of();
++        }
++        Set<String> distinct = new LinkedHashSet<>();
++        for (String part : value.split(",")) {
++            String key = part.trim();
++            if (!key.isEmpty()) {
++                distinct.add(key);
++            }
++        }
++        return List.copyOf(distinct);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImpl.java
+new file mode 100644
+index 0000000..3aef090
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImpl.java
+@@ -0,0 +1,146 @@
++package net.otlab.admin.module.iot.displayread.impl;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.displayread.MetricCompletenessVO;
++import net.otlab.admin.module.iot.displayread.MetricValueVO;
++import net.otlab.admin.module.openapi.OpenApiCodes;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiMetricVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.service.OpenApiQueryService;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++
++import java.time.Instant;
++import java.time.LocalDateTime;
++import java.time.ZoneId;
++import java.time.format.DateTimeFormatter;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * 管理面展示读口实现（TASK-0087）。
++ *
++ * <p><b>复用而非复制（D3）</b>：实时/历史/指标值全部委托 {@link OpenApiQueryService} 的显式
++ * scope 共享核心——HMAC 六接口与展示端四端点走同一份查询逻辑。差异只有「身份→scope」翻译：
++ * HMAC 用 resolveClientScope，本类用会话版 {@code DataPermService.resolve(SecurityUtils.getUserId())}。
++ * 租户取会话 tenant_id（跨租户由多租户插件 + 会话强制隔离），不引入 appKey/secret，不触 HMAC。
++ *
++ * <p><b>完整度诚实空态（D1#4 / REQ-0016 不造假）</b>：calc {@code /calc/v1/metric} 内存视图位于
++ * calc 8095 内网观测面（无鉴权、非管理面数据口），管理系统无其基址配置、运行期亦无监听，
++ * 管理面不可达；且完整度无持久化物理列（st_metric_value 冻结契约无该列）。故本读口返回
++ * {@code available=false} + reason + 空 rows，绝不返回伪造 0/1 或静默判完整。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++@Service
++public class IotDisplayReadServiceImpl implements IotDisplayReadService {
++
++    private static final Logger log = LoggerFactory.getLogger(IotDisplayReadServiceImpl.class);
++    private static final DateTimeFormatter WINDOW_FMT =
++            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
++
++    private final OpenApiQueryService queryService;
++    private final DataPermService dataPermService;
++
++    public IotDisplayReadServiceImpl(OpenApiQueryService queryService, DataPermService dataPermService) {
++        this.queryService = queryService;
++        this.dataPermService = dataPermService;
++    }
++
++    @Override
++    public Map<String, OpenApiRealtimeItemVO> itemsRealtime(Long instanceId, List<String> fullKeys) {
++        Long tenantId = requireTenant();
++        VisibleScope scope = sessionScope();
++        // 实例级入口：越权实例直接 403（单资源语义），不做集合裁剪——指定实例无权即拒绝
++        if (instanceId != null && !scope.allTenant() && !scope.instanceIds().contains(instanceId)) {
++            throw forbidden();
++        }
++        return queryService.itemsRealtime(tenantId, fullKeys, scope);
++    }
++
++    @Override
++    public OpenApiPage<OpenApiHistoryPointVO> itemHistory(String fullKey, Long start, Long end,
++                                                           String interval, String agg) {
++        Long tenantId = requireTenant();
++        VisibleScope scope = sessionScope();
++        try {
++            // 单资源类（按 fullKey 定位实例）：共享核心 scope 外抛 6003，管理面收敛为 403 通用文案
++            return queryService.itemsHistory(tenantId, fullKey, start, end, interval, agg, scope);
++        } catch (BusinessException e) {
++            if (OpenApiCodes.SCOPE_DENIED == e.getCode()) {
++                throw forbidden();
++            }
++            throw e; // 参数错 400 等原样透传（核心校验单一来源）
++        }
++    }
++
++    @Override
++    public List<MetricValueVO> metricValues(List<String> metricCodes, String period, Long start, Long end) {
++        Long tenantId = requireTenant();
++        VisibleScope scope = sessionScope();
++        OpenApiPage<OpenApiMetricVO> page =
++                queryService.metricsQuery(tenantId, metricCodes, period, start, end, scope);
++        // value/yoy/mom 同源展示不现算：只做字段形态映射（windowStart→ts、period 回填）
++        List<MetricValueVO> out = new ArrayList<>();
++        for (OpenApiMetricVO vo : page.rows()) {
++            out.add(new MetricValueVO(vo.getMetricCode(), vo.getInstanceCode(), period,
++                    parseWindowStart(vo.getWindowStart()), vo.getValue(), vo.getYoy(), vo.getMom(),
++                    vo.getUnit(), vo.getCompareNote()));
++        }
++        return out;
++    }
++
++    @Override
++    public MetricCompletenessVO metricCompleteness(List<String> metricCodes, String period) {
++        // 可达性评估结论：calc /calc/v1/metric 在 8095 内网观测面，管理系统无基址配置、
++        // 无运行期监听，且完整度无持久化列——不可达，诚实空集（不连、不伪造、不静默判完整）。
++        requireTenant(); // 登录态/租户上下文守卫（无租户上下文不返回任何数据）
++        sessionScope();  // 会话数据权限口径一致（受限角色同规约；本端点无源，不回显资源）
++        log.debug("[DISPLAY-READ] 完整度读口无源，返回诚实空态（metricCodes={}, period={}）", metricCodes, period);
++        return MetricCompletenessVO.unavailable("完整度读口接入中：calc 内网观测面未对管理面开放，暂无可用数据源");
++    }
++
++    /** 会话租户（跨租户隔离入口；多租户插件 + 会话 tenant_id 强制隔离） */
++    private Long requireTenant() {
++        Long tenantId = TenantContext.getTenantId();
++        if (tenantId == null) {
++            throw forbidden();
++        }
++        return tenantId;
++    }
++
++    /** 会话数据权限（与 IotStatusReadController 同口径：resolve(userId)，不是 resolveClientScope） */
++    private VisibleScope sessionScope() {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        return scope == null ? VisibleScope.denied() : scope;
++    }
++
++    /** 403 通用文案：不回显实例/fullKey 等资源标识 */
++    private BusinessException forbidden() {
++        return new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该资源");
++    }
++
++    /** windowStart（yyyy-MM-dd HH:mm:ss Asia/Shanghai）→ epoch 毫秒；不可解析返回 null（不现算） */
++    private Long parseWindowStart(String windowStart) {
++        if (windowStart == null || windowStart.isBlank()) {
++            return null;
++        }
++        try {
++            LocalDateTime ldt = LocalDateTime.parse(windowStart, WINDOW_FMT);
++            return ldt.atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
++        } catch (Exception e) {
++            return null;
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+index 2c67997..6c4b64f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiQueryService.java
+@@ -1,5 +1,6 @@
+ package net.otlab.admin.module.openapi.service;
+ 
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.instance.dto.IotInstanceTreeVO;
+ import net.otlab.admin.module.iot.statusread.StatusCurrentVO;
+ import net.otlab.admin.module.iot.statusread.StatusHistoryPointVO;
+@@ -95,4 +96,19 @@ public interface OpenApiQueryService {
+      */
+     List<StatusHistoryPointVO> statusHistory(OpenApiClientIdentity identity, Long instanceId,
+                                             Long fromMs, Long toMs);
++
++    // ---------- 共享查询核心（TASK-0087）----------
++    // 两个调用方共用：HMAC 六接口（identity → resolveClientScope）与管理面四端点
++    // （会话 → resolve(userId)）。差异只在「身份→scope」翻译，查询核心只有这一份。
++
++    /** 共享核心：数据项实时值（scope 已由调用方按身份翻译后显式传入） */
++    Map<String, OpenApiRealtimeItemVO> itemsRealtime(Long tenantId, List<String> fullKeys, VisibleScope scope);
++
++    /** 共享核心：数据项历史曲线（scope 显式传入；截断/裁剪/校验语义同 HMAC 入口） */
++    OpenApiPage<OpenApiHistoryPointVO> itemsHistory(Long tenantId, String fullKey, Long startMs, Long endMs,
++                                                    String interval, String agg, VisibleScope scope);
++
++    /** 共享核心：指标查询（scope 显式传入；value/yoy/mom 同源不现算） */
++    OpenApiPage<OpenApiMetricVO> metricsQuery(Long tenantId, List<String> metricCodes, String period,
++                                              Long startMs, Long endMs, VisibleScope scope);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+index 1fb3773..b9fc6bb 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiQueryServiceImpl.java
+@@ -149,6 +149,13 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+ 
+     @Override
+     public Map<String, OpenApiRealtimeItemVO> itemsRealtime(OpenApiClientIdentity identity, List<String> fullKeys) {
++        // HMAC 入口：身份→scope 翻译只在此适配层（resolveClientScope）；查询核心与展示端共用
++        return itemsRealtime(identity.getTenantId(), fullKeys, resolveScope(identity));
++    }
++
++    /** 共享核心（TASK-0087）：管理面/对外 HMAC 同一份查询逻辑，scope 由调用方翻译后传入 */
++    @Override
++    public Map<String, OpenApiRealtimeItemVO> itemsRealtime(Long tenantId, List<String> fullKeys, VisibleScope scope) {
+         List<String> keys = normalizeKeys(fullKeys);
+         if (keys.isEmpty()) {
+             throw paramError("fullKeys 不能为空");
+@@ -156,8 +163,10 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         if (keys.size() > REALTIME_MAX_KEYS) {
+             throw paramError("realtime 批量上限 " + REALTIME_MAX_KEYS + " 个 fullKey，当前 " + keys.size() + " 个");
+         }
+-        VisibleScope scope = resolveScope(identity);
+-        List<OpenApiItemRow> rows = itemMapper.selectByFullKeysForTenant(identity.getTenantId(), keys);
++        if (scope == null) {
++            scope = VisibleScope.denied();
++        }
++        List<OpenApiItemRow> rows = itemMapper.selectByFullKeysForTenant(tenantId, keys);
+         if (rows.isEmpty()) {
+             return Map.of();
+         }
+@@ -165,7 +174,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         for (OpenApiItemRow row : rows) {
+             byKey.put(row.getFullKey(), row);
+         }
+-        String tenantCode = tenantCode(identity.getTenantId());
++        String tenantCode = tenantCode(tenantId);
+         Map<String, OpenApiRealtimeItemVO> result = new LinkedHashMap<>();
+         for (String key : keys) {
+             OpenApiItemRow item = byKey.get(key);
+@@ -173,7 +182,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+             if (item == null || !scope.instanceIds().contains(item.getInstanceId())) {
+                 continue;
+             }
+-            OpenApiRealtimeItemVO value = realtimeStore.read(identity.getTenantId(), tenantCode, key);
++            OpenApiRealtimeItemVO value = realtimeStore.read(tenantId, tenantCode, key);
+             if (value != null) {
+                 result.put(key, value);
+             }
+@@ -186,6 +195,14 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     @Override
+     public OpenApiPage<OpenApiHistoryPointVO> itemsHistory(OpenApiClientIdentity identity, String fullKey,
+                                                            Long startMs, Long endMs, String interval, String agg) {
++        // HMAC 入口：身份→scope 翻译只在此适配层；查询核心与展示端共用
++        return itemsHistory(identity.getTenantId(), fullKey, startMs, endMs, interval, agg, resolveScope(identity));
++    }
++
++    /** 共享核心（TASK-0087）：历史曲线，scope 显式传入 */
++    @Override
++    public OpenApiPage<OpenApiHistoryPointVO> itemsHistory(Long tenantId, String fullKey, Long startMs, Long endMs,
++                                                           String interval, String agg, VisibleScope scope) {
+         if (StrUtil.isBlank(fullKey)) {
+             throw paramError("fullKey 不能为空");
+         }
+@@ -207,13 +224,16 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+             interval = interval.trim();
+             agg = normalizedAgg;
+         }
+-        List<OpenApiItemRow> rows = itemMapper.selectByFullKeysForTenant(identity.getTenantId(), List.of(fullKey));
++        if (scope == null) {
++            scope = VisibleScope.denied();
++        }
++        List<OpenApiItemRow> rows = itemMapper.selectByFullKeysForTenant(tenantId, List.of(fullKey));
+         if (rows.isEmpty()) {
+             // 数据不存在类返回空集（REQ-0027 验收 1：与 scope 外 6003 相区分——不给全租户键枚举探测面）
+             return new OpenApiPage<>(List.of(), false);
+         }
+-        requireInstanceVisible(identity, rows.get(0).getInstanceId(), "fullKey");
+-        return timeseriesClient.queryItemHistory(identity.getTenantId(), tenantCode(identity.getTenantId()),
++        requireInstanceVisible(tenantId, rows.get(0).getInstanceId(), scope, "fullKey");
++        return timeseriesClient.queryItemHistory(tenantId, tenantCode(tenantId),
+                 fullKey, startMs, endMs, interval, agg);
+     }
+ 
+@@ -222,6 +242,14 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     @Override
+     public OpenApiPage<OpenApiMetricVO> metricsQuery(OpenApiClientIdentity identity, List<String> metricCodes,
+                                                      String period, Long startMs, Long endMs) {
++        // HMAC 入口：身份→scope 翻译只在此适配层；查询核心与展示端共用
++        return metricsQuery(identity.getTenantId(), metricCodes, period, startMs, endMs, resolveScope(identity));
++    }
++
++    /** 共享核心（TASK-0087）：指标查询，scope 显式传入 */
++    @Override
++    public OpenApiPage<OpenApiMetricVO> metricsQuery(Long tenantId, List<String> metricCodes, String period,
++                                                     Long startMs, Long endMs, VisibleScope scope) {
+         List<String> codes = normalizeKeys(metricCodes);
+         if (codes.isEmpty()) {
+             throw paramError("metricCodes 不能为空");
+@@ -231,8 +259,10 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+         }
+         requireTimeRange(startMs, endMs);
+         String normalizedPeriod = period.trim().toUpperCase(Locale.ROOT);
+-        VisibleScope scope = resolveScope(identity);
+-        List<OpenApiMetricRow> rows = metricMapper.selectByCodesForTenant(identity.getTenantId(), codes);
++        if (scope == null) {
++            scope = VisibleScope.denied();
++        }
++        List<OpenApiMetricRow> rows = metricMapper.selectByCodesForTenant(tenantId, codes);
+         if (rows.isEmpty()) {
+             return new OpenApiPage<>(List.of(), false);
+         }
+@@ -246,8 +276,8 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+                 instanceIds.add(row.getInstanceId());
+             }
+         }
+-        String tenantCode = tenantCode(identity.getTenantId());
+-        Map<Long, String> instanceCodeById = loadInstanceCodes(identity, instanceIds);
++        String tenantCode = tenantCode(tenantId);
++        Map<Long, String> instanceCodeById = loadInstanceCodes(tenantId, instanceIds);
+         List<OpenApiMetricVO> result = new ArrayList<>();
+         boolean truncated = false;
+         for (String code : codes) {
+@@ -255,7 +285,7 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+             if (metric == null || !scope.instanceIds().contains(metric.getInstanceId())) {
+                 continue;
+             }
+-            OpenApiPage<OpenApiMetricVO> page = timeseriesClient.queryMetrics(identity.getTenantId(), tenantCode,
++            OpenApiPage<OpenApiMetricVO> page = timeseriesClient.queryMetrics(tenantId, tenantCode,
+                     metric.getMetricCode(), instanceCodeById.get(metric.getInstanceId()),
+                     normalizedPeriod, startMs, endMs, null);
+             result.addAll(page.rows());
+@@ -265,12 +295,12 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+     }
+ 
+     /** 指标归属实例编码回显（§3.5 示例 instanceCode 字段；一次批量载入） */
+-    private Map<Long, String> loadInstanceCodes(OpenApiClientIdentity identity, Set<Long> instanceIds) {
++    private Map<Long, String> loadInstanceCodes(Long tenantId, Set<Long> instanceIds) {
+         if (instanceIds.isEmpty()) {
+             return Map.of();
+         }
+         Map<Long, String> codes = new HashMap<>();
+-        for (OpenApiInstanceRow row : instanceMapper.selectByIdsForTenant(identity.getTenantId(), instanceIds)) {
++        for (OpenApiInstanceRow row : instanceMapper.selectByIdsForTenant(tenantId, instanceIds)) {
+             codes.put(row.getId(), row.getInstanceCode());
+         }
+         return codes;
+@@ -357,7 +387,12 @@ public class OpenApiQueryServiceImpl implements OpenApiQueryService {
+ 
+     /** 单目标接口的 scope 外判定（REQ-0027 验收 1：详情类 6003 且全量记录） */
+     private void requireInstanceVisible(OpenApiClientIdentity identity, Long instanceId, String targetKind) {
+-        if (instanceId == null || !resolveScope(identity).instanceIds().contains(instanceId)) {
++        requireInstanceVisible(identity.getTenantId(), instanceId, resolveScope(identity), targetKind);
++    }
++
++    /** 单目标接口 scope 判定（共享核心用；scope 显式传入） */
++    private void requireInstanceVisible(Long tenantId, Long instanceId, VisibleScope scope, String targetKind) {
++        if (instanceId == null || !scope.instanceIds().contains(instanceId)) {
+             throw new BusinessException(OpenApiCodes.SCOPE_DENIED,
+                     targetKind + " 不属于调用方授权范围（scope 外 6003）");
+         }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadControllerTest.java
+new file mode 100644
+index 0000000..df3ea6e
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/controller/IotDisplayReadControllerTest.java
+@@ -0,0 +1,162 @@
++package net.otlab.admin.module.iot.displayread.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import jakarta.servlet.http.HttpServletResponse;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.displayread.MetricCompletenessVO;
++import net.otlab.admin.module.iot.displayread.MetricValueVO;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.Result;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.HttpHeaders;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PatchMapping;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++
++import java.lang.reflect.Method;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0087：管理面四端点控制器契约——路径/参数透传、登录态权限、读不审、诚实空态。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotDisplayReadControllerTest {
++
++    @Mock private IotDisplayReadService displayReadService;
++    private AutoCloseable mocks;
++    private IotDisplayReadController controller;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        controller = new IotDisplayReadController(displayReadService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    @Test
++    @DisplayName("端点①：实时值正常取数 → 200 + v/q/ts 原样透传（不现算）")
++    void realtimePassthrough() {
++        OpenApiRealtimeItemVO vo = new OpenApiRealtimeItemVO(12.5, 0, 1700000000000L);
++        when(displayReadService.itemsRealtime(eq(101L), anyList()))
++                .thenReturn(Map.of("F01.WS01.EQ01.TEMP", vo));
++
++        Result<Map<String, OpenApiRealtimeItemVO>> r =
++                controller.itemsRealtime(101L, "F01.WS01.EQ01.TEMP");
++
++        assertEquals(200, r.getCode());
++        assertEquals(12.5, r.getData().get("F01.WS01.EQ01.TEMP").getV());
++        assertEquals(0, r.getData().get("F01.WS01.EQ01.TEMP").getQ());
++        assertEquals(1700000000000L, r.getData().get("F01.WS01.EQ01.TEMP").getTs());
++        verify(displayReadService).itemsRealtime(eq(101L), eq(List.of("F01.WS01.EQ01.TEMP")));
++    }
++
++    @Test
++    @DisplayName("端点②：历史值透传 + 截断标记经响应头携带（继承 HMAC 口径）")
++    void historyPassthroughWithTruncatedHeader() {
++        OpenApiPage<OpenApiHistoryPointVO> page = new OpenApiPage<>(
++                List.of(new OpenApiHistoryPointVO(100L, 1.0, 0)), true);
++        when(displayReadService.itemHistory(eq("F01.WS01.EQ01.TEMP"), eq(100L), eq(900L), eq("60s"), eq("AVG")))
++                .thenReturn(page);
++        HttpServletResponse response = mock(HttpServletResponse.class);
++
++        Result<List<OpenApiHistoryPointVO>> r =
++                controller.itemHistory("F01.WS01.EQ01.TEMP", 100L, 900L, "60s", "AVG", response);
++
++        assertEquals(200, r.getCode());
++        assertEquals(1, r.getData().size());
++        verify(response).setHeader(eq("X-Truncated"), eq("true"));
++    }
++
++    @Test
++    @DisplayName("端点③：指标值透传（value/yoy/mom 同源不现算，null 伴随值保留）")
++    void metricValuesPassthrough() {
++        MetricValueVO vo = new MetricValueVO("F01_WATER_AVG_DAY", "F01", "DAY", 1700000000000L,
++                412.6, 0.083, null, "m3", "上期无数据或分母为 0，同比/环比不可比");
++        when(displayReadService.metricValues(anyList(), eq("DAY"), eq(100L), eq(900L)))
++                .thenReturn(List.of(vo));
++
++        Result<List<MetricValueVO>> r =
++                controller.metricValues("F01_WATER_AVG_DAY", "DAY", 100L, 900L);
++
++        assertEquals(200, r.getCode());
++        assertEquals(412.6, r.getData().get(0).getValue());
++        assertEquals(0.083, r.getData().get(0).getYoy());
++        assertNull(r.getData().get(0).getMom(), "上期无数据不写 0 冒充");
++    }
++
++    @Test
++    @DisplayName("端点④：无源诚实空态 → available=false + reason + 空 rows，不伪造 0/1")
++    void completenessNoSourceHonestEmpty() {
++        MetricCompletenessVO empty = MetricCompletenessVO.unavailable("完整度读口接入中：calc 内网观测面未对管理面开放");
++        when(displayReadService.metricCompleteness(anyList(), eq("DAY"))).thenReturn(empty);
++
++        Result<MetricCompletenessVO> r = controller.metricCompleteness("F01_WATER_AVG_DAY", "DAY");
++
++        assertEquals(200, r.getCode());
++        assertFalse(r.getData().isAvailable());
++        assertNotNull(r.getData().getReason());
++        assertTrue(r.getData().getRows().isEmpty());
++        assertTrue(r.getData().getRows().stream().noneMatch(row -> row.getCompleteness() != null),
++                "无源不返回伪造 0/1 完整度");
++    }
++
++    @Test
++    @DisplayName("输入校验：服务层参数错原样抛出（400），控制器不吞错")
++    void validationErrorsPropagate() {
++        when(displayReadService.itemsRealtime(eq(101L), anyList()))
++                .thenThrow(new BusinessException(400, "fullKeys 不能为空"));
++        assertThrows(BusinessException.class, () -> controller.itemsRealtime(101L, ""));
++    }
++
++    @Test
++    @DisplayName("四端点均为登录态只读 GET + iot:instance:query + 读不审（无 @OperateLog / 无写动词）")
++    void fourEndpointsAreLoginStateReadOnlyAndGuarded() throws Exception {
++        String[] names = {"itemsRealtime", "itemHistory", "metricValues", "metricCompleteness"};
++        for (String name : names) {
++            Method m = java.util.Arrays.stream(IotDisplayReadController.class.getDeclaredMethods())
++                    .filter(x -> x.getName().equals(name))
++                    .findFirst().orElseThrow();
++            SaCheckPermission perm = m.getAnnotation(SaCheckPermission.class);
++            assertNotNull(perm, name + " 缺 @SaCheckPermission");
++            assertEquals("iot:instance:query", perm.value()[0]);
++            assertNotNull(m.getAnnotation(GetMapping.class), name + " 必须是 GET");
++            assertNull(m.getAnnotation(OperateLog.class), name + " 读不审，不挂 @OperateLog");
++        }
++        long writes = java.util.Arrays.stream(IotDisplayReadController.class.getDeclaredMethods())
++                .filter(m -> m.isAnnotationPresent(PostMapping.class) || m.isAnnotationPresent(PutMapping.class)
++                        || m.isAnnotationPresent(DeleteMapping.class) || m.isAnnotationPresent(PatchMapping.class))
++                .count();
++        assertEquals(0, writes, "零写口");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImplTest.java
+new file mode 100644
+index 0000000..4a81e45
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/displayread/impl/IotDisplayReadServiceImplTest.java
+@@ -0,0 +1,236 @@
++package net.otlab.admin.module.iot.displayread.impl;
++
++import cn.dev33.satoken.context.mock.SaTokenContextMockUtil;
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.displayread.IotDisplayReadService;
++import net.otlab.admin.module.iot.displayread.MetricCompletenessVO;
++import net.otlab.admin.module.iot.displayread.MetricValueVO;
++import net.otlab.admin.module.openapi.dto.OpenApiHistoryPointVO;
++import net.otlab.admin.module.openapi.dto.OpenApiMetricVO;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.service.OpenApiQueryService;
++import net.otlab.admin.module.openapi.support.OpenApiPage;
++import net.otlab.core.exception.BusinessException;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyList;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0087：管理面展示读口服务契约——会话 resolve 数据权限、跨租户隔离、输入校验、
++ * 完整度无源诚实空集、与 HMAC 共享核心（同参同结果）证据。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class IotDisplayReadServiceImplTest {
++
++    private static final long USER_ID = 7L;
++    private static final long TENANT_A = 1L;
++    private static final long TENANT_B = 2L;
++    private static final long INSTANCE_A = 101L;
++    private static final long INSTANCE_B = 202L;
++
++    private DataPermService dataPermService;
++    private OpenApiQueryService queryService;
++    private IotDisplayReadService service;
++
++    @BeforeEach
++    void setUp() {
++        SaTokenContextMockUtil.setMockContext();
++        StpUtil.login(String.valueOf(USER_ID));
++        StpUtil.getSession().set("tenant_id", TENANT_A);
++        dataPermService = mock(DataPermService.class);
++        queryService = mock(OpenApiQueryService.class);
++        service = new IotDisplayReadServiceImpl(queryService, dataPermService);
++    }
++
++    @AfterEach
++    void tearDown() {
++        StpUtil.logout();
++        SaTokenContextMockUtil.clearContext();
++    }
++
++    private void scope(Long... visibleInstanceIds) {
++        when(dataPermService.resolve(eq(USER_ID)))
++                .thenReturn(new VisibleScope(false, Set.of(), Set.of(visibleInstanceIds), false));
++    }
++
++    // ---------- ① 实时值 ----------
++
++    @Test
++    @DisplayName("① 正常取数：会话 resolve 得可见实例 → 显式 scope 调共享核心，返回 v/q/ts")
++    void realtimeNormalUsesSessionResolve() {
++        scope(INSTANCE_A);
++        when(queryService.itemsRealtime(eq(TENANT_A), anyList(), any()))
++                .thenReturn(Map.of("F01.A", new OpenApiRealtimeItemVO(12.5, 0, 1000L)));
++
++        Map<String, OpenApiRealtimeItemVO> got = service.itemsRealtime(INSTANCE_A, List.of("F01.A"));
++
++        assertEquals(12.5, got.get("F01.A").getV());
++        verify(dataPermService).resolve(eq(USER_ID));
++        verify(queryService).itemsRealtime(eq(TENANT_A), eq(List.of("F01.A")),
++                eq(new VisibleScope(false, Set.of(), Set.of(INSTANCE_A), false)));
++    }
++
++    @Test
++    @DisplayName("① scope 外实例（路径指定 instanceId 无权）：403 且不回显存在性，不查共享核心")
++    void realtimeOutOfScope403() {
++        scope(INSTANCE_A); // 仅 A 可见，请求 B 实例
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.itemsRealtime(INSTANCE_B, List.of("F99.X")));
++
++        assertEquals(403, ex.getCode());
++        assertFalse(ex.getMessage().contains("F99.X"), "文案不泄露资源标识");
++    }
++
++    @Test
++    @DisplayName("① allTenant 角色：不按实例裁剪，透传全租户 scope 给共享核心")
++    void realtimeAllTenantPassesThrough() {
++        when(dataPermService.resolve(eq(USER_ID))).thenReturn(VisibleScope.allTenant(false));
++        when(queryService.itemsRealtime(eq(TENANT_A), anyList(), any())).thenReturn(Map.of());
++
++        service.itemsRealtime(INSTANCE_B, List.of("F99.X"));
++
++        verify(queryService).itemsRealtime(eq(TENANT_A), eq(List.of("F99.X")),
++                eq(VisibleScope.allTenant(false)));
++    }
++
++    // ---------- ② 历史值 ----------
++
++    @Test
++    @DisplayName("② 正常取数：显式 scope 调共享核心，截断标记继承")
++    void historyNormalUsesSharedCore() {
++        scope(INSTANCE_A);
++        OpenApiPage<OpenApiHistoryPointVO> page = new OpenApiPage<>(List.of(new OpenApiHistoryPointVO(1L, 2.0, 0)), true);
++        when(queryService.itemsHistory(eq(TENANT_A), eq("F01.A"), eq(100L), eq(900L), eq("60s"), eq("AVG"), any()))
++                .thenReturn(page);
++
++        OpenApiPage<OpenApiHistoryPointVO> got = service.itemHistory("F01.A", 100L, 900L, "60s", "AVG");
++
++        assertEquals(1, got.rows().size());
++        assertTrue(got.truncated());
++        verify(queryService).itemsHistory(eq(TENANT_A), eq("F01.A"), eq(100L), eq(900L), eq("60s"), eq("AVG"), any());
++    }
++
++    @Test
++    @DisplayName("② scope 外实例（单资源类）：403 且不回显实例标识")
++    void historyOutOfScope403() {
++        scope(INSTANCE_A);
++        // 让共享核心判定 fullKey 归属 B 实例：核心抛 6003，管理面转 403 通用文案
++        when(queryService.itemsHistory(eq(TENANT_A), eq("F99.X"), anyLong(), anyLong(), any(), any(), any()))
++                .thenThrow(new BusinessException(6003, "scope 外 6003"));
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> service.itemHistory("F99.X", 100L, 900L, null, null));
++
++        assertEquals(403, ex.getCode());
++        assertFalse(ex.getMessage().contains("F99.X"), "文案不泄露资源标识");
++    }
++
++    @Test
++    @DisplayName("② 输入校验：空 fullKey/时间倒置 → 400 原样透传（核心校验单一来源）")
++    void historyInputValidation() {
++        scope(INSTANCE_A);
++        when(queryService.itemsHistory(eq(TENANT_A), eq(""), anyLong(), anyLong(), any(), any(), any()))
++                .thenThrow(new BusinessException(400, "fullKey 不能为空"));
++        BusinessException e = assertThrows(BusinessException.class,
++                () -> service.itemHistory("", 100L, 900L, null, null));
++        assertEquals(400, e.getCode());
++    }
++
++    // ---------- ③ 指标值 ----------
++
++    @Test
++    @DisplayName("③ 指标值：value/yoy/mom 同源映射不现算，period 回填，ts 由 windowStart 转换")
++    void metricValuesSameSource() {
++        scope(INSTANCE_A);
++        OpenApiMetricVO row = new OpenApiMetricVO();
++        row.setMetricCode("F01_WATER_AVG_DAY");
++        row.setInstanceCode("F01");
++        row.setWindowStart("2026-11-20 00:00:00");
++        row.setValue(412.6);
++        row.setYoy(0.083);
++        row.setMom(null);
++        row.setCompareNote("上期无数据或分母为 0，同比/环比不可比");
++        when(queryService.metricsQuery(eq(TENANT_A), anyList(), eq("DAY"), eq(100L), eq(900L), any()))
++                .thenReturn(new OpenApiPage<>(List.of(row), false));
++
++        List<MetricValueVO> got = service.metricValues(List.of("F01_WATER_AVG_DAY"), "DAY", 100L, 900L);
++
++        assertEquals(1, got.size());
++        assertEquals(412.6, got.get(0).getValue());
++        assertEquals(0.083, got.get(0).getYoy());
++        assertEquals(null, got.get(0).getMom(), "null 伴随值不冒充 0");
++        assertEquals("DAY", got.get(0).getPeriod());
++        assertNotNull(got.get(0).getTs(), "ts 从 windowStart 映射而非现算");
++    }
++
++    @Test
++    @DisplayName("③ 跨租户隔离：tenantId 取会话 tenant_id，不读请求参数/不触 HMAC scope")
++    void crossTenantIsolation() {
++        scope(INSTANCE_A);
++        when(queryService.metricsQuery(eq(TENANT_A), anyList(), eq("DAY"), eq(100L), eq(900L), any()))
++                .thenReturn(new OpenApiPage<>(List.of(), false));
++
++        service.metricValues(List.of("F01_WATER_AVG_DAY"), "DAY", 100L, 900L);
++
++        verify(queryService).metricsQuery(eq(TENANT_A), anyList(), eq("DAY"), eq(100L), eq(900L), any());
++        // 租户 B 参数不存在于服务签名——无跨租户入口
++    }
++
++    // ---------- ④ 完整度 ----------
++
++    @Test
++    @DisplayName("④ 无源诚实空态：available=false + reason + 空 rows，无伪造 0/1")
++    void completenessHonestEmpty() {
++        scope(INSTANCE_A);
++        MetricCompletenessVO got = service.metricCompleteness(List.of("F01_WATER_AVG_DAY"), "DAY");
++
++        assertFalse(got.isAvailable(), "无源明确 available=false");
++        assertNotNull(got.getReason());
++        assertTrue(got.getRows().isEmpty());
++        assertTrue(got.getRows().stream().noneMatch(r -> r.getCompleteness() != null
++                && (r.getCompleteness() == 0.0 || r.getCompleteness() == 1.0)),
++                "空态不返回伪造 0/1 完整度");
++    }
++
++    // ---------- 复用一致性 ----------
++
++    @Test
++    @DisplayName("复用一致性：管理面与 HMAC 同参经同一共享核心方法（同参同结果，不复制查询逻辑）")
++    void reuseConsistency() {
++        scope(INSTANCE_A);
++        OpenApiRealtimeItemVO vo = new OpenApiRealtimeItemVO(9.9, 0, 123L);
++        when(queryService.itemsRealtime(eq(TENANT_A), eq(List.of("F01.A")), any()))
++                .thenReturn(Map.of("F01.A", vo));
++
++        Map<String, OpenApiRealtimeItemVO> management =
++                service.itemsRealtime(INSTANCE_A, List.of("F01.A"));
++
++        // 同一 queryService 实例、同一参数形态；HMAC 侧只是 scope 来源不同（resolveClientScope vs resolve）
++        assertEquals(vo.getV(), management.get("F01.A").getV());
++        verify(queryService).itemsRealtime(eq(TENANT_A), eq(List.of("F01.A")),
++                eq(new VisibleScope(false, Set.of(), Set.of(INSTANCE_A), false)));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQuerySharedCoreTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQuerySharedCoreTest.java
+new file mode 100644
+index 0000000..6cc0509
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/service/impl/OpenApiQuerySharedCoreTest.java
+@@ -0,0 +1,81 @@
++package net.otlab.admin.module.openapi.service.impl;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.openapi.auth.OpenApiClientIdentity;
++import net.otlab.admin.module.openapi.dto.OpenApiRealtimeItemVO;
++import net.otlab.admin.module.openapi.mapper.OpenApiInstanceMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiItemMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiMetricMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiPointMapper;
++import net.otlab.admin.module.openapi.mapper.OpenApiTenantMapper;
++import net.otlab.admin.module.openapi.support.OpenApiRealtimeStore;
++import net.otlab.admin.module.openapi.support.OpenApiTimeseriesClient;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyCollection;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.spy;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * TASK-0087：复用一致性硬证据——HMAC 六接口与管理面四端点共用同一份查询核心。
++ *
++ * <p>用 spy 锁定「HMAC identity 入口 → 显式 scope 核心」的委托链：身份→scope 翻译只在适配层，
++ * 翻译完成后调用的是同一个 {@code itemsRealtime(tenantId, keys, scope)} 核心方法。管理面
++ * （IotDisplayReadServiceImpl）用会话 resolve(userId) 得到 scope 后调用同一方法——同参同结果，
++ * 查询逻辑零复制。
++ *
++ * @author dowei
++ * @date 2026-11-24
++ */
++class OpenApiQuerySharedCoreTest {
++
++    @Test
++    @DisplayName("HMAC identity 入口委托显式 scope 核心（共享逻辑单一来源，与展示端同参同结果）")
++    void hmacEntryDelegatesToSharedScopeCore() {
++        DataPermService dataPermService = mock(DataPermService.class);
++        OpenApiItemMapper itemMapper = mock(OpenApiItemMapper.class);
++        OpenApiTenantMapper tenantMapper = mock(OpenApiTenantMapper.class);
++        OpenApiRealtimeStore realtimeStore = mock(OpenApiRealtimeStore.class);
++        OpenApiQueryServiceImpl real = new OpenApiQueryServiceImpl(
++                dataPermService,
++                mock(OpenApiInstanceMapper.class), itemMapper, mock(OpenApiPointMapper.class),
++                mock(OpenApiMetricMapper.class), tenantMapper, realtimeStore, mock(OpenApiTimeseriesClient.class));
++        OpenApiQueryServiceImpl spy = spy(real);
++
++        Long tenantId = 1L;
++        Long clientId = 7L;
++        VisibleScope scope = new VisibleScope(false, Set.of(), Set.of(101L), false);
++        when(dataPermService.resolveClientScope(eq(clientId), eq(tenantId), any()))
++                .thenReturn(scope);
++        when(tenantMapper.selectTenantCodeById(tenantId)).thenReturn("default");
++        when(itemMapper.selectByFullKeysForTenant(eq(tenantId), anyCollection())).thenReturn(List.of());
++
++        OpenApiClientIdentity identity = new OpenApiClientIdentity();
++        identity.setClientId(clientId);
++        identity.setTenantId(tenantId);
++        identity.setScopeJson("{\"instanceIds\":[101],\"subtree\":false}");
++
++        Map<String, OpenApiRealtimeItemVO> viaHmac =
++                spy.itemsRealtime(identity, List.of("F01.A"));
++        Map<String, OpenApiRealtimeItemVO> viaSharedCore =
++                spy.itemsRealtime(tenantId, List.of("F01.A"), scope);
++
++        assertEquals(viaSharedCore, viaHmac, "两条入口同参同结果（共享核心单一来源）");
++        // 锁定委托链：HMAC identity 入口内部调用的就是展示端复用的显式 scope 核心方法
++        // （两次调用 = HMAC 委托 1 次 + 直接核心 1 次；两者同参同结果）
++        verify(spy, times(2)).itemsRealtime(eq(tenantId), eq(List.of("F01.A")), eq(scope));
++        verify(dataPermService).resolveClientScope(eq(clientId), eq(tenantId), any());
++    }
++}

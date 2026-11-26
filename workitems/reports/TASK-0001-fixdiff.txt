@@ -1,0 +1,104 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+index 56247d3..fa9fc0d 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImpl.java
+@@ -73,7 +73,23 @@ public class SysTenantServiceImpl extends ServiceImpl<SysTenantMapper, SysTenant
+         if (tenant.getTenantCode() == null || !tenant.getTenantCode().equals(existing.getTenantCode())) {
+             throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "租户编码不允许修改");
+         }
+-        return this.updateById(tenant);
++        // 字段白名单构建更新（不直接 updateById 请求实体）：
++        // 1) status 不进更新集——编辑接口不承载启停语义，status 强制以库内值为准（忽略请求值，
++        //    不报错），启停只能走 PUT /tenant/{id}/status（iot:tenant:status + 0/1 校验）；
++        // 2) createBy/createTime/updateBy/updateTime/deleted 等审计与逻辑删字段不进更新集，
++        //    杜绝客户端 mass assignment（updateBy/updateTime 由 MetaObjectHandler 按当前登录者回填）；
++        // 3) tenantCode 经上方不可改校验后与库内同值，回写为 no-op。
++        SysTenant upd = new SysTenant();
++        upd.setId(existing.getId());
++        upd.setTenantCode(existing.getTenantCode());
++        upd.setTenantName(tenant.getTenantName());
++        upd.setPointQuota(tenant.getPointQuota());
++        upd.setStorageQuotaGb(tenant.getStorageQuotaGb());
++        upd.setExpireTime(tenant.getExpireTime());
++        upd.setContactName(tenant.getContactName());
++        upd.setContactPhone(tenant.getContactPhone());
++        upd.setRemark(tenant.getRemark());
++        return this.updateById(upd);
+     }
+ 
+     @Override
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java
+index f22a15e..7ad05f1 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/service/impl/SysTenantServiceImplTest.java
+@@ -23,6 +23,7 @@ import java.time.LocalDateTime;
+ import java.util.List;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ import static org.mockito.ArgumentMatchers.any;
+@@ -168,6 +169,62 @@ class SysTenantServiceImplTest {
+         assertEquals(LocalDateTime.of(2027, 12, 31, 0, 0), saved.getExpireTime());
+     }
+ 
++    @Test
++    @DisplayName("编辑租户 - 请求携带 status 不进更新集（启停语义仅归专用接口）：合法 0 与非法 5 均不改库内状态")
++    void testUpdateTenant_RequestStatusNeverWritten() {
++        SysTenant existing = newTenant(); // 库内 status=1
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        // 合法值 0：持有 iot:tenant:edit 而无 iot:tenant:status 也不得经编辑接口启停
++        SysTenant requestDisable = newTenant();
++        requestDisable.setId(1L);
++        requestDisable.setStatus(0);
++        assertTrue(tenantService.updateTenant(requestDisable));
++
++        // 越界非法值 5：同样忽略，不落库（编辑接口不报错、也不承载启停语义）
++        SysTenant requestInvalid = newTenant();
++        requestInvalid.setId(1L);
++        requestInvalid.setStatus(5);
++        assertTrue(tenantService.updateTenant(requestInvalid));
++
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper, times(2)).updateById(captor.capture());
++        for (SysTenant upd : captor.getAllValues()) {
++            assertNull(upd.getStatus(), "请求携带的 status（0 或非法 5）不得进入更新实体，库内状态以库内值为准");
++            assertEquals(1L, upd.getId());
++        }
++    }
++
++    @Test
++    @DisplayName("编辑租户 - 请求携带的审计字段（createBy/createTime/updateBy/updateTime/deleted）不进更新集")
++    void testUpdateTenant_AuditFieldsNotUpdatable() {
++        SysTenant existing = newTenant();
++        existing.setId(1L);
++        when(baseMapper.selectById(1L)).thenReturn(existing);
++        when(baseMapper.updateById(any(SysTenant.class))).thenReturn(1);
++
++        SysTenant request = newTenant();
++        request.setId(1L);
++        request.setCreateBy(999L);
++        request.setCreateTime(LocalDateTime.of(2020, 1, 1, 0, 0));
++        request.setUpdateBy(999L);
++        request.setUpdateTime(LocalDateTime.of(2020, 1, 1, 0, 0));
++        request.setDeleted(1);
++
++        assertTrue(tenantService.updateTenant(request));
++
++        ArgumentCaptor<SysTenant> captor = ArgumentCaptor.captor();
++        verify(baseMapper).updateById(captor.capture());
++        SysTenant upd = captor.getValue();
++        assertNull(upd.getCreateBy(), "createBy 不得经编辑请求改写");
++        assertNull(upd.getCreateTime(), "createTime 不得经编辑请求改写");
++        assertNull(upd.getUpdateBy(), "updateBy 由 MetaObjectHandler 按当前登录者回填，不得采用请求值");
++        assertNull(upd.getUpdateTime(), "updateTime 由 MetaObjectHandler 回填，不得采用请求值");
++        assertNull(upd.getDeleted(), "deleted 为 @TableLogic 字段，不得经编辑请求改写");
++    }
++
+     @Test
+     @DisplayName("租户启停 - 仅接受 0/1，其余值（含空）报参数错误且不触库")
+     void testUpdateTenantStatus_OnlyZeroOrOne() {

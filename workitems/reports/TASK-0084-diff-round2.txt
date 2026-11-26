@@ -1,0 +1,703 @@
+diff --git a/ingest/cmd/ingestd/main.go b/ingest/cmd/ingestd/main.go
+index 642b1c9..d579538 100644
+--- a/ingest/cmd/ingestd/main.go
++++ b/ingest/cmd/ingestd/main.go
+@@ -337,7 +337,7 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 	// 装配失败（broker 不可达/参数不全）只 WARN，不阻断 ingest 主流水线；ctx 取消退出。
+ 	var bridgeStop func()
+ 	if cfg.ItemBridgeEnabled {
+-		bridgeStop = startItemBridge(pctx, cfg, logger)
++		bridgeStop = startItemBridge(pctx, cfg, logger, snapCache)
+ 	} else {
+ 		logger.Print("ingestd: 新值事件→MQTT 桥接未装配（INGEST_ITEM_BRIDGE_ENABLED 默认关）")
+ 	}
+@@ -421,7 +421,7 @@ func run(ctx context.Context, cfg Config, port mqttsource.Port) error {
+ 
+ // startItemBridge 装配并启动桥接生产者（TASK-0084；opt-in 调用）。
+ // 返回清理函数（关闭 MQTT 发布连接，幂等）；装配失败只 WARN 并降级不启动。
+-func startItemBridge(ctx context.Context, cfg Config, logger *log.Logger) func() {
++func startItemBridge(ctx context.Context, cfg Config, logger *log.Logger, snapCache *snapshot.Cache) func() {
+ 	broker := cfg.ItemBridgeBroker
+ 	if broker == "" {
+ 		broker = cfg.MQTTBroker // env 未单列时回退消费侧 broker
+@@ -445,7 +445,7 @@ func startItemBridge(ctx context.Context, cfg Config, logger *log.Logger) func()
+ 		Addr: cfg.RedisAddr,
+ 		DB:   cfg.RedisDB,
+ 	})
+-	bridge := itembridge.NewBridge(src, pub, logger)
++	bridge := itembridge.NewBridge(src, pub, itembridge.NewSnapshotPointMapper(snapCache), logger)
+ 	go func() {
+ 		if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
+ 			logger.Printf("ingestd: 桥接事件循环退出: %v", err)
+diff --git a/ingest/internal/itembridge/bridge.go b/ingest/internal/itembridge/bridge.go
+index 6d815e4..6cc82f4 100644
+--- a/ingest/internal/itembridge/bridge.go
++++ b/ingest/internal/itembridge/bridge.go
+@@ -2,21 +2,20 @@
+ // 按 pointCode 映射 fullKey/instanceCode，发布到 MQTT 数据项订阅主题
+ // iot/open/{tenant_code}/{instance_code}/item（统一消息模型 4 字段 fullKey/ts/value/quality）。
+ //
+-// 契约纪律（brief 决策 1-6，冻结契约 v1.1.0 §3.5 推送行）：
++// 契约纪律（brief 决策 1-6，冻结契约 v1.1.0 §3.5 推送行，TASK-0084 修订轮 C-1）：
+ //   - payload 恰 4 字段、camelCase、ts 毫秒（0053 定版）——tenant 只走主题段，不注入 payload；
+-//   - pointCode 即 fullKey 核心（「现场只认 pointCode 不认 id」字段纪律不改）：fullKey = pointCode
+-//     原样；instanceCode 取 pointCode 去掉末段数据码后的设备段（与 snapshot.DataItem.FullKey
+-//     的 instance_code + "." + data_code 定义互逆；F01.WS01.EQ001.M01 → F01.WS01.EQ001）；
+-//   - 映射失败（无分隔符 / 空段 / channel 租户不可解析 / payload 非法 JSON / payload tenant
+-//     与主题 tenant 不一致）→ WARN + 丢弃，不造假主题、不发空字段；
++//   - fullKey/instance 由 PointMapper 经配置快照反查（pointCode 是点位编码、fullKey 是数据项
++//     全键，两个编码空间——不再从 pointCode 字符串结构臆造 instance）；
++//   - 映射失败（快照未装载 / pointCode 未登记 / 点位未绑数据项 / channel 租户不可解析 /
++//     payload 非法 JSON / payload tenant 与主题 tenant 不一致）→ WARN + 丢弃，不造假主题；
+ //   - opt-in：INGEST_ITEM_BRIDGE_ENABLED 默认 false；开启后独立 goroutine，ctx 取消退出；
++//     发布用 Run 的 ctx 派生超时（I-2），取消即时生效；
+ //   - MQTT QoS1 fire-and-forget（无订阅者不报错）；桥接失败只 WARN，不影响 ingest 主流水线。
+ package itembridge
+ 
+ import (
+ 	"context"
+ 	"encoding/json"
+-	"fmt"
+ 	"log"
+ 	"strings"
+ 	"sync/atomic"
+@@ -47,24 +46,6 @@ func MarshalItemChange(ev ItemChangeEvent) ([]byte, error) {
+ 	return json.Marshal(ev)
+ }
+ 
+-// MapPointCode pointCode → (fullKey, instanceCode)。fullKey 恒等于 pointCode 原样（字段纪律：
+-// pointCode 即 fullKey 核心）；instanceCode = 去掉最后一段数据码后的前缀（设备段）。
+-// 契约合法域要求至少两段且每段非空；否则映射失败（丢弃+WARN，不造假主题）。
+-func MapPointCode(pointCode string) (string, string, error) {
+-	idx := strings.LastIndex(pointCode, ".")
+-	if idx <= 0 || idx == len(pointCode)-1 {
+-		return "", "", fmt.Errorf("itembridge: pointCode %q 无法解析 instanceCode（须含非空实例段与数据码段）", pointCode)
+-	}
+-	instance := pointCode[:idx]
+-	// 中间段不得为空（F01..M01 之类），避免造出含空段的实例路径。
+-	for _, seg := range strings.Split(instance, ".") {
+-		if seg == "" {
+-			return "", "", fmt.Errorf("itembridge: pointCode %q 实例路径含空段", pointCode)
+-		}
+-	}
+-	return pointCode, instance, nil
+-}
+-
+ // NewValuePattern Redis PSUBSCRIBE 模式（brief 逐字频道前缀 + 通配租户段）。
+ func NewValuePattern() string { return "iot:newvalue:*" }
+ 
+@@ -104,6 +85,7 @@ type BridgeStats struct {
+ type Bridge struct {
+ 	src    NewValueSource
+ 	pub    ItemPublisher
++	mapper PointMapper
+ 	logger *log.Logger
+ 
+ 	published     atomic.Uint64
+@@ -111,12 +93,12 @@ type Bridge struct {
+ 	publishFailed atomic.Uint64
+ }
+ 
+-// NewBridge 构造（logger 可空——内部补默认 logger）。
+-func NewBridge(src NewValueSource, pub ItemPublisher, logger *log.Logger) *Bridge {
++// NewBridge 构造（logger 可空——内部补默认 logger；mapper 用于 pointCode 反查，nil 时映射恒失败）。
++func NewBridge(src NewValueSource, pub ItemPublisher, mapper PointMapper, logger *log.Logger) *Bridge {
+ 	if logger == nil {
+ 		logger = log.Default()
+ 	}
+-	return &Bridge{src: src, pub: pub, logger: logger}
++	return &Bridge{src: src, pub: pub, mapper: mapper, logger: logger}
+ }
+ 
+ // Stats 观测快照（原子加载）。
+@@ -136,7 +118,7 @@ func (b *Bridge) Run(ctx context.Context) error {
+ 		if ctx.Err() != nil {
+ 			return ctx.Err()
+ 		}
+-		err := b.src.Run(ctx, b.onEvent)
++		err := b.src.Run(ctx, func(channel, payload string) { b.onEvent(ctx, channel, payload) })
+ 		if ctx.Err() != nil {
+ 			return ctx.Err()
+ 		}
+@@ -159,9 +141,10 @@ func (b *Bridge) Run(ctx context.Context) error {
+ 	}
+ }
+ 
+-// onEvent 单条事件处理：channel tenant 解析 → payload 解析 → 双一致性校验 → 映射 → 发布。
++// onEvent 单条事件处理：channel tenant 解析 → payload 解析 → 双一致性校验 → 快照反查映射 → 发布。
+ // 任一失败只 WARN + 计数丢弃（fail-soft），不 panic、不影响 ingest 主流水线。
+-func (b *Bridge) onEvent(channel, payload string) {
++// runCtx 为 Run 的生命周期 ctx——发布超时由它派生（I-2），取消即时打断在途发布。
++func (b *Bridge) onEvent(runCtx context.Context, channel, payload string) {
+ 	tenant, ok := TenantFromNewValueChannel(channel)
+ 	if !ok {
+ 		b.logger.Printf("itembridge: WARN 新值事件频道非法，丢弃 channel=%q", channel)
+@@ -186,9 +169,9 @@ func (b *Bridge) onEvent(channel, payload string) {
+ 		b.dropped.Add(1)
+ 		return
+ 	}
+-	fullKey, instance, err := MapPointCode(src.PointCode)
++	fullKey, instance, err := b.mapper.Map(src.PointCode)
+ 	if err != nil {
+-		b.logger.Printf("itembridge: WARN pointCode 映射失败，丢弃 channel=%q pointCode=%q err=%v", channel, src.PointCode, err)
++		b.logger.Printf("itembridge: WARN pointCode 映射失败（快照反查未命中），丢弃 channel=%q pointCode=%q err=%v", channel, src.PointCode, err)
+ 		b.dropped.Add(1)
+ 		return
+ 	}
+@@ -201,7 +184,11 @@ func (b *Bridge) onEvent(channel, payload string) {
+ 		return
+ 	}
+ 	topic := ItemTopic(tenant, instance)
+-	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	// I-2：发布超时从 Run 的 ctx 派生——ctx 取消即时打断在途 Publish（不再 Background+5s 悬挂）。
++	if runCtx == nil {
++		runCtx = context.Background()
++	}
++	pubCtx, cancel := context.WithTimeout(runCtx, 5*time.Second)
+ 	err = b.pub.Publish(pubCtx, topic, body)
+ 	cancel()
+ 	if err != nil {
+diff --git a/ingest/internal/itembridge/bridge_contract_test.go b/ingest/internal/itembridge/bridge_contract_test.go
+index 73f01c6..ee42465 100644
+--- a/ingest/internal/itembridge/bridge_contract_test.go
++++ b/ingest/internal/itembridge/bridge_contract_test.go
+@@ -1,8 +1,10 @@
+ // TASK-0084 契约测试：新值事件 → MQTT 数据项订阅主题桥接生产者。
+ //
+ // 覆盖 brief「测试口径」逐条：newvalue payload→4 字段映射精确 / ts 原样 / quality 透传 /
+-// pointCode→fullKey·instance 映射正确 / 映射失败丢弃 / 主题逐字 / opt-in 默认关 /
+-// 租户主题隔离 / 无订阅者不报错 / ctx 取消退出；既有契约测试零回归另有全套 go test 背书。
++// pointCode→(fullKey,instance) 经配置快照反查正确（C-1 修订：pointCode 是点位编码、fullKey 是
++// 数据项全键，两者不同编码空间）/ 映射失败丢弃 / 主题逐字 / opt-in 默认关 / 租户主题隔离 /
++// 无订阅者不报错 / ctx 取消退出（I-2 修订：发布 ctx 从 Run ctx 派生）。
++// 既有契约测试零回归另有全套 go test 背书。
+ package itembridge
+ 
+ import (
+@@ -13,8 +15,40 @@ import (
+ 	"sync"
+ 	"testing"
+ 	"time"
++
++	"net.otlab/ingest/internal/snapshot"
+ )
+ 
++// ---- 测试夹具：配置快照缓存（含下划线 pointCode 绑定，C-1 修订）----
++
++// testSnapshotCache 装载一份最小合法快照：下划线形态 pointCode 绑定数据项全键。
++// pointID 1 → V29_NUM_01 → fullKey=F01.WS01.EQ001.NUM_01, instance=F01.WS01.EQ001。
++// pointID 2 → F01_WS01_EQ001_M01 → fullKey=F01.M01, instance=F01。
++// pointID 3 → V29_STATE_01 → fullKey=F01.WS01.EQ002.STATE_01, instance=F01.WS01.EQ002。
++func testSnapshotCache(t *testing.T) *snapshot.Cache {
++	t.Helper()
++	c := snapshot.NewCache()
++	s := &snapshot.Snapshot{
++		SchemaVersion: "v1.0.1", TenantID: 1, ScopeType: snapshot.ScopeTypeCompute, Version: 1,
++		Points: []snapshot.Point{
++			{ID: 1, PointCode: "V29_NUM_01", PointName: "数值点1", DataType: 1, ValueType: "DOUBLE"},
++			{ID: 2, PointCode: "F01_WS01_EQ001_M01", PointName: "下划线点2", DataType: 1, ValueType: "DOUBLE"},
++			{ID: 3, PointCode: "V29_STATE_01", PointName: "状态点3", DataType: 3, ValueType: "ENUM"},
++		},
++		DataItems: []snapshot.DataItem{
++			{ID: 10, InstanceID: 100, FullKey: "F01.WS01.EQ001.NUM_01", PointID: ptrInt64(1)},
++			{ID: 11, InstanceID: 101, FullKey: "F01.M01", PointID: ptrInt64(2)},
++			{ID: 12, InstanceID: 102, FullKey: "F01.WS01.EQ002.STATE_01", PointID: ptrInt64(3)},
++		},
++	}
++	if err := c.Replace(s); err != nil {
++		t.Fatalf("夹具快照 Replace 失败: %v", err)
++	}
++	return c
++}
++
++func ptrInt64(v int64) *int64 { return &v }
++
+ // ---- 测试夹具：假 newvalue 源（实现 NewValueSource）----
+ 
+ type fakeSource struct {
+@@ -57,12 +91,13 @@ type recPub struct {
+ type pubCall struct {
+ 	topic   string
+ 	payload []byte
++	ctx     context.Context
+ }
+ 
+-func (p *recPub) Publish(_ context.Context, topic string, payload []byte) error {
++func (p *recPub) Publish(ctx context.Context, topic string, payload []byte) error {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+-	p.calls = append(p.calls, pubCall{topic, append([]byte(nil), payload...)})
++	p.calls = append(p.calls, pubCall{topic, append([]byte(nil), payload...), ctx})
+ 	return p.err
+ }
+ 
+@@ -97,35 +132,44 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration, msg string)
+ 	t.Fatalf("等待超时: %s", msg)
+ }
+ 
+-// ---- 1. 字段纪律 / 映射函数 ----
++// ---- 1. 快照反查映射（C-1 核心：下划线 pointCode 命中数据项全键）----
+ 
+-func TestContractMapPointCodeFullKeyIdentityAndInstanceDeviceSegment(t *testing.T) {
+-	// brief 决策 2：pointCode 即 fullKey 核心（identity）；instance 取到设备段（去掉数据码末段）。
++func TestContractSnapshotMapperUnderscorePointCodeResolvesDataItemFullKey(t *testing.T) {
++	m := NewSnapshotPointMapper(testSnapshotCache(t))
++	// 真实样本（下划线、无点号）——原字符串解析实现会 no-dot 丢弃，快照反查命中：
+ 	cases := []struct{ point, full, inst string }{
+-		{"F01.WS01.EQ001.M01", "F01.WS01.EQ001.M01", "F01.WS01.EQ001"},
+-		{"F01.M01", "F01.M01", "F01"},
+-		{"F01.WS02.EQ009.STATUS", "F01.WS02.EQ009.STATUS", "F01.WS02.EQ009"},
++		{"V29_NUM_01", "F01.WS01.EQ001.NUM_01", "F01.WS01.EQ001"},
++		{"F01_WS01_EQ001_M01", "F01.M01", "F01"},
++		{"V29_STATE_01", "F01.WS01.EQ002.STATE_01", "F01.WS01.EQ002"},
+ 	}
+ 	for _, c := range cases {
+-		full, inst, err := MapPointCode(c.point)
++		full, inst, err := m.Map(c.point)
+ 		if err != nil {
+-			t.Fatalf("MapPointCode(%q) 不应失败: %v", c.point, err)
++			t.Fatalf("Map(%q) 下划线形态不应失败: %v", c.point, err)
+ 		}
+ 		if full != c.full || inst != c.inst {
+-			t.Fatalf("MapPointCode(%q) = (%q,%q)，期望 (%q,%q)", c.point, full, inst, c.full, c.inst)
++			t.Fatalf("Map(%q) = (%q,%q)，期望 (%q,%q)", c.point, full, inst, c.full, c.inst)
+ 		}
+ 	}
+ }
+ 
+-func TestContractMapPointCodeFailureDrops(t *testing.T) {
+-	// 无分隔符 / 空 / 尾点 / 首点 / 纯点：无法解析出数据码或实例 → 映射失败（不造假主题）。
+-	for _, bad := range []string{"", "BADCODE", "F01.", ".M01", "."} {
+-		if _, _, err := MapPointCode(bad); err == nil {
+-			t.Fatalf("MapPointCode(%q) 应失败，实际成功", bad)
++func TestContractSnapshotMapperUnboundOrMissingDrops(t *testing.T) {
++	m := NewSnapshotPointMapper(testSnapshotCache(t))
++	// 未登记点位 / 点位未绑数据项（点号形态但快照无绑定）/ 空 → 映射失败（fail-soft 丢弃）。
++	for _, bad := range []string{"", "BADCODE", "F01.WS01.EQ001.M01", "V29_UNBOUND"} {
++		if _, _, err := m.Map(bad); err == nil {
++			t.Fatalf("Map(%q) 未绑定/未登记应失败，实际成功", bad)
+ 		}
+ 	}
+ }
+ 
++func TestContractSnapshotMapperNilCacheFailsClosed(t *testing.T) {
++	m := NewSnapshotPointMapper(nil)
++	if _, _, err := m.Map("V29_NUM_01"); err == nil {
++		t.Fatal("nil 快照缓存应 fail-closed 映射失败")
++	}
++}
++
+ func TestContractNewValueChannelPatternVerbatim(t *testing.T) {
+ 	if got := NewValuePattern(); got != "iot:newvalue:*" {
+ 		t.Fatalf("NewValuePattern() = %q，期望 iot:newvalue:*", got)
+@@ -145,12 +189,12 @@ func TestContractItemTopicVerbatim(t *testing.T) {
+ }
+ 
+ func TestContractItemChangeEventFourFieldsOrderedCamelCaseMilliseconds(t *testing.T) {
+-	ev := ItemChangeEvent{FullKey: "F01.WS01.EQ001.M01", Ts: 1790000000123, Value: 12.5, Quality: 7}
++	ev := ItemChangeEvent{FullKey: "F01.WS01.EQ001.NUM_01", Ts: 1790000000123, Value: 12.5, Quality: 7}
+ 	b, err := MarshalItemChange(ev)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	want := `{"fullKey":"F01.WS01.EQ001.M01","ts":1790000000123,"value":12.5,"quality":7}`
++	want := `{"fullKey":"F01.WS01.EQ001.NUM_01","ts":1790000000123,"value":12.5,"quality":7}`
+ 	if string(b) != want {
+ 		t.Fatalf("载荷逐字不符\n got=%s\nwant=%s", b, want)
+ 	}
+@@ -168,17 +212,18 @@ func TestContractItemChangeEventFourFieldsOrderedCamelCaseMilliseconds(t *testin
+ 	}
+ }
+ 
+-// ---- 2. 桥接行为（假源 + 假发布器）----
++// ---- 2. 桥接行为（假源 + 假发布器 + 快照映射）----
+ 
+ func TestContractBridgeMapsPublishesFourFieldsToTenantTopic(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
+ 	defer func() { cancel(); <-done }()
+ 
+-	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "F01.WS01.EQ001.M01", 1790000000123, 12.5, 7))
++	// 下划线 pointCode 真样本 → 快照反查数据项全键 + 主题实例段。
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "V29_NUM_01", 1790000000123, 12.5, 7))
+ 	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "1 条发布")
+ 
+ 	call := pub.snapshot()[0]
+@@ -189,7 +234,7 @@ func TestContractBridgeMapsPublishesFourFieldsToTenantTopic(t *testing.T) {
+ 	if err := json.Unmarshal(call.payload, &m); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if m["fullKey"] != "F01.WS01.EQ001.M01" || m["ts"] != float64(1790000000123) || m["value"] != 12.5 || m["quality"] != float64(7) {
++	if m["fullKey"] != "F01.WS01.EQ001.NUM_01" || m["ts"] != float64(1790000000123) || m["value"] != 12.5 || m["quality"] != float64(7) {
+ 		t.Fatalf("4 字段不符: %v", m)
+ 	}
+ 	if _, ok := m["tenant"]; ok {
+@@ -199,16 +244,16 @@ func TestContractBridgeMapsPublishesFourFieldsToTenantTopic(t *testing.T) {
+ 
+ func TestContractBridgeDropsOnMappingFailureWarnNoPublish(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
+ 
+-	// 坏 pointCode（无点分隔符）+ 坏 channel（租户无法解析）各一条，均应丢弃不发布。
+-	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "BADCODE", 1, 1, 0))
+-	src.emit("iot:other:bridge29", newvalue("bridge29", "F01.M01", 2, 2, 0))
++	// 未绑定 pointCode（点号形态但快照无绑定）+ 坏 channel（租户无法解析）各一条，均应丢弃。
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "F01.WS01.EQ001.M01", 1, 1, 0))
++	src.emit("iot:other:bridge29", newvalue("bridge29", "V29_NUM_01", 2, 2, 0))
+ 	// 放行一条合法的作为「桥接仍存活」的栅栏（栅栏到达即前面坏样本已被处理）。
+-	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "F01.M01", 3, 3, 0))
++	src.emit("iot:newvalue:bridge29", newvalue("bridge29", "V29_NUM_01", 3, 3, 0))
+ 	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "合法栅栏发布")
+ 	cancel()
+ 	<-done
+@@ -217,26 +262,26 @@ func TestContractBridgeDropsOnMappingFailureWarnNoPublish(t *testing.T) {
+ 	if len(calls) != 1 {
+ 		t.Fatalf("应恰 1 条发布（坏样本丢弃），实际 %d", len(calls))
+ 	}
+-	if calls[0].topic != "iot/open/bridge29/F01/item" {
++	if calls[0].topic != "iot/open/bridge29/F01.WS01.EQ001/item" {
+ 		t.Fatalf("栅栏主题不符: %q", calls[0].topic)
+ 	}
+ 	if b.Stats().Dropped < 2 {
+-		t.Fatalf("丢弃计数应 ≥2（坏 pointCode + 坏 channel），实际 %d", b.Stats().Dropped)
++		t.Fatalf("丢弃计数应 ≥2（未绑定 pointCode + 坏 channel），实际 %d", b.Stats().Dropped)
+ 	}
+ }
+ 
+ func TestContractBridgeTenantIsolationTopicOnlyPayloadTenantFree(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
+ 	defer func() { cancel(); <-done }()
+ 
+-	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 11, 0))
+-	src.emit("iot:newvalue:tB", newvalue("tB", "F01.M01", 2, 22, 0))
++	src.emit("iot:newvalue:tA", newvalue("tA", "V29_NUM_01", 1, 11, 0))
++	src.emit("iot:newvalue:tB", newvalue("tB", "V29_NUM_01", 2, 22, 0))
+ 	// payload tenant 与 channel tenant 不一致：fail-closed 丢弃（防跨租户注入）。
+-	src.emit("iot:newvalue:tA", newvalue("tB", "F01.M02", 3, 33, 0))
++	src.emit("iot:newvalue:tA", newvalue("tB", "F01_WS01_EQ001_M01", 3, 33, 0))
+ 	waitFor(t, func() bool { return len(pub.snapshot()) == 2 }, time.Second, "2 条合法发布")
+ 
+ 	topics := map[string]bool{}
+@@ -246,23 +291,23 @@ func TestContractBridgeTenantIsolationTopicOnlyPayloadTenantFree(t *testing.T) {
+ 			t.Fatalf("payload 含 tenant 字样: %s", c.payload)
+ 		}
+ 	}
+-	if !topics["iot/open/tA/F01/item"] || !topics["iot/open/tB/F01/item"] {
++	if !topics["iot/open/tA/F01.WS01.EQ001/item"] || !topics["iot/open/tB/F01.WS01.EQ001/item"] {
+ 		t.Fatalf("租户主题隔离失败: %v", topics)
+ 	}
+-	if topics["iot/open/tA/F01/item"] && len(pub.snapshot()) != 2 {
++	if len(pub.snapshot()) != 2 {
+ 		t.Fatalf("跨租户 payload 不应发布，实际 %d 条", len(pub.snapshot()))
+ 	}
+ }
+ 
+ func TestContractBridgePublishFailureFailSoftKeepsDraining(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{err: context.DeadlineExceeded}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
+ 
+-	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 1, 0))
+-	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M02", 2, 2, 0))
++	src.emit("iot:newvalue:tA", newvalue("tA", "V29_NUM_01", 1, 1, 0))
++	src.emit("iot:newvalue:tA", newvalue("tA", "V29_STATE_01", 2, 2, 0))
+ 	waitFor(t, func() bool { return b.Stats().PublishFailed >= 2 }, time.Second, "2 次发布失败计数")
+ 	cancel()
+ 	<-done
+@@ -274,13 +319,13 @@ func TestContractBridgePublishFailureFailSoftKeepsDraining(t *testing.T) {
+ 
+ func TestContractBridgeBadJSONWarnNoPublish(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
+ 
+ 	src.emit("iot:newvalue:tA", "{not json")
+-	src.emit("iot:newvalue:tA", newvalue("tA", "F01.M01", 1, 1, 0))
++	src.emit("iot:newvalue:tA", newvalue("tA", "V29_NUM_01", 1, 1, 0))
+ 	waitFor(t, func() bool { return len(pub.snapshot()) == 1 }, time.Second, "合法栅栏发布")
+ 	cancel()
+ 	<-done
+@@ -291,19 +336,67 @@ func TestContractBridgeBadJSONWarnNoPublish(t *testing.T) {
+ 
+ func TestContractBridgeContextCancelExits(t *testing.T) {
+ 	src, pub := newFakeSource(4), &recPub{}
+-	b := NewBridge(src, pub, silentLogger())
++	b := NewBridge(src, pub, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan error, 1)
++	go func() { done <- b.Run(ctx) }()
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("ctx 取消后桥接未退出")
++	}
++}
++
++// ---- 3. 发布 ctx 贯穿（I-2）----
++
++// blockingPub 在 Publish 中阻塞直至传入 ctx 取消（模拟在途发布卡住）。
++type blockingPub struct {
++	entered chan context.Context
++}
++
++func (p *blockingPub) Publish(ctx context.Context, _ string, _ []byte) error {
++	if p.entered != nil {
++		p.entered <- ctx
++	}
++	<-ctx.Done()
++	return ctx.Err()
++}
++
++func TestContractPublishUsesRunCtxCancelInterruptsInflight(t *testing.T) {
++	src := newFakeSource(4)
++	bp := &blockingPub{entered: make(chan context.Context, 1)}
++	b := NewBridge(src, bp, NewSnapshotPointMapper(testSnapshotCache(t)), silentLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- b.Run(ctx) }()
++
++	src.emit("iot:newvalue:tA", newvalue("tA", "V29_NUM_01", 1, 1, 0))
++	// 发布已开始（拿到 ctx），断言其父链可追溯 Run ctx 取消。
++	var pubCtx context.Context
++	select {
++	case pubCtx = <-bp.entered:
++	case <-time.After(time.Second):
++		t.Fatal("发布未开始")
++	}
++	if pubCtx == ctx {
++		t.Fatal("发布应使用 WithTimeout 派生的 ctx，而非 Run ctx 本体")
++	}
++	// 取消 Run ctx → 派生 pubCtx 应立即 Done（I-2：不再 Background+5s 悬挂）。
+ 	cancel()
+ 	select {
++	case <-pubCtx.Done():
++	case <-time.After(300 * time.Millisecond):
++		t.Fatal("Run ctx 取消后发布 ctx 未即时取消（仍在 Background 5s 悬挂）")
++	}
++	select {
+ 	case <-done:
+ 	case <-time.After(time.Second):
+ 		t.Fatal("ctx 取消后桥接未退出")
+ 	}
+ }
+ 
+-// ---- 3. opt-in 默认关 ----
++// ---- 4. opt-in 默认关 ----
+ 
+ func TestContractOptInDefaultOff(t *testing.T) {
+ 	getenv := func(string) string { return "" }
+diff --git a/ingest/internal/itembridge/bridge_live_test.go b/ingest/internal/itembridge/bridge_live_test.go
+index 64b317c..f1acecd 100644
+--- a/ingest/internal/itembridge/bridge_live_test.go
++++ b/ingest/internal/itembridge/bridge_live_test.go
+@@ -5,8 +5,8 @@
+ // PINGREQ/DISCONNECT + 通配符转发）+ 真 Redis（INGEST_REDIS_TEST_ADDR，默认 127.0.0.1:6379）
+ // + 真 Paho 发布器（itembridge.PahoItemPublisher）+ 真桥接主体（Bridge）。
+ //
+-// 全序列：opt-in 关→不发布 / 开启后 newvalue→4 字段真收（主题 tenant+instance 正确）/
+-// 映射失败样本丢弃 / 无订阅者不报错 / ctx 取消退出 / 全停归零。
++// 全序列：opt-in 关→不发布 / 开启后下划线 pointCode 经快照反查→4 字段真收（主题 tenant+
++// 数据项实例段正确）/ 未绑定样本丢弃 / 无订阅者不报错 / ctx 取消退出 / 全停归零。
+ package itembridge
+ 
+ import (
+@@ -25,6 +25,7 @@ import (
+ 	"time"
+ 
+ 	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/snapshot"
+ )
+ 
+ // ---- 内嵌 MQTT 3.1.1 夹具 broker ----
+@@ -347,7 +348,7 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 	}
+ 
+ 	// 步骤 1：桥接未开启（opt-in 关）→ 发布 newvalue 不应有任何 MQTT 消息。
+-	publish(nv("F01.WS01.EQ001.M01", 1790000001000, 12.5, 0))
++	publish(nv("V29_NUM_01", 1790000001000, 12.5, 0))
+ 	if _, _, err := sub.readMsg(400 * time.Millisecond); err == nil {
+ 		t.Fatal("桥接未开启却收到 MQTT 发布（opt-in 默认关被违反）")
+ 	}
+@@ -359,8 +360,26 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 		t.Fatalf("Paho 连接夹具 broker 失败: %v", err)
+ 	}
+ 	defer pub.Close()
++	// 装载含下划线 pointCode 绑定的配置快照（C-1 修订：pointCode 点位编码 → DataItem 数据项全键）。
++	snapCache := snapshot.NewCache()
++	id1, id2, id3 := int64(1), int64(2), int64(3)
++	if err := snapCache.Replace(&snapshot.Snapshot{
++		SchemaVersion: "v1.0.1", TenantID: 1, ScopeType: snapshot.ScopeTypeCompute, Version: 1,
++		Points: []snapshot.Point{
++			{ID: 1, PointCode: "V29_NUM_01", PointName: "数值点", DataType: 1, ValueType: "DOUBLE"},
++			{ID: 2, PointCode: "V29_STATE_01", PointName: "状态点", DataType: 3, ValueType: "ENUM"},
++			{ID: 3, PointCode: "F01_WS01_EQ001_M01", PointName: "下划线点", DataType: 1, ValueType: "DOUBLE"},
++		},
++		DataItems: []snapshot.DataItem{
++			{ID: 10, InstanceID: 100, FullKey: "F01.WS01.EQ001.NUM_01", PointID: &id1},
++			{ID: 11, InstanceID: 101, FullKey: "F01.WS01.EQ002.STATE_01", PointID: &id2},
++			{ID: 12, InstanceID: 102, FullKey: "F01.M01", PointID: &id3},
++		},
++	}); err != nil {
++		t.Fatalf("live 快照装载失败: %v", err)
++	}
+ 	src := NewRedisNewValueSource(RedisSourceOptions{Addr: redisAddr, DB: 15})
+-	bridge := NewBridge(src, pub, log.New(os.Stdout, "LIVE-BRIDGE ", log.LstdFlags))
++	bridge := NewBridge(src, pub, NewSnapshotPointMapper(snapCache), log.New(os.Stdout, "LIVE-BRIDGE ", log.LstdFlags))
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() { done <- bridge.Run(ctx) }()
+@@ -376,7 +395,7 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 	var err error
+ 	deadline := time.Now().Add(5 * time.Second)
+ 	for {
+-		publish(nv("F01.WS01.EQ001.M01", ts, 42.75, 6))
++		publish(nv("V29_NUM_01", ts, 42.75, 6))
+ 		topic, body, err = sub.readMsg(600 * time.Millisecond)
+ 		if err == nil {
+ 			break
+@@ -401,7 +420,7 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 	if err := json.Unmarshal(body, &ev); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if ev.FullKey != "F01.WS01.EQ001.M01" || ev.Ts != ts || ev.Value != 42.75 || ev.Quality != 6 {
++	if ev.FullKey != "F01.WS01.EQ001.NUM_01" || ev.Ts != ts || ev.Value != 42.75 || ev.Quality != 6 {
+ 		t.Fatalf("4 字段不符: %+v", ev)
+ 	}
+ 	if _, ok := m["tenant"]; ok {
+@@ -409,25 +428,25 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 	}
+ 	fmt.Printf("LIVE-S3 真收 4 字段: topic=%s payload=%s\n", topic, body)
+ 
+-	// 步骤 4：映射失败样本（无分隔符）→ 丢弃，无 MQTT 发布。
+-	publish(nv("BADCODE", ts, 1, 0))
++	// 步骤 4：映射失败样本（pointCode 未在快照点位登记）→ 丢弃，无 MQTT 发布。
++	publish(nv("V29_UNBOUND_99", ts, 1, 0))
+ 	if _, _, err := sub.readMsg(500 * time.Millisecond); err == nil {
+ 		t.Fatal("映射失败样本却发布了 MQTT 消息")
+ 	}
+-	fmt.Println("LIVE-S4 映射失败样本丢弃（500ms 无消息）")
++	fmt.Println("LIVE-S4 映射失败样本（快照未登记）丢弃（500ms 无消息）")
+ 
+ 	// 步骤 5：租户隔离——另一 tenant 的主题段正确、payload 无 tenant。
+ 	tenant2 := tenant + "B"
+ 	ch2 := "iot:newvalue:" + tenant2
+ 	rc2 := cache.NewRedisClient(cache.RedisOptions{Addr: redisAddr, DB: 15})
+-	b2, _ := json.Marshal(map[string]any{"tenant": tenant2, "pointCode": "F02.M09", "ts": ts, "value": 9.5, "quality": 1})
++	b2, _ := json.Marshal(map[string]any{"tenant": tenant2, "pointCode": "F01_WS01_EQ001_M01", "ts": ts, "value": 9.5, "quality": 1})
+ 	_, _ = rc2.Do(context.Background(), "PUBLISH", ch2, string(b2))
+ 	rc2.Close()
+ 	topic2, body2, err := sub.readMsg(3 * time.Second)
+ 	if err != nil {
+ 		t.Fatalf("租户 B 未收到: %v", err)
+ 	}
+-	if topic2 != "iot/open/"+tenant2+"/F02/item" {
++	if topic2 != "iot/open/"+tenant2+"/F01/item" {
+ 		t.Fatalf("租户 B 主题不符: %q", topic2)
+ 	}
+ 	if strings.Contains(string(body2), "tenant") {
+@@ -438,7 +457,7 @@ func TestLiveBridgeEndToEnd(t *testing.T) {
+ 	// 步骤 6：无订阅者不报错——关掉裸订阅者后发 newvalue，发布仍成功（publishFailed 不增）。
+ 	_ = sub.conn.Close()
+ 	before := bridge.Stats().PublishFailed
+-	publish(nv("F01.WS01.EQ003.M02", ts, 7.5, 0))
++	publish(nv("V29_STATE_01", ts, 7.5, 0))
+ 	deadline2 := time.Now().Add(2 * time.Second)
+ 	for time.Now().Before(deadline2) {
+ 		if bridge.Stats().Published >= 3 {
+diff --git a/ingest/internal/itembridge/mapper.go b/ingest/internal/itembridge/mapper.go
+new file mode 100644
+index 0000000..6cd1a27
+--- /dev/null
++++ b/ingest/internal/itembridge/mapper.go
+@@ -0,0 +1,71 @@
++// Package itembridge 承载 TASK-0084 桥接生产者。
++//
++// 本文件实现 pointCode → (fullKey, instanceCode) 的权威映射（TASK-0084 修订轮 C-1）：
++// pointCode 是点位编码（现场层，下划线形态如 V29_NUM_01），fullKey 是数据项全键
++// （instance_code + "." + data_code）——两者是不同编码空间，不能从 pointCode 字符串结构臆造
++// instance。正确路径是经配置快照反查 pointCode → Point(ID) → DataItem(PointID==ID)。
++package itembridge
++
++import (
++	"fmt"
++	"strings"
++
++	"net.otlab/ingest/internal/snapshot"
++)
++
++// PointMapper pointCode → (数据项全键 fullKey, 主题实例段 instanceCode) 映射薄接口。
++// 生产实现 = SnapshotPointMapper（配置快照反查）；测试可用同接口假实现。
++// 未绑定/未登记 → 返回 error（桥接 WARN + 丢弃，不造假主题）。
++type PointMapper interface {
++	Map(pointCode string) (fullKey, instanceCode string, err error)
++}
++
++// SnapshotPointMapper 基于配置快照的映射实现（C-1 裁决）。
++//
++// 反查链：Cache.LookupPoint(pointCode) → Point.ID → 快照 DataItems 中 PointID==ID 的
++// DataItem → FullKey（原样发布）+ 从 FullKey 去末段取 instanceCode（此时 "." 才是契约定义的
++// 数据项全键分隔符，解析合法）。快照未装载 / pointCode 未登记 / 点位未绑数据项 / FullKey
++// 无实例段 → error（fail-soft 丢弃）。
++type SnapshotPointMapper struct {
++	cache *snapshot.Cache
++}
++
++// NewSnapshotPointMapper 构造（cache 由 main 的 snapCache 注入；nil 时 Map 恒失败）。
++func NewSnapshotPointMapper(cache *snapshot.Cache) *SnapshotPointMapper {
++	return &SnapshotPointMapper{cache: cache}
++}
++
++// Map 实现 PointMapper。
++func (m *SnapshotPointMapper) Map(pointCode string) (string, string, error) {
++	if m == nil || m.cache == nil {
++		return "", "", fmt.Errorf("itembridge: 配置快照缓存未装配，pointCode=%q 无法反查", pointCode)
++	}
++	p, ok := m.cache.LookupPoint(pointCode)
++	if !ok || p == nil {
++		return "", "", fmt.Errorf("itembridge: pointCode %q 未在配置快照点位中登记", pointCode)
++	}
++	snap := m.cache.Get()
++	if snap == nil {
++		return "", "", fmt.Errorf("itembridge: 配置快照未装载，pointCode=%q 无法反查", pointCode)
++	}
++	var item *snapshot.DataItem
++	for i := range snap.DataItems {
++		di := &snap.DataItems[i]
++		if di.PointID != nil && *di.PointID == p.ID {
++			item = di
++			break
++		}
++	}
++	if item == nil {
++		return "", "", fmt.Errorf("itembridge: 点位 %q(id=%d) 未绑定数据项", pointCode, p.ID)
++	}
++	full := item.FullKey
++	idx := strings.LastIndex(full, ".")
++	if idx <= 0 || idx == len(full)-1 {
++		return "", "", fmt.Errorf("itembridge: 数据项 fullKey %q 无法解析实例段（须 instance_code + '.' + data_code）", full)
++	}
++	return full, full[:idx], nil
++}
++
++// 编译期接口面锁定。
++var _ PointMapper = (*SnapshotPointMapper)(nil)

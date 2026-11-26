@@ -1,0 +1,963 @@
+diff --git a/frontend/src/api/display/display-api.ts b/frontend/src/api/display/display-api.ts
+new file mode 100644
+index 0000000..e1db896
+--- /dev/null
++++ b/frontend/src/api/display/display-api.ts
+@@ -0,0 +1,98 @@
++/*
++ * 展示端数据服务（TASK-0058 批次一）
++ *
++ * 展示端（/display/**）只调数据服务；本批只封装**已交付**端点：
++ * - GET /iot/instance/tree（TASK-0012，按数据权限裁剪，无权节点不返回）——模型树主路径；
++ * - 未交付的 0050 状态读口 / 0045 指标聚合 / 0049 状态判定——本批不写占位调用，
++ *   卡片数据接入批次二（报告登记）。
++ *
++ * 不直连 openapi/v1（那套 appKey+HMAC 是内网系统对接，浏览器不可直连）；展示端走
++ * 管理面已登录态 API（与 /iot/** 共用 axios 实例与登录态，但组件独立）。
++ */
++import { getRequest } from '/@/lib/axios';
++
++/** 实例树节点（对齐后端 IotInstanceTreeVO；mark 为 ADR-0011 上看板标记预留字段，接口未交付前恒缺省） */
++export interface DisplayTreeNode {
++  id: number;
++  parentId: number;
++  ancestors?: string;
++  instanceCode: string;
++  instanceName: string;
++  nodeType: number;
++  templateId?: number | null;
++  appliedTemplateVersion?: number | null;
++  deptId?: number | null;
++  sort?: number;
++  /** 0 禁用 1 启用（禁用节点照常返回，展示层灰显） */
++  status?: number;
++  locked?: number;
++  /** ADR-0011：上看板标记；接口未交付，可选字段，视图层按标记决定放大/置顶 */
++  mark?: boolean;
++  children?: DisplayTreeNode[];
++}
++
++/** 节点类型（与 iot-consts 对齐：1 工厂 2 车间 3 产线 4 设备 5 组件） */
++export const DISPLAY_NODE_TYPE = {
++  FACTORY: 1,
++  WORKSHOP: 2,
++  LINE: 3,
++  DEVICE: 4,
++  COMPONENT: 5,
++} as const;
++
++/** 后端响应体 { code, message, data }；code!==200 已由 axios 拦截器全局处理并 reject */
++interface TreeResponse {
++  code: number;
++  message?: string;
++  data: DisplayTreeNode[];
++}
++
++export const displayApi = {
++  /**
++   * 查询完整实例树（已按数据权限裁剪——无权节点后端不返回，前端不二次过滤）。
++   * 返回 data 数组；空数组=无权/空厂，由视图渲染空态。
++   */
++  async queryInstanceTree(): Promise<DisplayTreeNode[]> {
++    const res: TreeResponse = await getRequest('/iot/instance/tree', undefined);
++    return Array.isArray(res?.data) ? res.data : [];
++  },
++};
++
++/** 按父节点 id 取子节点（模型树 lazy load 的纯函数；parentId=null 取根；无权节点不在树中自然不出现）。 */
++export function childrenOf(nodes: DisplayTreeNode[], parentId: number | null): DisplayTreeNode[] {
++  if (parentId == null) return [...nodes].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0));
++  const parent = findNode(nodes, parentId);
++  return parent ? [...childrenOfRaw(parent)].sort((a, b) => (a.sort ?? 0) - (b.sort ?? 0)) : [];
++}
++
++/** 在树中按 id 深度查找节点（下钻定位用；找不到返回 null）。 */
++export function findNode(nodes: DisplayTreeNode[], id: number): DisplayTreeNode | null {
++  for (const node of nodes) {
++    if (node.id === id) return node;
++    const hit = findNode(childrenOfRaw(node), id);
++    if (hit) return hit;
++  }
++  return null;
++}
++
++function childrenOfRaw(node: DisplayTreeNode): DisplayTreeNode[] {
++  return Array.isArray(node.children) ? node.children : [];
++}
++
++/**
++ * 取指定类型的直接子节点（跳过中间层级）：工厂页取车间列表（2），车间/产线页取设备列表（4）。
++ * 不做跨权限补节点——只见已裁剪树中存在的节点。
++ */
++export function descendantsOfType(nodes: DisplayTreeNode[], nodeId: number, nodeType: number): DisplayTreeNode[] {
++  const root = findNode(nodes, nodeId);
++  if (!root) return [];
++  const out: DisplayTreeNode[] = [];
++  const walk = (n: DisplayTreeNode) => {
++    for (const child of childrenOfRaw(n)) {
++      if (child.nodeType === nodeType) out.push(child);
++      walk(child);
++    }
++  };
++  walk(root);
++  return out;
++}
+diff --git a/frontend/src/router/display.ts b/frontend/src/router/display.ts
+new file mode 100644
+index 0000000..518f236
+--- /dev/null
++++ b/frontend/src/router/display.ts
+@@ -0,0 +1,31 @@
++/*
++ * 展示端独立路由段（TASK-0058 批次一）
++ *
++ * 展示端（/display/**）与管理端（/iot/**）并存不混用：
++ * - 本段为静态注册（无后端 sys_menu 菜单项，hideInMenu），与动态菜单路由同挂在 OtLayout 下；
++ * - 需要登录（无 meta.public），走 router/index.ts 的 token 守卫与已登录态数据服务；
++ * - 下钻路径 ≤3 次点击：/display（总览，0）→ /display/factory/:factoryId（1）
++ *   → /display/workshop/:factoryId/:workshopId（2）→ 设备详情（3，批次二 0059 承接，本批不写入口死链）。
++ */
++import type { RouteRecordRaw } from 'vue-router';
++
++export const displayRouters: Array<RouteRecordRaw> = [
++  {
++    path: '/display',
++    name: 'DisplayOverview',
++    component: () => import('/@/views/display/overview/index.vue'),
++    meta: { title: '工厂总览', hideInMenu: true },
++  },
++  {
++    path: '/display/factory/:factoryId',
++    name: 'DisplayFactory',
++    component: () => import('/@/views/display/factory/index.vue'),
++    meta: { title: '工厂', hideInMenu: true },
++  },
++  {
++    path: '/display/workshop/:factoryId/:workshopId',
++    name: 'DisplayWorkshop',
++    component: () => import('/@/views/display/workshop/index.vue'),
++    meta: { title: '车间 / 产线', hideInMenu: true },
++  },
++];
+diff --git a/frontend/src/router/index.ts b/frontend/src/router/index.ts
+index b4b54cd..90c10b7 100644
+--- a/frontend/src/router/index.ts
++++ b/frontend/src/router/index.ts
+@@ -11,6 +11,7 @@ import { createRouter, createWebHashHistory } from 'vue-router';
+ import { routerArray } from './routers';
+ import { surveyFormWorkbenchRouters, surveyRecycleRouter, surveyCategoryRouters, surveyTemplatePreviewRouters } from './survey';
+ import { iotUpgradeListRouter } from './iot';
++import { displayRouters } from './display';
+ import { PAGE_PATH_404, PAGE_PATH_LOGIN, HOME_PAGE_PATH, REFRESH_REDIRECT_NAME } from '/@/constants/common-const';
+ import { HOME_PAGE_NAME } from '/@/constants/system/home-const';
+ // FEAT-1100：后台骨架懒加载（同 router/system/home.ts 注释；切断 layout 组件树对首屏静态图的拉入）
+@@ -238,6 +239,10 @@ function buildRouteList(menuList) {
+   // 待升级清单（/iot/upgrade）：无后端菜单项（0016 复用既有权限位），入口为模板页行操作
+   routerList.push(iotUpgradeListRouter as never);
+ 
++  // 展示端（/display/**，TASK-0058）：独立视图区，无后端菜单项，静态挂到布局下；
++  // 需登录（无 meta.public），与管理端 /iot/** 并存不混用，hideInMenu 不进侧栏菜单树。
++  routerList.push(...(displayRouters as never[]));
++
+   // 标签页"刷新"中转路由：先离开目标页（清缓存后卸载），再由中转页跳回实现重新挂载
+   routerList.push({
+     path: '/refresh/:name',
+diff --git a/frontend/src/views/display/components/display-factory-card.vue b/frontend/src/views/display/components/display-factory-card.vue
+new file mode 100644
+index 0000000..9c8cd50
+--- /dev/null
++++ b/frontend/src/views/display/components/display-factory-card.vue
+@@ -0,0 +1,95 @@
++<!--
++  * 展示端工厂卡片（总览页，TASK-0058 批次一）
++  *
++  * 工厂名/下钻取实例树根级真数据（按数据权限裁剪，无权厂不出现）；
++  * 运行/异常/离线数与关键数据项均未交付（0050/0045）——只渲染空态槽位，不造假数字。
++  * 上看板标记（ADR-0011）由 mark 字段驱动放大/置顶，接口未交付前恒缺省=普通卡片。
++  * 点击卡片下钻到工厂页（第 1 次点击）；设备详情入口本批不写死链（批次二 0059 承接）。
++-->
++<template>
++  <a-card
++    size="small"
++    :bordered="false"
++    :hoverable="true"
++    class="display-factory-card"
++    :class="{ 'display-factory-card--marked': node.mark }"
++    @click="emit('drill', node)"
++  >
++    <template #title>
++      <span class="display-factory-card__title">
++        <span v-if="node.mark" class="display-factory-card__mark" title="上看板">上看板</span>
++        {{ node.instanceName }}
++      </span>
++    </template>
++    <template #extra>
++      <span class="display-factory-card__disabled" v-if="node.status === 0">已禁用</span>
++      <RightOutlined v-else class="display-factory-card__arrow" />
++    </template>
++    <div class="display-factory-card__meta">{{ node.instanceCode }}</div>
++
++    <a-row :gutter="8" class="display-factory-card__slots">
++      <a-col :span="8"><display-slot-card title="运行" /></a-col>
++      <a-col :span="8"><display-slot-card title="异常" /></a-col>
++      <a-col :span="8"><display-slot-card title="离线" /></a-col>
++    </a-row>
++    <display-slot-card class="display-factory-card__key" title="关键数据项" />
++    <display-slot-card class="display-factory-card__key" title="核心指标（同比/环比）" />
++  </a-card>
++</template>
++<script setup lang="ts">
++  import RightOutlined from '@ant-design/icons-vue/RightOutlined';
++  import type { DisplayTreeNode } from '/@/api/display/display-api';
++  import DisplaySlotCard from './display-slot-card.vue';
++
++  defineProps<{ node: DisplayTreeNode }>();
++  const emit = defineEmits<{ (e: 'drill', node: DisplayTreeNode): void }>();
++</script>
++<style scoped lang="less">
++  .display-factory-card {
++    cursor: pointer;
++    height: 100%;
++
++    &--marked {
++      border-left: 3px solid #1677ff;
++      box-shadow: 0 1px 6px rgba(22, 119, 255, 0.18);
++    }
++
++    &__title {
++      display: inline-flex;
++      align-items: center;
++      gap: 6px;
++    }
++
++    &__mark {
++      padding: 0 5px;
++      font-size: 11px;
++      line-height: 18px;
++      color: #1677ff;
++      background: #e6f4ff;
++      border-radius: 3px;
++    }
++
++    &__disabled {
++      color: #999;
++      font-size: 12px;
++    }
++
++    &__arrow {
++      color: #1677ff;
++    }
++
++    &__meta {
++      margin-bottom: 8px;
++      color: #999;
++      font-size: 12px;
++    }
++
++    &__slots {
++      margin-bottom: 8px;
++    }
++
++    &__key {
++      margin-top: 8px;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/components/display-slot-card.vue b/frontend/src/views/display/components/display-slot-card.vue
+new file mode 100644
+index 0000000..345c003
+--- /dev/null
++++ b/frontend/src/views/display/components/display-slot-card.vue
+@@ -0,0 +1,78 @@
++<!--
++  * 展示端数据槽位空态卡片（TASK-0058 批次一）
++  *
++  * 数据纪律（硬约束）：状态数/实时值/指标/能耗依赖未交付的 0050 状态读口与 0045
++  * 指标聚合——本批只渲染骨架+空态「实时数据接入中」，绝不造假数字。批次二只换数据源，
++  * 不改布局。上卡标记（ADR-0011）通过 mark 决定卡片放大/置顶，无标记走普通卡片。
++-->
++<template>
++  <a-card
++    size="small"
++    :bordered="false"
++    :hoverable="true"
++    class="display-slot-card"
++    :class="{ 'display-slot-card--marked': mark, 'display-slot-card--pinned': pinned }"
++  >
++    <template #title>
++      <span class="display-slot-card__title">
++        <span v-if="mark" class="display-slot-card__mark" title="上看板">上看板</span>
++        {{ title }}
++      </span>
++    </template>
++    <div class="display-slot-card__body">
++      <a-skeleton :loading="true" :paragraph="{ rows: 2 }" active />
++      <div class="display-slot-card__empty">实时数据接入中</div>
++    </div>
++  </a-card>
++</template>
++<script setup lang="ts">
++  defineProps<{
++    /** 槽位标题（如「运行状态」「核心指标」「能耗构成」「实时值」） */
++    title: string;
++    /** ADR-0011 上看板标记：接口未交付，预留可选字段；有标记放大显示 */
++    mark?: boolean;
++    /** 上看板标记卡片置顶（由父级按 mark 排序后传入，或直接用 CSS order） */
++    pinned?: boolean;
++  }>();
++</script>
++<style scoped lang="less">
++  .display-slot-card {
++    height: 100%;
++
++    &--marked {
++      border-left: 3px solid #1677ff;
++      box-shadow: 0 1px 6px rgba(22, 119, 255, 0.18);
++    }
++
++    &--pinned {
++      order: -1;
++    }
++
++    &__title {
++      display: inline-flex;
++      align-items: center;
++      gap: 6px;
++    }
++
++    &__mark {
++      display: inline-block;
++      padding: 0 5px;
++      font-size: 11px;
++      line-height: 18px;
++      color: #1677ff;
++      background: #e6f4ff;
++      border-radius: 3px;
++    }
++
++    &__body {
++      padding: 6px 0 2px;
++    }
++
++    &__empty {
++      margin-top: 10px;
++      color: #999;
++      font-size: 12px;
++      text-align: center;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/composables/use-display-tree.ts b/frontend/src/views/display/composables/use-display-tree.ts
+new file mode 100644
+index 0000000..8a82544
+--- /dev/null
++++ b/frontend/src/views/display/composables/use-display-tree.ts
+@@ -0,0 +1,37 @@
++/*
++ * 展示端模型树加载（TASK-0058 批次一）
++ *
++ * 三页共用：一次性拉取 GET /iot/instance/tree（已按数据权限裁剪，无权节点不返回），
++ * 前端只做树结构派生（子节点/类型筛选），不再二次过滤权限。加载失败走 error 态，
++ * 空树走 empty 态——两种都不造假数据。
++ */
++import { ref } from 'vue';
++import { displayApi, type DisplayTreeNode } from '/@/api/display/display-api';
++import { OtLoading } from '/@/components/framework/ot-loading';
++
++export function useDisplayTree() {
++  const tree = ref<DisplayTreeNode[]>([]);
++  const loading = ref(false);
++  const error = ref('');
++  const loaded = ref(false);
++
++  async function loadTree(force = false) {
++    if (loaded.value && !force) return;
++    loading.value = true;
++    error.value = '';
++    OtLoading.show();
++    try {
++      tree.value = await displayApi.queryInstanceTree();
++      loaded.value = true;
++    } catch (e) {
++      tree.value = [];
++      error.value = '模型树加载失败，请重试';
++      console.error('[display] load instance tree failed:', e);
++    } finally {
++      loading.value = false;
++      OtLoading.hide();
++    }
++  }
++
++  return { tree, loading, error, loaded, loadTree };
++}
+diff --git a/frontend/src/views/display/display.less b/frontend/src/views/display/display.less
+new file mode 100644
+index 0000000..d2cd7f2
+--- /dev/null
++++ b/frontend/src/views/display/display.less
+@@ -0,0 +1,49 @@
++// 展示端页面公共样式（TASK-0058 批次一）
++.display-page {
++  padding: 16px;
++}
++
++.display-page__header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: 16px;
++}
++
++.display-page__title {
++  margin: 0;
++  font-size: 20px;
++}
++
++.display-page__subtitle {
++  margin-top: 4px;
++  color: #999;
++  font-size: 12px;
++}
++
++.display-page__alert {
++  margin-bottom: 16px;
++}
++
++.display-page__empty {
++  padding: 60px 0;
++}
++
++.display-page__section {
++  margin-top: 20px;
++}
++
++.display-page__section-title {
++  margin: 0 0 12px;
++  font-size: 16px;
++}
++
++.display-page__back {
++  margin-bottom: 12px;
++}
++
++.display-page__crumbs {
++  margin-bottom: 12px;
++  color: #999;
++  font-size: 12px;
++}
+diff --git a/frontend/src/views/display/factory/index.vue b/frontend/src/views/display/factory/index.vue
+new file mode 100644
+index 0000000..732a5fe
+--- /dev/null
++++ b/frontend/src/views/display/factory/index.vue
+@@ -0,0 +1,129 @@
++<!--
++  * 展示端工厂页（TASK-0058 批次一）
++  *
++  * 车间列表 = 实例树工厂节点的第二级真数据（nodeType=2，无权重节点后端已裁剪）；
++  * 工厂指标看板、能耗构成 = 空态槽位（0045 未交付，不造假数字）。
++  * 下钻：点击车间 → /display/workshop/:factoryId/:workshopId（第 2 次点击）。
++  * 设备详情入口本批不写死链（0059 承接）。
++-->
++<template>
++  <div class="display-page">
++    <div class="display-page__back">
++      <a-button type="link" size="small" @click="router.push({ name: 'DisplayOverview' })">
++        <template #icon><LeftOutlined /></template>
++        返回总览
++      </a-button>
++    </div>
++
++    <div class="display-page__header">
++      <div>
++        <h2 class="display-page__title">{{ factory?.instanceName || '工厂' }}</h2>
++        <div class="display-page__subtitle">{{ factory?.instanceCode || '' }}</div>
++      </div>
++    </div>
++
++    <a-alert v-if="error" type="error" :message="error" show-icon class="display-page__alert" />
++
++    <template v-if="loaded">
++      <div v-if="factory" class="display-page__section">
++        <h3 class="display-page__section-title">车间列表</h3>
++        <a-row v-if="workshops.length" :gutter="16">
++          <a-col v-for="ws in sortedWorkshops" :key="ws.id" :span="8" :class="{ 'display-page__pinned': ws.mark }">
++            <a-card size="small" :bordered="false" :hoverable="true" class="display-node-card" @click="onDrill(ws)">
++              <template #title>
++                <span class="display-node-card__title">
++                  <span v-if="ws.mark" class="display-node-card__mark" title="上看板">上看板</span>
++                  {{ ws.instanceName }}
++                </span>
++              </template>
++              <template #extra>
++                <span v-if="ws.status === 0" class="display-node-card__disabled">已禁用</span>
++                <RightOutlined v-else class="display-node-card__arrow" />
++              </template>
++              <div class="display-node-card__meta">{{ ws.instanceCode }}</div>
++            </a-card>
++          </a-col>
++        </a-row>
++        <a-empty v-else description="暂无车间（空数据=新厂空态）" />
++      </div>
++      <a-empty v-else description="工厂不存在或无权访问" class="display-page__empty" />
++
++      <div class="display-page__section">
++        <h3 class="display-page__section-title">工厂指标看板</h3>
++        <a-row :gutter="16">
++          <a-col :span="12"><display-slot-card title="当日核心指标" /></a-col>
++          <a-col :span="12"><display-slot-card title="同比 / 环比" /></a-col>
++        </a-row>
++      </div>
++
++      <div class="display-page__section">
++        <h3 class="display-page__section-title">能耗构成（按车间占比）</h3>
++        <display-slot-card title="电 / 水 / 气 / 蒸汽" />
++      </div>
++    </template>
++    <a-skeleton v-else :loading="true" :paragraph="{ rows: 6 }" active />
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted } from 'vue';
++  import { useRoute, useRouter } from 'vue-router';
++  import LeftOutlined from '@ant-design/icons-vue/LeftOutlined';
++  import RightOutlined from '@ant-design/icons-vue/RightOutlined';
++  import { descendantsOfType, findNode, DISPLAY_NODE_TYPE, type DisplayTreeNode } from '/@/api/display/display-api';
++  import DisplaySlotCard from '../components/display-slot-card.vue';
++  import { useDisplayTree } from '../composables/use-display-tree';
++
++  const route = useRoute();
++  const router = useRouter();
++  const { tree, error, loaded, loadTree } = useDisplayTree();
++
++  const factoryId = computed(() => Number(route.params.factoryId));
++  const factory = computed(() => (Number.isFinite(factoryId.value) ? findNode(tree.value, factoryId.value) : null));
++  const workshops = computed(() => (factory.value ? descendantsOfType(tree.value, factory.value.id, DISPLAY_NODE_TYPE.WORKSHOP) : []));
++  // ADR-0011：标记置顶（接口未交付前恒缺省）。
++  const sortedWorkshops = computed(() => [...workshops.value].sort((a, b) => Number(!!b.mark) - Number(!!a.mark)));
++
++  function onDrill(ws: DisplayTreeNode) {
++    if (ws.status === 0) return;
++    void router.push({
++      name: 'DisplayWorkshop',
++      params: { factoryId: String(factory.value!.id), workshopId: String(ws.id) },
++    });
++  }
++
++  onMounted(() => void loadTree());
++</script>
++<style scoped lang="less">
++  @import '../display.less';
++  .display-page__pinned {
++    order: -1;
++  }
++  .display-node-card {
++    cursor: pointer;
++    height: 100%;
++    &__title {
++      display: inline-flex;
++      align-items: center;
++      gap: 6px;
++    }
++    &__mark {
++      padding: 0 5px;
++      font-size: 11px;
++      line-height: 18px;
++      color: #1677ff;
++      background: #e6f4ff;
++      border-radius: 3px;
++    }
++    &__disabled {
++      color: #999;
++      font-size: 12px;
++    }
++    &__arrow {
++      color: #1677ff;
++    }
++    &__meta {
++      color: #999;
++      font-size: 12px;
++    }
++  }
++</style>
+diff --git a/frontend/src/views/display/overview/index.vue b/frontend/src/views/display/overview/index.vue
+new file mode 100644
+index 0000000..948b787
+--- /dev/null
++++ b/frontend/src/views/display/overview/index.vue
+@@ -0,0 +1,64 @@
++<!--
++  * 展示端总览页（TASK-0058 批次一）
++  *
++  * 工厂卡片网格：工厂名/下钻取实例树根级真数据（数据权限裁剪，无权厂不出现）；
++  * 运行/异常/离线数、关键数据项、核心指标均为空态槽位（0050/0045 未交付，不造假数字）。
++  * 上看板标记（ADR-0011）：卡片按 mark 放大+置顶（接口未交付前恒缺省=普通卡片）。
++  * 下钻：点击工厂卡片 → /display/factory/:factoryId（第 1 次点击）。
++-->
++<template>
++  <div class="display-page">
++    <div class="display-page__header">
++      <div>
++        <h2 class="display-page__title">工厂总览</h2>
++        <div class="display-page__subtitle">按数据权限展示可见工厂（无权工厂不出现）</div>
++      </div>
++      <a-button size="small" @click="loadTree(true)">
++        <template #icon><ReloadOutlined /></template>
++        刷新
++      </a-button>
++    </div>
++
++    <a-alert v-if="error" type="error" :message="error" show-icon class="display-page__alert" />
++
++    <a-row v-if="factories.length" :gutter="16" class="display-overview__grid">
++      <a-col v-for="node in sortedFactories" :key="node.id" :span="8" :class="{ 'display-overview__pinned': node.mark }">
++        <display-factory-card :node="node" @drill="onDrill" />
++      </a-col>
++    </a-row>
++    <a-empty v-else-if="loaded" description="暂无可见工厂（空数据=新厂/无权空态）" class="display-page__empty" />
++    <a-skeleton v-else :loading="true" :paragraph="{ rows: 4 }" active />
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted } from 'vue';
++  import { useRouter } from 'vue-router';
++  import ReloadOutlined from '@ant-design/icons-vue/ReloadOutlined';
++  import { childrenOf, DISPLAY_NODE_TYPE, type DisplayTreeNode } from '/@/api/display/display-api';
++  import DisplayFactoryCard from '../components/display-factory-card.vue';
++  import { useDisplayTree } from '../composables/use-display-tree';
++
++  const router = useRouter();
++  const { tree, error, loaded, loadTree } = useDisplayTree();
++
++  // 根级即工厂（nodeType=1）；不二次过滤权限，树里没有的节点自然不出现。
++  const factories = computed(() => childrenOf(tree.value, null).filter((n) => n.nodeType === DISPLAY_NODE_TYPE.FACTORY));
++  // ADR-0011：上看板标记卡片置顶（mark 字段接口未交付，恒缺省时保持后端 sort 顺序）。
++  const sortedFactories = computed(() => [...factories.value].sort((a, b) => Number(!!b.mark) - Number(!!a.mark)));
++
++  function onDrill(node: DisplayTreeNode) {
++    if (node.status === 0) return; // 禁用节点不下钻
++    void router.push({ name: 'DisplayFactory', params: { factoryId: String(node.id) } });
++  }
++
++  onMounted(() => void loadTree());
++</script>
++<style scoped lang="less">
++  @import '../display.less';
++  .display-overview__grid {
++    align-items: stretch;
++  }
++  .display-overview__pinned {
++    order: -1;
++  }
++</style>
+diff --git a/frontend/src/views/display/workshop/index.vue b/frontend/src/views/display/workshop/index.vue
+new file mode 100644
+index 0000000..e42863a
+--- /dev/null
++++ b/frontend/src/views/display/workshop/index.vue
+@@ -0,0 +1,119 @@
++<!--
++  * 展示端车间 / 产线页（TASK-0058 批次一）
++  *
++  * 设备列表 = 实例树车间（或产线）节点的设备级真数据（nodeType=4，无权重节点后端已裁剪）；
++  * 设备状态色块、实时值 = 空态槽位（0050 状态读口 / 0045 未交付，不造假数字，状态色块仅占位）；
++  * 设备详情入口本批不写死链（0059 承接）——设备行只展示，不提供跳转。
++  * 下钻深度：总览(0)→工厂(1)→车间(2)，全程 2 次点击；设备详情将作为第 3 次（批次二接入）。
++-->
++<template>
++  <div class="display-page">
++    <div class="display-page__back">
++      <a-button type="link" size="small" @click="router.push({ name: 'DisplayFactory', params: { factoryId } })">
++        <template #icon><LeftOutlined /></template>
++        返回工厂
++      </a-button>
++    </div>
++
++    <div class="display-page__crumbs">{{ factory?.instanceName || '工厂' }} / {{ section?.instanceName || '车间 / 产线' }}</div>
++    <div class="display-page__header">
++      <div>
++        <h2 class="display-page__title">{{ section?.instanceName || '车间 / 产线' }}</h2>
++        <div class="display-page__subtitle">{{ section?.instanceCode || '' }}</div>
++      </div>
++    </div>
++
++    <a-alert v-if="error" type="error" :message="error" show-icon class="display-page__alert" />
++
++    <template v-if="loaded">
++      <div v-if="section" class="display-page__section">
++        <h3 class="display-page__section-title">设备列表</h3>
++        <a-row v-if="devices.length" :gutter="16">
++          <a-col v-for="dev in sortedDevices" :key="dev.id" :span="8" :class="{ 'display-page__pinned': dev.mark }">
++            <a-card size="small" :bordered="false" :hoverable="true" class="display-device-card">
++              <template #title>
++                <span class="display-device-card__title">
++                  <span v-if="dev.mark" class="display-device-card__mark" title="上看板">上看板</span>
++                  {{ dev.instanceName }}
++                </span>
++              </template>
++              <template #extra>
++                <span class="display-device-card__status" :class="{ 'display-device-card__status--disabled': dev.status === 0 }">
++                  {{ dev.status === 0 ? '已禁用' : '状态待接入' }}
++                </span>
++              </template>
++              <div class="display-device-card__meta">{{ dev.instanceCode }}</div>
++              <display-slot-card title="状态色块（待接入）" />
++              <display-slot-card class="display-device-card__realtime" title="实时值（待接入）" />
++            </a-card>
++          </a-col>
++        </a-row>
++        <a-empty v-else description="暂无设备（空数据=新车间空态）" />
++      </div>
++      <a-empty v-else description="车间不存在或无权访问" class="display-page__empty" />
++    </template>
++    <a-skeleton v-else :loading="true" :paragraph="{ rows: 6 }" active />
++  </div>
++</template>
++<script setup lang="ts">
++  import { computed, onMounted } from 'vue';
++  import { useRoute, useRouter } from 'vue-router';
++  import LeftOutlined from '@ant-design/icons-vue/LeftOutlined';
++  import { descendantsOfType, findNode, DISPLAY_NODE_TYPE } from '/@/api/display/display-api';
++  import DisplaySlotCard from '../components/display-slot-card.vue';
++  import { useDisplayTree } from '../composables/use-display-tree';
++
++  const route = useRoute();
++  const router = useRouter();
++  const { tree, error, loaded, loadTree } = useDisplayTree();
++
++  const factoryId = computed(() => route.params.factoryId as string);
++  const workshopId = computed(() => Number(route.params.workshopId));
++  const factory = computed(() => {
++    const id = Number(factoryId.value);
++    return Number.isFinite(id) ? findNode(tree.value, id) : null;
++  });
++  const section = computed(() => (Number.isFinite(workshopId.value) ? findNode(tree.value, workshopId.value) : null));
++  // 设备级直接子节点（车间下可能还有产线，descendantsOfType 跨层级收集 nodeType=4）。
++  const devices = computed(() => (section.value ? descendantsOfType(tree.value, section.value.id, DISPLAY_NODE_TYPE.DEVICE) : []));
++  const sortedDevices = computed(() => [...devices.value].sort((a, b) => Number(!!b.mark) - Number(!!a.mark)));
++
++  onMounted(() => void loadTree());
++</script>
++<style scoped lang="less">
++  @import '../display.less';
++  .display-page__pinned {
++    order: -1;
++  }
++  .display-device-card {
++    height: 100%;
++    &__title {
++      display: inline-flex;
++      align-items: center;
++      gap: 6px;
++    }
++    &__mark {
++      padding: 0 5px;
++      font-size: 11px;
++      line-height: 18px;
++      color: #1677ff;
++      background: #e6f4ff;
++      border-radius: 3px;
++    }
++    &__status {
++      color: #999;
++      font-size: 12px;
++      &--disabled {
++        color: #bfbfbf;
++      }
++    }
++    &__meta {
++      margin-bottom: 8px;
++      color: #999;
++      font-size: 12px;
++    }
++    &__realtime {
++      margin-top: 8px;
++    }
++  }
++</style>
+diff --git a/frontend/tests/unit/display/display-routes.spec.ts b/frontend/tests/unit/display/display-routes.spec.ts
+new file mode 100644
+index 0000000..32ff88f
+--- /dev/null
++++ b/frontend/tests/unit/display/display-routes.spec.ts
+@@ -0,0 +1,34 @@
++/*
++ * 展示端路由单测（TASK-0058 批次一）
++ *
++ * 覆盖：三页路由路径/命名、下钻深度 ≤3（总览 0→工厂 1→车间 2，设备详情 3 本批未注册=
++ * 不写死链）、需登录（无 meta.public）、hideInMenu（不进侧栏菜单树）、
++ * 与管理端 /iot/** 路径不混用。
++ */
++import { describe, expect, it } from 'vitest';
++import { displayRouters } from '/@/router/display';
++
++describe('display routes', () => {
++  it('注册三条展示端路由：总览 / 工厂 / 车间，均在 /display/** 命名空间', () => {
++    expect(displayRouters.map((r) => r.path)).toEqual(['/display', '/display/factory/:factoryId', '/display/workshop/:factoryId/:workshopId']);
++    expect(displayRouters.map((r) => r.name)).toEqual(['DisplayOverview', 'DisplayFactory', 'DisplayWorkshop']);
++  });
++
++  it('下钻深度 ≤3：三级路径存在，第四级设备详情本批未注册（不写死链，由 0059 承接）', () => {
++    const paths = displayRouters.map((r) => r.path);
++    expect(paths).toContain('/display');
++    expect(paths).toContain('/display/factory/:factoryId');
++    expect(paths).toContain('/display/workshop/:factoryId/:workshopId');
++    expect(paths.some((p) => p.includes('/device/'))).toBe(false);
++    // 路径段计数：总览=1、工厂=3、车间=4（含 display 前缀与参数段）；无第 5 段=未注册设备详情下钻
++    expect(paths.map((p) => p.split('/').filter(Boolean).length)).toEqual([1, 3, 4]);
++  });
++
++  it('需登录且不在侧栏菜单显示（与管理端 /iot/** 并存不混用）', () => {
++    for (const r of displayRouters) {
++      expect(r.meta?.public).toBeFalsy();
++      expect(r.meta?.hideInMenu).toBe(true);
++      expect(r.path).not.toContain('/iot/');
++    }
++  });
++});
+diff --git a/frontend/tests/unit/display/display-slot-card.spec.ts b/frontend/tests/unit/display/display-slot-card.spec.ts
+new file mode 100644
+index 0000000..0066d18
+--- /dev/null
++++ b/frontend/tests/unit/display/display-slot-card.spec.ts
+@@ -0,0 +1,45 @@
++/*
++ * 展示端空态卡片单测（TASK-0058 批次一）
++ *
++ * 覆盖：数据纪律——卡片只渲染骨架+「实时数据接入中」空态，不出现假数字；
++ * ADR-0011 上看板标记——mark 为真时渲染「上看板」标记并放大/置顶 Class，缺省不渲染。
++ */
++import { describe, expect, it } from 'vitest';
++import { mount } from '@vue/test-utils';
++import Antd from 'ant-design-vue';
++import DisplaySlotCard from '/@/views/display/components/display-slot-card.vue';
++
++describe('display slot card', () => {
++  it('空态卡片渲染骨架与「实时数据接入中」，不含硬编码假数字', () => {
++    const wrapper = mount(DisplaySlotCard, {
++      props: { title: '运行' },
++      global: { plugins: [Antd] },
++    });
++    expect(wrapper.text()).toContain('运行');
++    expect(wrapper.text()).toContain('实时数据接入中');
++    expect(wrapper.find('.ant-skeleton').exists()).toBe(true);
++    // 不造假数字：卡片内不出现 0/12/34 之类状态数占位
++    expect(wrapper.find('.display-slot-card__empty').text()).toBe('实时数据接入中');
++    wrapper.unmount();
++  });
++
++  it('mark 为真渲染上看板标记与放大 Class，缺省时无标记', () => {
++    const marked = mount(DisplaySlotCard, {
++      props: { title: '核心指标', mark: true, pinned: true },
++      global: { plugins: [Antd] },
++    });
++    expect(marked.find('.display-slot-card__mark').exists()).toBe(true);
++    expect(marked.find('.display-slot-card__mark').text()).toBe('上看板');
++    expect(marked.find('.display-slot-card--marked').exists()).toBe(true);
++    expect(marked.find('.display-slot-card--pinned').exists()).toBe(true);
++    marked.unmount();
++
++    const plain = mount(DisplaySlotCard, {
++      props: { title: '核心指标' },
++      global: { plugins: [Antd] },
++    });
++    expect(plain.find('.display-slot-card__mark').exists()).toBe(false);
++    expect(plain.find('.display-slot-card--marked').exists()).toBe(false);
++    plain.unmount();
++  });
++});
+diff --git a/frontend/tests/unit/display/display-tree.spec.ts b/frontend/tests/unit/display/display-tree.spec.ts
+new file mode 100644
+index 0000000..6f41313
+--- /dev/null
++++ b/frontend/tests/unit/display/display-tree.spec.ts
+@@ -0,0 +1,89 @@
++/*
++ * 展示端模型树辅助函数单测（TASK-0058 批次一）
++ *
++ * 覆盖：lazy load（childrenOf 按 parentId 取子节点并按 sort 排序）、
++ * 无权节点过滤（后端已裁剪的前置下前端不再二次过滤：未出现在树中的节点查不到）、
++ * 跨层级类型筛选（工厂→车间、车间→设备，跳过产线中间层）、
++ * 上看板标记字段（mark 为可选字段，缺省不抛错、有值透传供视图层放大/置顶）。
++ */
++import { describe, expect, it } from 'vitest';
++import { childrenOf, descendantsOfType, findNode, DISPLAY_NODE_TYPE, type DisplayTreeNode } from '/@/api/display/display-api';
++
++const tree: DisplayTreeNode[] = [
++  {
++    id: 1,
++    parentId: 0,
++    instanceCode: 'F01',
++    instanceName: '工厂A',
++    nodeType: DISPLAY_NODE_TYPE.FACTORY,
++    sort: 2,
++    mark: true,
++    children: [
++      {
++        id: 11,
++        parentId: 1,
++        instanceCode: 'F01.WS01',
++        instanceName: '车间A1',
++        nodeType: DISPLAY_NODE_TYPE.WORKSHOP,
++        sort: 1,
++        children: [
++          {
++            id: 111,
++            parentId: 11,
++            instanceCode: 'F01.WS01.EQ001',
++            instanceName: '设备A1-1',
++            nodeType: DISPLAY_NODE_TYPE.DEVICE,
++            sort: 1,
++          },
++        ],
++      },
++      {
++        id: 12,
++        parentId: 1,
++        instanceCode: 'F01.WS02',
++        instanceName: '车间A2',
++        nodeType: DISPLAY_NODE_TYPE.WORKSHOP,
++        sort: 2,
++      },
++    ],
++  },
++  {
++    id: 2,
++    parentId: 0,
++    instanceCode: 'F02',
++    instanceName: '工厂B',
++    nodeType: DISPLAY_NODE_TYPE.FACTORY,
++    sort: 1,
++    status: 0,
++  },
++];
++
++describe('display tree helpers', () => {
++  it('childrenOf(null) 返回根级工厂并按 sort 升序', () => {
++    const roots = childrenOf(tree, null);
++    expect(roots.map((n) => n.id)).toEqual([2, 1]);
++  });
++
++  it('childrenOf(父 id) 只返回该父的直接子节点（lazy load 语义）', () => {
++    expect(childrenOf(tree, 1).map((n) => n.id)).toEqual([11, 12]);
++    expect(childrenOf(tree, 11).map((n) => n.id)).toEqual([111]);
++  });
++
++  it('无权节点不出现：树中不存在的父/节点查不到（前端不二次补节点）', () => {
++    expect(findNode(tree, 999)).toBeNull();
++    expect(childrenOf(tree, 999)).toEqual([]);
++    // 工厂B 无车间子节点，下钻它只能得到空列表（无权/空厂空态由视图承接）
++    expect(childrenOf(tree, 2)).toEqual([]);
++  });
++
++  it('descendantsOfType 跨层级筛车间与设备（工厂→车间、车间→设备）', () => {
++    expect(descendantsOfType(tree, 1, DISPLAY_NODE_TYPE.WORKSHOP).map((n) => n.id)).toEqual([11, 12]);
++    expect(descendantsOfType(tree, 11, DISPLAY_NODE_TYPE.DEVICE).map((n) => n.id)).toEqual([111]);
++    expect(descendantsOfType(tree, 1, DISPLAY_NODE_TYPE.DEVICE).map((n) => n.id)).toEqual([111]);
++  });
++
++  it('上看板标记 mark 缺省为 undefined，有值透传（视图层据此放大/置顶）', () => {
++    expect(childrenOf(tree, null).find((n) => n.id === 1)?.mark).toBe(true);
++    expect(childrenOf(tree, null).find((n) => n.id === 2)?.mark).toBeUndefined();
++  });
++});

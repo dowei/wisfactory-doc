@@ -1,0 +1,2281 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategy.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategy.java
+index 948c613..d8bb316 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategy.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategy.java
+@@ -13,18 +13,26 @@ import javax.crypto.Mac;
+ import javax.crypto.spec.SecretKeySpec;
+ import java.nio.charset.StandardCharsets;
+ import java.security.MessageDigest;
++import java.time.Duration;
+ import java.time.LocalDateTime;
+ import java.util.HexFormat;
+ 
+ /**
+- * appKey + HMAC-SHA256 签名策略（TASK-0051 默认实现，ADR-0009 TD-0004）。
++ * appKey + HMAC-SHA256 签名策略（TASK-0051 默认实现，ADR-0009 TD-0004；TASK-0052 扩展轮换并行窗）。
+  *
+  * <p>校验序（brief 定版）：必填头完整性 → timestamp 防重放窗口 → 调用方加载（app_key
+- * 全局唯一定位，已删=不存在）→ 状态（禁用立即生效——验签前先查状态）→ 到期 →
+- * appKey 级可选 IP 白名单（ADR-0013 A7，NULL=不限）→ 签名比对。签名密钥 =
+- * secret_encrypted SM4 解密得的 secret 原文（HMAC 需服务端持原文——上游 secret_hash 列
+- * 无法支持，「与上游差异」登记）；secret_hash 保留列本期不参与验签（「SHA256(提交 secret)
+- * 快速校验」在纯 HMAC 通道无提交 secret 可算——登记报告，轮换期双密钥消费归 0052）。
++ * 全局唯一定位，已删=不存在）→ 状态（禁用立即生效——验签前每请求查库读状态，无缓存无
++ * TTL 空窗，吊销置 0 后下一个请求即 6001）→ 到期 → appKey 级可选 IP 白名单
++ * （ADR-0013 A7，NULL=不限）→ 签名比对。签名密钥 = secret_encrypted SM4 解密得的
++ * secret 原文（HMAC 需服务端持原文——上游 secret_hash 列无法支持，「与上游差异」登记）；
++ * secret_hash/secret_hash_prev 保留列不参与验签（「SHA256(提交 secret) 快速校验」在纯
++ * HMAC 通道无提交 secret 可算——登记报告）。
++ *
++ * <p><b>轮换并行窗（TASK-0052 brief 定版验签顺序）</b>：先当前列验 → 失败再 prev 列验
++ * （且 NOW - secret_rotated_at ≤ ot.openapi.rotation-window-days，默认 7 天——双密钥
++ * 并行，业务连续性）→ 过窗后惰性清理 prev（验签路径判定时清理，不建扫描任务）。
++ * rotated_at 缺失（起点未知）fail-closed 视同过窗（不给旧密钥验签通道）；过窗清理为
++ * 维护性动作 fail-soft（失败 WARN 不影响验签结论——旧密钥已被判定逻辑失效）。
+  *
+  * <p>比对恒时序（{@link MessageDigest#isEqual}）防逐字节试错；解密失败/密文缺失一律
+  * 6001 fail-closed（不降级 500、不给 500 探测面）。
+@@ -39,6 +47,9 @@ public class HmacAuthStrategy implements OpenApiAuthStrategy {
+     /** HMAC 算法名（JDK 标准实现） */
+     private static final String HMAC_ALGO = "HmacSHA256";
+ 
++    /** 轮换并行窗默认天数（TASK-0052 brief：双密钥并行一周；误配 ≤0 时回落本值） */
++    private static final long DEFAULT_ROTATION_WINDOW_DAYS = 7;
++
+     private final OpenApiClientMapper clientMapper;
+     private final OpenApiProperties properties;
+ 
+@@ -72,11 +83,19 @@ public class HmacAuthStrategy implements OpenApiAuthStrategy {
+         }
+         checkIpWhitelist(client, credentials.clientIp());
+ 
++        // 轮换并行窗（TASK-0052）：过窗旧密钥先判定失效（不给验签通道）并惰性清理 prev 列
++        boolean rotationWindowExpired = isRotationWindowExpired(client);
++        if (rotationWindowExpired) {
++            lazyClearRotationWindow(client);
++        }
++
+         String secret = decryptSecret(client);
+-        String expected = hmacSha256Hex(secret, credentials.signaturePayload());
+-        boolean same = MessageDigest.isEqual(
+-                expected.getBytes(StandardCharsets.UTF_8),
+-                credentials.signature().trim().toLowerCase().getBytes(StandardCharsets.UTF_8));
++        boolean same = constantTimeEquals(
++                hmacSha256Hex(secret, credentials.signaturePayload()), credentials.signature());
++        if (!same && !rotationWindowExpired && hasPrevSecret(client)) {
++            // 当前列验签失败 → prev 列验（并行窗内——双密钥并行，业务连续性）
++            same = verifyWithPrevSecret(client, credentials);
++        }
+         if (!same) {
+             throw new OpenApiAuthException("签名不匹配");
+         }
+@@ -107,6 +126,88 @@ public class HmacAuthStrategy implements OpenApiAuthStrategy {
+         throw new OpenApiAuthException("调用方 IP 白名单未放行");
+     }
+ 
++    // ---------- 轮换并行窗（TASK-0052） ----------
++
++    /** prev 列在位（secret_encrypted_prev 非空——并行窗内旧密钥验签输入） */
++    private static boolean hasPrevSecret(OpenApiClientRow client) {
++        return StrUtil.isNotBlank(client.getSecretEncryptedPrev());
++    }
++
++    /**
++     * 并行窗过窗判定：prev 在位且（rotated_at 缺失=起点未知 fail-closed 视同过窗，
++     * 或 NOW - rotated_at &gt; rotation-window-days）。负时差（时钟回拨/误写未来值）不判过窗
++     * （宽于严格——过窗误判会杀死并行窗内合法旧密钥，宁宽勿误杀）。
++     */
++    private boolean isRotationWindowExpired(OpenApiClientRow client) {
++        if (!hasPrevSecret(client)) {
++            return false;
++        }
++        LocalDateTime rotatedAt = client.getSecretRotatedAt();
++        if (rotatedAt == null) {
++            return true;
++        }
++        Duration elapsed = Duration.between(rotatedAt, LocalDateTime.now());
++        if (elapsed.isNegative()) {
++            return false;
++        }
++        return elapsed.compareTo(Duration.ofDays(rotationWindowDays())) > 0;
++    }
++
++    /**
++     * 并行窗天数（ot.openapi.rotation-window-days，默认 7）：≤0 误配回落 7（照 0051 修订轮
++     * I-3 误配回落范式；验签路径逐请求执行，回落静默不做逐请求 WARN——语义：并行窗关不死，
++     * 最短仍 1 天量级的业务连续性保障，误配经配置审计发现）。
++     */
++    private long rotationWindowDays() {
++        long days = properties.getRotationWindowDays();
++        return days > 0 ? days : DEFAULT_ROTATION_WINDOW_DAYS;
++    }
++
++    /**
++     * prev 列验签：SM4 解密旧密文重算 HMAC 恒时序比对；解密失败按「旧密钥不参与」处理
++     * （WARN 留痕不抛 500——并行窗判定已保证只在窗内才走本路径）。
++     */
++    private boolean verifyWithPrevSecret(OpenApiClientRow client, OpenApiCredentials credentials) {
++        try {
++            String prevSecret = SmDataCrypto.decrypt(client.getSecretEncryptedPrev());
++            if (StrUtil.isBlank(prevSecret)) {
++                return false;
++            }
++            return constantTimeEquals(hmacSha256Hex(prevSecret, credentials.signaturePayload()),
++                    credentials.signature());
++        } catch (OpenApiAuthException e) {
++            return false;
++        } catch (Exception e) {
++            log.warn("[OPENAPI] prev secret 解密失败（并行窗旧密钥不参与验签，length={}）",
++                    StrUtil.length(client.getSecretEncryptedPrev()));
++            return false;
++        }
++    }
++
++    /**
++     * 惰性清理（brief：验签路径判定时清理，不建扫描任务）：prev 三列置 NULL；
++     * 失败 WARN fail-soft——维护性动作非安全闸（过窗旧密钥已被判定逻辑失效，
++     * 清理成功与否不改变本次验签结论）。
++     */
++    private void lazyClearRotationWindow(OpenApiClientRow client) {
++        if (client.getId() == null) {
++            return;
++        }
++        try {
++            clientMapper.clearRotationWindow(client.getId());
++            log.info("[OPENAPI] 轮换并行窗已过，prev 密钥已惰性清理 clientId={}", client.getId());
++        } catch (Exception e) {
++            log.warn("[OPENAPI] prev 密钥惰性清理失败（不影响验签结论）clientId={}", client.getId(), e);
++        }
++    }
++
++    /** 签名恒时序比对（调用方签名先归一小写，与 0051 口径一致） */
++    private static boolean constantTimeEquals(String expectedHex, String providedSignature) {
++        return MessageDigest.isEqual(
++                expectedHex.getBytes(StandardCharsets.UTF_8),
++                providedSignature.trim().toLowerCase().getBytes(StandardCharsets.UTF_8));
++    }
++
+     /** secret_encrypted SM4 解密取原文（{v1} 密文，ot.crypto.data-key）；缺失/损坏 fail-closed 6001 */
+     private String decryptSecret(OpenApiClientRow client) {
+         if (StrUtil.isBlank(client.getSecretEncrypted())) {
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
+index fe9d87a..0f43229 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/config/OpenApiProperties.java
+@@ -39,4 +39,12 @@ public class OpenApiProperties {
+      * &lt;=0 视为误配，回落默认 60 并由调用方 WARN。
+      */
+     private long realtimeCacheTtlSeconds = 60;
++
++    /**
++     * 轮换并行窗天数（TASK-0052，默认 7——「双密钥轮换并行一周」）：轮换后
++     * NOW - secret_rotated_at ≤ 本值期间新旧 secret 均可验签（业务连续性）；
++     * 过窗旧 secret 失效并由验签路径惰性清理 prev 列。≤0 误配回落 7
++     * （验签路径逐请求消费，回落静默——HmacAuthStrategy.rotationWindowDays）。
++     */
++    private long rotationWindowDays = 7;
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiClientController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiClientController.java
+new file mode 100644
+index 0000000..cb80de2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/controller/OpenApiClientController.java
+@@ -0,0 +1,121 @@
++package net.otlab.admin.module.openapi.controller;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import cn.dev33.satoken.annotation.SaMode;
++import cn.dev33.satoken.stp.StpUtil;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.openapi.dto.OpenApiClientRotateForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSaveForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSecretVO;
++import net.otlab.admin.module.openapi.dto.OpenApiClientStatusForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientVO;
++import net.otlab.admin.module.openapi.service.OpenApiClientService;
++import net.otlab.core.annotation.OperateLog;
++import net.otlab.core.constant.BusinessType;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 对外调用方管理控制器（TASK-0052，REQ-0035 全生命周期管理面）。
++ *
++ * <p>路径命名空间 {@code /openapi/client}（管理面）——与 {@code /openapi/v1/**} 对外六接口
++ * 严格分层：/openapi/v1/** 由 OpenApiAuthFilter 以 appKey+HMAC 验签（无登录会话），本控制器
++ * 走管理面 Sa-Token 登录态 + @SaCheckPermission 权限码；过滤器对非 /openapi/v1 前缀直通
++ * （0051 既有），两者互不干扰。
++ *
++ * <p><b>权限双轨与编辑分支精查</b>（brief「rate_limit 编辑同接口」——开通/编辑同端点）：
++ * POST /openapi/client 以 {@code SaMode.OR} 放行 add/edit 两码，端点内按 id 有无分支精查
++ * （{@code StpUtil.checkPermission}）——只有 add 码的角色过不了编辑分支、只有 edit 码的
++ * 角色过不了开通分支；NotPermissionException 由 GlobalExceptionHandler 落 403 语义
++ * （越权留痕走 PermissionDeniedAuditListener 既有链路）。
++ *
++ * <p><b>审计无明文</b>：开通/轮换响应体含 secret 明文（全链路仅此一次展示）——两端点
++ * {@code @OperateLog(saveResponse=false)}，响应列不落库，明文不进 sys_operate_log；
++ * 开通入参无 secret（服务端生成）param 列默认落库；吊销/编辑入参响应均无敏感面。
++ * 列表/详情只回掩码、非生命周期动作，不挂 @OperateLog（0019 四动作口径同款）。
++ *
++ * <p><b>吊销立即生效</b>（REQ-0035 验收 4）：PUT /status 置 0 后验签路径下一个请求即 403
++ * ——验签每请求查库读 status（0051 HmacAuthStrategy 现状），无缓存无 TTL 空窗，
++ * 无需缓存主动失效钩子（ADR-0006 思路核对结论：现状已天然满足，报告登记）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Tag(name = "对外调用方管理")
++@RestController
++@RequestMapping("/openapi/client")
++public class OpenApiClientController {
++
++    @Autowired
++    private OpenApiClientService clientService;
++
++    @OperateLog(title = "调用方管理", businessType = BusinessType.INSERT, saveResponse = false)
++    @Operation(summary = "开通/编辑调用方（开通/编辑同接口——brief「rate_limit 编辑同接口」）："
++            + "无 id=开通（服务端生成随机 secret≥32 字符，SM4+SHA256 双列落库，明文仅本次响应"
++            + "返回一次；appKey 全局唯一撞键 4002）；带 id=编辑（白名单字段 client_name/scope/"
++            + "rate_limit/ip_whitelist/expire_time/remark，scope 传空白串=显式清空=默认拒绝；"
++            + "app_key/secret/status 不可经编辑触达）。审计响应列不落库——响应含明文")
++    @PostMapping
++    @SaCheckPermission(value = {"openapi:client:add", "openapi:client:edit"}, mode = SaMode.OR)
++    public Result<?> save(@Valid @RequestBody OpenApiClientSaveForm form) {
++        if (form.getId() == null) {
++            // 开通分支精查：仅持 edit 码的角色不可开通
++            StpUtil.checkPermission("openapi:client:add");
++            return Result.success(clientService.createClient(form));
++        }
++        // 编辑分支精查：仅持 add 码的角色不可编辑
++        StpUtil.checkPermission("openapi:client:edit");
++        clientService.editClient(form);
++        return Result.success();
++    }
++
++    @Operation(summary = "调用方列表（分页；只含掩码前四****后四、scope/rate_limit/status/"
++            + "轮换时间——永不返回明文/密文/哈希）")
++    @GetMapping("/list")
++    @SaCheckPermission("openapi:client:list")
++    public Result<Page<OpenApiClientVO>> list(
++            @RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
++            @RequestParam(value = "pageSize", defaultValue = "10") Integer pageSize,
++            @RequestParam(value = "appKey", required = false) String appKey,
++            @RequestParam(value = "status", required = false) Integer status) {
++        return Result.success(clientService.listClients(pageNum, pageSize, appKey, status));
++    }
++
++    @Operation(summary = "调用方详情（同列表口径：只回掩码）")
++    @GetMapping("/{id}")
++    @SaCheckPermission("openapi:client:list")
++    public Result<OpenApiClientVO> detail(@PathVariable("id") Long id) {
++        return Result.success(clientService.detail(id));
++    }
++
++    @OperateLog(title = "调用方管理", businessType = BusinessType.UPDATE, saveResponse = false)
++    @Operation(summary = "轮换密钥（当前值原子移入 prev 三列——并行窗口起点；新 secret 明文仅本次"
++            + "响应返回一次；并行窗默认 7 天内新旧双验签，过窗旧密钥失效并由验签路径惰性清理；"
++            + "审计响应列不落库——响应含明文）")
++    @PostMapping("/rotate")
++    @SaCheckPermission("openapi:client:edit")
++    public Result<OpenApiClientSecretVO> rotate(@Valid @RequestBody OpenApiClientRotateForm form) {
++        return Result.success(clientService.rotateSecret(form.getId()));
++    }
++
++    @OperateLog(title = "调用方管理", businessType = BusinessType.UPDATE)
++    @Operation(summary = "吊销/启用（status=0 吊销立即生效——验签路径每请求查库，无 TTL 空窗；"
++            + "status=1 启用；非物理删除，行保留审计）")
++    @PutMapping("/status")
++    @SaCheckPermission("openapi:client:remove")
++    public Result<Void> updateStatus(@Valid @RequestBody OpenApiClientStatusForm form) {
++        clientService.updateStatus(form.getId(), form.getStatus());
++        return Result.success();
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientRotateForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientRotateForm.java
+new file mode 100644
+index 0000000..dafa16c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientRotateForm.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.openapi.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 调用方轮换请求（TASK-0052 brief：body 传 id）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "调用方轮换请求（TASK-0052）")
++public class OpenApiClientRotateForm {
++
++    @NotNull(message = "调用方 ID 不能为空")
++    @Schema(description = "调用方 ID")
++    private Long id;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSaveForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSaveForm.java
+new file mode 100644
+index 0000000..ff4cf5c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSaveForm.java
+@@ -0,0 +1,54 @@
++package net.otlab.admin.module.openapi.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++import java.time.LocalDateTime;
++
++/**
++ * 调用方开通/编辑表单（TASK-0052，brief「rate_limit 编辑同接口」——POST /openapi/client）。
++ *
++ * <p>无 id = 开通（openapi:client:add 分支）：appKey/clientName 必填，secret 服务端生成；
++ * 带 id = 编辑（openapi:client:edit 分支）：白名单字段非空覆盖，appKey/secret/status 不可经
++ * 编辑触达（app_key 创建后不可改——REQ-0035 核心规则；明文永不回传）。status 不在表单——
++ * 启用起步固定 1，启停走 PUT /openapi/client/status 单设权限。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "调用方开通/编辑表单（TASK-0052）")
++public class OpenApiClientSaveForm {
++
++    @Schema(description = "调用方 ID（空=开通；带值=编辑）")
++    private Long id;
++
++    @Size(max = 64, message = "appKey 长度不能超过 64")
++    @Schema(description = "调用方标识（全局唯一；开通必填，编辑忽略——创建后不可改）")
++    private String appKey;
++
++    @Size(max = 100, message = "调用方名称长度不能超过 100")
++    @Schema(description = "调用方名称（开通必填）")
++    private String clientName;
++
++    @Schema(description = "授权模型范围 JSON（{\"instanceIds\":[...],\"subtree\":true}；"
++            + "开通传空=默认拒绝；编辑传空白串=显式清空（默认拒绝），不传=不改）")
++    private String scope;
++
++    @Min(value = 0, message = "限流不能为负数")
++    @Schema(description = "限流（次/分钟），0 不限；不传=不改")
++    private Integer rateLimit;
++
++    @Size(max = 500, message = "IP 白名单长度不能超过 500")
++    @Schema(description = "IP 白名单（CSV，空=不限；不传=不改）")
++    private String ipWhitelist;
++
++    @Schema(description = "密钥到期时间（空=不过期；不传=不改）")
++    private LocalDateTime expireTime;
++
++    @Size(max = 500, message = "备注长度不能超过 500")
++    @Schema(description = "备注（不传=不改）")
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSecretVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSecretVO.java
+new file mode 100644
+index 0000000..dd2eace
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientSecretVO.java
+@@ -0,0 +1,41 @@
++package net.otlab.admin.module.openapi.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++/**
++ * 调用方开通/轮换响应（TASK-0052）——<b>明文 secret 全链路仅此一次展示</b>
++ * （REQ-0035 验收 1「开通调用方时明文 secret 仅展示一次」）。
++ *
++ * <p>本 VO 只由开通（POST /openapi/client 无 id 分支）与轮换（POST /openapi/client/rotate）
++ * 两个端点返回；响应体经 @OperateLog(saveResponse=false) 不进操作日志、列表/详情 VO
++ * 结构上无明文字段、库中只落 SM4 密文与 SHA256 哈希——明文出服务端内存即消失。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "调用方开通/轮换响应（明文仅此一次——TASK-0052）")
++public class OpenApiClientSecretVO {
++
++    @Schema(description = "调用方 ID")
++    private Long id;
++
++    @Schema(description = "调用方标识（全局唯一）")
++    private String appKey;
++
++    @Schema(description = "secret 明文（仅本次响应展示一次，请立即妥善保存；任何接口不再返回）")
++    private String secret;
++
++    @Schema(description = "「仅此一次」提示")
++    private String notice;
++
++    public static OpenApiClientSecretVO of(Long id, String appKey, String secret) {
++        return new OpenApiClientSecretVO(id, appKey, secret,
++                "secret 明文仅本次响应展示一次，服务端不存明文、任何后续接口/列表不再返回，请立即妥善保存");
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientStatusForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientStatusForm.java
+new file mode 100644
+index 0000000..a68651a
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientStatusForm.java
+@@ -0,0 +1,31 @@
++package net.otlab.admin.module.openapi.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotNull;
++import lombok.Data;
++
++/**
++ * 调用方吊销/启用请求（TASK-0052 brief：PUT /openapi/client/status，status 置 0=吊销）。
++ *
++ * <p>吊销立即生效无 TTL 空窗：验签路径（HmacAuthStrategy）每请求查库读 status，
++ * 无任何客户端缓存——置 0 后下一个请求即 403（REQ-0035 验收 4）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "调用方吊销/启用请求（TASK-0052）")
++public class OpenApiClientStatusForm {
++
++    @NotNull(message = "调用方 ID 不能为空")
++    @Schema(description = "调用方 ID")
++    private Long id;
++
++    @NotNull(message = "status 不能为空")
++    @Min(value = 0, message = "status 仅允许 0/1")
++    @Max(value = 1, message = "status 仅允许 0/1")
++    @Schema(description = "目标状态：0 吊销（禁用，立即生效）1 启用")
++    private Integer status;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientVO.java
+new file mode 100644
+index 0000000..2ae4a4d
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/dto/OpenApiClientVO.java
+@@ -0,0 +1,79 @@
++package net.otlab.admin.module.openapi.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.time.LocalDateTime;
++
++/**
++ * 调用方列表/详情视图（TASK-0052，REQ-0035 验收 6「列表与详情永不返回明文密钥」）。
++ *
++ * <p>结构化边界：本 VO <b>不存在</b> secret 明文/SM4 密文/SHA256 哈希任何密钥材料字段
++ * （单测反射断言固化——OpenApiClientAuditNoPlaintextTest）；密钥仅 {@link #secretMask}
++ * 掩码形态（前四****后四，0019 CredentialMask 同款范式；解密失败降级纯 ****）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@Schema(description = "调用方视图（只含掩码，永不回明文/密文/哈希——TASK-0052）")
++public class OpenApiClientVO {
++
++    @Schema(description = "调用方 ID")
++    private Long id;
++
++    @Schema(description = "调用方标识（全局唯一）")
++    private String appKey;
++
++    @Schema(description = "调用方名称")
++    private String clientName;
++
++    @Schema(description = "授权模型范围 JSON（空=默认拒绝）")
++    private String scope;
++
++    @Schema(description = "限流（次/分钟），0 不限")
++    private Integer rateLimit;
++
++    @Schema(description = "IP 白名单（CSV，空=不限）")
++    private String ipWhitelist;
++
++    @Schema(description = "密钥到期时间")
++    private LocalDateTime expireTime;
++
++    @Schema(description = "状态 0 禁用 1 启用")
++    private Integer status;
++
++    @Schema(description = "secret 掩码（前四****后四；解密失败/空=****）")
++    private String secretMask;
++
++    @Schema(description = "最近轮换时间（并行窗口起点；未轮换过为空）")
++    private LocalDateTime secretRotatedAt;
++
++    @Schema(description = "备注")
++    private String remark;
++
++    @Schema(description = "创建时间")
++    private LocalDateTime createTime;
++
++    @Schema(description = "更新时间")
++    private LocalDateTime updateTime;
++
++    /** 实体 → 视图（掩码由服务层解密后派生传入——唯一持明文瞬间在服务层，不进 VO 字段名） */
++    public static OpenApiClientVO of(net.otlab.admin.module.openapi.entity.IotApiClient row, String secretMask) {
++        OpenApiClientVO vo = new OpenApiClientVO();
++        vo.setId(row.getId());
++        vo.setAppKey(row.getAppKey());
++        vo.setClientName(row.getClientName());
++        vo.setScope(row.getScope());
++        vo.setRateLimit(row.getRateLimit());
++        vo.setIpWhitelist(row.getIpWhitelist());
++        vo.setExpireTime(row.getExpireTime());
++        vo.setStatus(row.getStatus());
++        vo.setSecretMask(secretMask);
++        vo.setSecretRotatedAt(row.getSecretRotatedAt());
++        vo.setRemark(row.getRemark());
++        vo.setCreateTime(row.getCreateTime());
++        vo.setUpdateTime(row.getUpdateTime());
++        return vo;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/entity/IotApiClient.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/entity/IotApiClient.java
+new file mode 100644
+index 0000000..b581b48
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/entity/IotApiClient.java
+@@ -0,0 +1,90 @@
++package net.otlab.admin.module.openapi.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.time.LocalDateTime;
++
++/**
++ * 对外调用方实体类（TASK-0052，iot_api_client——附录 A p34 + 0051 两差异列 + 0052 轮换三新列）。
++ *
++ * <p>列族（升级脚本 20261122_iot_openapi_domain.sql + 20261123_iot_api_client_rotation.sql）：
++ * <ul>
++ * <li>{@code secret_hash} / {@code secret_hash_prev}——SHA256(明文 secret)，快速校验保留列
++ *     （纯 HMAC 通道无提交 secret 可算，不参与验签——0051 报告登记）；</li>
++ * <li>{@code secret_encrypted}——现役密钥 SM4 密文（{v1} 前缀，ot.crypto.data-key），
++ *     HMAC 验签需服务端持原文；</li>
++ * <li>{@code secret_encrypted_prev} / {@code secret_rotated_at}——轮换并行窗承载
++ *     （TASK-0052「双密钥轮换并行一周」）：轮换时现值原子移入 prev，窗口起点 rotated_at，
++ *     窗内新旧双验签，过窗旧密钥失效并惰性清理。</li>
++ * </ul>
++ *
++ * <p>明文 secret 只在服务端内存存在（开通/轮换响应体一次性返回），任何列/日志/列表均不落
++ * （REQ-0035 验收 1/6）；app_key 全局唯一（uk_app_key）且创建后不可改（REQ-0035 核心规则）。
++ * 多租户：iot_ 前缀表由 OtTenantLineHandler 前缀规则按会话租户注入条件（管理面会话链路）；
++ * /openapi/v1 机器验签链路走旁路显式条件范式（OpenApiClientMapper，0051）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_api_client")
++@Schema(description = "对外调用方（TASK-0052）")
++public class IotApiClient extends BaseEntity {
++
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "调用方 ID")
++    private Long id;
++
++    @Schema(description = "租户 ID（服务层从会话覆盖，禁前端传参）")
++    private Long tenantId;
++
++    @Schema(description = "调用方标识（全局唯一 uk_app_key，创建后不可改）")
++    private String appKey;
++
++    @Schema(description = "密钥哈希 SHA256(明文)（快速校验保留列，不参与验签）")
++    private String secretHash;
++
++    @Schema(description = "现役密钥 SM4 密文（{v1} 前缀）——永不经管理面接口回传")
++    private String secretEncrypted;
++
++    @Schema(description = "轮换前密文（SM4，并行窗内仍可验签）——永不经管理面接口回传")
++    private String secretEncryptedPrev;
++
++    @Schema(description = "轮换前哈希（SHA256，快速校验保留列）")
++    private String secretHashPrev;
++
++    @Schema(description = "轮换时间（并行窗口起点）")
++    private LocalDateTime secretRotatedAt;
++
++    @Schema(description = "调用方名称")
++    private String clientName;
++
++    @Schema(description = "授权模型范围 JSON（{\"instanceIds\":[...],\"subtree\":true}；空=默认拒绝）")
++    private String scope;
++
++    @Schema(description = "限流（次/分钟），0 不限")
++    private Integer rateLimit;
++
++    @Schema(description = "IP 白名单（CSV，NULL=不限）")
++    private String ipWhitelist;
++
++    @Schema(description = "密钥到期时间")
++    private LocalDateTime expireTime;
++
++    @Schema(description = "状态 0 禁用（吊销，立即生效）1 启用")
++    private Integer status;
++
++    @Schema(description = "备注")
++    private String remark;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/IotApiClientManageMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/IotApiClientManageMapper.java
+new file mode 100644
+index 0000000..d80ec46
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/IotApiClientManageMapper.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.openapi.mapper;
++
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.openapi.entity.IotApiClient;
++import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Update;
++
++/**
++ * 对外调用方管理 Mapper（TASK-0052，管理面会话链路）。
++ *
++ * <p>继承 BaseMapper 供 MyBatis-Plus 通用 CRUD（分页/按 id 取行/白名单更新）；iot_ 前缀表
++ * 由 OtTenantLineHandler 在会话线程自动注入租户条件、@TableLogic 自动过滤已删行
++ * （照 module/iot 管理面范式）。/openapi/v1 机器验签链路的旁路显式条件读取走
++ * {@link OpenApiClientMapper}（0051 既有，本 Mapper 不承载验签路径）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Mapper
++public interface IotApiClientManageMapper extends BaseMapper<IotApiClient> {
++
++    /**
++     * 轮换（TASK-0052 brief 定版）：当前值原子移入 prev 三列 + 新密钥入主列——
++     * 单条 UPDATE 行内换装，不存在「旧值既不在 prev 也不在主列」的中间态（业务连续性）。
++     *
++     * <p>会话链路执行：租户条件由多租户插件注入（防御纵深）；deleted=0 显式声明
++     * （原生 @Update 不过 @TableLogic）。影响行数 0 = 行不存在/已删/越租户 → 服务层拒绝。
++     */
++    @Update("UPDATE iot_api_client SET secret_encrypted_prev = secret_encrypted, "
++            + "secret_hash_prev = secret_hash, secret_rotated_at = NOW(), "
++            + "secret_encrypted = #{newEncrypted}, secret_hash = #{newHash} "
++            + "WHERE id = #{id} AND deleted = 0")
++    int rotateSecret(@Param("id") Long id,
++                     @Param("newEncrypted") String newEncrypted,
++                     @Param("newHash") String newHash);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientMapper.java
+index 787bca7..9e60e1c 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientMapper.java
+@@ -1,9 +1,10 @@
+ package net.otlab.admin.module.openapi.mapper;
+ 
+ import org.apache.ibatis.annotations.Mapper;
+-import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ import org.apache.ibatis.annotations.Param;
+ import org.apache.ibatis.annotations.Select;
++import org.apache.ibatis.annotations.Update;
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ 
+ /**
+  * 对外调用方只读 Mapper（TASK-0051，iot_api_client）。
+@@ -27,8 +28,23 @@ public interface OpenApiClientMapper {
+      * 范式）：app_key 全局唯一，无租户歧义；deleted 显式声明（原生 @Select 不过 @TableLogic）。
+      */
+     @InterceptorIgnore(tenantLine = "true")
+-    @Select("SELECT id, tenant_id, app_key, secret_hash, secret_encrypted, client_name, scope, "
+-            + "rate_limit, ip_whitelist, expire_time, status, remark, deleted "
++    @Select("SELECT id, tenant_id, app_key, secret_hash, secret_encrypted, "
++            + "secret_encrypted_prev, secret_hash_prev, secret_rotated_at, "
++            + "client_name, scope, rate_limit, ip_whitelist, expire_time, status, remark, deleted "
+             + "FROM iot_api_client WHERE app_key = #{appKey} LIMIT 1")
+     OpenApiClientRow selectByAppKey(@Param("appKey") String appKey);
++
++    /**
++     * 轮换并行窗惰性清理（TASK-0052，brief「过窗后惰性清理 prev——验签路径判定时清理，
++     * 不建扫描任务」）：prev 三列置 NULL，行主列（现役密钥）不动。
++     *
++     * <p>调用方为 {@code HmacAuthStrategy}（机器线程，无登录会话）——旁路多租户插件
++     * （显式条件范式，id 为物理主键无租户歧义）；清理属维护性动作非安全闸（过窗旧密钥
++     * 已被策略判定逻辑失效，清理失败仅 WARN 不影响验签结论）。只读投影 Mapper 的唯一
++     * 写入例外，即本方法；管理面轮换走 IotApiClientManageMapper.rotateSecret。
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Update("UPDATE iot_api_client SET secret_encrypted_prev = NULL, secret_hash_prev = NULL, "
++            + "secret_rotated_at = NULL WHERE id = #{id} AND deleted = 0")
++    int clearRotationWindow(@Param("id") Long id);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientRow.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientRow.java
+index e7c27dd..54d0b9f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientRow.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/mapper/OpenApiClientRow.java
+@@ -12,6 +12,8 @@ import java.time.LocalDateTime;
+  * <li>{@code secret_encrypted}——HMAC 验签需服务端持 secret 原文，上游仅 secret_hash
+  *     无法支持；SM4 密文（{v1} 前缀，ot.crypto.data-key 加密，与 iot_channel_credential
+  *     同款组件）；secret_hash 保留（SHA256(明文 secret)）供轮换/快速校验消费（0052）。</li>
++ * <li>{@code secret_encrypted_prev} / {@code secret_hash_prev} / {@code secret_rotated_at}
++ *     ——轮换并行窗承载（TASK-0052）：窗内旧密钥可参与验签，过窗失效并惰性清理。</li>
+  * <li>{@code ip_whitelist}——appKey 级可选 IP 白名单（ADR-0013 A7），NULL=不限，CSV 形态。</li>
+  * </ul>
+  *
+@@ -33,9 +35,18 @@ public class OpenApiClientRow {
+     /** 密钥哈希（SHA256(明文 secret)，不存明文——上游原列，保留） */
+     private String secretHash;
+ 
+-    /** 密钥 SM4 密文（{v1} 前缀——本任务新增列，HMAC 验签解密取原文） */
++    /** 密钥 SM4 密文（{v1} 前缀——0051 新增列，HMAC 验签解密取原文） */
+     private String secretEncrypted;
+ 
++    /** 轮换前密文（SM4，并行窗内仍可参与验签——TASK-0052 三新列） */
++    private String secretEncryptedPrev;
++
++    /** 轮换前哈希（SHA256，快速校验保留列——TASK-0052 三新列） */
++    private String secretHashPrev;
++
++    /** 轮换时间（并行窗口起点，过窗判定与惰性清理依据——TASK-0052 三新列） */
++    private LocalDateTime secretRotatedAt;
++
+     /** 调用方名称 */
+     private String clientName;
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiClientService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiClientService.java
+new file mode 100644
+index 0000000..070009e
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/OpenApiClientService.java
+@@ -0,0 +1,52 @@
++package net.otlab.admin.module.openapi.service;
++
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSaveForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSecretVO;
++import net.otlab.admin.module.openapi.dto.OpenApiClientVO;
++
++/**
++ * 对外调用方管理服务（TASK-0052，REQ-0035 全生命周期：开通/编辑/列表/轮换/吊销）。
++ *
++ * <p>明文 secret 只在开通与轮换的响应 VO 中出现一次（REQ-0035 验收 1）；列表/详情只回掩码
++ * （验收 6）；轮换双密钥并行窗默认 7 天（ot.openapi.rotation-window-days）——窗内新旧
++ * secret 均可验签（业务连续性），过窗旧密钥失效并由验签路径惰性清理（验收 3）；吊销
++ * 立即生效无 TTL 空窗（验收 4——验签路径每请求查库）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++public interface OpenApiClientService {
++
++    /**
++     * 开通调用方：服务端生成随机 secret（≥32 字符安全随机）→ SM4 落 secret_encrypted +
++     * SHA256 落 secret_hash；appKey 全局唯一（撞键 4002）；scope JSON 合法性校验（空=默认
++     * 拒绝）；明文仅本次响应 VO 返回一次。
++     */
++    OpenApiClientSecretVO createClient(OpenApiClientSaveForm form);
++
++    /**
++     * 编辑调用方（brief「rate_limit 编辑同接口」）：白名单字段 client_name/scope/rate_limit/
++     * ip_whitelist/expire_time/remark；app_key/secret/status 不可经编辑触达；编辑分支鉴权
++     * （openapi:client:edit）由控制器分支精查。
++     */
++    void editClient(OpenApiClientSaveForm form);
++
++    /**
++     * 列表（分页）：只含掩码（前四****后四）与 scope/rate_limit/status/轮换时间，
++     * 无任何密文/明文/哈希。
++     */
++    Page<OpenApiClientVO> listClients(long pageNum, long pageSize, String appKey, Integer status);
++
++    /** 详情：同列表口径（只回掩码）。 */
++    OpenApiClientVO detail(Long id);
++
++    /**
++     * 轮换：当前值原子移入 prev 三列（secret_encrypted_prev/secret_hash_prev/
++     * secret_rotated_at=NOW）→ 新 secret 入主列；新明文仅本次响应 VO 返回一次。
++     */
++    OpenApiClientSecretVO rotateSecret(Long id);
++
++    /** 吊销/启用（status 置 0/1）；吊销立即生效——验签路径每请求查库，无 TTL 空窗。 */
++    void updateStatus(Long id, Integer status);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiClientServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiClientServiceImpl.java
+new file mode 100644
+index 0000000..ce3bdc3
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/openapi/service/impl/OpenApiClientServiceImpl.java
+@@ -0,0 +1,300 @@
++package net.otlab.admin.module.openapi.service.impl;
++
++import cn.hutool.core.util.StrUtil;
++import cn.hutool.json.JSONUtil;
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.credential.domain.CredentialMask;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSaveForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSecretVO;
++import net.otlab.admin.module.openapi.dto.OpenApiClientVO;
++import net.otlab.admin.module.openapi.entity.IotApiClient;
++import net.otlab.admin.module.openapi.mapper.IotApiClientManageMapper;
++import net.otlab.admin.module.openapi.auth.OpenApiCredentials;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.security.SmDataCrypto;
++import net.otlab.core.tenant.TenantContext;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.nio.charset.StandardCharsets;
++import java.security.SecureRandom;
++import java.util.Base64;
++import java.util.List;
++
++/**
++ * 对外调用方管理服务实现（TASK-0052，REQ-0035 / ADR-0006 口径）。
++ *
++ * <p><b>密钥生命周期</b>：开通/轮换时服务端生成随机 secret（SecureRandom 32 字节 →
++ * base64url 43 字符，≥32 字符安全随机）→ SM4 加密落 {@code secret_encrypted}
++ * （{v1} 前缀，ot.crypto.data-key；加密失败 fail-closed 拒保存——明文恰以 {v1} 开头
++ * 幂等原样返回的形态直接拒绝，照 0019 同款守卫）+ SHA256 落 {@code secret_hash}
++ * （快速校验保留列，纯 HMAC 通道不参与验签——0051 登记口径）；明文全链路仅在响应
++ * VO 出现一次，库中/日志/列表均无（REQ-0035 验收 1/6）。
++ *
++ * <p><b>轮换（双密钥并行窗）</b>：单条原子 UPDATE 行内换装——当前值移入 prev 三列
++ * （secret_encrypted_prev/secret_hash_prev/secret_rotated_at=NOW）+ 新密钥入主列，
++ * 不存在「旧值既不在 prev 也不在主列」的中间态；并行窗判定与过窗惰性清理在验签路径
++ * （{@code HmacAuthStrategy}——判定时清理，不建扫描任务）。并发轮换语义：两管理员
++ * 同时轮换，后到者以前到者落库后的主列值为 prev（「当前值移入 prev」按语句执行时刻
++ * 的行内值，语义自洽），无中间态暴露。
++ *
++ * <p><b>appKey 全局唯一</b>：预检（本租户可见范围）+ DuplicateKeyException 兜底双闸，
++ * 均转业务码 4002（ResultCode.DUPLICATE_CODE，0015 M-2 同款）——uk_app_key 为物理
++ * 全局唯一（跨租户、含逻辑删行），预检查不到他租户/已删行占用时落库撞键由兜底闸拒绝，
++ * 两闸同文案不区分原因（不给枚举探测面）；逻辑删行占用 app_key 属物理唯一约束范畴，
++ * 亦归 4002（登记：如需复用被逻辑删 appKey，先由管理员清理行）。
++ *
++ * <p><b>租户与隔离</b>：管理面会话链路——tenant_id 服务层从会话覆盖（禁前端传参，
++ * 0019 同款）；查询经多租户插件注入会话租户条件 + @TableLogic 过滤已删行。
++ *
++ * <p><b>列表永不回明文</b>：服务层解密 secret_encrypted 后经 {@link CredentialMask}
++ * 掩码化（0019 同款：≥12 前四****后四 / 8-11 前四**** / 更短或解密失败纯 ****），
++ * 解密失败降级纯占位（列表不崩、不泄底）；VO 结构上无密钥材料字段。
++ *
++ * <p><b>吊销立即生效</b>（REQ-0035 验收 4）：status 置 0（字段白名单更新，不触密钥列）；
++ * 验签路径（HmacAuthStrategy）每请求查库读 status，无缓存无 TTL——置 0 后下一个请求
++ * 即 403，无主动失效钩子需求（0051 filter 现状实证，报告登记）。
++ *
++ * <p><b>日志无明文</b>：本服务任何日志调用不携带明文/密文（只记 id/appKey 长度等元数据）。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++@Slf4j
++@Service
++public class OpenApiClientServiceImpl extends ServiceImpl<IotApiClientManageMapper, IotApiClient>
++        implements net.otlab.admin.module.openapi.service.OpenApiClientService {
++
++    /** secret 随机字节长度（32 字节 → base64url 43 字符，满足 brief ≥32 字符） */
++    private static final int SECRET_RANDOM_BYTES = 32;
++
++    /** 状态值域（0 禁用 1 启用） */
++    private static final int STATUS_DISABLED = 0;
++    private static final int STATUS_ENABLED = 1;
++
++    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
++
++    // ---------- 开通 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public OpenApiClientSecretVO createClient(OpenApiClientSaveForm form) {
++        String appKey = StrUtil.trimToNull(form.getAppKey());
++        if (appKey == null) {
++            throw paramError("appKey 不能为空");
++        }
++        String clientName = StrUtil.trimToNull(form.getClientName());
++        if (clientName == null) {
++            throw paramError("调用方名称不能为空");
++        }
++        String scope = normalizeScope(form.getScope());
++
++        // appKey 全局唯一预检（本租户可见范围；跨租户/已删行占用由落库撞键兜底闸拒绝）
++        IotApiClient existing = this.getOne(new LambdaQueryWrapper<IotApiClient>()
++                .eq(IotApiClient::getAppKey, appKey)
++                .last("LIMIT 1"));
++        if (existing != null) {
++            throw duplicateAppKey(appKey);
++        }
++
++        String secret = generateSecret();
++        String ciphertext = SmDataCrypto.encrypt(secret);
++        if (!SmDataCrypto.isCiphertext(ciphertext) || ciphertext.equals(secret)) {
++            // fail-closed：明文恰以 {v1} 开头时 encrypt 幂等原样返回（落库将是未加密明文），拒绝
++            throw paramError("secret 加密失败，拒绝保存（fail-closed）");
++        }
++        String hash = OpenApiCredentials.sha256Hex(secret.getBytes(StandardCharsets.UTF_8));
++
++        IotApiClient entity = new IotApiClient();
++        entity.setTenantId(TenantContext.getTenantId());
++        entity.setAppKey(appKey);
++        entity.setSecretHash(hash);
++        entity.setSecretEncrypted(ciphertext);
++        entity.setClientName(clientName);
++        entity.setScope(scope);
++        entity.setRateLimit(form.getRateLimit());
++        entity.setIpWhitelist(StrUtil.trimToNull(form.getIpWhitelist()));
++        entity.setExpireTime(form.getExpireTime());
++        entity.setStatus(STATUS_ENABLED);
++        entity.setRemark(StrUtil.trimToNull(form.getRemark()));
++        try {
++            this.save(entity);
++        } catch (DuplicateKeyException e) {
++            // 并发/跨租户/逻辑删行占用的物理唯一约束兜底：同 4002 口径（不给存在性差异探测面）
++            throw duplicateAppKey(appKey);
++        }
++        log.info("[OPENAPI] 调用方开通 id={}, appKey 长度={}, rateLimit={}", entity.getId(),
++                StrUtil.length(appKey), entity.getRateLimit());
++        // 明文全链路仅此一次（响应体）；notice 提示「仅此一次」
++        return OpenApiClientSecretVO.of(entity.getId(), entity.getAppKey(), secret);
++    }
++
++    // ---------- 编辑 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void editClient(OpenApiClientSaveForm form) {
++        if (form.getId() == null) {
++            throw paramError("编辑调用方：id 不能为空");
++        }
++        IotApiClient row = this.getById(form.getId());
++        if (row == null) {
++            throw paramError("调用方不存在或已删除");
++        }
++        LambdaUpdateWrapper<IotApiClient> upd = new LambdaUpdateWrapper<IotApiClient>()
++                .eq(IotApiClient::getId, form.getId());
++        if (StrUtil.trimToNull(form.getClientName()) != null) {
++            upd.set(IotApiClient::getClientName, StrUtil.trim(form.getClientName()));
++        }
++        // scope 三态：不传（null）=不改；空白串=显式清空（默认拒绝）；非空=校验合法 JSON 后覆盖
++        if (form.getScope() != null) {
++            upd.set(IotApiClient::getScope, normalizeScope(form.getScope()));
++        }
++        if (form.getRateLimit() != null) {
++            upd.set(IotApiClient::getRateLimit, form.getRateLimit());
++        }
++        if (StrUtil.trimToNull(form.getIpWhitelist()) != null) {
++            upd.set(IotApiClient::getIpWhitelist, StrUtil.trim(form.getIpWhitelist()));
++        }
++        if (form.getExpireTime() != null) {
++            upd.set(IotApiClient::getExpireTime, form.getExpireTime());
++        }
++        if (StrUtil.trimToNull(form.getRemark()) != null) {
++            upd.set(IotApiClient::getRemark, StrUtil.trim(form.getRemark()));
++        }
++        this.update(upd);
++        log.info("[OPENAPI] 调用方编辑 id={}（白名单字段覆盖；app_key/secret/status 不触）", form.getId());
++    }
++
++    // ---------- 列表 / 详情（只回掩码） ----------
++
++    @Override
++    public Page<OpenApiClientVO> listClients(long pageNum, long pageSize, String appKey, Integer status) {
++        LambdaQueryWrapper<IotApiClient> wrapper = new LambdaQueryWrapper<IotApiClient>()
++                .like(appKey != null && !appKey.isBlank(), IotApiClient::getAppKey, appKey)
++                .eq(status != null, IotApiClient::getStatus, status)
++                .orderByDesc(IotApiClient::getId);
++        Page<IotApiClient> page = this.page(new Page<>(pageNum, Math.max(1, pageSize)), wrapper);
++        List<OpenApiClientVO> vos = page.getRecords().stream().map(this::toMaskView).toList();
++        Page<OpenApiClientVO> result = new Page<>(page.getCurrent(), page.getSize(), page.getTotal());
++        result.setRecords(vos);
++        return result;
++    }
++
++    @Override
++    public OpenApiClientVO detail(Long id) {
++        if (id == null) {
++            throw paramError("请选择要查看的调用方");
++        }
++        IotApiClient row = this.getById(id);
++        if (row == null) {
++            throw paramError("调用方不存在或已删除");
++        }
++        return toMaskView(row);
++    }
++
++    /** 实体 → 掩码视图：解密后掩码化（唯一持明文瞬间），解密失败降级纯占位（不泄底、不崩） */
++    private OpenApiClientVO toMaskView(IotApiClient row) {
++        String mask;
++        try {
++            mask = CredentialMask.mask(SmDataCrypto.decrypt(row.getSecretEncrypted()));
++        } catch (Exception e) {
++            log.warn("[OPENAPI] list mask decrypt failed, clientId={}", row.getId());
++            mask = CredentialMask.mask(null);
++        }
++        return OpenApiClientVO.of(row, mask);
++    }
++
++    // ---------- 轮换 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public OpenApiClientSecretVO rotateSecret(Long id) {
++        if (id == null) {
++            throw paramError("请选择要轮换的调用方");
++        }
++        IotApiClient row = this.getById(id);
++        if (row == null) {
++            throw paramError("调用方不存在或已删除");
++        }
++        String secret = generateSecret();
++        String ciphertext = SmDataCrypto.encrypt(secret);
++        if (!SmDataCrypto.isCiphertext(ciphertext) || ciphertext.equals(secret)) {
++            throw paramError("secret 加密失败，拒绝保存（fail-closed）");
++        }
++        String hash = OpenApiCredentials.sha256Hex(secret.getBytes(StandardCharsets.UTF_8));
++        // 原子换装：当前值移入 prev 三列 + 新密钥入主列（单条 UPDATE 行内换装，无中间态）
++        int updated = this.getBaseMapper().rotateSecret(row.getId(), ciphertext, hash);
++        if (updated == 0) {
++            // 并发删除兜底：轮换语句影响行数 0 = 行已删/越租户
++            throw paramError("调用方不存在或已删除");
++        }
++        log.info("[OPENAPI] 调用方轮换 id={}，并行窗起点=NOW（窗内新旧双验签，过窗旧密钥失效）", row.getId());
++        return OpenApiClientSecretVO.of(row.getId(), row.getAppKey(), secret);
++    }
++
++    // ---------- 吊销 / 启用 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void updateStatus(Long id, Integer status) {
++        if (id == null) {
++            throw paramError("请选择要操作的调用方");
++        }
++        if (status == null || (status != STATUS_DISABLED && status != STATUS_ENABLED)) {
++            throw paramError("status 仅允许 0/1");
++        }
++        IotApiClient row = this.getById(id);
++        if (row == null) {
++            throw paramError("调用方不存在或已删除");
++        }
++        // 吊销=置禁用立即生效（验签路径每请求查库，无 TTL 空窗）；字段白名单更新：
++        // 仅 status——密钥/租户/app_key 不触；非物理删除（行保留审计）
++        IotApiClient upd = new IotApiClient();
++        upd.setId(row.getId());
++        upd.setStatus(status);
++        this.updateById(upd);
++        log.info("[OPENAPI] 调用方启停 id={}, status={}", row.getId(), status);
++    }
++
++    // ---------- 内部辅助 ----------
++
++    /**
++     * scope 归一与 JSON 合法性校验（brief「管理侧透传校验 JSON 合法性」）：空白 → null
++     * （默认拒绝——0051 filter 已强制空 scope 无任何数据权限）；非空必须为合法 JSON 对象
++     * （dataperm 契约形态 {"instanceIds":[...],"subtree":bool}，深层结构语义归消费组件）。
++     */
++    private String normalizeScope(String scope) {
++        if (StrUtil.isBlank(scope)) {
++            return null;
++        }
++        try {
++            JSONUtil.parseObj(scope);
++        } catch (Exception e) {
++            throw paramError("scope 不是合法 JSON 对象（应为 {\"instanceIds\":[...],\"subtree\":true} 形态）");
++        }
++        return scope;
++    }
++
++    /** 随机 secret：SecureRandom 32 字节 → base64url（无填充）43 字符，≥32 字符安全随机 */
++    public static String generateSecret() {
++        byte[] bytes = new byte[SECRET_RANDOM_BYTES];
++        SECURE_RANDOM.nextBytes(bytes);
++        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
++    }
++
++    private BusinessException duplicateAppKey(String appKey) {
++        return new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                "appKey 已存在（全局唯一，不可重复）: " + appKey);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index 00dcee3..bc4c937 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -45,6 +45,7 @@ ot:
+     rate-limit-window-seconds: ${OT_OPENAPI_RATE_LIMIT_WINDOW_SECONDS:60}   # 限流固定窗宽（秒，brief：简单固定窗 60s——RedisService.incrementWithTtl 原子 INCR+TTL，BUG-0053 口径）
+     realtime-cache-key-prefix: ${OT_OPENAPI_REALTIME_CACHE_KEY_PREFIX:openapi:realtime:}   # Redis 实时值键前缀（0068 联调契约锚）：键 = 前缀 + tenantId + ":" + fullKey，值 JSON {"v","q","ts"}；ingest 写链未交付，本期读取恒未命中 → 空集如实
+     realtime-cache-ttl-seconds: ${OT_OPENAPI_REALTIME_CACHE_TTL_SECONDS:60}   # 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填的键必须短 TTL 过期——键过期即回源，杜绝 ingest 停写后旧值长期充当「实时值」与键无限累积（BUG-0053 同危害类）
++    rotation-window-days: ${OT_OPENAPI_ROTATION_WINDOW_DAYS:7}   # 轮换并行窗天数（TASK-0052，默认 7——「双密钥轮换并行一周」）：轮换后窗内新旧 secret 均可验签（业务连续性），过窗旧密钥失效并由验签路径惰性清理 prev 列
+   publish:
+     storage-path: ${OT_PUBLISH_STORAGE_PATH:./data/snapshots}   # 配置版本快照本地存储根目录（TASK-0024 一期本地目录裁决；文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，snapshot_uri 存相对路径）；MinIO 对象存储二期登记
+     ack-scan-interval-seconds: ${OT_PUBLISH_ACK_SCAN_INTERVAL_SECONDS:60}   # ACK 超时扫描周期（秒，TASK-0025 fixedDelay——上次执行完毕后计时；扫描逾窗未回执行置 2，幂等）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategyTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategyTest.java
+index 707424e..3e1f364 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategyTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/auth/HmacAuthStrategyTest.java
+@@ -13,6 +13,7 @@ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
++import org.mockito.Mockito;
+ import org.mockito.MockitoAnnotations;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -20,7 +21,10 @@ import java.time.LocalDateTime;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ 
+ /**
+@@ -248,4 +252,121 @@ class HmacAuthStrategyTest {
+         long warns = logAppender.list.stream().filter(e -> e.getLevel() == Level.WARN).count();
+         org.junit.jupiter.api.Assertions.assertTrue(warns >= 1, "解密失败应 WARN 留痕");
+     }
++
++    // ---------- 轮换并行窗（TASK-0052） ----------
++
++    /** 构造轮换后行：现役密钥=newSecret，prev 列携带 oldSecret（rotatedAt 回拨 daysBefore 天） */
++    private OpenApiClientRow rotatedClient(String newSecret, String oldSecret, long daysBefore) {
++        OpenApiClientRow row = enabledClient();
++        row.setSecretEncrypted(SmDataCrypto.encrypt(newSecret));
++        row.setSecretEncryptedPrev(SmDataCrypto.encrypt(oldSecret));
++        row.setSecretHashPrev("prev-hash-placeholder");
++        row.setSecretRotatedAt(LocalDateTime.now().minusDays(daysBefore));
++        return row;
++    }
++
++    @Test
++    @DisplayName("轮换并行窗内旧密钥验签通过（当前列失败 → prev 列验——双密钥并行，业务连续性）")
++    void rotationInWindowOldSecretStillVerifies() {
++        String newSecret = "brand_new_secret_value_2026";
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(rotatedClient(newSecret, SECRET, 1));
++        String timestamp = String.valueOf(System.currentTimeMillis());
++
++        OpenApiClientIdentity identity = strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(SECRET, timestamp), "127.0.0.1"));
++
++        assertEquals(7L, identity.getClientId(), "窗内旧 secret 验签通过");
++        verify(clientMapper, never()).clearRotationWindow(any());
++    }
++
++    @Test
++    @DisplayName("轮换后现役密钥验签通过（当前列优先——prev 不干扰现役密钥）")
++    void rotationCurrentSecretVerifiesFirst() {
++        String newSecret = "brand_new_secret_value_2026";
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(rotatedClient(newSecret, SECRET, 1));
++        String timestamp = String.valueOf(System.currentTimeMillis());
++
++        OpenApiClientIdentity identity = strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(newSecret, timestamp), "127.0.0.1"));
++
++        assertEquals(7L, identity.getClientId());
++    }
++
++    @Test
++    @DisplayName("并行窗过窗（8 天 > 7 天）旧密钥失效 → 6001，且 prev 惰性清理（验签路径判定时清理）")
++    void rotationWindowExpiredOldSecretFailsAndLazyClears() {
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(rotatedClient("brand_new_secret_value_2026", SECRET, 8));
++        String timestamp = String.valueOf(System.currentTimeMillis());
++        assertAuthError(() -> strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(SECRET, timestamp), "127.0.0.1")), "签名不匹配");
++        verify(clientMapper).clearRotationWindow(7L);
++    }
++
++    @Test
++    @DisplayName("并行窗过窗后现役密钥照常验签通过，prev 同步惰性清理（清理与验签结论解耦）")
++    void rotationWindowExpiredCurrentStillVerifiesAndClears() {
++        String newSecret = "brand_new_secret_value_2026";
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(rotatedClient(newSecret, SECRET, 8));
++        String timestamp = String.valueOf(System.currentTimeMillis());
++
++        OpenApiClientIdentity identity = strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(newSecret, timestamp), "127.0.0.1"));
++
++        assertEquals(7L, identity.getClientId(), "过窗不影响现役密钥");
++        verify(clientMapper).clearRotationWindow(7L);
++    }
++
++    @Test
++    @DisplayName("rotated_at 缺失（起点未知）fail-closed 视同过窗：旧密钥 6001 + 惰性清理")
++    void rotationWindowUnknownStartFailClosed() {
++        OpenApiClientRow row = rotatedClient("brand_new_secret_value_2026", SECRET, 1);
++        row.setSecretRotatedAt(null);
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(row);
++        String timestamp = String.valueOf(System.currentTimeMillis());
++        assertAuthError(() -> strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(SECRET, timestamp), "127.0.0.1")), "签名不匹配");
++        verify(clientMapper).clearRotationWindow(7L);
++    }
++
++    @Test
++    @DisplayName("窗内新旧密钥均验签失败（第三把密钥）→ 6001，且不触发惰性清理（窗未过不清理）")
++    void inWindowBothFailNoCleanup() {
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(rotatedClient("brand_new_secret_value_2026", SECRET, 1));
++        String timestamp = String.valueOf(System.currentTimeMillis());
++        assertAuthError(() -> strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign("third_wrong_secret", timestamp), "127.0.0.1")), "签名不匹配");
++        verify(clientMapper, never()).clearRotationWindow(any());
++    }
++
++    @Test
++    @DisplayName("prev 密文损坏 → 旧密钥不参与验签（6001，不降级 500）")
++    void rotationPrevCorruptFailClosed() {
++        OpenApiClientRow row = rotatedClient("brand_new_secret_value_2026", SECRET, 1);
++        row.setSecretEncryptedPrev("{v1}AAAA:AAAA");
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(row);
++        String timestamp = String.valueOf(System.currentTimeMillis());
++        assertAuthError(() -> strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(SECRET, timestamp), "127.0.0.1")), "签名不匹配");
++        verify(clientMapper, never()).clearRotationWindow(any());
++    }
++
++    @Test
++    @DisplayName("吊销立即 403（状态每请求查库，无实例级/请求间缓存——REQ-0035 验收 4 无 TTL 空窗实证面）")
++    void statusReadEveryRequestNoCache() {
++        OpenApiClientRow enabled = enabledClient();
++        OpenApiClientRow disabled = enabledClient();
++        disabled.setStatus(0);
++        when(clientMapper.selectByAppKey(APP_KEY)).thenReturn(enabled, disabled);
++        String timestamp = String.valueOf(System.currentTimeMillis());
++
++        OpenApiClientIdentity first = strategy.authenticate(
++                credentials(APP_KEY, timestamp, sign(SECRET, timestamp), "127.0.0.1"));
++        assertEquals(7L, first.getClientId(), "吊销前验签通过");
++
++        assertAuthError(() -> strategy.authenticate(
++                credentials(APP_KEY, String.valueOf(System.currentTimeMillis()), sign(SECRET, timestamp), "127.0.0.1")),
++                "已禁用");
++        // 同 JVM 内第二次 authenticate 仍查库——无任何缓存层，吊销（管理面 UPDATE）下一个请求即生效
++        verify(clientMapper, Mockito.times(2)).selectByAppKey(APP_KEY);
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+index 3464412..9dfd5a0 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/config/OpenApiYmlStructureTest.java
+@@ -55,18 +55,18 @@ class OpenApiYmlStructureTest {
+     }
+ 
+     @Test
+-    @DisplayName("I-1 回归：ot.openapi 为顶层独立块，只含本任务四键、不含 dataperm 两键")
++    @DisplayName("I-1 回归：ot.openapi 为顶层独立块，只含本任务五键（0052 增轮换并行窗键）、不含 dataperm 两键")
+     void openapiBlockTopLevelAndExclusive() throws Exception {
+         Map<String, Object> ot = loadOt();
+         Map<String, Object> openapi = (Map<String, Object>) ot.get("openapi");
+         assertNotNull(openapi, "ot.openapi 必须是 ot 顶层独立块");
+         for (String key : new String[]{"replay-window-seconds", "rate-limit-window-seconds",
+-                "realtime-cache-key-prefix", "realtime-cache-ttl-seconds"}) {
+-            assertTrue(openapi.containsKey(key), "ot.openapi." + key + " 必须存在（修订轮 I-3 新增回填 TTL 键）");
++                "realtime-cache-key-prefix", "realtime-cache-ttl-seconds", "rotation-window-days"}) {
++            assertTrue(openapi.containsKey(key), "ot.openapi." + key + " 必须存在（0052 轮换并行窗键）");
+         }
+         assertFalse(openapi.containsKey("cache-enabled"), "ot.openapi 不得包含 dataperm 的 cache-enabled（I-1）");
+         assertFalse(openapi.containsKey("cache-ttl-seconds"), "ot.openapi 不得包含 dataperm 的 cache-ttl-seconds（I-1）");
+         assertFalse(openapi.containsKey("subtree-max"));
+-        assertEquals(4, openapi.size(), "openapi 块恰四键（防块结构漂移）");
++        assertEquals(5, openapi.size(), "openapi 块恰五键（防块结构漂移）");
+     }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientAuditNoPlaintextTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientAuditNoPlaintextTest.java
+new file mode 100644
+index 0000000..d02d987
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientAuditNoPlaintextTest.java
+@@ -0,0 +1,250 @@
++package net.otlab.admin.module.openapi.management;
++
++import cn.dev33.satoken.stp.StpUtil;
++import net.otlab.admin.module.openapi.controller.OpenApiClientController;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSaveForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSecretVO;
++import net.otlab.admin.module.openapi.dto.OpenApiClientStatusForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientVO;
++import net.otlab.admin.module.openapi.service.OpenApiClientService;
++import net.otlab.admin.module.system.aspect.OperateLogAspect;
++import net.otlab.admin.module.system.entity.SysOperateLog;
++import net.otlab.admin.module.system.service.OperateLogService;
++import net.otlab.admin.module.system.service.SysDeptService;
++import net.otlab.admin.module.system.service.SysUserService;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.OtIpUtils;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.aop.aspectj.annotation.AspectJProxyFactory;
++import org.springframework.mock.web.MockHttpServletRequest;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.web.context.request.RequestContextHolder;
++import org.springframework.web.context.request.ServletRequestAttributes;
++
++import java.lang.reflect.Field;
++import java.util.Arrays;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++
++/**
++ * 调用方审计无明文 grep 级测试（TASK-0052，brief「明文 secret 全链路仅一次展示」硬项）。
++ *
++ * <p>开通/轮换响应体含 secret 明文（REQ-0035 验收 1「明文仅展示一次」的唯一出口）——两端点
++ * @OperateLog(saveResponse=false)，响应列不落库。实现方式照 IotCredentialAuditNoPlaintextTest
++ * 范式：真实 {@link OperateLogAspect} 经 AspectJProxyFactory 织入真实
++ * {@link OpenApiClientController}（服务层 mock），捕获落库 {@link SysOperateLog} 全文做
++ * 明文子串 grep——整链（注解标志 → 切面序列化 → 实体列）真实走通后 grep，非注解纸面检查。
++ *
++ * <p>另锁定：列表/详情 VO 结构上无密钥材料字段（REQ-0035 验收 6「列表与详情永不返回
++ * 明文密钥」——反射断言固化，非约定）；开通/轮换响应 VO 是唯一含 secret 字段的形态。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class OpenApiClientAuditNoPlaintextTest {
++
++    private static final String PLAINTEXT = "S3cret-Plaintext-Abcd1234Xyz-43chars-ok";
++
++    @Mock
++    private OpenApiClientService clientService;
++
++    @Mock
++    private OperateLogService operateLogService;
++
++    @Mock
++    private SysUserService sysUserService;
++
++    @Mock
++    private SysDeptService sysDeptService;
++
++    private AutoCloseable mocks;
++    private MockedStatic<OtIpUtils> otIpUtils;
++    private MockedStatic<StpUtil> stpUtil;
++
++    /** 已捕获的落库日志实体（operateLog 线程池在单测中为 mock，同步捕获） */
++    private SysOperateLog capturedLog;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        request.setRequestURI("/openapi/client");
++        request.setMethod("POST");
++        request.addHeader("User-Agent", "JUnit-Agent");
++        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
++
++        otIpUtils = Mockito.mockStatic(OtIpUtils.class);
++        otIpUtils.when(() -> OtIpUtils.getClientIp(any())).thenReturn("127.0.0.1");
++        otIpUtils.when(() -> OtIpUtils.getRegion(any())).thenReturn("");
++
++        // 管理面权限码双轨（SaMode.OR + 分支精查）在单测中放行——本测试只管审计链
++        stpUtil = Mockito.mockStatic(StpUtil.class);
++
++        Mockito.doAnswer(invocation -> {
++            capturedLog = invocation.getArgument(0);
++            return true;
++        }).when(operateLogService).saveOperateLog(any(SysOperateLog.class));
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        RequestContextHolder.resetRequestAttributes();
++        if (stpUtil != null) {
++            stpUtil.close();
++        }
++        if (otIpUtils != null) {
++            otIpUtils.close();
++        }
++        if (mocks != null) {
++            mocks.close();
++        }
++    }
++
++    /** 真实切面织入真实控制器：返回代理后的控制器（@OperateLog 环绕真实生效） */
++    private OpenApiClientController proxiedController() {
++        OpenApiClientController controller = new OpenApiClientController();
++        ReflectionTestUtils.setField(controller, "clientService", clientService);
++        OperateLogAspect aspect = new OperateLogAspect();
++        ReflectionTestUtils.setField(aspect, "operateLogService", operateLogService);
++        ReflectionTestUtils.setField(aspect, "sysUserService", sysUserService);
++        ReflectionTestUtils.setField(aspect, "sysDeptService", sysDeptService);
++        AspectJProxyFactory factory = new AspectJProxyFactory(controller);
++        factory.addAspect(aspect);
++        factory.setProxyTargetClass(true);
++        return factory.getProxy();
++    }
++
++    /**
++     * grep 断言：日志实体全部文本列不含明文；param/response/failReason 三个动态列从严
++     * （0019 同款口径——content 列为开发者撰写的静态 @Operation 摘要）。
++     */
++    private void assertNoPlaintext(SysOperateLog log) {
++        assertNotNull(log, "操作日志未落库——审计链路断裂");
++        String[] allColumns = {log.getParam(), log.getResponse(), log.getFailReason(),
++                log.getContent(), log.getModule(), log.getUrl(), log.getMethod()};
++        for (String column : allColumns) {
++            if (column == null) {
++                continue;
++            }
++            assertFalse(column.contains(PLAINTEXT), "审计列不得含 secret 明文: " + column);
++        }
++    }
++
++    @Test
++    @DisplayName("开通审计 - 响应含明文：response 列不落库（saveResponse=false），其余列 grep 无明文")
++    void createAudit_ResponseColumnNeverHoldsPlaintext() {
++        Mockito.doReturn(OpenApiClientSecretVO.of(9L, "mid_client", PLAINTEXT))
++                .when(clientService).createClient(any(OpenApiClientSaveForm.class));
++
++        OpenApiClientSaveForm form = new OpenApiClientSaveForm();
++        form.setAppKey("mid_client");
++        form.setClientName("数据中台");
++        proxiedController().save(form);
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        Mockito.verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertEquals("调用方管理", log.getModule());
++        assertTrue(log.getResponse() == null || log.getResponse().isEmpty(),
++                "开通响应含明文——response 列必须为空（saveResponse=false），实测: " + log.getResponse());
++        assertNoPlaintext(log);
++    }
++
++    @Test
++    @DisplayName("轮换审计 - 新明文仅响应一次：response 列不落库（saveResponse=false），全列 grep 干净")
++    void rotateAudit_ResponseColumnNeverHoldsPlaintext() {
++        MockHttpServletRequest request = new MockHttpServletRequest();
++        request.setRequestURI("/openapi/client/rotate");
++        request.setMethod("POST");
++        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
++
++        Mockito.doReturn(OpenApiClientSecretVO.of(9L, "mid_client", PLAINTEXT))
++                .when(clientService).rotateSecret(9L);
++
++        net.otlab.admin.module.openapi.dto.OpenApiClientRotateForm form =
++                new net.otlab.admin.module.openapi.dto.OpenApiClientRotateForm();
++        form.setId(9L);
++        proxiedController().rotate(form);
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        Mockito.verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertTrue(log.getResponse() == null || log.getResponse().isEmpty(),
++                "轮换响应含明文——response 列必须为空（saveResponse=false），实测: " + log.getResponse());
++        assertNoPlaintext(log);
++    }
++
++    @Test
++    @DisplayName("开通失败路径 - failReason/param 均无明文（异常文案不含凭据值）")
++    void createAudit_FailurePathNoPlaintext() {
++        Mockito.doThrow(new BusinessException(ResultCode.DUPLICATE_CODE.getCode(),
++                "appKey 已存在（全局唯一，不可重复）: mid_client"))
++                .when(clientService).createClient(any(OpenApiClientSaveForm.class));
++
++        OpenApiClientSaveForm form = new OpenApiClientSaveForm();
++        form.setAppKey("mid_client");
++        form.setClientName("数据中台");
++        try {
++            proxiedController().save(form);
++        } catch (BusinessException expected) {
++            // 切面 AfterThrowing 先落审计再抛出——异常照常上抛
++        }
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        Mockito.verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertEquals(0, log.getStatus(), "失败记录 status=0");
++        assertNoPlaintext(log);
++    }
++
++    @Test
++    @DisplayName("吊销审计 - 入参/响应无敏感面：param 只有 id/status，全列 grep 干净")
++    void revokeAudit_NoPlaintext() {
++        Mockito.doNothing().when(clientService).updateStatus(9L, 0);
++
++        OpenApiClientStatusForm form = new OpenApiClientStatusForm();
++        form.setId(9L);
++        form.setStatus(0);
++        proxiedController().updateStatus(form);
++
++        ArgumentCaptor<SysOperateLog> captor = ArgumentCaptor.forClass(SysOperateLog.class);
++        Mockito.verify(operateLogService).saveOperateLog(captor.capture());
++        SysOperateLog log = captor.getValue();
++        assertNoPlaintext(log);
++        assertTrue(log.getParam() != null && log.getParam().contains("9"),
++                "吊销 param 承载 id（审计「谁吊销了哪个调用方」）");
++    }
++
++    @Test
++    @DisplayName("结构边界 - 列表/详情 VO 无密钥材料字段（REQ-0035 验收 6，反射断言固化）")
++    void voHasNoSecretMaterialFields() {
++        List<String> forbidden = Arrays.asList("secret", "secretEncrypted", "secretHash",
++                "secretEncryptedPrev", "secretHashPrev", "ciphertext");
++        for (Field field : OpenApiClientVO.class.getDeclaredFields()) {
++            assertFalse(forbidden.contains(field.getName()),
++                    "列表/详情 VO 不得含密钥材料字段: " + field.getName());
++        }
++        assertTrue(Arrays.stream(OpenApiClientVO.class.getDeclaredFields())
++                        .anyMatch(f -> "secretMask".equals(f.getName())),
++                "掩码字段在位（前四****后四，0019 范式）");
++        boolean secretVoHasPlain = Arrays.stream(OpenApiClientSecretVO.class.getDeclaredFields())
++                .anyMatch(f -> "secret".equals(f.getName()));
++        assertTrue(secretVoHasPlain, "开通/轮换响应 VO 是唯一含 secret 明文的形态（仅此一次出口）");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientMenuPermissionGuardTest.java
+new file mode 100644
+index 0000000..4263023
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientMenuPermissionGuardTest.java
+@@ -0,0 +1,156 @@
++package net.otlab.admin.module.openapi.management;
++
++import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.openapi.controller.OpenApiClientController;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.lang.reflect.Method;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * TASK-0052 守卫测试：调用方管理菜单权限（sys_menu 4075-4078 四行）与控制器接口清单核对。
++ *
++ * <p>brief 硬要求「权限码 openapi:client:list/add/edit/remove 四码 + 菜单种子 + 超管授权」；
++ * 页面行承载 list 权限（微信模块页面行承载 list 权限为在库先例，03_wechat.sql 2001/2007 等），
++ * 挂点智慧工厂目录（sys_menu 4000）——头注登记见升级脚本。本测试锁定（照
++ * IotCredentialMenuPermissionGuardTest 范式）：
++ * <ul>
++ * <li>SQL 侧：升级脚本 20261123_iot_api_client_rotation.sql 的 sys_menu 四行种子
++ *     （id 4075-4078，页面挂 4000、按钮挂 4075）权限码必须恰好等于预期映射——删行/换码/
++ *     挪 parent 即红；</li>
++ * <li>代码侧：调用方管理面 @SaCheckPermission 权限码并集必须恰好等于四值集合；</li>
++ * <li>双向核对：控制器四码全部被 SQL 登记，4075-4078 四行全部挂端点（无死行）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class OpenApiClientMenuPermissionGuardTest {
++
++    /** 四行菜单种子的预期映射（id → perms），与升级脚本 4075-4078 一一对应 */
++    private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
++            4075L, "openapi:client:list",
++            4076L, "openapi:client:add",
++            4077L, "openapi:client:edit",
++            4078L, "openapi:client:remove");
++
++    /** 预期挂点：页面 4075 挂智慧工厂目录 4000，按钮三行挂页面 4075（头注登记） */
++    private static final Map<Long, Long> EXPECTED_PARENTS = Map.of(
++            4075L, 4000L,
++            4076L, 4075L,
++            4077L, 4075L,
++            4078L, 4075L);
++
++    /** 调用方管理面控制器预期权限码并集（brief 四码） */
++    private static final Set<String> EXPECTED_CONTROLLER_PERMS = Set.of(
++            "openapi:client:list", "openapi:client:add", "openapi:client:edit", "openapi:client:remove");
++
++    /** 本任务升级脚本路径 */
++    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261123_iot_api_client_rotation.sql";
++
++    /** 菜单种子行形如 (4075, 4000, 4, '调用方管理', 2, '/iot/apiclient', 'iot/apiclient/index', NULL, 'openapi:client:list', ...)
++     *  与 (4076, 4075, 4, '调用方新增', 3, NULL, NULL, NULL, 'openapi:client:add', ...) */
++    private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
++            "\\((40[0-9]{2}),\\s*(4000|4075),\\s*4,\\s*'([^']*)',\\s*[23],\\s*(?:NULL|'[^']*'),\\s*(?:NULL|'[^']*'),\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
++
++    @Test
++    @DisplayName("SQL 侧 - 升级脚本登记的调用方菜单行恰好等于预期四值映射（4075-4078，挂点 4000/4075）")
++    void scriptRegistersExactlyTheFourMenuRows() throws Exception {
++        Map<Long, String[]> actual = parseMenuRows(readScript(SCRIPT_RELATIVE));
++        Map<Long, String[]> actualFiltered = new LinkedHashMap<>();
++        for (Map.Entry<Long, String[]> e : actual.entrySet()) {
++            if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
++                actualFiltered.put(e.getKey(), e.getValue());
++            }
++        }
++        assertEquals(EXPECTED_MENU_ROWS.size(), actualFiltered.size(),
++                "sys_menu 4075-4078 四行必须全部在位（删行即失败）");
++        for (Map.Entry<Long, String> expected : EXPECTED_MENU_ROWS.entrySet()) {
++            String[] row = actualFiltered.get(expected.getKey());
++            assertTrue(row != null, "sys_menu " + expected.getKey() + " 行缺失");
++            assertEquals(expected.getValue(), row[1],
++                    "sys_menu " + expected.getKey() + " 权限码必须与预期一致（换码即失败）");
++            assertEquals(EXPECTED_PARENTS.get(expected.getKey()), Long.parseLong(row[0]),
++                    "sys_menu " + expected.getKey() + " 挂点必须与头注登记一致（挪 parent 即失败）");
++        }
++    }
++
++    @Test
++    @DisplayName("代码侧 - 调用方管理面控制器权限码并集恰好等于四值集合（brief 四码）")
++    void controllerPermissionsAreExactlyTheFourPerms() {
++        Set<String> annotated = collectControllerPerms();
++        assertEquals(EXPECTED_CONTROLLER_PERMS, annotated,
++                "调用方管理面 @SaCheckPermission 权限码并集必须恰好等于四值集合（多/漏/错码即失败）");
++    }
++
++    @Test
++    @DisplayName("双向核对 - 控制器四码全部被 SQL 登记，4075-4078 四行全部挂端点（无死行）")
++    void controllerPermsAllRegisteredInSql() throws Exception {
++        Set<String> fromSql = new TreeSet<>();
++        parseMenuRows(readScript(SCRIPT_RELATIVE)).values().forEach(row -> fromSql.add(row[1]));
++
++        Set<String> fromCode = collectControllerPerms();
++        assertTrue(fromSql.containsAll(fromCode),
++                "管理面权限码必须全部在 sys_menu SQL 登记（BUG-0046 口径）——否则任何角色（含超管）都无法持有");
++        for (String expected : EXPECTED_MENU_ROWS.values()) {
++            assertTrue(fromCode.contains(expected),
++                    "调用方域种子权限码 " + expected + " 必须挂端点（无死行）");
++        }
++    }
++
++    /** 收集调用方管理面控制器的全部 @SaCheckPermission 权限码（方法级 + 类级；SaMode.OR 多码全收） */
++    private Set<String> collectControllerPerms() {
++        Set<String> perms = new TreeSet<>();
++        Class<?> clazz = OpenApiClientController.class;
++        assertTrue(clazz.isAnnotationPresent(RestController.class),
++                clazz.getSimpleName() + " 必须是 @RestController（路由扫描前提）");
++        SaCheckPermission classLevel = clazz.getAnnotation(SaCheckPermission.class);
++        if (classLevel != null) {
++            perms.addAll(Arrays.asList(classLevel.value()));
++        }
++        for (Method method : clazz.getDeclaredMethods()) {
++            SaCheckPermission annotation = method.getAnnotation(SaCheckPermission.class);
++            if (annotation != null) {
++                perms.addAll(Arrays.asList(annotation.value()));
++            }
++        }
++        return perms;
++    }
++
++    /** 解析升级脚本 sys_menu INSERT 中的 (id → [parent_id, perms]) 映射（4000/4075 之下的行） */
++    private Map<Long, String[]> parseMenuRows(String sqlText) {
++        Map<Long, String[]> rows = new LinkedHashMap<>();
++        Matcher matcher = MENU_ROW_PATTERN.matcher(sqlText);
++        while (matcher.find()) {
++            rows.put(Long.parseLong(matcher.group(1)),
++                    new String[]{matcher.group(2), matcher.group(4)});
++        }
++        return rows;
++    }
++
++    private String readScript(String relative) throws Exception {
++        Path dir = Paths.get("").toAbsolutePath();
++        while (dir != null && !Files.exists(dir.resolve("resources/sql/01_base.sql"))) {
++            dir = dir.getParent();
++        }
++        assertTrue(dir != null, "未定位到仓库 resources/sql：请从仓库根目录或模块目录运行测试");
++        Path script = dir.resolve(relative);
++        assertTrue(Files.exists(script), "升级脚本不存在：" + script);
++        return Files.readString(script, StandardCharsets.UTF_8);
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientServiceTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientServiceTest.java
+new file mode 100644
+index 0000000..c0dfc02
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/openapi/management/OpenApiClientServiceTest.java
+@@ -0,0 +1,406 @@
++package net.otlab.admin.module.openapi.management;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSaveForm;
++import net.otlab.admin.module.openapi.dto.OpenApiClientSecretVO;
++import net.otlab.admin.module.openapi.dto.OpenApiClientVO;
++import net.otlab.admin.module.openapi.entity.IotApiClient;
++import net.otlab.admin.module.openapi.mapper.IotApiClientManageMapper;
++import net.otlab.admin.module.openapi.service.impl.OpenApiClientServiceImpl;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.security.SmDataCrypto;
++import net.otlab.core.tenant.TenantContext;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++import org.springframework.dao.DuplicateKeyException;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.nio.charset.StandardCharsets;
++import java.time.LocalDateTime;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 调用方管理服务单测（TASK-0052，brief 测试口径：开通明文仅一次/appKey 唯一 4002/scope 空
++ * 默认拒绝落库/轮换 prev 三列带走旧值/新明文一次性/白名单编辑/吊销字段白名单）。
++ *
++ * <p>standalone Mockito 范式（照 IotChannelServiceImplTest）：Mapper 全 mock 不触真实库；
++ * 租户上下文静态 mock（TenantContext.getTenantId → 1L）；SM4 组件以 dev 默认 data-key 初始化
++ * （与 HmacAuthStrategyTest 同款），密文/哈希断言真实走 SmDataCrypto + SHA256。
++ *
++ * @author dowei
++ * @date 2026-11-23
++ */
++class OpenApiClientServiceTest {
++
++    private static final String DEV_DATA_KEY = "otlab-data260930";
++    private static final Long TENANT_ID = 1L;
++
++    @Mock
++    private IotApiClientManageMapper baseMapper;
++
++    private OpenApiClientServiceImpl clientService;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        // standalone 测试无 MyBatis-Plus 上下文，LambdaQueryWrapper/LambdaUpdateWrapper 解析实体列需要实体 lambda 缓存
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotApiClient.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT_ID);
++        clientService = new OpenApiClientServiceImpl();
++        ReflectionTestUtils.setField(clientService, "baseMapper", baseMapper);
++        SmDataCrypto.init(DEV_DATA_KEY);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private OpenApiClientSaveForm createForm() {
++        OpenApiClientSaveForm form = new OpenApiClientSaveForm();
++        form.setAppKey("mid_client");
++        form.setClientName("数据中台");
++        form.setScope("{\"instanceIds\":[1],\"subtree\":true}");
++        form.setRateLimit(100);
++        return form;
++    }
++
++    private IotApiClient existingRow() {
++        IotApiClient row = new IotApiClient();
++        row.setId(5L);
++        row.setTenantId(TENANT_ID);
++        row.setAppKey("mid_client");
++        row.setSecretEncrypted(SmDataCrypto.encrypt("old_plain_secret_value"));
++        row.setClientName("数据中台");
++        row.setScope("{\"instanceIds\":[1],\"subtree\":true}");
++        row.setRateLimit(100);
++        row.setStatus(1);
++        row.setDeleted(0);
++        return row;
++    }
++
++    // ---------- 开通 ----------
++
++    @Test
++    @DisplayName("开通成功 - secret ≥32 字符随机、SM4 密文 + SHA256 哈希双列落库、明文仅本次响应 VO")
++    void createClientSuccess() {
++        when(baseMapper.selectOne(any(), org.mockito.ArgumentMatchers.eq(Boolean.TRUE))).thenReturn(null);
++        doAnswer(invocation -> {
++            IotApiClient entity = invocation.getArgument(0);
++            entity.setId(99L);
++            return 1;
++        }).when(baseMapper).insert(any(IotApiClient.class));
++
++        OpenApiClientSecretVO vo = clientService.createClient(createForm());
++
++        assertEquals(99L, vo.getId());
++        assertEquals("mid_client", vo.getAppKey());
++        assertTrue(vo.getSecret().length() >= 32, "brief：服务端生成随机 secret ≥32 字符，实测 " + vo.getSecret().length());
++        assertTrue(vo.getSecret().matches("[A-Za-z0-9_-]+"), "base64url 安全随机字符集（无特殊字符转义面）");
++        assertNotNull(vo.getNotice(), "「仅此一次」提示在位");
++
++        ArgumentCaptor<IotApiClient> captor = ArgumentCaptor.forClass(IotApiClient.class);
++        verify(baseMapper).insert(captor.capture());
++        IotApiClient stored = captor.getValue();
++        assertEquals(TENANT_ID, stored.getTenantId(), "tenant_id 服务层从会话覆盖");
++        assertEquals(1, stored.getStatus(), "开通启用起步");
++        assertTrue(SmDataCrypto.isCiphertext(stored.getSecretEncrypted()), "落库为 {v1} SM4 密文");
++        assertNotEquals(vo.getSecret(), stored.getSecretEncrypted(), "库中无明文");
++        assertEquals(SmDataCrypto.decrypt(stored.getSecretEncrypted()), vo.getSecret(),
++                "密文可解密还原出本次展示的明文（HMAC 验签数据源）");
++        assertEquals(net.otlab.admin.module.openapi.auth.OpenApiCredentials
++                        .sha256Hex(vo.getSecret().getBytes(StandardCharsets.UTF_8)),
++                stored.getSecretHash(), "secret_hash = SHA256(明文)（快速校验保留列）");
++    }
++
++    @Test
++    @DisplayName("开通撞键 - 预检命中既有 appKey → 4002（ResultCode.DUPLICATE_CODE，0015 M-2 同款）")
++    void createClientDuplicateAppKey() {
++        when(baseMapper.selectOne(any(), org.mockito.ArgumentMatchers.eq(Boolean.TRUE))).thenReturn(existingRow());
++
++        BusinessException e = assertThrows(BusinessException.class, () -> clientService.createClient(createForm()));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode(), "业务码 4002");
++    }
++
++    @Test
++    @DisplayName("开通撞键兜底 - 预检放行后落库撞 uk_app_key（跨租户/逻辑删行占用）→ 同 4002 文案（不给探测面）")
++    void createClientInsertConflictFallsBackTo4002() {
++        when(baseMapper.selectOne(any())).thenReturn(null);
++        Mockito.doThrow(new DuplicateKeyException("Duplicate entry 'mid_client' for key 'uk_app_key'"))
++                .when(baseMapper).insert(any(IotApiClient.class));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> clientService.createClient(createForm()));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode(), "兜底闸同 4002 口径");
++    }
++
++    @Test
++    @DisplayName("开通 scope 空白 → 落库 null（默认拒绝——0051 filter 强制空 scope 无数据权限）")
++    void createClientBlankScopeStoredNull() {
++        when(baseMapper.selectOne(any(), org.mockito.ArgumentMatchers.eq(Boolean.TRUE))).thenReturn(null);
++        doAnswer(invocation -> {
++            IotApiClient entity = invocation.getArgument(0);
++            entity.setId(100L);
++            return 1;
++        }).when(baseMapper).insert(any(IotApiClient.class));
++
++        OpenApiClientSaveForm form = createForm();
++        form.setScope("   ");
++        clientService.createClient(form);
++
++        ArgumentCaptor<IotApiClient> captor = ArgumentCaptor.forClass(IotApiClient.class);
++        verify(baseMapper).insert(captor.capture());
++        assertNull(captor.getValue().getScope(), "scope 空=默认拒绝（null 落库）");
++    }
++
++    @Test
++    @DisplayName("开通 scope 非法 JSON → 400 参数拒绝（管理侧透传校验 JSON 合法性，brief）")
++    void createClientInvalidScopeRejected() {
++        when(baseMapper.selectOne(any(), org.mockito.ArgumentMatchers.eq(Boolean.TRUE))).thenReturn(null);
++
++        OpenApiClientSaveForm form = createForm();
++        form.setScope("{\"instanceIds\": [broken");
++        BusinessException e = assertThrows(BusinessException.class, () -> clientService.createClient(form));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), e.getCode());
++        verify(baseMapper, never()).insert(any(IotApiClient.class));
++    }
++
++    @Test
++    @DisplayName("开通缺 appKey/名称 → 400 参数拒绝")
++    void createClientMissingRequired() {
++        OpenApiClientSaveForm noKey = createForm();
++        noKey.setAppKey(" ");
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.createClient(noKey)).getCode());
++
++        OpenApiClientSaveForm noName = createForm();
++        noName.setClientName(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.createClient(noName)).getCode());
++    }
++
++    // ---------- 编辑 ----------
++
++    @Test
++    @DisplayName("编辑白名单 - 仅 client_name/scope/rate_limit 等可编辑列，app_key/secret/status 不进更新集")
++    void editClientWhitelistOnly() {
++        when(baseMapper.selectById(5L)).thenReturn(existingRow());
++        when(baseMapper.update(any(), any())).thenReturn(1);
++
++        OpenApiClientSaveForm form = new OpenApiClientSaveForm();
++        form.setId(5L);
++        form.setClientName("数据中台 V2");
++        form.setRateLimit(200);
++        clientService.editClient(form);
++
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<LambdaUpdateWrapper<IotApiClient>> captor =
++                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(baseMapper).update(any(), captor.capture());
++        String sqlSet = captor.getValue().getSqlSet();
++        assertTrue(sqlSet.contains("client_name"), "名称可编辑");
++        assertTrue(sqlSet.contains("rate_limit"), "rate_limit 编辑同接口（brief）");
++        assertTrue(!sqlSet.contains("app_key"), "app_key 创建后不可改（REQ-0035）");
++        assertTrue(!sqlSet.contains("secret_encrypted"), "secret 不可经编辑触达");
++        assertTrue(!sqlSet.contains("secret_hash"), "hash 不可经编辑触达");
++        assertTrue(!sqlSet.contains("status"), "启停走 PUT /status 单设权限，编辑不触 status");
++        assertTrue(!sqlSet.contains("tenant_id"), "租户不触");
++    }
++
++    @Test
++    @DisplayName("编辑 scope 空白串 = 显式清空（默认拒绝）进更新集；不传 scope = 不改")
++    void editClientScopeExplicitClear() {
++        when(baseMapper.selectById(5L)).thenReturn(existingRow());
++        when(baseMapper.update(any(), any())).thenReturn(1);
++
++        OpenApiClientSaveForm clear = new OpenApiClientSaveForm();
++        clear.setId(5L);
++        clear.setScope("  ");
++        clientService.editClient(clear);
++        @SuppressWarnings("unchecked")
++        ArgumentCaptor<LambdaUpdateWrapper<IotApiClient>> captor =
++                ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(baseMapper).update(any(), captor.capture());
++        assertTrue(captor.getValue().getSqlSet().contains("scope="), "空白串=显式清空进更新集");
++    }
++
++    @Test
++    @DisplayName("编辑行不存在 → 400")
++    void editClientRowMissing() {
++        when(baseMapper.selectById(404L)).thenReturn(null);
++        OpenApiClientSaveForm form = new OpenApiClientSaveForm();
++        form.setId(404L);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.editClient(form)).getCode());
++    }
++
++    // ---------- 列表 / 详情（掩码） ----------
++
++    @Test
++    @DisplayName("列表只回掩码 - 解密后前四****（0019 CredentialMask 范式），VO 无明文/密文/哈希字段值")
++    void listClientsMaskOnly() {
++        IotApiClient row = existingRow();
++        row.setSecretEncrypted(SmDataCrypto.encrypt("test_secret"));
++        Page<IotApiClient> page = new Page<>(1, 10, 1);
++        page.setRecords(List.of(row));
++        when(baseMapper.selectPage(any(), any())).thenReturn(page);
++
++        Page<OpenApiClientVO> result = clientService.listClients(1, 10, null, null);
++
++        assertEquals(1, result.getRecords().size());
++        OpenApiClientVO vo = result.getRecords().get(0);
++        assertEquals("test****", vo.getSecretMask(), "长度 11 → 前四+****（0019 掩码口径）");
++        assertEquals(1, vo.getStatus());
++        assertEquals(100, vo.getRateLimit());
++    }
++
++    @Test
++    @DisplayName("详情解密失败降级纯 ****（列表不崩、不泄底——0019 同款）")
++    void detailMaskFallbackOnDecryptFailure() {
++        IotApiClient row = existingRow();
++        row.setSecretEncrypted("{v1}AAAA:AAAA");
++        when(baseMapper.selectById(5L)).thenReturn(row);
++
++        OpenApiClientVO vo = clientService.detail(5L);
++        assertEquals("****", vo.getSecretMask(), "解密失败降级纯占位");
++    }
++
++    @Test
++    @DisplayName("详情行不存在 → 400")
++    void detailRowMissing() {
++        when(baseMapper.selectById(404L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.detail(404L)).getCode());
++    }
++
++    // ---------- 轮换 ----------
++
++    @Test
++    @DisplayName("轮换 - 单条 UPDATE 原子换装（prev 三列带走旧值服务端不经手旧明文），新明文仅本次响应 VO")
++    void rotateSecretMovesCurrentToPrev() {
++        when(baseMapper.selectById(5L)).thenReturn(existingRow());
++        when(baseMapper.rotateSecret(any(), any(), any())).thenReturn(1);
++
++        String oldPlaintext = SmDataCrypto.decrypt(existingRow().getSecretEncrypted());
++        OpenApiClientSecretVO vo = clientService.rotateSecret(5L);
++
++        assertEquals(5L, vo.getId());
++        assertEquals("mid_client", vo.getAppKey());
++        assertTrue(vo.getSecret().length() >= 32);
++        assertNotEquals(oldPlaintext, vo.getSecret(), "新明文与旧明文不同（一次性新生成）");
++        assertNotNull(vo.getNotice());
++
++        ArgumentCaptor<String> cipherCaptor = ArgumentCaptor.forClass(String.class);
++        ArgumentCaptor<String> hashCaptor = ArgumentCaptor.forClass(String.class);
++        verify(baseMapper).rotateSecret(Mockito.eq(5L), cipherCaptor.capture(), hashCaptor.capture());
++        assertTrue(SmDataCrypto.isCiphertext(cipherCaptor.getValue()), "新密钥以 SM4 密文入主列");
++        assertEquals(vo.getSecret(), SmDataCrypto.decrypt(cipherCaptor.getValue()));
++        assertEquals(net.otlab.admin.module.openapi.auth.OpenApiCredentials
++                        .sha256Hex(vo.getSecret().getBytes(StandardCharsets.UTF_8)),
++                hashCaptor.getValue(), "新 SHA256 哈希随换装落库");
++    }
++
++    @Test
++    @DisplayName("轮换影响行数 0（并发删除/越租户）→ 400")
++    void rotateRowGone() {
++        when(baseMapper.selectById(5L)).thenReturn(existingRow());
++        when(baseMapper.rotateSecret(any(), any(), any())).thenReturn(0);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.rotateSecret(5L)).getCode());
++    }
++
++    // ---------- 吊销 / 启用 ----------
++
++    @Test
++    @DisplayName("吊销 - 字段白名单只更新 status=0（密钥/租户/app_key 不触），行保留审计")
++    void revokeOnlyTouchesStatus() {
++        when(baseMapper.selectById(5L)).thenReturn(existingRow());
++        when(baseMapper.updateById(any(IotApiClient.class))).thenReturn(1);
++
++        clientService.updateStatus(5L, 0);
++
++        ArgumentCaptor<IotApiClient> captor = ArgumentCaptor.forClass(IotApiClient.class);
++        verify(baseMapper).updateById(captor.capture());
++        IotApiClient upd = captor.getValue();
++        assertEquals(5L, upd.getId());
++        assertEquals(0, upd.getStatus());
++        assertNull(upd.getAppKey(), "吊销不触 app_key");
++        assertNull(upd.getSecretEncrypted(), "吊销不触密钥列");
++        assertNull(upd.getTenantId(), "吊销不触租户");
++    }
++
++    @Test
++    @DisplayName("启停 status 值域非法（2）→ 400；行不存在 → 400")
++    void updateStatusValidation() {
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.updateStatus(5L, 2)).getCode());
++
++        when(baseMapper.selectById(404L)).thenReturn(null);
++        assertEquals(ResultCode.PARAM_ERROR.getCode(),
++                assertThrows(BusinessException.class, () -> clientService.updateStatus(404L, 0)).getCode());
++    }
++
++    // ---------- 随机 secret 生成 ----------
++
++    @Test
++    @DisplayName("generateSecret 连续生成两枚不同（SecureRandom 无重放面）")
++    void generateSecretDistinct() {
++        String a = OpenApiClientServiceImpl.generateSecret();
++        String b = OpenApiClientServiceImpl.generateSecret();
++        assertNotEquals(a, b);
++        assertTrue(a.length() >= 32 && b.length() >= 32);
++    }
++
++    // ---------- 时间字段 ----------
++
++    @Test
++    @DisplayName("列表 VO 带轮换时间（并行窗口起点透出——管理面可见轮换状态）")
++    void listVoCarriesRotationTime() {
++        IotApiClient row = existingRow();
++        row.setSecretEncrypted(SmDataCrypto.encrypt("x"));
++        row.setSecretRotatedAt(LocalDateTime.now().minusDays(1));
++        Page<IotApiClient> page = new Page<>(1, 10, 1);
++        page.setRecords(List.of(row));
++        when(baseMapper.selectPage(any(), any())).thenReturn(page);
++
++        Page<OpenApiClientVO> result = clientService.listClients(1, 10, null, null);
++        assertNotNull(result.getRecords().get(0).getSecretRotatedAt(), "轮换时间在 VO 透出");
++    }
++}
+diff --git a/resources/sql/upgrade/20261123_iot_api_client_rotation.sql b/resources/sql/upgrade/20261123_iot_api_client_rotation.sql
+new file mode 100644
+index 0000000..32adc7c
+--- /dev/null
++++ b/resources/sql/upgrade/20261123_iot_api_client_rotation.sql
+@@ -0,0 +1,124 @@
++-- ============================================================
++-- 存量库升级脚本：iot_api_client 轮换三新列（双密钥并行窗承载）+ 调用方管理菜单种子
++--   （TASK-0052 / FEAT-0017 / REQ-0035 / ADR-0006 缓存主动失效思路）
++--
++-- 用途：
++--   1) iot_api_client 加三列（TASK-0052 实施 brief 逐字列定义）——「双密钥轮换并行一周」
++--      需物理承载（secret_hash 单列无法同时容纳新旧两代密钥）：
++--        secret_encrypted_prev  轮换前密文（SM4 {v1}，并行窗内仍可参与 HMAC 验签）；
++--        secret_hash_prev       轮换前哈希（SHA256，快速校验/轮换消费点——0051 登记）；
++--        secret_rotated_at      轮换时间（并行窗口起点，过窗判定与惰性清理依据）。
++--      加列不动既有列与种子行（test_client 行零改动）。
++--   2) sys_menu 登记调用方管理新页 + 三按钮权限行（四码 openapi:client:list/add/edit/remove，
++--      页面行承载 list 权限——微信模块页面行承载 list 权限为在库先例：
++--      03_wechat.sql 2001/2007 等、20260925_wechat_mp_template_send.sql 2020）：
++--        4075 调用方管理页（menu_type=2，perms=openapi:client:list）；
++--        4076 调用方新增（openapi:client:add）、4077 调用方修改（openapi:client:edit）、
++--        4078 调用方吊销（openapi:client:remove——吊销/启停，非物理删除）。
++--   3) sys_role_menu 将上述四行授予超级管理员（role_id=1；照 20261122_iot_publish_domain.sql
++--      / 20261121_iot_console_menus.sql 范式）。
++--
++-- 挂点登记（brief：「新页挂系统管理下合适父节点——挂点在头注登记」）：
++--   实测菜单树：管理后台「系统管理」目录为 sys_menu id 1（module_id=1，上游 01_base.sql
++--   框架面）；智慧工厂控制台目录为 sys_menu id 4000（module_id=4，TASK-0001 建）。
++--   调用方管理属智慧工厂对外开放域（FEAT-0017），目标角色为租户管理员（REQ-0035，
++--   在智慧工厂控制台操作），且本脚本号段沿用 4000 段（见下）——故挂点落智慧工厂目录
++--   （4000）第 11 个子页（导入向导 4016 之后，sort=11），与字典/模板/实例等管理页同层。
++--   brief 字面「系统管理」按控制台实际骨架收敛为「智慧工厂管理控制台」，登记供收尾复核。
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4075-4078：本任务（TASK-0052）占用（一页三按钮四行，parent_id=4000），
++--   连续取号（4074 已被 TASK-0025 占用）。
++--
++-- 接口对应（TASK-0052 brief 管理接口四组，权限标识与接口清单一一对应）：
++--   openapi:client:list   GET  /openapi/client/list、GET /openapi/client/{id}
++--                          （列表/详情：只回掩码前四****后四（0019 CredentialMask 范式）、
++--                          scope/rate_limit/status/轮换时间；永不回密文/明文/哈希）
++--   openapi:client:add    POST /openapi/client（无 id 分支——开通：服务端生成随机 secret
++--                          ≥32 字符安全随机，SM4 落 secret_encrypted + SHA256 落 secret_hash，
++--                          明文仅本次响应体返回一次；app_key 全局唯一，撞键业务码 4002）
++--   openapi:client:edit   POST /openapi/client（带 id 分支——编辑：brief「rate_limit 编辑
++--                          同接口」；白名单字段 client_name/scope/rate_limit/ip_whitelist/
++--                          expire_time/remark，app_key/secret/status 不可经编辑触达；
++--                          scope JSON 透传校验合法性，空=默认拒绝）；
++--                          POST /openapi/client/rotate（轮换：当前值原子移入 prev 三列，
++--                          生成新 secret，新明文仅本次响应体返回一次；并行窗内新旧双验签）
++--   openapi:client:remove PUT  /openapi/client/status（吊销/禁用 status=0；启停 status=1；
++--                          立即生效无 TTL 空窗——验签路径每请求查库读状态，无缓存）
++--   （守卫：backend OpenApiClientMenuPermissionGuardTest 强制 SQL 4075-4078 与控制器注解
++--   双向核对；SaPermissionRegistryConsistencyTest 强制注解 ⊆ sys_menu SQL 登记）
++--
++-- 与上游差异（一处，登记待回写上游）：
++--   **iot_api_client 增三列**（secret_encrypted_prev/secret_hash_prev/secret_rotated_at）：
++--   上游附录 A p34 无此三列，「双密钥轮换并行一周」（REQ-0035 验收 3 / TASK-0052 要点）
++--   需物理承载新旧两代密钥；0051 已登记 secret_encrypted（HMAC 验签需服务端持原文）
++--   同为上游缺列，本三列延续同面差异，随上游修订清单攒回写。
++--
++-- 验签顺序（轮换并行窗，OpenApiAuthStrategy 扩展，brief 定版）：
++--   先当前列验 → 失败再 prev 列验（且 NOW - secret_rotated_at ≤ ot.openapi.rotation-window-days，
++--   默认 7 天）→ 过窗后惰性清理 prev（验签路径判定时清理，不建扫描任务）；
++--   并行窗内新旧 secret 均可验签（业务连续性），过窗旧 secret 失效。
++--
++-- 幂等口径：
++--   information_schema 探列 + PREPARE 条件加列（照 20261122_iot_instance_columns.sql 范式，
++--   MySQL 8 不支持 ADD COLUMN IF NOT EXISTS）+ INSERT IGNORE 显式 id——重复执行不报错、
++--   不重复加列、不重复插入、不改已有行。可安全重复执行。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+02/03）与 20261122_iot_openapi_domain.sql（iot_api_client 在位）
++--   的存量库及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++SET @col_enc_prev_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_api_client' AND COLUMN_NAME = 'secret_encrypted_prev');
++
++SET @ddl_enc_prev = IF(@col_enc_prev_exists = 0, 'ALTER TABLE `iot_api_client` ADD COLUMN `secret_encrypted_prev` varchar(512) DEFAULT NULL COMMENT ''轮换前密文（SM4，并行窗内仍可验签）'' AFTER `secret_encrypted`', 'SELECT ''skip: secret_encrypted_prev already exists'' AS note');
++
++PREPARE stmt_enc_prev FROM @ddl_enc_prev;
++
++EXECUTE stmt_enc_prev;
++
++DEALLOCATE PREPARE stmt_enc_prev;
++
++SET @col_hash_prev_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_api_client' AND COLUMN_NAME = 'secret_hash_prev');
++
++SET @ddl_hash_prev = IF(@col_hash_prev_exists = 0, 'ALTER TABLE `iot_api_client` ADD COLUMN `secret_hash_prev` varchar(128) DEFAULT NULL COMMENT ''轮换前哈希（SHA256，快速校验）'' AFTER `secret_encrypted_prev`', 'SELECT ''skip: secret_hash_prev already exists'' AS note');
++
++PREPARE stmt_hash_prev FROM @ddl_hash_prev;
++
++EXECUTE stmt_hash_prev;
++
++DEALLOCATE PREPARE stmt_hash_prev;
++
++SET @col_rotated_at_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_api_client' AND COLUMN_NAME = 'secret_rotated_at');
++
++SET @ddl_rotated_at = IF(@col_rotated_at_exists = 0, 'ALTER TABLE `iot_api_client` ADD COLUMN `secret_rotated_at` datetime DEFAULT NULL COMMENT ''轮换时间（并行窗口起点）'' AFTER `secret_hash_prev`', 'SELECT ''skip: secret_rotated_at already exists'' AS note');
++
++PREPARE stmt_rotated_at FROM @ddl_rotated_at;
++
++EXECUTE stmt_rotated_at;
++
++DEALLOCATE PREPARE stmt_rotated_at;
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4075, 4000, 4, '调用方管理', 2, '/iot/apiclient', 'iot/apiclient/index', NULL, 'openapi:client:list', 'ApiOutlined', 11, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4076, 4075, 4, '调用方新增', 3, NULL, NULL, NULL, 'openapi:client:add', NULL, 1, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4077, 4075, 4, '调用方修改', 3, NULL, NULL, NULL, 'openapi:client:edit', NULL, 2, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0),
++  (4078, 4075, 4, '调用方吊销', 3, NULL, NULL, NULL, 'openapi:client:remove', NULL, 3, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4075), (1, 4076), (1, 4077), (1, 4078);
++
++-- ============================================================
++-- 执行后核对（第一条应见三新列、第二条应 4 行、第三条应 4 行）：
++--   SHOW COLUMNS FROM iot_api_client LIKE 'secret%';
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id BETWEEN 4075 AND 4078;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id BETWEEN 4075 AND 4078;
++-- ============================================================

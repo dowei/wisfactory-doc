@@ -1,0 +1,1562 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+index e0db94c..d69ee62 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemController.java
+@@ -3,6 +3,8 @@ package net.otlab.admin.module.iot.dataitem.controller;
+ import cn.dev33.satoken.annotation.SaCheckPermission;
+ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
+ import net.otlab.core.annotation.OperateLog;
+@@ -12,23 +14,28 @@ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+ 
+ import java.util.List;
+ 
+ /**
+- * 实例数据项控制器（TASK-0013）
++ * 实例数据项控制器（TASK-0013 清单/重生成 + TASK-0014 参数覆盖与继承链）
+  *
+  * <p>路径命名空间 /iot/item（详细设计 §3.1 p22「按 instanceId 查实例数据项列表」）+
+- * 重生成入口挂实例子资源路径 POST /iot/instance/{id}/items/regenerate（brief 裁决路由；
+- * 控制器不设类级 @RequestMapping，两方法各持全路径）。权限：清单查询 iot:item:list、
+- * 重生成 iot:item:add（brief：生成随实例创建由 iot:instance:add 触发不设独立权限点，
+- * 重生成入口由 iot:item:add 覆盖；sys_menu 4036-4040 五行，query/edit/remove 为预留行，
+- * 绑定/公式/删除接口归 0023/0015 等后续任务）。
++ * 实例子资源路径（regenerate/params/effective-params 三入口挂
++ * /iot/instance/{instanceId}/items/**；控制器不设类级 @RequestMapping，各方法持全路径）。
++ * 权限：清单查询 iot:item:list、重生成 iot:item:add（brief：生成随实例创建由 iot:instance:add
++ * 触发不设独立权限点，重生成入口由 iot:item:add 覆盖）、参数覆盖 iot:item:edit（4039 复用）、
++ * 继承链读取 iot:item:query（4037 复用）——四权限点均为 sys_menu 4036-4040 既有行，
++ * TASK-0014 不新增菜单种子。remove 为预留行（绑定/删除接口归 0023/0015 等后续任务）。
+  *
+- * <p>写路径数据权限防线在服务层（{@link IotDataItemService#regenerateForInstance}：
+- * 目标实例 ∈ 可见集，否则 403）；清单查询按数据权限裁剪（不可见实例返回空清单）。
++ * <p>写路径数据权限防线在服务层（{@link IotDataItemService#regenerateForInstance} 与
++ * {@link IotDataItemService#overrideParams}：目标实例 ∈ 可见集，否则 403；读单实例资源
++ * {@link IotDataItemService#getEffectiveParams} 同口径 403）；清单查询按数据权限裁剪
++ * （不可见实例返回空清单，集合类语义）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -54,4 +61,24 @@ public class IotDataItemController {
+     public Result<Integer> regenerate(@PathVariable("instanceId") Long instanceId) {
+         return Result.success(dataItemService.regenerateForInstance(instanceId));
+     }
++
++    @OperateLog(title = "实例数据项", businessType = BusinessType.UPDATE)
++    @Operation(summary = "覆盖实例参数阈值（TASK-0014：valid/alarm 四字段逐字段生效，null=清除覆盖回归继承；"
++            + "仅写实例行四列，运行时继承不改模板）")
++    @PutMapping("/iot/instance/{instanceId}/items/{itemId}/params")
++    @SaCheckPermission("iot:item:edit")
++    public Result<Void> overrideParams(@PathVariable("instanceId") Long instanceId,
++                                       @PathVariable("itemId") Long itemId,
++                                       @RequestBody IotItemParamOverrideForm form) {
++        dataItemService.overrideParams(instanceId, itemId, form);
++        return Result.success();
++    }
++
++    @Operation(summary = "实例参数有效值与继承来源（TASK-0014：实例值/模板默认/不判定三态逐字段标注）")
++    @GetMapping("/iot/instance/{instanceId}/items/{itemId}/effective-params")
++    @SaCheckPermission("iot:item:query")
++    public Result<IotItemEffectiveParamsVO> effectiveParams(@PathVariable("instanceId") Long instanceId,
++                                                            @PathVariable("itemId") Long itemId) {
++        return Result.success(dataItemService.getEffectiveParams(instanceId, itemId));
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java
+new file mode 100644
+index 0000000..0b29aec
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemEffectiveParamsVO.java
+@@ -0,0 +1,57 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.math.BigDecimal;
++
++/**
++ * 实例参数有效值 VO（TASK-0014，GET /iot/instance/{instanceId}/items/{itemId}/effective-params）
++ *
++ * <p>运行时继承链读取（非复制落库——REQ-0005/TASK-0014 硬要求）：实例行有值→实例值
++ * （来源 INSTANCE）；否则→模板 default_ 同名值（来源 TEMPLATE）；再否则→null 不判定
++ * （来源 NONE）。逐字段携带 {@link IotParamSource} 供前端展示继承来源。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "实例参数有效值（逐字段区分继承来源 INSTANCE/TEMPLATE/NONE）")
++public class IotItemEffectiveParamsVO {
++
++    @Schema(description = "实例ID")
++    private Long instanceId;
++
++    @Schema(description = "实例数据项ID")
++    private Long itemId;
++
++    @Schema(description = "数据编码（取自字典）")
++    private String dataCode;
++
++    @Schema(description = "全键 = instance_code + \".\" + data_code")
++    private String fullKey;
++
++    @Schema(description = "有效范围下限（继承链解析后的有效值）")
++    private BigDecimal validMin;
++
++    @Schema(description = "有效范围下限来源")
++    private IotParamSource validMinSource;
++
++    @Schema(description = "有效范围上限（继承链解析后的有效值）")
++    private BigDecimal validMax;
++
++    @Schema(description = "有效范围上限来源")
++    private IotParamSource validMaxSource;
++
++    @Schema(description = "告警低阈值（继承链解析后的有效值）")
++    private BigDecimal alarmLow;
++
++    @Schema(description = "告警低阈值来源")
++    private IotParamSource alarmLowSource;
++
++    @Schema(description = "告警高阈值（继承链解析后的有效值）")
++    private BigDecimal alarmHigh;
++
++    @Schema(description = "告警高阈值来源")
++    private IotParamSource alarmHighSource;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemParamOverrideForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemParamOverrideForm.java
+new file mode 100644
+index 0000000..1910c5c
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotItemParamOverrideForm.java
+@@ -0,0 +1,38 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.Data;
++
++import java.math.BigDecimal;
++
++/**
++ * 实例参数覆盖表单（TASK-0014，PUT /iot/instance/{instanceId}/items/{itemId}/params）
++ *
++ * <p>body 仅接受 valid_min/valid_max/alarm_low/alarm_high 四字段（brief 契约），
++ * partial 语义逐字段生效：null=清除覆盖回归继承（写 NULL）、数值=覆盖实例行该列。
++ * 四字段全 null=清除覆盖（合法，回归继承）。校验（min&lt;=max、负值/decimal(20,6) 范围）
++ * 在服务层 fail-closed（PARAM_ERROR）——本表单不挂 bean validation（null 合法，约束
++ * 表达不了「null=清除」语义）。
++ *
++ * <p>覆盖语义=仅写实例行四列（0013 已交付的 valid_min/valid_max/alarm_low/alarm_high 列），
++ * 不改模板、不复制规则行（状态规则门限载体归 FEAT-0016/模板配置，本期不在此接口处理）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "实例参数覆盖表单（四字段逐字段生效：null=清除覆盖回归继承，数值=覆盖）")
++public class IotItemParamOverrideForm {
++
++    @Schema(description = "有效范围下限覆盖（null=清除覆盖回归模板继承）")
++    private BigDecimal validMin;
++
++    @Schema(description = "有效范围上限覆盖（null=清除覆盖回归模板继承）")
++    private BigDecimal validMax;
++
++    @Schema(description = "告警低阈值覆盖（null=清除覆盖回归模板继承）")
++    private BigDecimal alarmLow;
++
++    @Schema(description = "告警高阈值覆盖（null=清除覆盖回归模板继承）")
++    private BigDecimal alarmHigh;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotParamSource.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotParamSource.java
+new file mode 100644
+index 0000000..b323afe
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/dto/IotParamSource.java
+@@ -0,0 +1,24 @@
++package net.otlab.admin.module.iot.dataitem.dto;
++
++/**
++ * 参数继承来源三态枚举（TASK-0014，REQ-0005 继承链验收）
++ *
++ * <p>effective-params 接口逐字段标注有效值的来源，供前端展示继承来源：
++ * <ul>
++ * <li>{@link #INSTANCE}：实例数据项行该字段有覆盖值（覆盖接口 PUT params 写入的实例行四列）；</li>
++ * <li>{@link #TEMPLATE}：实例行无覆盖值，取来源模板 default_ 同名默认值（运行时继承，
++ *     非复制落库——模板默认值变更按 ADR-0008 二档随发布对未覆盖实例生效）；</li>
++ * <li>{@link #NONE}：实例与模板均未配置——不判定（null 透传，判定语义归计算引擎）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public enum IotParamSource {
++    /** 实例行覆盖值（覆盖接口写入实例行四列） */
++    INSTANCE,
++    /** 模板 default_ 同名默认值（运行时继承，非复制落库） */
++    TEMPLATE,
++    /** 实例与模板均未配置：不判定（null） */
++    NONE
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemHistoryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemHistoryService.java
+new file mode 100644
+index 0000000..42a03ea
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemHistoryService.java
+@@ -0,0 +1,35 @@
++package net.otlab.admin.module.iot.dataitem.service;
++
++/**
++ * 数据项变更时间线服务接口（TASK-0014 占位钩子，REQ-0018 / TASK-0039 接缝）
++ *
++ * <p><b>时序倒挂消解口径（TASK-0014 brief 明文）</b>：时间线表 iot_data_item_history 由
++ * TASK-0039 交付——本任务只定义接口并交付 NoOp 实现，不建表、不写历史行。覆盖动作
++ * （{@code PUT /iot/instance/{instanceId}/items/{itemId}/params}）保存成功后调用
++ * {@link #recordParamChange}，接线点在
++ * {@code IotDataItemServiceImpl.overrideParams}（javadoc 同步声明）。
++ *
++ * <p><b>change_type=PARAM 语义（REQ-0018）</b>：阈值参数每次保存成功后同事务追加一行
++ * iot_data_item_history（change_type=PARAM、before/after JSON、变更人、时间）；
++ * 保存失败则无记录（同事务性，与业务写库同一 @Transactional）。BIND/FORMULA/ROLLUP
++ * 等其余 change_type 的记录动作归 0015（公式编辑）/0023（点位绑定）等任务交付时扩展本接口。
++ *
++ * <p><b>零改动接线承诺</b>：TASK-0039 交付真实实现（替换/移除
++ * {@link NoOpIotDataItemHistoryService}）后，调用方无需任何改动——接口签名即合同。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotDataItemHistoryService {
++
++    /**
++     * 记录一条阈值参数变更（change_type=PARAM）。
++     *
++     * <p>实现方契约（REQ-0018）：与调用方事务同事务落库（保存失败则无记录）；
++     * before/after 序列化为 JSON 供 diff 展示（一期纯 JSON，REQ-0018 非目标明文）；
++     * 变更人取载荷 operatorId，时间由实现方落库时刻生成。NoOp 期不产生任何持久化副作用。
++     *
++     * @param change 变更载荷（含 before/after 四阈值快照、变更人、冗余 full_key）
++     */
++    void recordParamChange(IotDataItemParamChange change);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemParamChange.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemParamChange.java
+new file mode 100644
+index 0000000..c132daa
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemParamChange.java
+@@ -0,0 +1,36 @@
++package net.otlab.admin.module.iot.dataitem.service;
++
++import java.math.BigDecimal;
++
++/**
++ * 数据项阈值参数变更载荷（TASK-0014 时间线钩子入参，REQ-0018 change_type=PARAM 语义）
++ *
++ * <p>携带时间线行所需的语义要素：目标数据项、冗余全键（项删除后按 full_key 仍可查时间线，
++ * REQ-0018 验收 3）、变更人与 before/after 四阈值快照。JSON 序列化（before/after JSON 列
++ * 形态）归时间线服务实现方（TASK-0039），本载荷只传语义值，不预设 JSON 形态。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record IotDataItemParamChange(
++        /** 实例数据项 id（iot_data_item.id） */
++        Long itemId,
++        /** 冗余全键 = instance_code + "." + data_code（时间线按 full_key 可查性） */
++        String fullKey,
++        /** 变更人（sys_user.id，会话当前用户） */
++        Long operatorId,
++        /** 变更前四阈值快照（清除覆盖时对应字段为 null） */
++        Thresholds before,
++        /** 变更后四阈值快照（清除覆盖时对应字段为 null） */
++        Thresholds after) {
++
++    /**
++     * 四阈值快照（valid/alarm 两对；null=未覆盖/不判定——与实例行四列同语义）
++     */
++    public record Thresholds(
++            BigDecimal validMin,
++            BigDecimal validMax,
++            BigDecimal alarmLow,
++            BigDecimal alarmHigh) {
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+index 6d1a567..a4fddb6 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/IotDataItemService.java
+@@ -1,5 +1,7 @@
+ package net.otlab.admin.module.iot.dataitem.service;
+ 
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ 
+ import java.util.List;
+@@ -67,4 +69,42 @@ public interface IotDataItemService {
+      * @return 有数据项的实例 → 项数映射（零项实例不在结果中）
+      */
+     Map<Long, Long> countByInstanceIds(List<Long> instanceIds);
++
++    /**
++     * 覆盖实例参数阈值（TASK-0014，PUT /iot/instance/{instanceId}/items/{itemId}/params，
++     * 权限 iot:item:edit）。
++     *
++     * <p>覆盖语义=仅写实例行四列 valid_min/valid_max/alarm_low/alarm_high（0013 已交付列），
++     * 运行时继承不改模板、不复制规则行（状态规则门限载体归 FEAT-0016/模板配置）。partial
++     * 逐字段生效：null=清除覆盖回归继承（写 NULL）、数值=覆盖；四字段全 null=清除覆盖
++     * （合法）。校验 fail-closed（PARAM_ERROR）：min&lt;=max（valid 对与 alarm 对各自成立）、
++     * 负值与超 decimal(20,6) 范围拒绝。
++     *
++     * <p>防线顺序照 0012 修订轮写路径范式：存在性→数据权限（目标实例 ∈ 可见集，403 文案
++     * 不泄露实例标识）→数据项归属→参数校验。保存成功后同事务调用
++     * {@link IotDataItemHistoryService#recordParamChange}（change_type=PARAM 占位钩子，
++     * TASK-0039 交付真实实现后零改动接线）。
++     *
++     * @param instanceId 实例 id（须为活跃行）
++     * @param itemId     实例数据项 id（须存在且属于该实例）
++     * @param form       四字段覆盖表单（逐字段 null=清除）
++     */
++    void overrideParams(Long instanceId, Long itemId, IotItemParamOverrideForm form);
++
++    /**
++     * 实例参数有效值与继承来源（TASK-0014，GET /iot/instance/{instanceId}/items/{itemId}/
++     * effective-params，权限 iot:item:query）。
++     *
++     * <p>运行时继承链读取（非复制落库——REQ-0005/TASK-0014 硬要求）：实例行有值→实例值
++     * （来源 {@code INSTANCE}）；否则→模板 default_ 同名值（来源 {@code TEMPLATE}）；
++     * 再否则→null 不判定（来源 {@code NONE}）。逐字段标注来源三态
++     * （{@link IotParamSource}）供前端展示继承来源。
++     *
++     * <p>数据权限照 0012 单实例资源读口径：目标实例 ∈ 可见集，否则 403（文案不泄露实例标识）。
++     *
++     * @param instanceId 实例 id（须为活跃行）
++     * @param itemId     实例数据项 id（须存在且属于该实例）
++     * @return 有效参数 VO（逐字段值+来源三态）
++     */
++    IotItemEffectiveParamsVO getEffectiveParams(Long instanceId, Long itemId);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryService.java
+new file mode 100644
+index 0000000..496cc9f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryService.java
+@@ -0,0 +1,26 @@
++package net.otlab.admin.module.iot.dataitem.service;
++
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.stereotype.Service;
++
++/**
++ * 数据项变更时间线服务 NoOp 实现（TASK-0014 占位，TASK-0039 交付真实实现后移除）
++ *
++ * <p>不产生任何持久化副作用（时间线表 iot_data_item_history 归 TASK-0039 建表交付）；
++ * 仅 debug 留痕证明钩子被调用。真实实现上线后本类整体删除（接口签名即合同，
++ * 调用方 {@code IotDataItemServiceImpl.overrideParams} 零改动）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Service
++public class NoOpIotDataItemHistoryService implements IotDataItemHistoryService {
++
++    @Override
++    public void recordParamChange(IotDataItemParamChange change) {
++        // TASK-0039 接线点：真实实现按 change_type=PARAM 同事务写 iot_data_item_history
++        log.debug("[ITEM-HISTORY] NoOp recordParamChange: itemId={}, fullKey={}（时间线表归 TASK-0039，本期不落库）",
++                change.itemId(), change.fullKey());
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+index d039473..c749b0f 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImpl.java
+@@ -1,13 +1,19 @@
+ package net.otlab.admin.module.iot.dataitem.service.impl;
+ 
+ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItemRef;
+ import net.otlab.admin.module.iot.dataitem.event.InstanceItemsGeneratedEvent;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemRefMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemHistoryService;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemParamChange;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
+ import net.otlab.admin.module.iot.dataitem.service.support.RelativeRefExpander;
+ import net.otlab.admin.module.iot.dataperm.DataPermService;
+@@ -28,6 +34,7 @@ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.math.BigDecimal;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+@@ -36,6 +43,7 @@ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.function.Consumer;
+ import java.util.stream.Collectors;
+ 
+ /**
+@@ -90,6 +98,15 @@ import java.util.stream.Collectors;
+  * 展开期即失败，ref 不落悬空边；M-5 剥壳绝对引用键 >180 paramError 拒（不触 SQL
+  * Data-too-long）；M-6 source_type=2 且公式空白整批拒（「公式项缺少公式」）。
+  *
++ * <p><b>参数覆盖与继承链</b>（TASK-0014，REQ-0005 继承链验收）：{@link #overrideParams}
++ * 覆盖语义=仅写实例行四列（valid_min/valid_max/alarm_low/alarm_high，0013 已交付列），
++ * partial 逐字段生效（null=清除覆盖回归继承）；不改模板、不复制规则行——运行时继承
++ * （{@link #getEffectiveParams}：实例值→INSTANCE / 模板 default_→TEMPLATE / 双空→NONE），
++ * 模板默认值变更按 ADR-0008 二档随发布对未覆盖实例生效。防线顺序照 0012 修订轮口径
++ * （存在性→数据权限 403→归属→校验 fail-closed）。保存成功后同事务调时间线钩子
++ * {@link IotDataItemHistoryService#recordParamChange}（change_type=PARAM，REQ-0018 语义；
++ * 本期为 NoOp 占位，TASK-0039 交付真实实现后零改动接线）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -106,6 +123,12 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     /** ref_type：1 数据项（本期生成只产此类型；2 点位随绑定动作写入，归 0023） */
+     private static final int REF_TYPE_DATA_ITEM = 1;
+ 
++    /** 阈值列小数位上限（valid/alarm 四列 decimal(20,6)，TASK-0014 校验口径） */
++    private static final int MAX_SCALE_THRESHOLD = 6;
++
++    /** 阈值列整数位上限（decimal(20,6) → 20-6=14 位整数，上限 9999999999.999999） */
++    private static final int MAX_INTEGER_DIGITS_THRESHOLD = 14;
++
+     /** 取值方式兜底：模板 default_source_type 可空，实例 source_type NOT NULL——未配按直绑落地 */
+     private static final int SOURCE_TYPE_BIND = 1;
+ 
+@@ -130,6 +153,9 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+     @Autowired
+     private ApplicationEventPublisher eventPublisher;
+ 
++    @Autowired
++    private IotDataItemHistoryService dataItemHistoryService;
++
+     // ---------- 生成主链（触发一：实例创建同事务 / 触发二：重生成入口） ----------
+ 
+     @Override
+@@ -367,6 +393,152 @@ public class IotDataItemServiceImpl extends ServiceImpl<IotDataItemMapper, IotDa
+                 .collect(Collectors.groupingBy(IotDataItem::getInstanceId, Collectors.counting()));
+     }
+ 
++    // ---------- 参数覆盖与继承链（TASK-0014） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void overrideParams(Long instanceId, Long itemId, IotItemParamOverrideForm form) {
++        // 防线顺序照 0012 修订轮编辑口径：存在性 → 数据权限 → 数据项归属 → 参数校验
++        IotModelInstance instance = modelInstanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + instanceId);
++        }
++        // 写路径数据权限防线（0012 修订轮 I-1 同源同口径）：目标实例 ∈ 可见集，403 文案不泄露实例标识
++        requireDataPerm(instanceId, "无权操作该实例（数据权限不命中）");
++        IotDataItem item = baseMapper.selectById(itemId);
++        if (item == null || !instanceId.equals(item.getInstanceId())) {
++            throw paramError("数据项不存在或不属于该实例: " + itemId);
++        }
++        validateThresholds(form);
++
++        // 覆盖语义=仅写实例行四列（brief 契约）：LambdaUpdateWrapper 显式 set 四列——partial
++        // 逐字段生效，null 值也必须落 SET（写 NULL 清除覆盖回归继承），updateById 空值忽略
++        // 策略做不到；实体传空对象仅让 updateFill 补 update_by/update_time 审计元数据
++        LambdaUpdateWrapper<IotDataItem> updateWrapper = new LambdaUpdateWrapper<IotDataItem>()
++                .eq(IotDataItem::getId, item.getId())
++                .set(IotDataItem::getValidMin, form.getValidMin())
++                .set(IotDataItem::getValidMax, form.getValidMax())
++                .set(IotDataItem::getAlarmLow, form.getAlarmLow())
++                .set(IotDataItem::getAlarmHigh, form.getAlarmHigh());
++        this.update(new IotDataItem(), updateWrapper);
++
++        // 时间线钩子（REQ-0018 change_type=PARAM，同事务——保存失败则无记录）：占位接口
++        // IotDataItemHistoryService + NoOp 实现，TASK-0039 交付真实实现后零改动接线；
++        // before=实例行覆盖前状态，after=本次覆盖值（清除覆盖对应字段为 null）
++        dataItemHistoryService.recordParamChange(new IotDataItemParamChange(
++                item.getId(), item.getFullKey(), SecurityUtils.getUserId(),
++                new IotDataItemParamChange.Thresholds(item.getValidMin(), item.getValidMax(),
++                        item.getAlarmLow(), item.getAlarmHigh()),
++                new IotDataItemParamChange.Thresholds(form.getValidMin(), form.getValidMax(),
++                        form.getAlarmLow(), form.getAlarmHigh())));
++        log.info("实例参数覆盖完成: instanceId={}, itemId={}, fullKey={}, valid=[{},{}], alarm=[{},{}]",
++                instanceId, itemId, item.getFullKey(), form.getValidMin(), form.getValidMax(),
++                form.getAlarmLow(), form.getAlarmHigh());
++    }
++
++    @Override
++    public IotItemEffectiveParamsVO getEffectiveParams(Long instanceId, Long itemId) {
++        // 读单实例资源照 0012 详情口径：存在性 → 数据权限 403（不泄露实例标识）→ 归属
++        IotModelInstance instance = modelInstanceMapper.selectById(instanceId);
++        if (instance == null) {
++            throw paramError("实例不存在或已删除: " + instanceId);
++        }
++        requireDataPerm(instanceId, "无权访问该实例（数据权限不命中）");
++        IotDataItem item = baseMapper.selectById(itemId);
++        if (item == null || !instanceId.equals(item.getInstanceId())) {
++            throw paramError("数据项不存在或不属于该实例: " + itemId);
++        }
++
++        // 运行时继承（非复制落库——REQ-0005/TASK-0014 硬要求）：模板 default_ 同名值只读不写。
++        // 模板已删项/模板已删行经 @TableLogic 自动过滤——继承源缺失即逐字段 NONE（不判定）
++        IotDataItemTemplate templateItem = null;
++        if (instance.getTemplateId() != null) {
++            templateItem = dataItemTemplateMapper.selectOne(new LambdaQueryWrapper<IotDataItemTemplate>()
++                    .eq(IotDataItemTemplate::getTemplateId, instance.getTemplateId())
++                    .eq(IotDataItemTemplate::getDataCode, item.getDataCode()));
++        }
++
++        IotItemEffectiveParamsVO vo = new IotItemEffectiveParamsVO();
++        vo.setInstanceId(instanceId);
++        vo.setItemId(item.getId());
++        vo.setDataCode(item.getDataCode());
++        vo.setFullKey(item.getFullKey());
++        // 逐字段继承链解析：实例行有值→INSTANCE；否则模板 default_→TEMPLATE；再否则→NONE
++        applyEffective(vo::setValidMin, vo::setValidMinSource,
++                item.getValidMin(), templateItem != null ? templateItem.getDefaultValidMin() : null);
++        applyEffective(vo::setValidMax, vo::setValidMaxSource,
++                item.getValidMax(), templateItem != null ? templateItem.getDefaultValidMax() : null);
++        applyEffective(vo::setAlarmLow, vo::setAlarmLowSource,
++                item.getAlarmLow(), templateItem != null ? templateItem.getDefaultAlarmLow() : null);
++        applyEffective(vo::setAlarmHigh, vo::setAlarmHighSource,
++                item.getAlarmHigh(), templateItem != null ? templateItem.getDefaultAlarmHigh() : null);
++        return vo;
++    }
++
++    /** 单字段继承链解析：实例值优先，其次模板默认，双空 NONE（值恒 null 透传不判定） */
++    private void applyEffective(Consumer<BigDecimal> valueSetter,
++                                Consumer<IotParamSource> sourceSetter,
++                                BigDecimal instanceValue, BigDecimal templateDefault) {
++        if (instanceValue != null) {
++            valueSetter.accept(instanceValue);
++            sourceSetter.accept(IotParamSource.INSTANCE);
++            return;
++        }
++        if (templateDefault != null) {
++            valueSetter.accept(templateDefault);
++            sourceSetter.accept(IotParamSource.TEMPLATE);
++            return;
++        }
++        sourceSetter.accept(IotParamSource.NONE);
++    }
++
++    /**
++     * 四字段校验（fail-closed，PARAM_ERROR）：负值与小数位超 6、整数位超 14（decimal(20,6)
++     * 上限 9999999999.999999）拒绝；min&lt;=max 在 valid 对与 alarm 对各自成立（仅双方均提交
++     * 数值时校验——单侧清除后另一侧与模板默认的配对关系由计算引擎运行期判定，不在保存期）。
++     */
++    private void validateThresholds(IotItemParamOverrideForm form) {
++        validateThreshold(form.getValidMin(), "有效范围下限 valid_min");
++        validateThreshold(form.getValidMax(), "有效范围上限 valid_max");
++        validateThreshold(form.getAlarmLow(), "告警低阈值 alarm_low");
++        validateThreshold(form.getAlarmHigh(), "告警高阈值 alarm_high");
++        if (form.getValidMin() != null && form.getValidMax() != null
++                && form.getValidMin().compareTo(form.getValidMax()) > 0) {
++            throw paramError("有效范围下限不能大于上限（valid_min > valid_max）");
++        }
++        if (form.getAlarmLow() != null && form.getAlarmHigh() != null
++                && form.getAlarmLow().compareTo(form.getAlarmHigh()) > 0) {
++            throw paramError("告警低阈值不能大于高阈值（alarm_low > alarm_high）");
++        }
++    }
++
++    /** 单字段范围校验：负值拒；decimal(20,6)=精度 20、小数 6 → 整数位上限 14 */
++    private void validateThreshold(BigDecimal value, String label) {
++        if (value == null) {
++            return;
++        }
++        if (value.signum() < 0) {
++            throw paramError(label + "不允许负值");
++        }
++        if (value.scale() > MAX_SCALE_THRESHOLD) {
++            throw paramError(label + "小数位超限（decimal(20,6) 上限 6 位小数）");
++        }
++        if (value.precision() - value.scale() > MAX_INTEGER_DIGITS_THRESHOLD) {
++            throw paramError(label + "整数位超限（decimal(20,6) 上限 14 位整数）");
++        }
++    }
++
++    /**
++     * 写路径数据权限防线（0012 修订轮 I-1 同源同口径）：resolve(当前用户) → VisibleScope，
++     * allTenant 直过；否则目标实例必须 ∈ 可见集，不在即 403——文案不泄露实例标识（照详情范式）。
++     */
++    private void requireDataPerm(Long targetId, String message) {
++        VisibleScope scope = dataPermService.resolve(SecurityUtils.getUserId());
++        if (!scope.allTenant() && !scope.instanceIds().contains(targetId)) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(), message);
++        }
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 模板项 → 实例项实体（字段白名单构建，映射口径见类注释；公式由调用方展开后回填） */
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/config/IotDataItemMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/config/IotDataItemMenuPermissionGuardTest.java
+index efb0562..e207d66 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/config/IotDataItemMenuPermissionGuardTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/config/IotDataItemMenuPermissionGuardTest.java
+@@ -33,11 +33,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
+  *     （id 4036-4040，parent_id=4010）权限码必须恰好等于预期的五值映射——删行/换码/
+  *     挪 parent 即红；</li>
+  * <li>代码侧：数据项域 @RestController 全部 @SaCheckPermission 权限码并集必须 ⊆ 五值集合
+- *     ——写错码/未登记码即红（query/edit/remove 为本任务预留行，对应接口绑定/公式/删除
+- *     归 0023/0015 等后续任务交付，故本期为子集而非恰好相等——多注解必红、预留行漏登记
+- *     同样必红，双向不漂移）；</li>
+- * <li>精确锚点：清单接口=iot:item:list、重生成接口=iot:item:add（brief 裁决，
+- *     生成不设独立权限点）。</li>
++ *     ——写错码/未登记码即红（remove 仍为预留行，对应接口归 0023 等后续任务交付，故本期
++ *     为子集而非恰好相等——多注解必红、预留行漏登记同样必红，双向不漂移）；</li>
++ * <li>精确锚点：清单接口=iot:item:list、重生成接口=iot:item:add（0013 brief 裁决）、
++ *     参数覆盖=iot:item:edit（4039 复用）、继承链=iot:item:query（4037 复用）——
++ *     TASK-0014 两接口复用既有权限点不新增（brief 契约）。</li>
+  * </ul>
+  *
+  * @author dowei
+@@ -81,11 +81,12 @@ class IotDataItemMenuPermissionGuardTest {
+ 
+         assertTrue(annotated.stream().allMatch(EXPECTED_MENU_ROWS.values()::contains),
+                 "数据项域 @SaCheckPermission 权限码必须 ⊆ 菜单五值集合（写错码/未登记码即失败）：实际 " + annotated);
+-        assertTrue(annotated.size() >= 2, "至少应有 list/add 两个接口注解（本期两接口）");
++        assertTrue(annotated.size() >= 4,
++                "至少应有 list/add/edit/query 四个权限注解（0013 两接口 + 0014 覆盖/继承链两接口；remove 仍预留）");
+     }
+ 
+     @Test
+-    @DisplayName("精确锚点 - 清单接口=iot:item:list、重生成接口=iot:item:add（brief 裁决）")
++    @DisplayName("精确锚点 - 清单=iot:item:list / 重生成=iot:item:add（0013）/ 覆盖=iot:item:edit、继承链=iot:item:query（0014 复用）")
+     void endpointPermAnchors() throws Exception {
+         assertEquals("iot:item:list", IotDataItemController.class
+                 .getMethod("list", Long.class)
+@@ -93,6 +94,13 @@ class IotDataItemMenuPermissionGuardTest {
+         assertEquals("iot:item:add", IotDataItemController.class
+                 .getMethod("regenerate", Long.class)
+                 .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("overrideParams", Long.class, Long.class,
++                        net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:query", IotDataItemController.class
++                .getMethod("effectiveParams", Long.class, Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
+         Set<String> annotated = collectControllerPerms();
+         Set<String> expected = new TreeSet<>(EXPECTED_MENU_ROWS.values());
+         assertTrue(expected.containsAll(annotated), "注解集必须被 SQL 登记集覆盖（SaPermissionRegistry 一致性域内复核）");
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+index 57c3858..2386fb6 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/controller/IotDataItemControllerTest.java
+@@ -1,6 +1,9 @@
+ package net.otlab.admin.module.iot.dataitem.controller;
+ 
+ import cn.dev33.satoken.annotation.SaCheckPermission;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.service.IotDataItemService;
+ import net.otlab.core.annotation.OperateLog;
+@@ -11,6 +14,7 @@ import net.otlab.core.result.ResultCode;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.DisplayName;
+ import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
+ import org.mockito.Mock;
+ import org.mockito.MockitoAnnotations;
+ import org.springframework.http.MediaType;
+@@ -19,25 +23,30 @@ import org.springframework.test.web.servlet.MockMvc;
+ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+ 
+ import java.lang.reflect.Method;
++import java.math.BigDecimal;
+ import java.util.List;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.when;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+ 
+ /**
+- * 实例数据项控制器测试（TASK-0013 接口层）
++ * 实例数据项控制器测试（TASK-0013 接口层 + TASK-0014 覆盖/继承链接口层）
+  *
+  * <p>standalone MockMvc + Mockito（不加载 Spring 上下文），权限注解以反射断言，路由与参数
+- * 校验走真实 MockMvc 请求（照 IotModelInstanceControllerTest 范式）。本期两接口契约：
+- * GET /iot/item/list（iot:item:list）+ POST /iot/instance/{id}/items/regenerate（iot:item:add，
+- * brief 裁决路由）；query/edit/remove 为预留权限行，接口归后续任务。
++ * 校验走真实 MockMvc 请求（照 IotModelInstanceControllerTest 范式）。契约四接口：
++ * GET /iot/item/list（iot:item:list）+ POST /iot/instance/{id}/items/regenerate（iot:item:add）
++ * + TASK-0014 覆盖 PUT /iot/instance/{id}/items/{itemId}/params（iot:item:edit，复用 4039
++ * 权限点不新增）与继承链 GET .../effective-params（iot:item:query，复用 4037）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -87,6 +96,17 @@ class IotDataItemControllerTest {
+                 .getAnnotation(SaCheckPermission.class).value()[0]);
+     }
+ 
++    @Test
++    @DisplayName("权限注解（TASK-0014）- 覆盖=iot:item:edit（复用 4039）/ 继承链=iot:item:query（复用 4037），不新增权限点")
++    void testParamEndpointsPermissionAnnotations() throws Exception {
++        assertEquals("iot:item:edit", IotDataItemController.class
++                .getMethod("overrideParams", Long.class, Long.class, IotItemParamOverrideForm.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++        assertEquals("iot:item:query", IotDataItemController.class
++                .getMethod("effectiveParams", Long.class, Long.class)
++                .getAnnotation(SaCheckPermission.class).value()[0]);
++    }
++
+     @Test
+     @DisplayName("操作日志注解 - 重生成有 @OperateLog 且 businessType=INSERT")
+     void testOperateLogAnnotation() throws Exception {
+@@ -96,6 +116,16 @@ class IotDataItemControllerTest {
+         assertEquals(BusinessType.INSERT, operateLog.businessType());
+     }
+ 
++    @Test
++    @DisplayName("操作日志注解（TASK-0014）- 覆盖有 @OperateLog 且 businessType=UPDATE")
++    void testOverrideOperateLogAnnotation() throws Exception {
++        Method overrideParams = IotDataItemController.class
++                .getMethod("overrideParams", Long.class, Long.class, IotItemParamOverrideForm.class);
++        OperateLog operateLog = overrideParams.getAnnotation(OperateLog.class);
++        assertNotNull(operateLog, "overrideParams 缺少 @OperateLog");
++        assertEquals(BusinessType.UPDATE, operateLog.businessType());
++    }
++
+     // ---------- 路由（真实 MockMvc 请求） ----------
+ 
+     @Test
+@@ -157,4 +187,108 @@ class IotDataItemControllerTest {
+                 .andExpect(status().isOk())
+                 .andExpect(jsonPath("$.code").value(403));
+     }
++
++    // ---------- TASK-0014：参数覆盖与继承链接口 ----------
++
++    @Test
++    @DisplayName("覆盖 - PUT /iot/instance/{id}/items/{itemId}/params 委派服务层（表单四字段透传）")
++    void testOverrideParams_Success() throws Exception {
++        mockMvc.perform(put("/iot/instance/{instanceId}/items/{itemId}/params", 100L, 200L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"validMin\":5,\"validMax\":200,\"alarmLow\":2,\"alarmHigh\":150}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        ArgumentCaptor<IotItemParamOverrideForm> captor = ArgumentCaptor.forClass(IotItemParamOverrideForm.class);
++        verify(dataItemService).overrideParams(eq(100L), eq(200L), captor.capture());
++        assertEquals(new BigDecimal("5"), captor.getValue().getValidMin());
++        assertEquals(new BigDecimal("200"), captor.getValue().getValidMax());
++        assertEquals(new BigDecimal("2"), captor.getValue().getAlarmLow());
++        assertEquals(new BigDecimal("150"), captor.getValue().getAlarmHigh());
++    }
++
++    @Test
++    @DisplayName("覆盖 - 空对象 body（全 null=清除覆盖）合法到达服务层")
++    void testOverrideParams_EmptyObjectMeansClear() throws Exception {
++        mockMvc.perform(put("/iot/instance/{instanceId}/items/{itemId}/params", 100L, 200L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        ArgumentCaptor<IotItemParamOverrideForm> captor = ArgumentCaptor.forClass(IotItemParamOverrideForm.class);
++        verify(dataItemService).overrideParams(eq(100L), eq(200L), captor.capture());
++        assertNull(captor.getValue().getValidMin());
++        assertNull(captor.getValue().getValidMax());
++        assertNull(captor.getValue().getAlarmLow());
++        assertNull(captor.getValue().getAlarmHigh());
++    }
++
++    @Test
++    @DisplayName("覆盖 - 服务层 400 透传（min>max 拒）")
++    void testOverrideParams_400Passthrough() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                "有效范围下限不能大于上限（valid_min > valid_max）"))
++                .when(dataItemService).overrideParams(eq(100L), eq(200L), any());
++
++        mockMvc.perform(put("/iot/instance/{instanceId}/items/{itemId}/params", 100L, 200L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"validMin\":101,\"validMax\":100}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++    }
++
++    @Test
++    @DisplayName("覆盖 - 服务层 403 透传（数据权限不命中）")
++    void testOverrideParams_403Passthrough() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权操作该实例（数据权限不命中）"))
++                .when(dataItemService).overrideParams(eq(100L), eq(200L), any());
++
++        mockMvc.perform(put("/iot/instance/{instanceId}/items/{itemId}/params", 100L, 200L)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"validMin\":5}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
++
++    @Test
++    @DisplayName("继承链 - GET .../effective-params 返回有效参数与来源三态")
++    void testEffectiveParams_Success() throws Exception {
++        IotItemEffectiveParamsVO vo = new IotItemEffectiveParamsVO();
++        vo.setInstanceId(100L);
++        vo.setItemId(200L);
++        vo.setDataCode("ELEC_CONS");
++        vo.setFullKey("F01.WS01.EQ001.ELEC_CONS");
++        vo.setValidMin(new BigDecimal("5"));
++        vo.setValidMinSource(IotParamSource.INSTANCE);
++        vo.setValidMax(new BigDecimal("100000"));
++        vo.setValidMaxSource(IotParamSource.TEMPLATE);
++        vo.setAlarmLow(null);
++        vo.setAlarmLowSource(IotParamSource.NONE);
++        when(dataItemService.getEffectiveParams(100L, 200L)).thenReturn(vo);
++
++        mockMvc.perform(get("/iot/instance/{instanceId}/items/{itemId}/effective-params", 100L, 200L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data.instanceId").value(100))
++                .andExpect(jsonPath("$.data.itemId").value(200))
++                .andExpect(jsonPath("$.data.dataCode").value("ELEC_CONS"))
++                .andExpect(jsonPath("$.data.validMin").value(5))
++                .andExpect(jsonPath("$.data.validMinSource").value("INSTANCE"))
++                .andExpect(jsonPath("$.data.validMaxSource").value("TEMPLATE"))
++                .andExpect(jsonPath("$.data.alarmLowSource").value("NONE"));
++
++        verify(dataItemService).getEffectiveParams(100L, 200L);
++    }
++
++    @Test
++    @DisplayName("继承链 - 服务层 403 透传（受限用户读不可见实例）")
++    void testEffectiveParams_403Passthrough() throws Exception {
++        when(dataItemService.getEffectiveParams(100L, 200L))
++                .thenThrow(new BusinessException(ResultCode.FORBIDDEN.getCode(), "无权访问该实例（数据权限不命中）"));
++
++        mockMvc.perform(get("/iot/instance/{instanceId}/items/{itemId}/effective-params", 100L, 200L))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(403));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryServiceTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryServiceTest.java
+new file mode 100644
+index 0000000..c616f90
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/NoOpIotDataItemHistoryServiceTest.java
+@@ -0,0 +1,45 @@
++package net.otlab.admin.module.iot.dataitem.service;
++
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.springframework.stereotype.Service;
++
++import java.math.BigDecimal;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * 时间线钩子 NoOp 实现测试（TASK-0014 占位钩子契约）
++ *
++ * <p>NoOp 期不产生任何持久化副作用（时间线表归 TASK-0039）：调用必须静默通过；
++ * 实现必须为 Spring 管理 bean（覆盖接口调用链装配前提）且实现钩子接口。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class NoOpIotDataItemHistoryServiceTest {
++
++    @Test
++    @DisplayName("NoOp - recordParamChange 静默通过（before/after 任意载荷均无异常、无副作用）")
++    void recordParamChangeIsSilentNoOp() {
++        NoOpIotDataItemHistoryService service = new NoOpIotDataItemHistoryService();
++        IotDataItemParamChange.Thresholds before =
++                new IotDataItemParamChange.Thresholds(new BigDecimal("0"), new BigDecimal("100"), null, null);
++        IotDataItemParamChange.Thresholds after =
++                new IotDataItemParamChange.Thresholds(null, null, new BigDecimal("1"), new BigDecimal("99"));
++        assertDoesNotThrow(() -> service.recordParamChange(
++                new IotDataItemParamChange(1L, "F01.WS01.EQ001.ELEC_CONS", 1L, before, after)));
++        assertDoesNotThrow(() -> service.recordParamChange(
++                new IotDataItemParamChange(2L, "F01.WS01.EQ002.POWER", 1L, null, null)));
++    }
++
++    @Test
++    @DisplayName("NoOp - Spring 管理 bean（@Service）且实现钩子接口（装配契约）")
++    void beanContract() {
++        assertTrue(IotDataItemHistoryService.class.isAssignableFrom(NoOpIotDataItemHistoryService.class));
++        assertNotNull(NoOpIotDataItemHistoryService.class.getAnnotation(Service.class),
++                "NoOp 必须为 Spring bean（@Service），覆盖接口才能注入钩子");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java
+new file mode 100644
+index 0000000..943b561
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/dataitem/service/impl/IotDataItemServiceImplParamOverrideTest.java
+@@ -0,0 +1,640 @@
++package net.otlab.admin.module.iot.dataitem.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.Wrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemEffectiveParamsVO;
++import net.otlab.admin.module.iot.dataitem.dto.IotItemParamOverrideForm;
++import net.otlab.admin.module.iot.dataitem.dto.IotParamSource;
++import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
++import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemHistoryService;
++import net.otlab.admin.module.iot.dataitem.service.IotDataItemParamChange;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
++import net.otlab.admin.module.iot.template.entity.IotModelInstance;
++import net.otlab.admin.module.iot.template.mapper.IotDataItemTemplateMapper;
++import net.otlab.admin.module.iot.template.mapper.IotModelInstanceMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Captor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.MockitoAnnotations;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertAll;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 实例参数覆盖与继承链服务单元测试（TASK-0014）
++ *
++ * <p>standalone Mockito 范式（照 IotDataItemServiceImplTest）：Mapper 全 mock 不触真实库；
++ * SecurityUtils 静态 mock。覆盖六项验收（brief 决策 6）：覆盖生效仅本实例（兄弟行不触）、
++ * 清除覆盖回归继承（四列写 NULL）、继承链三态（INSTANCE/TEMPLATE/NONE）、min&gt;max 拒、
++ * 时间线钩子被调用（载荷 before/after 断言）、数据权限 403（读/写两接口）。wrapper 断言
++ * 锁「仅写实例行四列」语义：sqlSet 恰四列、参数值逐一核对（MPGENVALn 键随调用序确定，
++ * MP 内部键名契约变化时会响亮失败，属预期守护）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotDataItemServiceImplParamOverrideTest {
++
++    private static final Long TENANT = 1L;
++    private static final Long TEMPLATE_ID = 10L;
++    private static final Long INSTANCE_ID = 100L;
++    private static final Long SIBLING_INSTANCE_ID = 101L;
++    private static final Long ITEM_ID = 200L;
++    private static final Long OPERATOR_ID = 7L;
++    private static final String INSTANCE_CODE = "F01.WS01.EQ001";
++    private static final String DATA_CODE = "ELEC_CONS";
++    private static final String FULL_KEY = INSTANCE_CODE + "." + DATA_CODE;
++
++    /** 模板默认值（继承链 TEMPLATE 态夹具） */
++    private static final BigDecimal TPL_VALID_MIN = new BigDecimal("0");
++    private static final BigDecimal TPL_VALID_MAX = new BigDecimal("100000");
++    private static final BigDecimal TPL_ALARM_LOW = new BigDecimal("1");
++    private static final BigDecimal TPL_ALARM_HIGH = new BigDecimal("99");
++
++    /** 实例行既有覆盖值（覆盖前状态，钩子 before 快照夹具） */
++    private static final BigDecimal OLD_VALID_MIN = new BigDecimal("10");
++    private static final BigDecimal OLD_VALID_MAX = new BigDecimal("5000");
++    private static final BigDecimal OLD_ALARM_LOW = new BigDecimal("5");
++    private static final BigDecimal OLD_ALARM_HIGH = new BigDecimal("80");
++
++    @Mock
++    private IotDataItemMapper baseMapper;
++
++    @Mock
++    private IotModelInstanceMapper modelInstanceMapper;
++
++    @Mock
++    private IotDataItemTemplateMapper dataItemTemplateMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private IotDataItemHistoryService dataItemHistoryService;
++
++    @Captor
++    private ArgumentCaptor<Wrapper<IotDataItem>> updateWrapperCaptor;
++
++    @Captor
++    private ArgumentCaptor<IotDataItemParamChange> changeCaptor;
++
++    private IotDataItemServiceImpl dataItemService;
++
++    private MockedStatic<TenantContext> tenantContext;
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    private AutoCloseable mocks;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotDataItem.class);
++        TableInfoHelper.initTableInfo(assistant, IotDataItemTemplate.class);
++        TableInfoHelper.initTableInfo(assistant, IotModelInstance.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = org.mockito.Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = org.mockito.Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(OPERATOR_ID);
++        dataItemService = new IotDataItemServiceImpl();
++        ReflectionTestUtils.setField(dataItemService, "baseMapper", baseMapper);
++        ReflectionTestUtils.setField(dataItemService, "modelInstanceMapper", modelInstanceMapper);
++        ReflectionTestUtils.setField(dataItemService, "dataItemTemplateMapper", dataItemTemplateMapper);
++        ReflectionTestUtils.setField(dataItemService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(dataItemService, "dataItemHistoryService", dataItemHistoryService);
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++        when(baseMapper.update(any(), any())).thenReturn(1);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotModelInstance instance(Long id, String code, Long templateId) {
++        IotModelInstance inst = new IotModelInstance();
++        inst.setId(id);
++        inst.setTenantId(TENANT);
++        inst.setInstanceCode(code);
++        inst.setInstanceName("实例-" + code);
++        inst.setParentId(0L);
++        inst.setAncestors("0");
++        inst.setNodeType(4);
++        inst.setTemplateId(templateId);
++        inst.setStatus(1);
++        inst.setLocked(0);
++        return inst;
++    }
++
++    private IotDataItem item(Long id, Long instanceId, String fullKey,
++                             BigDecimal validMin, BigDecimal validMax,
++                             BigDecimal alarmLow, BigDecimal alarmHigh) {
++        IotDataItem item = new IotDataItem();
++        item.setId(id);
++        item.setTenantId(TENANT);
++        item.setInstanceId(instanceId);
++        item.setDataCode(DATA_CODE);
++        item.setFullKey(fullKey);
++        item.setSourceType(2);
++        item.setValidMin(validMin);
++        item.setValidMax(validMax);
++        item.setAlarmLow(alarmLow);
++        item.setAlarmHigh(alarmHigh);
++        item.setEnabled(1);
++        item.setStatus(1);
++        item.setDeleted(0);
++        return item;
++    }
++
++    /** 既有覆盖状态的实例行（before 快照基准） */
++    private IotDataItem itemWithOldOverrides(Long instanceId, String fullKey) {
++        return item(ITEM_ID, instanceId, fullKey, OLD_VALID_MIN, OLD_VALID_MAX, OLD_ALARM_LOW, OLD_ALARM_HIGH);
++    }
++
++    private IotDataItemTemplate templateItem(Long id, String dataCode, BigDecimal validMin, BigDecimal validMax,
++                                             BigDecimal alarmLow, BigDecimal alarmHigh) {
++        IotDataItemTemplate item = new IotDataItemTemplate();
++        item.setId(id);
++        item.setTemplateId(TEMPLATE_ID);
++        item.setTenantId(TENANT);
++        item.setDataCode(dataCode);
++        item.setDataName("累计电量");
++        item.setDefaultSourceType(2);
++        item.setDefaultValidMin(validMin);
++        item.setDefaultValidMax(validMax);
++        item.setDefaultAlarmLow(alarmLow);
++        item.setDefaultAlarmHigh(alarmHigh);
++        return item;
++    }
++
++    private IotItemParamOverrideForm form(BigDecimal validMin, BigDecimal validMax,
++                                          BigDecimal alarmLow, BigDecimal alarmHigh) {
++        IotItemParamOverrideForm form = new IotItemParamOverrideForm();
++        form.setValidMin(validMin);
++        form.setValidMax(validMax);
++        form.setAlarmLow(alarmLow);
++        form.setAlarmHigh(alarmHigh);
++        return form;
++    }
++
++    private void stubTargetInstance() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, TEMPLATE_ID));
++    }
++
++    private void stubTargetItem() {
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(itemWithOldOverrides(INSTANCE_ID, FULL_KEY));
++    }
++
++    private void stubTemplateItem(IotDataItemTemplate templateItem) {
++        when(dataItemTemplateMapper.selectOne(any())).thenReturn(templateItem);
++    }
++
++    /** 取捕获 wrapper（先渲染全部 SQL 段——MP 3.5.x formatParam 惰性求值，渲染时才写入参数表） */
++    private LambdaUpdateWrapper<IotDataItem> capturedWrapper() {
++        LambdaUpdateWrapper<IotDataItem> uw =
++                (LambdaUpdateWrapper<IotDataItem>) updateWrapperCaptor.getValue();
++        uw.getSqlSet();
++        uw.getSqlSegment();
++        return uw;
++    }
++
++    /** 取捕获 wrapper 的 sqlSet 列名集合（按 set 调用序） */
++    private List<String> capturedSetColumns() {
++        return Arrays.stream(capturedWrapper().getSqlSet().split(","))
++                .map(seg -> seg.substring(0, seg.indexOf('=')))
++                .toList();
++    }
++
++    /** 按列名取 sqlSet 段的参数值（键从段文本 MPGENVALn 正则提取，不依赖参数表迭代序） */
++    private Object setParamValue(String column) {
++        LambdaUpdateWrapper<IotDataItem> uw = capturedWrapper();
++        for (String seg : uw.getSqlSet().split(",")) {
++            String col = seg.substring(0, seg.indexOf('='));
++            if (col.equals(column)) {
++                java.util.regex.Matcher matcher = java.util.regex.Pattern
++                        .compile("(MPGENVAL\\d+)")
++                        .matcher(seg);
++                assertTrue(matcher.find(), () -> "sqlSet 段未含参数键: " + seg);
++                return uw.getParamNameValuePairs().get(matcher.group(1));
++            }
++        }
++        throw new AssertionError("sqlSet 中不存在列: " + column);
++    }
++
++    /** 按列名取 where 段的条件参数值（照 "col = #{ew.paramNameValuePairs.MPGENVALn}" 文本解析） */
++    private Object whereParamValue(String column) {
++        LambdaUpdateWrapper<IotDataItem> uw = capturedWrapper();
++        java.util.regex.Matcher matcher = java.util.regex.Pattern
++                .compile(column + "\\s*=\\s*#\\{ew\\.paramNameValuePairs\\.(MPGENVAL\\d+)}")
++                .matcher(uw.getSqlSegment());
++        assertTrue(matcher.find(), () -> "where 段未找到列条件: " + column + "，实际 " + uw.getSqlSegment());
++        return uw.getParamNameValuePairs().get(matcher.group(1));
++    }
++
++    // ---------- 覆盖写入 ----------
++
++    @Test
++    @DisplayName("覆盖 - 四列全部覆盖：update 恰写实例行四列（sqlSet 恰 4 列、参数值逐一核对）、仅 1 次更新")
++    void testOverride_AllFourColumnsWritesOnlyThoseColumns() {
++        stubTargetInstance();
++        stubTargetItem();
++        IotItemParamOverrideForm form = form(new BigDecimal("5"), new BigDecimal("200"),
++                new BigDecimal("2"), new BigDecimal("150"));
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form);
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        List<String> columns = capturedSetColumns();
++        assertEquals(List.of("valid_min", "valid_max", "alarm_low", "alarm_high"), columns,
++                "覆盖语义=仅写实例行四列（brief 契约），不得触碰其他任何列");
++        assertEquals(5, capturedWrapper().getParamNameValuePairs().size(), "恰 1 个 where 条件 + 4 个 set 参数");
++        assertEquals(ITEM_ID, ((Number) whereParamValue("id")).longValue(), "更新目标=本行主键（兄弟实例行不可达）");
++        assertAll("四列写入值逐一核对",
++                () -> assertEquals(new BigDecimal("5"), setParamValue("valid_min")),
++                () -> assertEquals(new BigDecimal("200"), setParamValue("valid_max")),
++                () -> assertEquals(new BigDecimal("2"), setParamValue("alarm_low")),
++                () -> assertEquals(new BigDecimal("150"), setParamValue("alarm_high")));
++    }
++
++    @Test
++    @DisplayName("覆盖 - partial：仅 valid_min 数值，其余三字段 null=清除覆盖（写 NULL 回归继承）")
++    void testOverride_PartialNullFieldsClearOverrides() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null));
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        List<String> columns = capturedSetColumns();
++        assertEquals(List.of("valid_min", "valid_max", "alarm_low", "alarm_high"), columns,
++                "partial 语义逐字段生效：未提交字段也要写 NULL 清除，而非保持原值");
++        assertEquals(new BigDecimal("5"), setParamValue("valid_min"), "提交数值的列=覆盖");
++        assertNull(setParamValue("valid_max"), "null 字段=清除覆盖（写 NULL）");
++        assertNull(setParamValue("alarm_low"));
++        assertNull(setParamValue("alarm_high"));
++    }
++
++    @Test
++    @DisplayName("覆盖 - 四字段全 null=清除覆盖（合法，回归继承）：四列全写 NULL")
++    void testOverride_ClearOverrideWritesAllNulls() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, null, null, null));
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(List.of("valid_min", "valid_max", "alarm_low", "alarm_high"), capturedSetColumns());
++        assertNull(setParamValue("valid_min"));
++        assertNull(setParamValue("valid_max"));
++        assertNull(setParamValue("alarm_low"));
++        assertNull(setParamValue("alarm_high"));
++    }
++
++    @Test
++    @DisplayName("覆盖 - 覆盖生效仅本实例：兄弟实例同码项不产生任何 update（单行 update、目标=本行主键）")
++    void testOverride_SiblingInstanceRowNotTouched() {
++        stubTargetInstance();
++        stubTargetItem();
++        // 兄弟实例同码项在库（本用例证明写路径不触它）
++        when(baseMapper.selectById(201L)).thenReturn(item(201L, SIBLING_INSTANCE_ID,
++                "F01.WS01.EQ002.ELEC_CONS", null, null, null, null));
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), new BigDecimal("300"), null, null));
++
++        verify(baseMapper, times(1)).update(any(), updateWrapperCaptor.capture());
++        assertEquals(ITEM_ID, ((Number) whereParamValue("id")).longValue(),
++                "更新条件=目标行主键；兄弟实例行（id=201）不在任何写语句目标内");
++    }
++
++    // ---------- 时间线钩子 ----------
++
++    @Test
++    @DisplayName("钩子 - 覆盖成功后 recordParamChange 被调用，载荷含 before/after 快照与变更人（同事务语义）")
++    void testOverride_HookCalledWithBeforeAfterPayload() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), new BigDecimal("200"),
++                new BigDecimal("2"), new BigDecimal("150")));
++
++        verify(dataItemHistoryService, times(1)).recordParamChange(changeCaptor.capture());
++        IotDataItemParamChange change = changeCaptor.getValue();
++        assertEquals(ITEM_ID, change.itemId());
++        assertEquals(FULL_KEY, change.fullKey());
++        assertEquals(OPERATOR_ID, change.operatorId());
++        assertEquals(new IotDataItemParamChange.Thresholds(OLD_VALID_MIN, OLD_VALID_MAX, OLD_ALARM_LOW, OLD_ALARM_HIGH),
++                change.before(), "before=实例行覆盖前状态");
++        assertEquals(new IotDataItemParamChange.Thresholds(new BigDecimal("5"), new BigDecimal("200"),
++                        new BigDecimal("2"), new BigDecimal("150")),
++                change.after(), "after=本次覆盖值");
++    }
++
++    @Test
++    @DisplayName("钩子 - 清除覆盖同样记录（after 快照全 null）；校验失败路径不调钩子")
++    void testOverride_HookOnClearAndNotOnRejection() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        // 清除覆盖：钩子记录 after=全 null
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, null, null, null));
++        verify(dataItemHistoryService, times(1)).recordParamChange(changeCaptor.capture());
++        assertEquals(new IotDataItemParamChange.Thresholds(null, null, null, null), changeCaptor.getValue().after());
++
++        // min>max 拒：零写入零钩子（同事务性——保存失败则无记录）
++        clearInvocationsAndStub();
++        assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("101"), new BigDecimal("100"), null, null)));
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++
++    private void clearInvocationsAndStub() {
++        org.mockito.Mockito.clearInvocations(baseMapper, dataItemHistoryService);
++    }
++
++    // ---------- 校验（fail-closed PARAM_ERROR） ----------
++
++    @Test
++    @DisplayName("校验 - valid 对 min>max 拒（PARAM_ERROR），零写入零钩子")
++    void testOverride_ValidPairMinGreaterThanMaxRejected() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("101"), new BigDecimal("100"), null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++
++    @Test
++    @DisplayName("校验 - alarm 对 min>max 拒（PARAM_ERROR）")
++    void testOverride_AlarmPairMinGreaterThanMaxRejected() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(null, null, new BigDecimal("100"), new BigDecimal("99"))));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("校验 - 负值拒（PARAM_ERROR）")
++    void testOverride_NegativeValueRejected() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("-0.000001"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("负值"));
++    }
++
++    @Test
++    @DisplayName("校验 - 小数位超 6（decimal(20,6)）拒")
++    void testOverride_ScaleBeyondSixRejected() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("0.0000001"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("校验 - 整数位超 14（decimal(20,6) 上限 9999999999.999999）拒")
++    void testOverride_IntegerDigitsBeyondFourteenRejected() {
++        stubTargetInstance();
++        stubTargetItem();
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("100000000000000"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++
++        // 边界内（14 位整数 + 6 位小数）合法
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("9999999999.999999"), null, null, null));
++        verify(baseMapper, times(1)).update(any(), any());
++    }
++
++    // ---------- 存在性与归属 ----------
++
++    @Test
++    @DisplayName("存在性 - 实例不存在或已删除 400（先于数据权限，照 0012 编辑防线顺序）")
++    void testOverride_InstanceMissingRejected() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("归属 - 数据项不存在 / 属于其他实例 400")
++    void testOverride_ItemMissingOrForeignRejected() {
++        stubTargetInstance();
++
++        // 不存在
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(null);
++        BusinessException ex1 = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex1.getCode());
++
++        // 属于其他实例（同租户他行）
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, SIBLING_INSTANCE_ID,
++                "F01.WS01.EQ002.ELEC_CONS", null, null, null, null));
++        BusinessException ex2 = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex2.getCode());
++        verify(baseMapper, never()).update(any(), any());
++    }
++
++    // ---------- 数据权限（0012 写路径范式） ----------
++
++    @Test
++    @DisplayName("数据权限 - 受限用户覆盖不可见实例项 403（文案不泄露实例标识，零写入零钩子）")
++    void testOverride_DataPermForbidden() {
++        stubTargetInstance();
++        stubTargetItem();
++        when(dataPermService.resolve(any())).thenReturn(new VisibleScope(false, java.util.Set.of(4L), java.util.Set.of(3L, 6L), false));
++
++        BusinessException ex = assertThrows(BusinessException.class, () ->
++                dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null)));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex.getCode());
++        assertFalse(ex.getMessage().contains(INSTANCE_CODE), "403 文案不得泄露实例编码");
++        assertFalse(ex.getMessage().contains(String.valueOf(INSTANCE_ID)), "403 文案不得泄露实例 id");
++        verify(baseMapper, never()).update(any(), any());
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++
++    @Test
++    @DisplayName("数据权限 - allTenant（租户管理员）直过")
++    void testOverride_AllTenantPasses() {
++        stubTargetInstance();
++        stubTargetItem();
++        when(dataPermService.resolve(any())).thenReturn(VisibleScope.allTenant(false));
++
++        dataItemService.overrideParams(INSTANCE_ID, ITEM_ID, form(new BigDecimal("5"), null, null, null));
++        verify(baseMapper, times(1)).update(any(), any());
++    }
++
++    // ---------- 继承链三态 ----------
++
++    @Test
++    @DisplayName("继承链 - 混合三态：实例值→INSTANCE / 模板默认→TEMPLATE / 双空→NONE（逐字段）")
++    void testEffective_MixedSources() {
++        stubTargetInstance();
++        // 实例行：valid_min=5（INSTANCE）；valid_max/alarm_low=null；alarm_high=88（INSTANCE）
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY,
++                new BigDecimal("5"), null, null, new BigDecimal("88")));
++        // 模板项：valid_max=100000（TEMPLATE）；alarm_low 无默认（NONE）
++        stubTemplateItem(templateItem(300L, DATA_CODE, TPL_VALID_MIN, TPL_VALID_MAX, null, TPL_ALARM_HIGH));
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertEquals(INSTANCE_ID, vo.getInstanceId());
++        assertEquals(ITEM_ID, vo.getItemId());
++        assertEquals(DATA_CODE, vo.getDataCode());
++        assertEquals(FULL_KEY, vo.getFullKey());
++        assertAll("逐字段三态",
++                () -> assertEquals(new BigDecimal("5"), vo.getValidMin()),
++                () -> assertEquals(IotParamSource.INSTANCE, vo.getValidMinSource()),
++                () -> assertEquals(TPL_VALID_MAX, vo.getValidMax()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getValidMaxSource()),
++                () -> assertNull(vo.getAlarmLow()),
++                () -> assertEquals(IotParamSource.NONE, vo.getAlarmLowSource()),
++                () -> assertEquals(new BigDecimal("88"), vo.getAlarmHigh()),
++                () -> assertEquals(IotParamSource.INSTANCE, vo.getAlarmHighSource()));
++    }
++
++    @Test
++    @DisplayName("继承链 - 实例行四列全空 → 全部 TEMPLATE（模板 default_ 同名值）")
++    void testEffective_AllFromTemplate() {
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY, null, null, null, null));
++        stubTemplateItem(templateItem(300L, DATA_CODE, TPL_VALID_MIN, TPL_VALID_MAX, TPL_ALARM_LOW, TPL_ALARM_HIGH));
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertAll("清除覆盖后回归继承（运行时继承，非复制落库）",
++                () -> assertEquals(TPL_VALID_MIN, vo.getValidMin()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getValidMinSource()),
++                () -> assertEquals(TPL_VALID_MAX, vo.getValidMax()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getValidMaxSource()),
++                () -> assertEquals(TPL_ALARM_LOW, vo.getAlarmLow()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getAlarmLowSource()),
++                () -> assertEquals(TPL_ALARM_HIGH, vo.getAlarmHigh()),
++                () -> assertEquals(IotParamSource.TEMPLATE, vo.getAlarmHighSource()));
++    }
++
++    @Test
++    @DisplayName("继承链 - 实例与模板均未配置 → NONE + null（不判定）")
++    void testEffective_AllNoneWhenNothingConfigured() {
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY, null, null, null, null));
++        stubTemplateItem(templateItem(300L, DATA_CODE, null, null, null, null));
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertAll("不判定态透传 null",
++                () -> assertEquals(IotParamSource.NONE, vo.getValidMinSource()),
++                () -> assertNull(vo.getValidMin()),
++                () -> assertEquals(IotParamSource.NONE, vo.getValidMaxSource()),
++                () -> assertEquals(IotParamSource.NONE, vo.getAlarmLowSource()),
++                () -> assertEquals(IotParamSource.NONE, vo.getAlarmHighSource()));
++    }
++
++    @Test
++    @DisplayName("继承链 - 模板项已删/缺失（selectOne 空）→ 模板默认不可用，逐字段 NONE")
++    void testEffective_TemplateItemMissingFallsToNone() {
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY, null, null, null, null));
++        stubTemplateItem(null);
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertEquals(IotParamSource.NONE, vo.getValidMinSource());
++        assertEquals(IotParamSource.NONE, vo.getAlarmHighSource());
++    }
++
++    @Test
++    @DisplayName("继承链 - 组织节点实例（templateId=null）无模板可继承 → 逐字段 NONE")
++    void testEffective_NoTemplateInstance() {
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(instance(INSTANCE_ID, INSTANCE_CODE, null));
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, INSTANCE_ID, FULL_KEY, null, null, null, null));
++
++        IotItemEffectiveParamsVO vo = dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID);
++
++        assertEquals(IotParamSource.NONE, vo.getValidMinSource());
++        assertEquals(IotParamSource.NONE, vo.getAlarmHighSource());
++        verify(dataItemTemplateMapper, never()).selectOne(any());
++    }
++
++    @Test
++    @DisplayName("继承链 - 实例不存在 400 / 数据项归属他实例 400 / 受限用户 403")
++    void testEffective_Guards() {
++        // 实例不存在
++        when(modelInstanceMapper.selectById(INSTANCE_ID)).thenReturn(null);
++        BusinessException ex1 = assertThrows(BusinessException.class, () ->
++                dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex1.getCode());
++
++        // 数据项归属他实例
++        stubTargetInstance();
++        when(baseMapper.selectById(ITEM_ID)).thenReturn(item(ITEM_ID, SIBLING_INSTANCE_ID,
++                "F01.WS01.EQ002.ELEC_CONS", null, null, null, null));
++        BusinessException ex2 = assertThrows(BusinessException.class, () ->
++                dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex2.getCode());
++
++        // 受限用户不可见实例：403 且不泄露标识
++        when(dataPermService.resolve(any())).thenReturn(new VisibleScope(false, java.util.Set.of(4L), java.util.Set.of(3L, 6L), false));
++        BusinessException ex3 = assertThrows(BusinessException.class, () ->
++                dataItemService.getEffectiveParams(INSTANCE_ID, ITEM_ID));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), ex3.getCode());
++        assertFalse(ex3.getMessage().contains(INSTANCE_CODE));
++        assertFalse(ex3.getMessage().contains(String.valueOf(INSTANCE_ID)));
++
++        // 全程无钩子调用（读路径零副作用）
++        verify(dataItemHistoryService, never()).recordParamChange(any());
++    }
++}

@@ -1,0 +1,252 @@
+commit c94c9b716749cd16159f69171e79036830160332
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 04:08:40 2026 +0800
+
+    fix(iot): 模板数据项库内预检改含已删行——逻辑删行占用编码的永久死路修正 + 文案区分已存在/已删占用（TASK-0011 修订轮 I-1）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java
+index 3d4d7e1..603c8e2 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/controller/IotDataItemTemplateController.java
+@@ -30,6 +30,11 @@ import java.util.stream.Collectors;
+  * 双道闸/白名单构建全部在服务层（IotDataDictService.validateForTemplateRef 接线，
+  * NOT_REGISTERED/DISABLED 按文案拒整批不落库）。
+  *
++ * <p><b>同模板数据项逻辑删后编码不可复用</b>（修订轮 I-1 决策声明，与模板编码同款决策
++ * 声明对齐）：uk_template_data_code 为 (template_id, data_code) 物理唯一索引且不含
++ * deleted 列，DELETE 逻辑删行永久占用编码——重存同码 4002「已被删除记录占用，不可复用」；
++ * 换编码=新增一项+停用旧项（REQ-0004 核心规则）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java
+index 751f3f6..a2c98f2 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/mapper/IotDataItemTemplateMapper.java
+@@ -1,13 +1,19 @@
+ package net.otlab.admin.module.iot.template.mapper;
+ 
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
+ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+ import net.otlab.admin.module.iot.template.entity.IotDataItemTemplate;
+ import org.apache.ibatis.annotations.Mapper;
++import org.apache.ibatis.annotations.Param;
++import org.apache.ibatis.annotations.Select;
++
++import java.util.Collection;
++import java.util.List;
+ 
+ /**
+- * 模板数据项数据访问层（TASK-0011）
++ * 模板数据项数据访问层（TASK-0011 / 修订轮 I-1）
+  *
+- * <p>空 BaseMapper：iot_data_item_template 为 iot_ 前缀表，多租户条件由 TASK-0002
++ * <p>iot_data_item_template 为 iot_ 前缀表，多租户条件由 TASK-0002
+  * TenantLineInnerInterceptor 自动注入（OtTenantLineHandler 前缀规则）——tenant_id 列为
+  * §0.3 改造二统一补列（升级脚本「与上游差异」2），缺列会使插件注入后的 SQL 运行期报错。
+  *
+@@ -16,4 +22,32 @@ import org.apache.ibatis.annotations.Mapper;
+  */
+ @Mapper
+ public interface IotDataItemTemplateMapper extends BaseMapper<IotDataItemTemplate> {
++
++    /**
++     * 按 (template_id, data_code) 显式查占用行——批量保存库内预检专用（修订轮 I-1）。
++     *
++     * <p><b>含已删行</b>：uk_template_data_code 为 (template_id, data_code) 物理唯一索引、
++     * 不含 deleted 列，逻辑删行仍占用编码且无任何 API 途径复活/清除（编码不复用纪律，
++     * 与字典/租户域同款）——预检若只看活跃行（@TableLogic 过滤），重存同码必撞物理索引
++     * 且被误报为瞬态并发冲突。故本方法绕过 @TableLogic（原生 @Select 不过逻辑删注入）
++     * 返回占用行的 deleted 标记，由调用方区分文案。
++     *
++     * <p>旁路多租户插件（{@code @InterceptorIgnore(tenantLine = "true")}，照 TASK-0002
++     * 三处旁路的显式条件范式）：显式条件仅 template_id + data_code——template_id 已由
++     * 服务层会话态存在性校验保证归属本租户（插件隔离经 template_id 传递，uk 本就是
++     * 模板作用域），预检语义与物理唯一索引的作用域精确一致。
++     *
++     * <p>调用方保证 dataCodes 非空（空集走调用方短路，不发 IN ()）。
++     *
++     * @param templateId 宿主模板 id（已验会话租户归属）
++     * @param dataCodes  待预检编码集合（非空）
++     * @return 命中的占用行（含已删行，携带 deleted 标记）；无命中返回空表
++     */
++    @InterceptorIgnore(tenantLine = "true")
++    @Select("<script>SELECT id, data_code, deleted FROM iot_data_item_template "
++            + "WHERE template_id = #{templateId} AND data_code IN "
++            + "<foreach collection='dataCodes' item='code' open='(' separator=',' close=')'>#{code}</foreach>"
++            + "</script>")
++    List<IotDataItemTemplate> selectByTemplateAndCodes(@Param("templateId") Long templateId,
++                                                       @Param("dataCodes") Collection<String> dataCodes);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java
+index aa2c25e..fd2dadb 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/IotDataItemTemplateService.java
+@@ -40,9 +40,12 @@ public interface IotDataItemTemplateService extends IService<IotDataItemTemplate
+      * 宿主模板不存在 → PARAM_ERROR 拒绝；逐项必填与公式基础格式校验 + (template_id,
+      * data_code) 批内互撞先判（4002）；全项编码收集后一次 validateForTemplateRef 三态核对，
+      * 任一项非 OK 按请求顺序取首个失败项以 0010 文案拒整批（PARAM_ERROR，不落库）；库内
+-     * 已有同 (template_id, data_code) 活跃行预检 4002；全部通过才白名单构建逐项落库
+-     * （status=1、deleted=0、templateId/tenantId 以入参会话为准，项内携带值不信任），
+-     * 并发撞物理唯一索引兜底映射 4002 整批拒绝。
++     * 同 (template_id, data_code) 占用预检 4002（修订轮 I-1：走含已删行旁路 Mapper——
++     * uk_template_data_code 不含 deleted，逻辑删行永久占用编码不可复用；文案区分：活跃行
++     * 「模板数据项编码已存在: <code>」、已删行「模板数据项编码已被删除记录占用，不可复用:
++     * <code>」）；全部通过才白名单构建逐项落库（deleted=0、templateId/tenantId 以入参/
++     * 会话为准，项内携带值不信任），并发撞物理唯一索引兜底映射 4002 整批拒绝（该兜底经
++     * 含已删行预检后仅剩真实并发插入窗口，文案「请重试」语义成立）。
+      *
+      * @param templateId 宿主模板 id（form.templateId，服务层以此覆盖项内携带值）
+      * @param items      数据项清单（1-500 项）
+@@ -61,6 +64,12 @@ public interface IotDataItemTemplateService extends IService<IotDataItemTemplate
+     /**
+      * 批量逻辑删数据项（removeByIds；模板数据项无外部引用方——实例数据项由 TASK-0012
+      * 生成时即独立落行，不回指模板数据项——故无删除保护）；空列表 PARAM_ERROR 拒绝。
++     *
++     * <p><b>同模板数据项逻辑删后编码不可复用</b>（修订轮 I-1 决策声明，与模板编码同款）：
++     * uk_template_data_code 为 (template_id, data_code) 物理唯一索引且不含 deleted 列，
++     * 逻辑删行永久占用编码且无 API 途径复活/清除——重存同码被预检拒（4002「已被删除记录
++     * 占用，不可复用」）。换编码=新增一项+停用旧项（REQ-0004 核心规则）；若产品未来要
++     * 复用语义，属演进式变更须立 ADR，不在本任务范围。
+      */
+     boolean deleteItems(List<Long> ids);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+index ea6ee1c..4559de1 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImpl.java
+@@ -18,6 +18,7 @@ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+@@ -35,8 +36,12 @@ import java.util.Set;
+  * {@link #ITEM_BATCH_MAX}=500 项（0010 评审 Minor② 调用侧约束）。
+  *
+  * <p>(template_id, data_code) 唯一双道闸（照 IotDataDictServiceImpl 范式）：批内互撞先判
+- * （先于字典校验，brief 明文）；库内活跃行预检 4002；落库并发撞 uk_template_data_code 由
+- * {@link DuplicateKeyException} 兜底映射 4002（rollbackFor=Exception 整批回滚）。
++ * （先于字典校验，brief 明文）；库内占用预检 4002——修订轮 I-1 改走<b>含已删行</b>旁路
++ * Mapper（{@code selectByTemplateAndCodes}，照 0002 显式条件范式）：uk_template_data_code
++ * 不含 deleted 列，逻辑删行永久占用编码且无 API 途径复活/清除（编码不复用纪律，与字典/
++ * 租户域同款），文案区分活跃行「已存在」/已删行「已被删除记录占用，不可复用」；落库并发
++ * 撞 uk_template_data_code 由 {@link DuplicateKeyException} 兜底映射 4002（rollbackFor=
++ * Exception 整批回滚；经含已删行预检后该兜底仅剩真实并发插入窗口，「请重试」语义成立）。
+  *
+  * <p>默认公式一期降级口径（brief 裁决）：非空时长度 ≤2000 + 括号/占位符配平的基础格式
+  * 占位校验——<b>Aviator 真实语法校验归 FEAT-0012 公式校验器交付时接线</b>（任务正文
+@@ -110,16 +115,28 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+             }
+         }
+ 
+-        // 第二遍：库内已有 (template_id, data_code) 活跃行预检（双道闸第一道；
+-        // @TableLogic 过滤已删行，租户条件由插件追加）
+-        LambdaQueryWrapper<IotDataItemTemplate> existWrapper = new LambdaQueryWrapper<>();
+-        existWrapper.select(IotDataItemTemplate::getDataCode)
+-                .eq(IotDataItemTemplate::getTemplateId, templateId)
+-                .in(IotDataItemTemplate::getDataCode, seenCodes);
+-        List<IotDataItemTemplate> existingRows = this.list(existWrapper);
+-        if (!existingRows.isEmpty()) {
+-            throw duplicateDataCode("模板数据项编码已存在: "
+-                    + existingRows.get(0).getDataCode() + "（同模板内编码唯一，重复请改用编辑）");
++        // 第二遍：库内 (template_id, data_code) 占用预检（双道闸第一道，修订轮 I-1）——
++        // 走含已删行旁路 Mapper（IotDataItemTemplateMapper.selectByTemplateAndCodes，照 0002
++        // 显式条件范式）：uk_template_data_code 不含 deleted 列，逻辑删行永久占用编码且无
++        // API 途径复活/清除（编码不复用纪律，与字典/租户域同款）——活跃行报「已存在」、
++        // 已删行报「已被删除记录占用，不可复用」，消除「重存同码必撞索引却被误报并发冲突」
++        // 的永久死路。按请求顺序取首个命中项报错。
++        List<IotDataItemTemplate> occupiedRows =
++                baseMapper.selectByTemplateAndCodes(templateId, seenCodes);
++        if (!occupiedRows.isEmpty()) {
++            Map<String, IotDataItemTemplate> occupiedByCode = new HashMap<>();
++            for (IotDataItemTemplate row : occupiedRows) {
++                occupiedByCode.put(row.getDataCode(), row);
++            }
++            for (IotDataItemTemplate item : items) {
++                IotDataItemTemplate occupied = occupiedByCode.get(item.getDataCode());
++                if (occupied != null) {
++                    if (occupied.getDeleted() != null && occupied.getDeleted() == 1) {
++                        throw duplicateDataCode("模板数据项编码已被删除记录占用，不可复用: " + item.getDataCode());
++                    }
++                    throw duplicateDataCode("模板数据项编码已存在: " + item.getDataCode());
++                }
++            }
+         }
+ 
+         // 全部通过：白名单构建实体逐项落库（照 IotDataDictServiceImpl.importDicts 范式）——
+@@ -133,7 +150,8 @@ public class IotDataItemTemplateServiceImpl extends ServiceImpl<IotDataItemTempl
+                 this.save(buildEntity(templateId, item));
+             }
+         } catch (DuplicateKeyException e) {
+-            // 兜底：预检与落库之间的并发撞码窗口（物理唯一索引 uk_template_data_code），
++            // 兜底：预检（含已删行）与落库之间的真实并发插入窗口（物理唯一索引
++            // uk_template_data_code；「重存同码撞已删行」场景已在预检拦截，不会走到此处），
+             // rollbackFor=Exception 整批回滚——批量口径统一 4002
+             throw duplicateDataCode("模板数据项编码并发冲突，整批未入库，请重试");
+         }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+index 9cf5b6a..19abe63 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/template/service/impl/IotDataItemTemplateServiceImplTest.java
+@@ -284,20 +284,46 @@ class IotDataItemTemplateServiceImplTest {
+         Map<String, DictCodeStatus> okMap = statusMap();
+         okMap.put("ELEC_CONS", DictCodeStatus.OK);
+         when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
+-        IotDataItemTemplate existingRow = new IotDataItemTemplate();
+-        existingRow.setId(50L);
+-        existingRow.setTemplateId(1L);
+-        existingRow.setDataCode("ELEC_CONS");
+-        when(baseMapper.selectList(any())).thenReturn(List.of(existingRow));
++        IotDataItemTemplate activeRow = new IotDataItemTemplate();
++        activeRow.setId(50L);
++        activeRow.setTemplateId(1L);
++        activeRow.setDataCode("ELEC_CONS");
++        activeRow.setDeleted(0);
++        when(baseMapper.selectByTemplateAndCodes(eq(1L), anyCollection())).thenReturn(List.of(activeRow));
+ 
+         BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(newItem("ELEC_CONS"))));
+         assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
+-        assertTrue(e.getMessage().contains("ELEC_CONS"));
+-        ArgumentCaptor<Wrapper<IotDataItemTemplate>> captor = ArgumentCaptor.captor();
+-        verify(baseMapper).selectList(captor.capture());
+-        String sql = captor.getValue().getSqlSegment();
+-        assertTrue(sql.contains("template_id"), "库内预检应按 template_id 过滤");
+-        assertTrue(sql.contains("data_code"), "库内预检应按 data_code IN 过滤");
++        // 修订轮 I-1：文案区分——活跃行占用报「已存在」（不含「已被删除记录占用」）
++        assertEquals("模板数据项编码已存在: ELEC_CONS", e.getMessage());
++        // 库内预检走含已删行旁路方法（修订轮 I-1），显式 (template_id, data_code IN) 条件
++        verify(baseMapper).selectByTemplateAndCodes(eq(1L), anyCollection());
++        verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
++    }
++
++    @Test
++    @DisplayName("批量保存 - 逻辑删行占用同码（uk 不含 deleted，编码不复用）报 4002 且文案为「已被删除记录占用」（修订轮 I-1 红转绿）")
++    void testSaveItems_DeletedRowOccupiesCode() {
++        // DB 现实：DELETE /iot/template/item 逻辑删后，uk_template_data_code 不释放编码——
++        // 活跃行预检（@TableLogic 视角）查无此码，落库必撞物理唯一索引
++        when(modelTemplateMapper.selectById(1L)).thenReturn(existingTemplate());
++        Map<String, DictCodeStatus> okMap = statusMap();
++        okMap.put("ELEC_CONS", DictCodeStatus.OK);
++        when(dictService.validateForTemplateRef(any(), anyCollection())).thenReturn(okMap);
++        // 含已删行旁路预检返回 deleted=1 占用行（修复后服务层据此直接拒绝）
++        IotDataItemTemplate deletedRow = new IotDataItemTemplate();
++        deletedRow.setId(50L);
++        deletedRow.setTemplateId(1L);
++        deletedRow.setDataCode("ELEC_CONS");
++        deletedRow.setDeleted(1);
++        when(baseMapper.selectByTemplateAndCodes(eq(1L), anyCollection())).thenReturn(List.of(deletedRow));
++        // 修复前路径：活跃行预检放行 → 落库撞索引 → 被误报为「并发冲突请重试」（永久死路被报成瞬态冲突）
++        when(baseMapper.insert(any(IotDataItemTemplate.class)))
++                .thenThrow(new DuplicateKeyException("Duplicate entry '1-ELEC_CONS' for key 'uk_template_data_code'"));
++
++        BusinessException e = assertThrows(BusinessException.class, () -> itemService.saveItems(1L, List.of(newItem("ELEC_CONS"))));
++        assertEquals(ResultCode.DUPLICATE_CODE.getCode(), e.getCode());
++        assertEquals("模板数据项编码已被删除记录占用，不可复用: ELEC_CONS",
++                e.getMessage(), "修复前此处误报「模板数据项编码并发冲突，整批未入库，请重试」（I-1 双重缺陷）");
+         verify(baseMapper, never()).insert(any(IotDataItemTemplate.class));
+     }
+ 

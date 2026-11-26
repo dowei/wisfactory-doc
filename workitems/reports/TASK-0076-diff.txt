@@ -1,0 +1,2570 @@
+diff --git a/ingest/internal/gwtoken/gwtoken.go b/ingest/internal/gwtoken/gwtoken.go
+new file mode 100644
+index 0000000..3e3767e
+--- /dev/null
++++ b/ingest/internal/gwtoken/gwtoken.go
+@@ -0,0 +1,166 @@
++// Package gwtoken 承载网关令牌链（TASK-0076 brief 决策 3）：
++//
++//	网关编码 → 通道定位（GatewayChannelResolver）→ 凭据拉取（CredentialPuller，0019
++//	/internal/v1/credential/pull，静态内部令牌 X-Internal-Token 配置化）→ 本地缓存
++//	（TTL 配置化）→ 校验器（上报/认证回调携带令牌 vs 拉取凭据比对）。
++//
++// fail-closed 纪律：网关未知、凭据拉取失败（后端不可达 / 403 吊销禁用）、令牌不匹配
++// 一律拒绝——FEAT-0009 处理顺序第 1 步「验令牌与租户」的令牌侧实现，后端不可达不放行。
++// 租户必须来自令牌链解析产物（GatewayIdentity.TenantCode），不从消息自带 tenant 取。
++//
++// mock 口径（brief 裁决）：凭据明文比对占位——拉取的 ciphertext 原样作为期望令牌做
++// 常量时间比对，不做 SM4 解密；真网关令牌体系（校验令牌归属通道、密文解密、轮换并行）
++// 归 TASK-0020/0027 正式认领时定版，本包以三个接口留位：
++// GatewayChannelResolver / CredentialPuller / Validator，替换实现不改调用方。
++package gwtoken
++
++import (
++	"context"
++	"crypto/subtle"
++	"fmt"
++	"sync"
++	"time"
++)
++
++// 凭据类型（REQ-0011：DEVICE_TOKEN/MQTT_PASSWORD/HTTP_SECRET/CERT）。
++const (
++	CredTypeDeviceToken  = "DEVICE_TOKEN"
++	CredTypeMQTTPassword = "MQTT_PASSWORD"
++	CredTypeHTTPSecret   = "HTTP_SECRET"
++	CredTypeCert         = "CERT"
++)
++
++// DefaultCacheTTL 凭据本地缓存默认 TTL（可配置覆盖）。
++const DefaultCacheTTL = 30 * time.Second
++
++// GatewayIdentity 令牌链校验产物：租户选库（iot_<tenant_code>）与处理顺序第 1 步
++// 的租户来源，只信任此结构（令牌侧），不信任消息自带 tenant。
++type GatewayIdentity struct {
++	GatewayCode string
++	TenantCode  string
++	ChannelID   int64
++}
++
++// ResolvedChannel 网关编码解析产物：凭据所在通道 + 令牌侧租户。
++type ResolvedChannel struct {
++	ChannelID  int64
++	TenantCode string
++}
++
++// GatewayChannelResolver 网关编码 → 通道定位。mock 口径为静态映射（StaticResolver）；
++// 真实现（网关注册表/快照通道，校验令牌归属通道）归 TASK-0020/0027，接口留位。
++type GatewayChannelResolver interface {
++	Resolve(gatewayCode string) (ResolvedChannel, bool)
++}
++
++// StaticResolver 静态映射实现（配置/测试用）。
++type StaticResolver map[string]ResolvedChannel
++
++// Resolve 实现 GatewayChannelResolver。
++func (r StaticResolver) Resolve(gatewayCode string) (ResolvedChannel, bool) {
++	rc, ok := r[gatewayCode]
++	return rc, ok
++}
++
++// Credential 凭据拉取产物（0019 CredentialPullVO 契约形态：只回密文与 key_version，
++// 服务端不解密传输——调用方内存解密，ADR-0006）。
++type Credential struct {
++	ChannelID  int64
++	CredType   string
++	Ciphertext string // {v1} 密文原样（mock 口径：明文比对占位，不解密）
++	KeyVersion string
++}
++
++// CredentialPuller 凭据拉取抽象。HTTPPuller 为 0019 锚点实现；测试可注入假实现。
++type CredentialPuller interface {
++	Pull(ctx context.Context, channelID int64, credType string) (Credential, error)
++}
++
++// Validator 网关令牌校验器（fail-closed 语义）。上报端点与 EMQX 认证回调共用；
++// 真网关令牌体系替换实现时接口零改动。
++type Validator interface {
++	// Validate 校验（凭据类型, 网关编码, 携带令牌）。任何失败（网关未知/拉取失败/
++	// 不匹配/空参数）返回错误——调用方必须拒绝放行，不得降级。
++	Validate(ctx context.Context, credType, gatewayCode, token string) (GatewayIdentity, error)
++}
++
++// TokenChainValidator 令牌链实现：Resolver → Puller（TTL 缓存）→ 常量时间比对。
++type TokenChainValidator struct {
++	Resolver GatewayChannelResolver // 必填
++	Puller   CredentialPuller       // 必填
++	// TTL 凭据本地缓存 TTL（配置化）；<=0 → DefaultCacheTTL。
++	TTL time.Duration
++
++	now func() time.Time // 可替换时钟（测试用；非导出）
++
++	mu    sync.Mutex
++	cache map[cacheKey]cacheEntry
++}
++
++type cacheKey struct {
++	channelID int64
++	credType  string
++}
++
++type cacheEntry struct {
++	cred    Credential
++	expires time.Time
++}
++
++// NewTokenChainValidator 构造令牌链校验器。resolver/puller 为 nil 时返回 nil
++// （装配方自查依赖），与 0073 组件「接口注入」口径一致。
++func NewTokenChainValidator(resolver GatewayChannelResolver, puller CredentialPuller, ttl time.Duration) *TokenChainValidator {
++	if resolver == nil || puller == nil {
++		return nil
++	}
++	if ttl <= 0 {
++		ttl = DefaultCacheTTL
++	}
++	return &TokenChainValidator{
++		Resolver: resolver,
++		Puller:   puller,
++		TTL:      ttl,
++		now:      time.Now,
++		cache:    make(map[cacheKey]cacheEntry),
++	}
++}
++
++// Validate 实现 Validator：fail-closed 五闸（空参数 → 网关未知 → 拉取失败 → 空凭据 →
++// 令牌不匹配），任一失败即拒绝；成功返回令牌侧解析产物。
++func (v *TokenChainValidator) Validate(ctx context.Context, credType, gatewayCode, token string) (GatewayIdentity, error) {
++	if gatewayCode == "" || token == "" {
++		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关编码或令牌为空，fail-closed 拒绝")
++	}
++	rc, ok := v.Resolver.Resolve(gatewayCode)
++	if !ok {
++		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关 %q 未知（通道定位未命中），fail-closed 拒绝", gatewayCode)
++	}
++	cred, err := v.credential(ctx, rc.ChannelID, credType)
++	if err != nil {
++		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关 %q 凭据拉取失败（后端不可达/吊销），fail-closed 拒绝: %w", gatewayCode, err)
++	}
++	if cred.Ciphertext == "" {
++		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关 %q 拉取到空凭据，fail-closed 拒绝", gatewayCode)
++	}
++	if subtle.ConstantTimeCompare([]byte(token), []byte(cred.Ciphertext)) != 1 {
++		return GatewayIdentity{}, fmt.Errorf("gwtoken: 网关 %q 令牌不匹配，fail-closed 拒绝", gatewayCode)
++	}
++	return GatewayIdentity{GatewayCode: gatewayCode, TenantCode: rc.TenantCode, ChannelID: rc.ChannelID}, nil
++}
++
++// credential 带本地缓存的凭据拉取（TTL 配置化）。持锁拉取（串行化同一键的并发回源，
++// 防后端惊群）；拉取失败不缓存（fail-closed：下次校验重新回源）。
++func (v *TokenChainValidator) credential(ctx context.Context, channelID int64, credType string) (Credential, error) {
++	key := cacheKey{channelID: channelID, credType: credType}
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if entry, ok := v.cache[key]; ok && v.now().Before(entry.expires) {
++		return entry.cred, nil
++	}
++	cred, err := v.Puller.Pull(ctx, channelID, credType)
++	if err != nil {
++		return Credential{}, err
++	}
++	v.cache[key] = cacheEntry{cred: cred, expires: v.now().Add(v.TTL)}
++	return cred, nil
++}
+diff --git a/ingest/internal/gwtoken/gwtoken_contract_test.go b/ingest/internal/gwtoken/gwtoken_contract_test.go
+new file mode 100644
+index 0000000..03bc6e0
+--- /dev/null
++++ b/ingest/internal/gwtoken/gwtoken_contract_test.go
+@@ -0,0 +1,165 @@
++package gwtoken_test
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// TASK-0076 网关令牌链契约测试（brief 决策 3）：
++// 凭据拉取客户端（0019 /internal/v1/credential/pull）+ 本地缓存（TTL 配置化）+ 校验器
++// （上报/认证回调携带令牌 vs 拉取凭据比对——明文比对占位，真网关令牌体系归 0020/0027）；
++// 拉取失败 fail-closed（后端不可达不放行）。
++
++// countingPuller 记录调用次数的假拉取器（可注入失败）。
++type countingPuller struct {
++	calls  int
++	cred   gwtoken.Credential
++	err    error
++	credTy string
++}
++
++func (p *countingPuller) Pull(_ context.Context, channelID int64, credType string) (gwtoken.Credential, error) {
++	p.calls++
++	p.credTy = credType
++	if p.err != nil {
++		return gwtoken.Credential{}, p.err
++	}
++	return p.cred, nil
++}
++
++func staticResolver() gwtoken.StaticResolver {
++	return gwtoken.StaticResolver{
++		"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"},
++	}
++}
++
++func chainCredential() gwtoken.Credential {
++	return gwtoken.Credential{
++		ChannelID:  7,
++		CredType:   gwtoken.CredTypeMQTTPassword,
++		Ciphertext: "gw-token-secret", // mock 口径：ciphertext 原样作为期望令牌比对
++		KeyVersion: "v1",
++	}
++}
++
++// 契约依据：brief 决策 3——校验器比对「携带令牌 vs 拉取凭据」，成功返回令牌侧解析产物
++// （租户来自令牌链，处理顺序第 1 步「验令牌与租户」）；重复校验命中本地缓存（只拉取一次）。
++func TestContractTokenChainValidatesAndCachesPull(t *testing.T) {
++	puller := &countingPuller{cred: chainCredential()}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, 10*time.Second)
++	ctx := context.Background()
++
++	id, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++	if err != nil {
++		t.Fatalf("Validate error: %v", err)
++	}
++	if id != (gwtoken.GatewayIdentity{GatewayCode: "GW_F01_01", TenantCode: "group_a", ChannelID: 7}) {
++		t.Errorf("identity = %+v, want {GW_F01_01 group_a 7}（租户来自令牌侧）", id)
++	}
++	if puller.calls != 1 {
++		t.Errorf("pull calls = %d, want 1", puller.calls)
++	}
++	if puller.credTy != gwtoken.CredTypeMQTTPassword {
++		t.Errorf("credType = %q, want MQTT_PASSWORD", puller.credTy)
++	}
++
++	// 缓存命中：TTL 内重复校验不再拉取。
++	for i := 0; i < 3; i++ {
++		if _, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret"); err != nil {
++			t.Fatalf("Validate #%d error: %v", i, err)
++		}
++	}
++	if puller.calls != 1 {
++		t.Errorf("pull calls after repeats = %d, want 1（本地缓存 TTL 内命中）", puller.calls)
++	}
++
++	// 不同凭据类型是不同缓存键：MQTT_PASSWORD 与 HTTP_SECRET 各拉一次。
++	if _, err := v.Validate(ctx, gwtoken.CredTypeHTTPSecret, "GW_F01_01", "gw-token-secret"); err != nil {
++		t.Fatalf("Validate(HTTP_SECRET) error: %v", err)
++	}
++	if puller.calls != 2 {
++		t.Errorf("pull calls = %d, want 2（credType 维度独立缓存）", puller.calls)
++	}
++}
++
++// 契约依据：brief 决策 3——本地缓存 TTL 配置化；TTL 过期后重新拉取。
++func TestContractTokenChainCacheTTLExpiryRepull(t *testing.T) {
++	puller := &countingPuller{cred: chainCredential()}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, 20*time.Millisecond)
++	ctx := context.Background()
++
++	if _, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret"); err != nil {
++		t.Fatalf("Validate #1 error: %v", err)
++	}
++	if puller.calls != 1 {
++		t.Fatalf("pull calls = %d, want 1", puller.calls)
++	}
++	time.Sleep(60 * time.Millisecond) // 越过 TTL
++	if _, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret"); err != nil {
++		t.Fatalf("Validate #2 error: %v", err)
++	}
++	if puller.calls != 2 {
++		t.Errorf("pull calls after TTL = %d, want 2（过期重拉）", puller.calls)
++	}
++}
++
++// 契约依据：brief 决策 3——拉取失败 fail-closed（后端不可达不放行）。
++func TestContractTokenChainFailClosedOnPullFailure(t *testing.T) {
++	puller := &countingPuller{err: errors.New("backend unreachable")}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, time.Second)
++	ctx := context.Background()
++
++	id, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, "GW_F01_01", "gw-token-secret")
++	if err == nil {
++		t.Fatalf("Validate error = nil, want fail-closed 拒绝")
++	}
++	if id != (gwtoken.GatewayIdentity{}) {
++		t.Errorf("identity = %+v, want 零值（拒绝不产出租户）", id)
++	}
++}
++
++// 契约依据：brief 决策 3——网关未知（Resolver 未命中）fail-closed。
++func TestContractTokenChainFailClosedOnUnknownGateway(t *testing.T) {
++	puller := &countingPuller{cred: chainCredential()}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, time.Second)
++
++	if _, err := v.Validate(context.Background(), gwtoken.CredTypeMQTTPassword, "GW_UNKNOWN", "gw-token-secret"); err == nil {
++		t.Fatal("Validate(unknown gateway) error = nil, want fail-closed 拒绝")
++	}
++	if puller.calls != 0 {
++		t.Errorf("pull calls = %d, want 0（网关未知不发起拉取）", puller.calls)
++	}
++}
++
++// 契约依据：brief 决策 3——携带令牌与拉取凭据不匹配 fail-closed；空令牌/空网关编码拒绝。
++func TestContractTokenChainFailClosedOnMismatchAndEmpty(t *testing.T) {
++	puller := &countingPuller{cred: chainCredential()}
++	v := gwtoken.NewTokenChainValidator(staticResolver(), puller, time.Second)
++	ctx := context.Background()
++
++	cases := []struct {
++		name       string
++		gateway    string
++		token      string
++		wantPulls int
++	}{
++		{"令牌不匹配", "GW_F01_01", "forged-token", 1},
++		{"空令牌", "GW_F01_01", "", 0},
++		{"空网关编码", "", "gw-token-secret", 0},
++	}
++	var pulls int
++	for i, c := range cases {
++		if _, err := v.Validate(ctx, gwtoken.CredTypeMQTTPassword, c.gateway, c.token); err == nil {
++			t.Errorf("#%d %s: error = nil, want 拒绝", i, c.name)
++		}
++		got := puller.calls - pulls
++		if got != c.wantPulls {
++			t.Errorf("#%d %s: 本轮拉取 = %d, want %d", i, c.name, got, c.wantPulls)
++		}
++		pulls = puller.calls
++	}
++}
+diff --git a/ingest/internal/gwtoken/puller.go b/ingest/internal/gwtoken/puller.go
+new file mode 100644
+index 0000000..9ab8b87
+--- /dev/null
++++ b/ingest/internal/gwtoken/puller.go
+@@ -0,0 +1,131 @@
++package gwtoken
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"sync"
++	"time"
++)
++
++// 0019 凭据拉取锚点（响应形状以后端代码为准）。
++const (
++	// CredentialPullPath 凭据拉取路径：GET /internal/v1/credential/pull（0019）。
++	CredentialPullPath = "/internal/v1/credential/pull"
++	// InternalTokenHeader 内部静态令牌请求头（后端 InternalAuthChecker.TOKEN_HEADER 同名对齐）。
++	InternalTokenHeader = "X-Internal-Token"
++	// DefaultPullTimeout 拉取默认超时：后端不可达必须在有限时间内转为错误
++	//（上层据此 fail-closed 拒绝），不得悬挂令牌链。
++	DefaultPullTimeout = 10 * time.Second
++	// resultSuccessCode 后端框架 Result 成功业务码（ot-core ResultCode.SUCCESS=200）。
++	resultSuccessCode = 200
++)
++
++// HTTPPuller 0019 凭据拉取客户端：GET {BaseURL}/internal/v1/credential/pull
++// ?channelId=&credType=，请求头 X-Internal-Token（配置化——后端 InternalAuthChecker
++// 静态令牌 + IP 白名单口径；本客户端只承担令牌头，白名单在服务端）。
++type HTTPPuller struct {
++	// BaseURL 管理系统基址（如 http://mgmt-host:8080）。
++	BaseURL string
++	// InternalToken 内部静态令牌（配置化；空 = 不带头，服务端必拒——fail-closed）。
++	InternalToken string
++	// Timeout 单次拉取超时；<=0 → DefaultPullTimeout。
++	Timeout time.Duration
++
++	clientOnce sync.Once
++	client     *http.Client
++}
++
++// NewHTTPPuller 构造拉取客户端（timeout<=0 取默认）。
++func NewHTTPPuller(baseURL, internalToken string, timeout time.Duration) *HTTPPuller {
++	return &HTTPPuller{BaseURL: baseURL, InternalToken: internalToken, Timeout: timeout}
++}
++
++func (p *HTTPPuller) httpClient() *http.Client {
++	p.clientOnce.Do(func() {
++		timeout := p.Timeout
++		if timeout <= 0 {
++			timeout = DefaultPullTimeout
++		}
++		p.client = &http.Client{Timeout: timeout}
++	})
++	return p.client
++}
++
++// pullEnvelope 后端框架 Result<CredentialPullVO> 信封（响应形状以 0019 代码为准：
++// Result{code, message, data, timestamp}；data=CredentialPullVO{channelId, credType,
++// ciphertext, keyVersion}——只回密文不回明文，ADR-0006）。
++type pullEnvelope struct {
++	Code    int    `json:"code"`
++	Message string `json:"message"`
++	Data    *struct {
++		ChannelID  int64  `json:"channelId"`
++		CredType   string `json:"credType"`
++		Ciphertext string `json:"ciphertext"`
++		KeyVersion string `json:"keyVersion"`
++	} `json:"data"`
++}
++
++// Pull 拉取通道凭据（0019 锚点）。非 200 HTTP 状态、非 200 业务码、data 缺失、
++// 密文为空一律转错误（fail-closed 前置：失败不产出可用凭据）。
++func (p *HTTPPuller) Pull(ctx context.Context, channelID int64, credType string) (Credential, error) {
++	q := url.Values{}
++	q.Set("channelId", strconv.FormatInt(channelID, 10))
++	q.Set("credType", credType)
++	endpoint := p.BaseURL + CredentialPullPath + "?" + q.Encode()
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return Credential{}, fmt.Errorf("gwtoken: 构造凭据拉取请求失败: %w", err)
++	}
++	req.Header.Set(InternalTokenHeader, p.InternalToken)
++
++	resp, err := p.httpClient().Do(req)
++	if err != nil {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取失败（后端不可达）: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return Credential{}, fmt.Errorf("gwtoken: 读取凭据拉取响应失败: %w", err)
++	}
++
++	var env pullEnvelope
++	if err := json.Unmarshal(body, &env); err != nil {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取响应解析失败 status=%d body=%s: %w",
++			resp.StatusCode, truncateForLog(body), err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取失败 status=%d code=%d message=%q（REQ-0011：吊销/禁用 403）",
++			resp.StatusCode, env.Code, env.Message)
++	}
++	if env.Code != resultSuccessCode {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取失败 code=%d message=%q", env.Code, env.Message)
++	}
++	if env.Data == nil {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取响应缺 data（0019 CredentialPullVO 形态）")
++	}
++	if env.Data.Ciphertext == "" {
++		return Credential{}, fmt.Errorf("gwtoken: 凭据拉取响应密文为空（channelId=%d credType=%s）", channelID, credType)
++	}
++	return Credential{
++		ChannelID:  env.Data.ChannelID,
++		CredType:   env.Data.CredType,
++		Ciphertext: env.Data.Ciphertext,
++		KeyVersion: env.Data.KeyVersion,
++	}, nil
++}
++
++// truncateForLog 截断响应体用于错误信息（日志卫生：密文出口为契约本身，但错误信息
++// 不携带完整响应体）。
++func truncateForLog(b []byte) string {
++	const n = 256
++	if len(b) <= n {
++		return string(b)
++	}
++	return string(b[:n]) + "…"
++}
+diff --git a/ingest/internal/gwtoken/puller_contract_test.go b/ingest/internal/gwtoken/puller_contract_test.go
+new file mode 100644
+index 0000000..5fd685d
+--- /dev/null
++++ b/ingest/internal/gwtoken/puller_contract_test.go
+@@ -0,0 +1,137 @@
++package gwtoken_test
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// TASK-0076 凭据拉取客户端（0019 锚点）契约测试：请求形态与失败口径。
++//
++// 契约依据（后端代码为准）：IotCredentialInternalController——GET /internal/v1/credential/pull
++// ?channelId=&credType=，InternalAuthChecker 静态令牌请求头 X-Internal-Token；
++// 响应 Result<CredentialPullVO>（ot-core Result：code/message/data/timestamp；
++// CredentialPullVO：channelId/credType/ciphertext/keyVersion——只回密文不回明文，ADR-0006）；
++// 凭据缺失/吊销/通道禁用统一 403（REQ-0011 验收 5）。
++
++// fakeBackend 0019 凭据拉取假服务：记录最近一次请求，按注入策略回放响应。
++type fakeBackend struct {
++	r          *http.Request
++	body       []byte
++	status     int // 0 → 200
++	code       int // 0 → 200（框架 Result code）
++	ciphertext string
++}
++
++func (b *fakeBackend) handler(w http.ResponseWriter, r *http.Request) {
++	b.r = r
++	b.body, _ = io.ReadAll(r.Body)
++	w.Header().Set("Content-Type", "application/json")
++	status := b.status
++	if status == 0 {
++		status = http.StatusOK
++	}
++	code := b.code
++	if code == 0 {
++		code = 200
++	}
++	resp := map[string]any{
++		"code":      code,
++		"message":   "操作成功",
++		"timestamp": 1795212000000,
++	}
++	if code == 200 {
++		resp["data"] = map[string]any{
++			"channelId":  7,
++			"credType":   "MQTT_PASSWORD",
++			"ciphertext": b.ciphertext,
++			"keyVersion": "v1",
++		}
++	}
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(resp)
++}
++
++// 契约依据：0019 请求形态——GET /internal/v1/credential/pull?channelId=&credType=，
++// 请求头 X-Internal-Token（配置化静态令牌）；响应信封解析为 Credential（密文 + key_version）。
++func TestContractCredentialPullHTTPRequestShape(t *testing.T) {
++	b := &fakeBackend{ciphertext: "{v1}ciphertext-sample"}
++	srv := httptest.NewServer(http.HandlerFunc(b.handler))
++	defer srv.Close()
++
++	puller := gwtoken.NewHTTPPuller(srv.URL, "static-internal-token", 0)
++	cred, err := puller.Pull(context.Background(), 7, gwtoken.CredTypeMQTTPassword)
++	if err != nil {
++		t.Fatalf("Pull error: %v", err)
++	}
++
++	if b.r.Method != http.MethodGet {
++		t.Errorf("method = %s, want GET", b.r.Method)
++	}
++	if b.r.URL.Path != "/internal/v1/credential/pull" {
++		t.Errorf("path = %s, want /internal/v1/credential/pull（0019 锚点）", b.r.URL.Path)
++	}
++	if q := b.r.URL.Query(); q.Get("channelId") != "7" || q.Get("credType") != "MQTT_PASSWORD" {
++		t.Errorf("query = %v, want channelId=7 & credType=MQTT_PASSWORD", q)
++	}
++	if got := b.r.Header.Get("X-Internal-Token"); got != "static-internal-token" {
++		t.Errorf("X-Internal-Token = %q, want 配置化静态令牌", got)
++	}
++
++	if cred.ChannelID != 7 || cred.CredType != "MQTT_PASSWORD" ||
++		cred.Ciphertext != "{v1}ciphertext-sample" || cred.KeyVersion != "v1" {
++		t.Errorf("cred = %+v, want 0019 CredentialPullVO 形态", cred)
++	}
++}
++
++// 契约依据：REQ-0011 验收 5——令牌失效或通道禁用时拉取返回 403；调用方按失败处理
++// （fail-closed 由上层裁决，本层只负责把非成功一律转错误）。
++func TestContractCredentialPullFailClosedOnFailureResponses(t *testing.T) {
++	cases := []struct {
++		name   string
++		status int
++		code   int
++	}{
++		{"HTTP 403（吊销/禁用）", http.StatusForbidden, 0},
++		{"HTTP 401（内部令牌无效）", http.StatusUnauthorized, 0},
++		{"业务码非 200", http.StatusOK, 500},
++		{"业务码 403", http.StatusOK, 403},
++	}
++	for _, c := range cases {
++		b := &fakeBackend{status: c.status, code: c.code, ciphertext: "x"}
++		srv := httptest.NewServer(http.HandlerFunc(b.handler))
++		puller := gwtoken.NewHTTPPuller(srv.URL, "tok", 0)
++		cred, err := puller.Pull(context.Background(), 7, "MQTT_PASSWORD")
++		srv.Close()
++		if err == nil {
++			t.Errorf("%s: Pull error = nil, want 失败转错误（fail-closed 前置）", c.name)
++			continue
++		}
++		if cred != (gwtoken.Credential{}) {
++			t.Errorf("%s: cred = %+v, want 零值", c.name, cred)
++		}
++	}
++}
++
++// 契约依据：fail-closed——后端不可达必须在有限时间内转为错误（拉取超时配置化），
++// 不得悬挂令牌链（校验器据此拒绝）。
++func TestContractCredentialPullBackendUnreachableTimesOut(t *testing.T) {
++	block := make(chan struct{})
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		<-block // 悬挂，模拟后端不可达
++	}))
++	defer srv.Close()
++	defer close(block)
++
++	puller := gwtoken.NewHTTPPuller(srv.URL, "tok", 50*time.Millisecond)
++	_, err := puller.Pull(context.Background(), 7, "MQTT_PASSWORD")
++	if err == nil {
++		t.Fatal("Pull error = nil, want 超时错误")
++	}
++}
+diff --git a/ingest/internal/httpapi/authmqtt.go b/ingest/internal/httpapi/authmqtt.go
+new file mode 100644
+index 0000000..f78e769
+--- /dev/null
++++ b/ingest/internal/httpapi/authmqtt.go
+@@ -0,0 +1,107 @@
++package httpapi
++
++import (
++	"crypto/subtle"
++	"encoding/json"
++	"fmt"
++	"net/http"
++
++	"net.otlab/ingest/internal/gwtoken"
++)
++
++// MQTTAuthHandler POST /ingest/v1/auth/mqtt——EMQX HTTP 认证回调（契约 §3.2（续）：
++// 「EMQX 认证回调；内部令牌」）。
++//
++// 流程：端点自身鉴权（内部令牌，常量时间比较）→ 校验网关编码与设备令牌、租户与网关
++// status（令牌链，fail-closed）→ 返回 allow/deny 及该连接允许订阅/发布的主题范围
++// （只能收自己的 config、只能发自己的 data/status，REQ-0013）。
++//
++// 响应形状按 EMQX HTTP 认证文档惯例（{result: "allow"|"deny"}），主题范围为自定契约
++// 扩展（topics.publish/subscribe）；形状由测试锁定，真 EMQX 联调归 0068。
++type MQTTAuthHandler struct {
++	// Validator 网关令牌链校验器（fail-closed）。
++	Validator gwtoken.Validator
++	// InternalToken 回调端点自身鉴权的内部令牌（配置化）。空值 = 全部拒绝（fail-closed：
++	// 未配置保护时不暴露无鉴权端点）。
++	InternalToken string
++}
++
++// mqttAuthRequest EMQX HTTP 认证回调入参（username=gatewayCode，password=网关令牌，
++// brief 决策 2）。EMQX 其余回调字段（clientid/peerhost/sock 等）宽松忽略——回调载荷
++// 演进不打停接入面。
++type mqttAuthRequest struct {
++	Username string `json:"username"`
++	Password string `json:"password"`
++}
++
++// mqttTopics 主题范围：只能发自己的 data/status，只能收自己的 config（REQ-0013）。
++type mqttTopics struct {
++	Publish   []string `json:"publish"`
++	Subscribe []string `json:"subscribe"`
++}
++
++// mqttAuthResponse 响应：{result: allow|deny} + 主题范围（deny 时省略 topics）。
++type mqttAuthResponse struct {
++	Result string      `json:"result"`
++	Topics *mqttTopics `json:"topics,omitempty"`
++}
++
++const (
++	authResultAllow = "allow"
++	authResultDeny  = "deny"
++)
++
++// ServeHTTP 实现 http.Handler。
++func (h *MQTTAuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	defer func() {
++		if rec := recover(); rec != nil {
++			writeAuth(w, http.StatusInternalServerError, mqttAuthResponse{Result: authResultDeny})
++		}
++	}()
++
++	// 端点自身鉴权（内部令牌；缺失/不匹配 401 + 响应体 deny 双信号——不依赖调用方
++	// 对非 200 的处理口径，fail-closed 收敛）。
++	presented := r.Header.Get(gwtoken.InternalTokenHeader)
++	if h.InternalToken == "" ||
++		subtle.ConstantTimeCompare([]byte(presented), []byte(h.InternalToken)) != 1 {
++		writeAuth(w, http.StatusUnauthorized, mqttAuthResponse{Result: authResultDeny})
++		return
++	}
++
++	var req mqttAuthRequest
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)).Decode(&req); err != nil {
++		writeAuth(w, http.StatusOK, mqttAuthResponse{Result: authResultDeny})
++		return
++	}
++	// 认证三要素缺失即拒绝（不做部分匹配放行；不触发令牌链）。
++	if req.Username == "" || req.Password == "" {
++		writeAuth(w, http.StatusOK, mqttAuthResponse{Result: authResultDeny})
++		return
++	}
++
++	// 令牌链校验（fail-closed）：网关未知/凭据拉取失败/令牌不匹配一律 deny。
++	identity, err := h.Validator.Validate(r.Context(), gwtoken.CredTypeMQTTPassword, req.Username, req.Password)
++	if err != nil {
++		writeAuth(w, http.StatusOK, mqttAuthResponse{Result: authResultDeny})
++		return
++	}
++
++	writeAuth(w, http.StatusOK, mqttAuthResponse{
++		Result: authResultAllow,
++		Topics: &mqttTopics{
++			Publish:   []string{dataTopic(identity), statusTopic(identity)},
++			Subscribe: []string{configTopic(identity)},
++		},
++	})
++}
++
++// 主题范围（契约 §3.2 主题规划：iot/{tenant_code}/{gateway_code}/{data,status,config}）。
++func dataTopic(id gwtoken.GatewayIdentity) string    { return fmt.Sprintf("iot/%s/%s/data", id.TenantCode, id.GatewayCode) }
++func statusTopic(id gwtoken.GatewayIdentity) string  { return fmt.Sprintf("iot/%s/%s/status", id.TenantCode, id.GatewayCode) }
++func configTopic(id gwtoken.GatewayIdentity) string  { return fmt.Sprintf("iot/%s/%s/config", id.TenantCode, id.GatewayCode) }
++
++func writeAuth(w http.ResponseWriter, status int, resp mqttAuthResponse) {
++	w.Header().Set("Content-Type", "application/json; charset=utf-8")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(resp)
++}
+diff --git a/ingest/internal/httpapi/authmqtt_contract_test.go b/ingest/internal/httpapi/authmqtt_contract_test.go
+new file mode 100644
+index 0000000..d6a9196
+--- /dev/null
++++ b/ingest/internal/httpapi/authmqtt_contract_test.go
+@@ -0,0 +1,255 @@
++package httpapi_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/httpapi"
++)
++
++// TASK-0076 EMQX 认证回调契约测试（POST /ingest/v1/auth/mqtt）。
++//
++// 契约依据：统一消息模型 v1.1.0 §3.2（续）——「EMQX 认证回调；内部令牌」鉴权；
++// brief 决策 2——入参 username/password（username=gatewayCode，password=网关令牌），
++// allow/deny + 主题范围（允许该网关的 data/status 主题通配：只能收自己的 config、
++// 只能发自己的 data/status，REQ-0013）；响应形状按 EMQX HTTP 认证文档惯例
++// （{result: "allow"|"deny"}），测试以自定契约锁形状（真 EMQX 联调归 0068）。
++
++// postAuth 构造认证回调请求并执行。
++func postAuth(t *testing.T, h http.Handler, internalToken string, body string) *http.Response {
++	t.Helper()
++	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/auth/mqtt", strings.NewReader(body))
++	if internalToken != "" {
++		req.Header.Set("X-Internal-Token", internalToken)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	return rec.Result()
++}
++
++func decodeAuth(t *testing.T, resp *http.Response) map[string]any {
++	t.Helper()
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("读响应失败: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("响应 JSON 解析失败: %v body=%s", err, b)
++	}
++	return m
++}
++
++func authHandler(mv *mockValidator, internalToken string) *httpapi.MQTTAuthHandler {
++	return &httpapi.MQTTAuthHandler{Validator: mv, InternalToken: internalToken}
++}
++
++func authBody() string {
++	return `{"clientid":"gw-f01-01","username":"GW_F01_01","password":"gw-token-secret","peerhost":"10.0.0.8"}`
++}
++
++// 契约依据：brief 决策 2 + REQ-0013「只能收自己的 config、只能发自己的 data/status」——
++// allow + 主题范围；EMQX 其余回调字段（clientid/peerhost 等）宽松忽略。
++func TestContractMQTTAuthAllowWithTopicScope(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	h := authHandler(mv, "internal-static-token")
++
++	resp := postAuth(t, h, "internal-static-token", authBody())
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200", resp.StatusCode)
++	}
++	body := decodeAuth(t, resp)
++	if body["result"] != "allow" {
++		t.Fatalf("result = %v, want allow", body["result"])
++	}
++	topics, ok := body["topics"].(map[string]any)
++	if !ok {
++		t.Fatalf("topics = %v, want 对象", body["topics"])
++	}
++	wantPublish := []any{"iot/group_a/GW_F01_01/data", "iot/group_a/GW_F01_01/status"}
++	wantSubscribe := []any{"iot/group_a/GW_F01_01/config"}
++	if !equalAnySlice(topics["publish"], wantPublish) {
++		t.Errorf("publish = %v, want %v（只能发自己的 data/status）", topics["publish"], wantPublish)
++	}
++	if !equalAnySlice(topics["subscribe"], wantSubscribe) {
++		t.Errorf("subscribe = %v, want %v（只能收自己的 config）", topics["subscribe"], wantSubscribe)
++	}
++
++	mv.mu.Lock()
++	defer mv.mu.Unlock()
++	if mv.calls != 1 {
++		t.Errorf("validator calls = %d, want 1", mv.calls)
++	}
++	if mv.credType != gwtoken.CredTypeMQTTPassword {
++		t.Errorf("credType = %q, want MQTT_PASSWORD", mv.credType)
++	}
++	if mv.gateway != "GW_F01_01" || mv.token != "gw-token-secret" {
++		t.Errorf("username/password 口径 = %q/%q, want gatewayCode/token", mv.gateway, mv.token)
++	}
++}
++
++// 契约依据：brief 决策 2——令牌错 deny；deny 不带主题范围。
++func TestContractMQTTAuthDenyOnWrongGatewayToken(t *testing.T) {
++	mv := &mockValidator{err: fmt.Errorf("gwtoken: 令牌不匹配，fail-closed 拒绝")}
++	h := authHandler(mv, "internal-static-token")
++
++	resp := postAuth(t, h, "internal-static-token", authBody())
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200（deny 走响应体）", resp.StatusCode)
++	}
++	body := decodeAuth(t, resp)
++	if body["result"] != "deny" {
++		t.Errorf("result = %v, want deny", body["result"])
++	}
++	if _, present := body["topics"]; present {
++		t.Errorf("topics = %v, want 缺省（deny 不带主题范围）", body["topics"])
++	}
++}
++
++// 契约依据：brief 决策 3——拉取失败 fail-closed（后端不可达不放行）→ deny。
++func TestContractMQTTAuthDenyOnPullFailureFailClosed(t *testing.T) {
++	mv := &mockValidator{err: fmt.Errorf("backend unreachable")}
++	h := authHandler(mv, "internal-static-token")
++	resp := postAuth(t, h, "internal-static-token", authBody())
++	body := decodeAuth(t, resp)
++	if body["result"] != "deny" {
++		t.Errorf("result = %v, want deny（后端不可达不放行）", body["result"])
++	}
++}
++
++// 契约依据：契约 §3.2（续）「EMQX 认证回调；内部令牌」——端点自身由内部令牌保护；
++// 缺失/不匹配 401 且响应体 deny（双信号，fail-closed 不依赖调用方对状态码的处理）。
++func TestContractMQTTAuthRejectsMissingOrWrongInternalToken(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	h := authHandler(mv, "internal-static-token")
++
++	cases := []struct {
++		name string
++		tok  string
++	}{
++		{"缺内部令牌", ""},
++		{"内部令牌不匹配", "wrong-token"},
++	}
++	for _, c := range cases {
++		resp := postAuth(t, h, c.tok, authBody())
++		if resp.StatusCode != http.StatusUnauthorized {
++			t.Errorf("%s: status = %d, want 401", c.name, resp.StatusCode)
++		}
++		body := decodeAuth(t, resp)
++		if body["result"] != "deny" {
++			t.Errorf("%s: result = %v, want deny", c.name, body["result"])
++		}
++		mv.mu.Lock()
++		got := mv.calls
++		mv.mu.Unlock()
++		if got != 0 {
++			t.Errorf("%s: validator calls = %d, want 0（端点未鉴权不触发令牌链）", c.name, got)
++		}
++	}
++}
++
++// 契约依据：认证三要素缺失即拒绝（不做部分匹配放行）。
++func TestContractMQTTAuthDenyOnEmptyUsernameOrPassword(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	h := authHandler(mv, "internal-static-token")
++
++	cases := []struct {
++		name string
++		body string
++	}{
++		{"空 username", `{"username":"","password":"gw-token-secret"}`},
++		{"空 password", `{"username":"GW_F01_01","password":""}`},
++		{"非法 JSON", `{not-json`},
++	}
++	for _, c := range cases {
++		resp := postAuth(t, h, "internal-static-token", c.body)
++		body := decodeAuth(t, resp)
++		if body["result"] != "deny" {
++			t.Errorf("%s: result = %v, want deny", c.name, body["result"])
++		}
++		mv.mu.Lock()
++		got := mv.calls
++		mv.mu.Unlock()
++		if got != 0 {
++			t.Errorf("%s: validator calls = %d, want 0", c.name, got)
++		}
++	}
++}
++
++// 契约依据：真令牌链端到端（Resolver + HTTPPuller + 比对）——合法凭据 allow；
++// 后端吊销（403）与令牌错误 deny；后端不可达 deny（fail-closed 闭环）。
++func TestContractMQTTAuthRealTokenChainFailClosed(t *testing.T) {
++	cred := map[string]any{
++		"channelId": 7, "credType": "MQTT_PASSWORD",
++		"ciphertext": "gw-token-secret", "keyVersion": "v1",
++	}
++	suspended := make(chan struct{})
++	defer close(suspended)
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("X-Internal-Token") != "internal-static-token" {
++			w.WriteHeader(http.StatusUnauthorized)
++			_ = json.NewEncoder(w).Encode(map[string]any{"code": 401, "message": "内部令牌无效"})
++			return
++		}
++		if r.URL.Query().Get("channelId") != "7" {
++			w.WriteHeader(http.StatusForbidden)
++			_ = json.NewEncoder(w).Encode(map[string]any{"code": 403, "message": "通道禁用"})
++			return
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "操作成功", "data": cred})
++	}))
++	defer srv.Close()
++
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		gwtoken.NewHTTPPuller(srv.URL, "internal-static-token", 0), 0)
++	h := &httpapi.MQTTAuthHandler{Validator: validator, InternalToken: "callback-internal-token"}
++
++	// 合法：allow + 主题范围。
++	body := decodeAuth(t, postAuth(t, h, "callback-internal-token", authBody()))
++	if body["result"] != "allow" {
++		t.Fatalf("result = %v, want allow", body["result"])
++	}
++	topics := body["topics"].(map[string]any)
++	if !equalAnySlice(topics["publish"], []any{"iot/group_a/GW_F01_01/data", "iot/group_a/GW_F01_01/status"}) {
++		t.Errorf("publish = %v, want 网关 data/status", topics["publish"])
++	}
++
++	// 令牌错：deny。
++	wrong := `{"username":"GW_F01_01","password":"forged"}`
++	body = decodeAuth(t, postAuth(t, h, "callback-internal-token", wrong))
++	if body["result"] != "deny" {
++		t.Errorf("wrong token: result = %v, want deny", body["result"])
++	}
++
++	// 后端不可达：deny（fail-closed）。
++	brokenValidator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		gwtoken.NewHTTPPuller("http://127.0.0.1:1", "internal-static-token", 300_000_000), 0)
++	broken := &httpapi.MQTTAuthHandler{Validator: brokenValidator, InternalToken: "callback-internal-token"}
++	body = decodeAuth(t, postAuth(t, broken, "callback-internal-token", authBody()))
++	if body["result"] != "deny" {
++		t.Errorf("backend down: result = %v, want deny（后端不可达不放行）", body["result"])
++	}
++}
++
++func equalAnySlice(got any, want []any) bool {
++	gotSlice, ok := got.([]any)
++	if !ok || len(gotSlice) != len(want) {
++		return false
++	}
++	for i := range want {
++		if gotSlice[i] != want[i] {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/ingest/internal/httpapi/mux.go b/ingest/internal/httpapi/mux.go
+new file mode 100644
+index 0000000..b04de0b
+--- /dev/null
++++ b/ingest/internal/httpapi/mux.go
+@@ -0,0 +1,16 @@
++package httpapi
++
++import "net/http"
++
++// Mux 装配 HTTP 接入面路由（TASK-0076 两端点 + 存活探针）。方法精确匹配：
++// 非约定方法返回 405（net/http ServeMux 方法模式语义）。
++func Mux(report *ReportHandler, auth *MQTTAuthHandler) *http.ServeMux {
++	mux := http.NewServeMux()
++	mux.Handle("POST "+ReportPath, report)
++	mux.Handle("POST "+MQTTAuthPath, auth)
++	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte("ok"))
++	})
++	return mux
++}
+diff --git a/ingest/internal/httpapi/pipeline_sink.go b/ingest/internal/httpapi/pipeline_sink.go
+new file mode 100644
+index 0000000..e15f70b
+--- /dev/null
++++ b/ingest/internal/httpapi/pipeline_sink.go
+@@ -0,0 +1,39 @@
++package httpapi
++
++import (
++	"context"
++	"fmt"
++
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// PipelineSink ReportSink 的内核流水线实现：经 pipeline.Submit 同步提交——与 MQTT
++// 消费循环（Run）同一 processOne 五步冻结顺序（统一流水线入口，HTTP 与 MQTT 同构结果），
++// 攒批缓冲、flusher、去重表与 Run 路径共享。租户取令牌侧解析产物。
++type PipelineSink struct {
++	// Pipe 已装配的内核流水线（Run 或 StartFlusher 须已启动，flusher 承担写库）。
++	Pipe *pipeline.Pipeline
++}
++
++// Report 实现 ReportSink。
++func (s *PipelineSink) Report(ctx context.Context, tenant string, payload []byte) (ReportOutcome, error) {
++	res := s.Pipe.Submit(ctx, pipeline.Inbound{Tenant: tenant, Payload: payload})
++	if res.RejectedWhole {
++		// 信封级整批拒绝理论上已被端点入口 400 拦截；此处为防御分支（直提交/口径漂移）。
++		return ReportOutcome{}, fmt.Errorf("httpapi: 信封级整批拒绝（入口纪律应已拦截）")
++	}
++	out := ReportOutcome{
++		Accepted:   res.Accepted,
++		Rejected:   res.Rejected,
++		Rejections: make([]Rejection, 0, len(res.Rejections)),
++		Duplicate:  res.Duplicate,
++	}
++	for _, rj := range res.Rejections {
++		out.Rejections = append(out.Rejections, Rejection{
++			PointCode: rj.PointCode,
++			Ts:        rj.Ts,
++			Reason:    string(rj.Reason),
++		})
++	}
++	return out, nil
++}
+diff --git a/ingest/internal/httpapi/report.go b/ingest/internal/httpapi/report.go
+new file mode 100644
+index 0000000..ba8816c
+--- /dev/null
++++ b/ingest/internal/httpapi/report.go
+@@ -0,0 +1,176 @@
++// Package httpapi 承载采集接入服务的 HTTP 接入面（TASK-0076）：
++//
++//	POST /ingest/v1/report    统一消息模型 v1.1.0 §3.2（续）HTTP 批量上报
++//	                          （网关令牌 X-Gateway-Token；请求体与 MQTT 上行消息同构）
++//	POST /ingest/v1/auth/mqtt EMQX HTTP 认证回调（内部令牌；allow/deny + 主题范围）
++//	GET  /healthz             存活探针
++//
++// 契约纪律：
++//   - 信封级纪律在入口整批拒绝（空 points 4001、单消息 ≤500 超限 400 契约文案、
++//     缺 tenant/batchId、JSON 非法），超限/非法不进流水线；
++//   - 租户以令牌链解析产物为准（FEAT-0009 处理顺序第 1 步「验令牌与租户」），
++//     消息自带 tenant 仅作声明、不参与选库；
++//   - 令牌链 fail-closed：校验失败（含后端不可达）一律 401 / deny，不放行；
++//   - 响应数值码纪律：契约已定数值码（4001）原样返回，未定数值码为 0，不臆造。
++package httpapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/message"
++)
++
++// 契约 §3.2（续）端点路径与请求头（路径/头名逐字）。
++const (
++	ReportPath   = "/ingest/v1/report"
++	MQTTAuthPath = "/ingest/v1/auth/mqtt"
++	// GatewayTokenHeader 网关令牌请求头（契约 §3.2（续）：网关令牌（请求头 X-Gateway-Token））。
++	GatewayTokenHeader = "X-Gateway-Token"
++)
++
++// MaxRequestBodyBytes 请求体上限（防御性：契约上限单消息 500 点，约百余 KB；
++// 2 MiB 覆盖余量并挡无界请求体）。超限请求按 400 处理，不进流水线。
++const MaxRequestBodyBytes int64 = 2 << 20
++
++// ReportSink 统一流水线入口抽象（0073 pipeline 的 HTTP 面）。测试以假实现断言
++// 调用形态（brief 测试口径：mock pipeline）；生产接线用 PipelineSink。
++type ReportSink interface {
++	// Report 提交一封已过令牌校验的上报。tenant 为令牌侧解析产物（非消息自带 tenant）；
++	// payload 为原始请求体（与 MQTT 上行消息 JSON 同构）。
++	Report(ctx context.Context, tenant string, payload []byte) (ReportOutcome, error)
++}
++
++// Rejection 拒绝明细条目（契约 §3.2（续）：响应返回拒绝明细——未知编码、时间戳越界等）。
++type Rejection struct {
++	PointCode string `json:"pointCode"`
++	Ts        int64  `json:"ts"`
++	Reason    string `json:"reason"`
++}
++
++// ReportOutcome 受理结果（响应「接收条数、拒绝条数与拒绝明细」的数据来源）。
++type ReportOutcome struct {
++	// Accepted 受理点数（提交攒批的新行 + 幂等重复点数——QoS1 重报按成功无操作计）。
++	Accepted int
++	// Rejected 死信/丢弃点数（未知编码/禁用/无效配置）。
++	Rejected int
++	// Rejections 逐点拒绝明细。
++	Rejections []Rejection
++	// Duplicate batchId 整批重复命中（整批幂等：无新增提交）。
++	Duplicate bool
++}
++
++// reportResponse 上报响应（契约 §3.2（续）：响应返回接收条数、拒绝条数与拒绝明细）。
++// accepted + rejected = 接收总点数；拒绝明细逐点给出 reason。
++type reportResponse struct {
++	Accepted   int         `json:"accepted"`
++	Rejected   int         `json:"rejected"`
++	Rejections []Rejection `json:"rejections"`
++	Duplicate  bool        `json:"duplicate"`
++}
++
++// errorResponse 错误响应。Code 为契约已定数值码（4001 空 points）；契约未定数值码的
++// 拒绝 Code=0（message.Error 纪律：不臆造码值），语义由 HTTP 状态与文案承载。
++type errorResponse struct {
++	Code    int64  `json:"code"`
++	Message string `json:"message"`
++}
++
++// ReportHandler POST /ingest/v1/report。
++type ReportHandler struct {
++	// Validator 网关令牌链校验器（fail-closed）。
++	Validator gwtoken.Validator
++	// Sink 统一流水线入口（0073 pipeline）。
++	Sink ReportSink
++	// CredType 上报通道凭据类型；空 → HTTP_SECRET（REQ-0011 凭据类型口径）。
++	CredType string
++}
++
++func (h *ReportHandler) credType() string {
++	if h.CredType != "" {
++		return h.CredType
++	}
++	return gwtoken.CredTypeHTTPSecret
++}
++
++// ServeHTTP 实现 http.Handler。
++func (h *ReportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	defer func() {
++		if rec := recover(); rec != nil {
++			writeJSON(w, http.StatusInternalServerError, errorResponse{Message: fmt.Sprintf("上报处理异常: %v", rec)})
++		}
++	}()
++
++	body, err := readBody(w, r)
++	if err != nil {
++		writeJSON(w, http.StatusBadRequest, errorResponse{Message: err.Error()})
++		return
++	}
++
++	// 信封级纪律（空 points 4001 / 超 500 整批 / 缺 tenant/batchId / JSON 非法）：
++	// 入口整批拒绝，不进流水线（契约文案与数值码照 message.Error）。
++	env, err := message.Parse(body)
++	if err != nil {
++		var msgErr *message.Error
++		if errors.As(err, &msgErr) {
++			writeJSON(w, http.StatusBadRequest, errorResponse{Code: msgErr.Code, Message: msgErr.Msg})
++			return
++		}
++		writeJSON(w, http.StatusBadRequest, errorResponse{Message: err.Error()})
++		return
++	}
++
++	// 处理顺序第 1 步：验令牌与租户（fail-closed）。网关编码取信封 gateway 声明
++	// （身份主张），租户只取校验产物；缺令牌头不发起校验。
++	token := r.Header.Get(GatewayTokenHeader)
++	if token == "" {
++		writeJSON(w, http.StatusUnauthorized, errorResponse{Message: "缺少网关令牌（X-Gateway-Token）"})
++		return
++	}
++	identity, err := h.Validator.Validate(r.Context(), h.credType(), env.Gateway, token)
++	if err != nil {
++		writeJSON(w, http.StatusUnauthorized, errorResponse{Message: "网关令牌校验失败（fail-closed）: " + err.Error()})
++		return
++	}
++
++	// 统一流水线入口（0073 pipeline；租户 = 令牌侧解析产物）。
++	out, err := h.Sink.Report(r.Context(), identity.TenantCode, body)
++	if err != nil {
++		writeJSON(w, http.StatusServiceUnavailable, errorResponse{Message: "流水线入口暂不可用: " + err.Error()})
++		return
++	}
++	rejections := out.Rejections
++	if rejections == nil {
++		rejections = make([]Rejection, 0)
++	}
++	writeJSON(w, http.StatusOK, reportResponse{
++		Accepted:   out.Accepted,
++		Rejected:   out.Rejected,
++		Rejections: rejections,
++		Duplicate:  out.Duplicate,
++	})
++}
++
++// readBody 读取请求体（带上限）。超限/读失败转 400。
++func readBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes))
++	if err != nil {
++		var maxErr *http.MaxBytesError
++		if errors.As(err, &maxErr) {
++			return nil, fmt.Errorf("请求体超过上限 %d 字节", MaxRequestBodyBytes)
++		}
++		return nil, fmt.Errorf("读取请求体失败: %w", err)
++	}
++	return body, nil
++}
++
++func writeJSON(w http.ResponseWriter, status int, v any) {
++	w.Header().Set("Content-Type", "application/json; charset=utf-8")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(v)
++}
+diff --git a/ingest/internal/httpapi/report_contract_test.go b/ingest/internal/httpapi/report_contract_test.go
+new file mode 100644
+index 0000000..79141dd
+--- /dev/null
++++ b/ingest/internal/httpapi/report_contract_test.go
+@@ -0,0 +1,487 @@
++package httpapi_test
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/gwtoken"
++	"net.otlab/ingest/internal/httpapi"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0076 HTTP 上报端点契约测试（POST /ingest/v1/report）。
++//
++// 契约依据：统一消息模型 v1.1.0 §3.2（续）——「网关令牌（请求头 X-Gateway-Token）；
++// HTTP 批量上报，请求体与 MQTT 上行消息 JSON 完全同构；响应返回接收条数、拒绝条数
++// 与拒绝明细（未知编码、时间戳越界）」；FEAT-0009 处理顺序第 1 步验令牌与租户
++// （租户必须来自令牌侧解析产物）；REQ-0013 验收 3（单消息>500 整批拒绝）、
++// TC-0009 步骤 6（空 points 4001）。
++
++// contractUpstreamJSON 逐字取自统一消息模型契约 v1.1.0 §3.2「上行消息 JSON」示例。
++const contractUpstreamJSON = `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "20261121-100000-0001",
++  "sentAt": 1795212000000,
++  "points": [
++    {"pointCode": "F01_WS01_EQ001_M01", "ts": 1795211995000, "value": 98231.4, "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_M02", "ts": 1795211995000, "value": 132.5,  "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_S01", "ts": 1795211995000, "value": 1,      "quality": 0}
++  ]
++}`
++
++// ---- mock（brief 测试口径：流水线调用断言用 mock pipeline；令牌校验用 mock validator）----
++
++type mockValidator struct {
++	mu       sync.Mutex
++	calls    int
++	credType string
++	gateway  string
++	token    string
++	id       gwtoken.GatewayIdentity
++	err      error
++}
++
++func (m *mockValidator) Validate(_ context.Context, credType, gatewayCode, token string) (gwtoken.GatewayIdentity, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.calls++
++	m.credType, m.gateway, m.token = credType, gatewayCode, token
++	return m.id, m.err
++}
++
++type mockSink struct {
++	mu      sync.Mutex
++	calls   int
++	tenant  string
++	payload []byte
++	out     httpapi.ReportOutcome
++	err     error
++}
++
++func (s *mockSink) Report(_ context.Context, tenant string, payload []byte) (httpapi.ReportOutcome, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.calls++
++	s.tenant, s.payload = tenant, payload
++	return s.out, s.err
++}
++
++func identity() gwtoken.GatewayIdentity {
++	return gwtoken.GatewayIdentity{GatewayCode: "GW_F01_01", TenantCode: "group_a", ChannelID: 7}
++}
++
++// postReport 构造上报请求并执行。
++func postReport(t *testing.T, h http.Handler, token string, body string) *http.Response {
++	t.Helper()
++	req := httptest.NewRequest(http.MethodPost, "/ingest/v1/report", strings.NewReader(body))
++	if token != "" {
++		req.Header.Set("X-Gateway-Token", token)
++	}
++	req.Header.Set("Content-Type", "application/json")
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	return rec.Result()
++}
++
++func decodeJSON(t *testing.T, resp *http.Response) map[string]any {
++	t.Helper()
++	defer resp.Body.Close()
++	b, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("读响应失败: %v", err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(b, &m); err != nil {
++		t.Fatalf("响应 JSON 解析失败: %v body=%s", err, b)
++	}
++	return m
++}
++
++// ---- 契约符合性测试 ----
++
++// 契约依据：§3.2（续）——请求体与 MQTT 上行消息 JSON 完全同构；网关令牌请求头
++// X-Gateway-Token；租户来自令牌链解析产物（消息自带 tenant 仅声明）。mock sink 断言
++// 统一流水线入口的调用形态（brief 测试口径），mock validator 断言凭据类型口径。
++func TestContractReportEndpointContractSampleViaMockSink(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	ms := &mockSink{out: httpapi.ReportOutcome{Accepted: 3, Rejected: 0, Rejections: []httpapi.Rejection{}}}
++	h := &httpapi.ReportHandler{Validator: mv, Sink: ms}
++
++	resp := postReport(t, h, "gw-token-secret", contractUpstreamJSON)
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200", resp.StatusCode)
++	}
++	body := decodeJSON(t, resp)
++	if body["accepted"] != float64(3) {
++		t.Errorf("accepted = %v, want 3（接收条数）", body["accepted"])
++	}
++	if body["rejected"] != float64(0) {
++		t.Errorf("rejected = %v, want 0", body["rejected"])
++	}
++	if body["duplicate"] != false {
++		t.Errorf("duplicate = %v, want false", body["duplicate"])
++	}
++	rej, ok := body["rejections"].([]any)
++	if !ok || len(rej) != 0 {
++		t.Errorf("rejections = %v, want 空 数组（非 null）", body["rejections"])
++	}
++
++	mv.mu.Lock()
++	defer mv.mu.Unlock()
++	if mv.calls != 1 {
++		t.Errorf("validator calls = %d, want 1", mv.calls)
++	}
++	if mv.credType != gwtoken.CredTypeHTTPSecret {
++		t.Errorf("credType = %q, want HTTP_SECRET（HTTP 上报通道凭据口径）", mv.credType)
++	}
++	if mv.gateway != "GW_F01_01" || mv.token != "gw-token-secret" {
++		t.Errorf("gateway/token = %q/%q, want 信封 gateway 声明 + X-Gateway-Token", mv.gateway, mv.token)
++	}
++
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if ms.calls != 1 {
++		t.Errorf("sink calls = %d, want 1（统一流水线入口）", ms.calls)
++	}
++	if ms.tenant != "group_a" {
++		t.Errorf("tenant = %q, want group_a（令牌侧解析产物，非消息 tenant 以外来源）", ms.tenant)
++	}
++	if !bytes.Equal(ms.payload, []byte(contractUpstreamJSON)) {
++		t.Errorf("payload 与请求体不同构（MQTT 报文同构纪律）")
++	}
++}
++
++// 契约依据：§3.2 批量上限 + REQ-0013 验收 3「单消息>500 整批拒绝」+ brief 决策 1
++// 「批量上限 500（超限 400 契约文案）」——501 条 → 400，文案取契约语义原文。
++func TestContractReportEndpointRejectsOverLimitWith400ContractWording(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	ms := &mockSink{}
++	h := &httpapi.ReportHandler{Validator: mv, Sink: ms}
++
++	var b strings.Builder
++	b.WriteString(`{"tenant": "group_a", "gateway": "GW_F01_01", "batchId": "20261121-100000-0001", "sentAt": 1795212000000, "points": [`)
++	for i := 0; i < 501; i++ {
++		if i > 0 {
++			b.WriteByte(',')
++		}
++		fmt.Fprintf(&b, `{"pointCode": "F01_WS01_EQ001_M%03d", "ts": 1795211995000, "value": 132.5, "quality": 0}`, i)
++	}
++	b.WriteString(`]}`)
++
++	resp := postReport(t, h, "gw-token-secret", b.String())
++	if resp.StatusCode != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400（超限整批拒绝）", resp.StatusCode)
++	}
++	body := decodeJSON(t, resp)
++	if body["message"] != message.ErrTooManyPoints.Msg {
++		t.Errorf("message = %v, want 契约文案 %q", body["message"], message.ErrTooManyPoints.Msg)
++	}
++	if code := body["code"]; code != float64(0) {
++		t.Errorf("code = %v, want 0（契约未定数值码，不臆造）", code)
++	}
++	ms.mu.Lock()
++	defer ms.mu.Unlock()
++	if ms.calls != 0 {
++		t.Errorf("sink calls = %d, want 0（超限不进流水线）", ms.calls)
++	}
++}
++
++// 契约依据：REQ-0013「空数据=空 points 4001」、TC-0009 步骤 6——空 points 消息 → 4001 拒绝。
++func TestContractReportEndpointRejectsEmptyPointsWith4001(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	ms := &mockSink{}
++	h := &httpapi.ReportHandler{Validator: mv, Sink: ms}
++
++	empty := `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "20261121-100000-0001",
++  "sentAt": 1795212000000,
++  "points": []
++}`
++	resp := postReport(t, h, "gw-token-secret", empty)
++	if resp.StatusCode != http.StatusBadRequest {
++		t.Fatalf("status = %d, want 400", resp.StatusCode)
++	}
++	body := decodeJSON(t, resp)
++	if body["code"] != float64(message.CodeEmptyPoints) {
++		t.Errorf("code = %v, want 4001", body["code"])
++	}
++}
++
++// 契约依据：brief 决策 3——令牌链 fail-closed（后端不可达/校验失败不放行）；
++// 缺令牌请求头直接拒绝且不发起校验。
++func TestContractReportEndpointFailsClosedOnTokenFailure(t *testing.T) {
++	cases := []struct {
++		name        string
++		token       string
++		valErr      error
++		wantStatus  int
++		wantValCall bool
++	}{
++		{"校验失败（后端不可达）", "gw-token-secret", fmt.Errorf("backend unreachable"), http.StatusUnauthorized, true},
++		{"缺令牌请求头", "", nil, http.StatusUnauthorized, false},
++	}
++	for _, c := range cases {
++		mv := &mockValidator{id: identity(), err: c.valErr}
++		ms := &mockSink{}
++		h := &httpapi.ReportHandler{Validator: mv, Sink: ms}
++		resp := postReport(t, h, c.token, contractUpstreamJSON)
++		if resp.StatusCode != c.wantStatus {
++			t.Errorf("%s: status = %d, want %d", c.name, resp.StatusCode, c.wantStatus)
++		}
++		mv.mu.Lock()
++		got := mv.calls
++		mv.mu.Unlock()
++		if c.wantValCall && got != 1 {
++			t.Errorf("%s: validator calls = %d, want 1", c.name, got)
++		}
++		if !c.wantValCall && got != 0 {
++			t.Errorf("%s: validator calls = %d, want 0（缺令牌不发起校验）", c.name, got)
++		}
++		ms.mu.Lock()
++		sinkCalls := ms.calls
++		ms.mu.Unlock()
++		if sinkCalls != 0 {
++			t.Errorf("%s: sink calls = %d, want 0（fail-closed 不进流水线）", c.name, sinkCalls)
++		}
++	}
++}
++
++// 契约依据：brief 决策 1——统一流水线入口（0073 pipeline）→ 未知编码死信（0073 已有）；
++// §3.2（续）响应拒绝明细（未知编码）。真流水线接线：未知编码 X99 不落库、响应明细
++// reason=unknown_code、死信出口收到记录。
++func TestContractReportEndpointUnknownCodeDeadLetterViaRealPipeline(t *testing.T) {
++	fixture := newRealPipelineFixture(t)
++	defer fixture.close()
++
++	payload := `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "B-HTTP-X99",
++  "sentAt": 1795212000000,
++  "points": [
++    {"pointCode": "X99", "ts": 1795211995000, "value": 1, "quality": 0},
++    {"pointCode": "F01_WS01_EQ001_M01", "ts": 1795211995000, "value": 132.5, "quality": 0}
++  ]
++}`
++	resp := postReport(t, fixture.handler(), "gw-token-secret", payload)
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200（消息已受理，逐点结果在响应明细）", resp.StatusCode)
++	}
++	body := decodeJSON(t, resp)
++	if body["accepted"] != float64(1) {
++		t.Errorf("accepted = %v, want 1", body["accepted"])
++	}
++	if body["rejected"] != float64(1) {
++		t.Errorf("rejected = %v, want 1", body["rejected"])
++	}
++	rej, ok := body["rejections"].([]any)
++	if !ok || len(rej) != 1 {
++		t.Fatalf("rejections = %v, want 1 条", body["rejections"])
++	}
++	r0 := rej[0].(map[string]any)
++	if r0["pointCode"] != "X99" || r0["reason"] != "unknown_code" {
++		t.Errorf("rejection = %v, want {X99 unknown_code}", r0)
++	}
++	if got := fixture.deadLetterCount("unknown_code"); got != 1 {
++		t.Errorf("dead letter unknown_code = %d, want 1（0073 死信出口）", got)
++	}
++}
++
++// 契约依据：§3.2 处理顺序第 5 步 + FEAT-0009「同一流水线同构结果」——HTTP 上报经真
++// 流水线端到端写库（全限定名 INSERT）并更新点位缓存（v/q/ts）。
++func TestContractReportEndpointEndToEndWritesThroughPipeline(t *testing.T) {
++	fixture := newRealPipelineFixture(t)
++	defer fixture.close()
++
++	payload := `{
++  "tenant": "group_a",
++  "gateway": "GW_F01_01",
++  "batchId": "B-HTTP-E2E",
++  "sentAt": 1795212000000,
++  "points": [
++    {"pointCode": "F01_WS01_EQ001_M01", "ts": 1795211995000, "value": 98231.4, "quality": 0}
++  ]
++}`
++	resp := postReport(t, fixture.handler(), "gw-token-secret", payload)
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200", resp.StatusCode)
++	}
++
++	eventually(t, 2*time.Second, "端到端写库", func() bool { return len(fixture.exec.Calls()) == 1 })
++	sql := fixture.exec.Calls()[0].SQL
++	if !strings.Contains(sql, "INSERT INTO iot_group_5fa.F01_5fWS01_5fEQ001_5fM01 USING iot_group_5fa.st_point_num") {
++		t.Errorf("SQL = %s, want 全限定名 INSERT（db.child USING db.stable）", sql)
++	}
++	// 点位缓存 v/q/ts（§3.5 值形态）。
++	v, err := fixture.cache.GetPoint(context.Background(), "group_a", "F01_WS01_EQ001_M01")
++	if err != nil {
++		t.Fatalf("GetPoint error: %v", err)
++	}
++	if v.V != 98231.4 || v.Q != 0 || v.Ts != 1795211995000 {
++		t.Errorf("cache = %+v, want {98231.4 0 1795211995000}", v)
++	}
++}
++
++// 契约依据：QoS1 batchId 整批幂等（REQ-0013 验收 3）——HTTP 通道同批重报：响应标记
++// duplicate=true、不重复落库。
++func TestContractReportEndpointBatchIdIdempotentReplay(t *testing.T) {
++	fixture := newRealPipelineFixture(t)
++	defer fixture.close()
++
++	payload := `{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-HTTP-DUP","sentAt":1795212000000,"points":[{"pointCode":"F01_WS01_EQ001_M01","ts":1795211995000,"value":132.5,"quality":0}]}`
++
++	r1 := decodeJSON(t, postReport(t, fixture.handler(), "gw-token-secret", payload))
++	if r1["duplicate"] != false || r1["accepted"] != float64(1) {
++		t.Fatalf("first = %v, want duplicate=false accepted=1", r1)
++	}
++	r2 := decodeJSON(t, postReport(t, fixture.handler(), "gw-token-secret", payload))
++	if r2["duplicate"] != true {
++		t.Errorf("second.duplicate = %v, want true（batchId 整批幂等）", r2["duplicate"])
++	}
++	if r2["accepted"] != float64(1) {
++		t.Errorf("second.accepted = %v, want 1（重报按成功无操作报全部点数）", r2["accepted"])
++	}
++	eventually(t, 2*time.Second, "仅一次写库", func() bool { return len(fixture.exec.Calls()) == 1 })
++}
++
++// 契约依据：统一流水线入口不可用时不伪造成功——503 明确失败（fail-closed 同族口径）。
++func TestContractReportEndpointSinkError503(t *testing.T) {
++	mv := &mockValidator{id: identity()}
++	ms := &mockSink{err: fmt.Errorf("pipeline unavailable")}
++	h := &httpapi.ReportHandler{Validator: mv, Sink: ms}
++	resp := postReport(t, h, "gw-token-secret", contractUpstreamJSON)
++	if resp.StatusCode != http.StatusServiceUnavailable {
++		t.Errorf("status = %d, want 503", resp.StatusCode)
++	}
++}
++
++// ---- 真流水线接线 fixture ----
++
++// realPipelineFixture 真流水线 + PipelineSink + ReportHandler 的端到端接线。
++// 快照预置 M01/M02 启用点位（字段派生自配置快照 Schema，编码沿用契约示例）。
++type realPipelineFixture struct {
++	exec    *tdengine.FakeExecutor
++	sink    *deadLetterRecorder
++	cache   *cache.MemoryPointCache
++	pipe    *pipeline.Pipeline
++	handler func() http.Handler
++	cancel  context.CancelFunc
++}
++
++type deadLetterRecorder struct {
++	mu      sync.Mutex
++	reasons map[string]int
++}
++
++func (r *deadLetterRecorder) OnDeadLetter(reason pipeline.DeadLetterReason, _ string, _ string, _ *message.Point) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.reasons[string(reason)]++
++}
++
++func (r *deadLetterRecorder) count(reason string) int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.reasons[reason]
++}
++
++func (f *realPipelineFixture) deadLetterCount(reason string) int { return f.sink.count(reason) }
++
++func (f *realPipelineFixture) close() { f.cancel() }
++
++func newRealPipelineFixture(t *testing.T) *realPipelineFixture {
++	t.Helper()
++	const snapJSON = `{
++	  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++	  "points": [
++	    {"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1},
++	    {"id":102,"tenantId":1,"pointCode":"F01_WS01_EQ001_M02","pointName":"P2","dataType":1,"valueType":"DOUBLE","maxValue":100000,"deptId":3,"status":1}
++	  ]
++	}`
++	snap, err := snapshot.ParseSnapshot([]byte(snapJSON))
++	if err != nil {
++		t.Fatalf("预置快照解析失败: %v", err)
++	}
++	snapCache := snapshot.NewCache()
++	if err := snapCache.Replace(snap); err != nil {
++		t.Fatalf("预置快照替换失败: %v", err)
++	}
++
++	f := &realPipelineFixture{
++		exec:  tdengine.NewFakeExecutor(0),
++		sink:  &deadLetterRecorder{reasons: make(map[string]int)},
++		cache: cache.NewMemoryPointCache(),
++	}
++	ch := make(chan pipeline.Inbound, 64) // 有界消费源（HTTP 面不使用，保留 MQTT 共享入口）
++	deps := pipeline.Deps{
++		Consumer:  channelConsumer(ch),
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   pipeline.NewMemoryBatchDeduper(0),
++		Points:    pipeline.NewMemoryPointDeduper(0),
++		Writer:    &tdengine.Writer{Ex: f.exec},
++		Cache:     f.cache,
++		Dead:      f.sink,
++	}
++	p, err := pipeline.Assemble(pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond}, deps)
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	f.pipe = p
++	ctx, cancel := context.WithCancel(context.Background())
++	f.cancel = cancel
++	go func() { _ = p.Run(ctx) }() // flusher + 空闲消费源
++
++	sink := &httpapi.PipelineSink{Pipe: p}
++	validator := gwtoken.NewTokenChainValidator(
++		gwtoken.StaticResolver{"GW_F01_01": {ChannelID: 7, TenantCode: "group_a"}},
++		&staticPuller{cred: gwtoken.Credential{Ciphertext: "gw-token-secret"}},
++		0)
++	f.handler = func() http.Handler {
++		return &httpapi.ReportHandler{Validator: validator, Sink: sink}
++	}
++	return f
++}
++
++// channelConsumer 有界通道消费源适配（0073 Consumer 接口）。
++type chanConsumer struct{ ch chan pipeline.Inbound }
++
++func channelConsumer(ch chan pipeline.Inbound) *chanConsumer { return &chanConsumer{ch: ch} }
++
++func (c *chanConsumer) Messages() <-chan pipeline.Inbound { return c.ch }
++
++// staticPuller 固定凭据假拉取器（令牌链 mock 口径：ciphertext 原样比对）。
++type staticPuller struct{ cred gwtoken.Credential }
++
++func (s *staticPuller) Pull(_ context.Context, _ int64, _ string) (gwtoken.Credential, error) {
++	return s.cred, nil
++}
++
++// eventually 轮询等待条件成立（异步攒批断言辅助）。
++func eventually(t *testing.T, timeout time.Duration, what string, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if cond() {
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: %s", what)
++}
+diff --git a/ingest/internal/pipeline/pipeline.go b/ingest/internal/pipeline/pipeline.go
+index 5aa1531..31a1c45 100644
+--- a/ingest/internal/pipeline/pipeline.go
++++ b/ingest/internal/pipeline/pipeline.go
+@@ -263,27 +263,74 @@ func (p *Pipeline) Run(ctx context.Context) error {
+ 
+ // ---- 处理顺序（冻结五步）----
+ 
+-// processOne 处理一条入站消息（单消费循环内串行执行）。
+-func (p *Pipeline) processOne(ctx context.Context, in Inbound) {
++// SubmitRejection 单点拒绝明细（TASK-0076 HTTP 上报响应「拒绝明细」的数据来源，
++// 统一消息模型 v1.1.0 §3.2（续）：响应返回拒绝明细（未知编码、时间戳越界等））。
++type SubmitRejection struct {
++	PointCode string
++	Ts        int64
++	Reason    DeadLetterReason
++}
++
++// SubmitResult 同步提交（Submit）一次的受理结果。
++type SubmitResult struct {
++	// Duplicate batchId 整批重复命中（整批幂等）：无新增提交，
++	// Accepted 报全部点数（首次接收时已受理，QoS1 重报按成功无操作计）。
++	Duplicate bool
++	// RejectedWhole 信封级整批拒绝（缺租户/解析失败）——不产出逐点结果。
++	RejectedWhole bool
++	// Accepted 受理点数：提交攒批的新行 + 幂等重复点数（QoS1 重报为成功无操作）。
++	Accepted int
++	// Rejected 死信/丢弃点数（未知编码/禁用/无效配置）。
++	Rejected int
++	// Rejections 逐点拒绝明细（顺序与 points 一致）。
++	Rejections []SubmitRejection
++}
++
++// Submit 同步提交一条入站消息（TASK-0076 HTTP 上报同构入口）：处理顺序与 Run 消费
++// 循环完全一致（同一 processOne 五步冻结顺序），仅并发模型不同——不经消息通道，
++// 在调用方 goroutine 内执行；攒批缓冲、flusher、去重表与 Run 路径共享。
++//
++// 并发纪律：可与 Run（及多个 Submit）并发调用——流水线组件均并发安全；
++// DeadLetterSink 由调用方保证并发安全（Run 消费循环与 HTTP handler 双入口写）。
++// flusher 由 Run 启动；纯 HTTP 面接线（无 MQTT 消费源）时用 StartFlusher 单独启动。
++func (p *Pipeline) Submit(ctx context.Context, in Inbound) SubmitResult {
++	return p.processOne(ctx, in)
++}
++
++// StartFlusher 启动攒批 flusher（Run 的组成步骤单独暴露：纯 HTTP 面 Submit 接线时
++// 没有 Run 消费循环，需单独启动）。已调用 Run 的流水线不得再调用（flusher 只允许一个）。
++func (p *Pipeline) StartFlusher(ctx context.Context) {
++	go p.flusher(ctx)
++}
++
++// processOne 处理一条入站消息（单消费循环内串行执行；Submit 同步面复用同一实现，
++// 处理顺序为冻结五步，不得在此之外出现第二份流水线逻辑）。返回受理结果供
++// HTTP 上报响应构造；Run 消费循环忽略返回值。
++func (p *Pipeline) processOne(ctx context.Context, in Inbound) SubmitResult {
+ 	p.stats.ReceivedBatches.Add(1)
++	var res SubmitResult
+ 
+ 	// 第 1 步：验令牌与租户（挂点）。租户只来自令牌解析产物；缺租户整批拒绝。
+ 	if in.Tenant == "" {
+ 		p.rejectWholeBatch(in, "")
+-		return
++		res.RejectedWhole = true
++		return res
+ 	}
+ 
+ 	env, err := p.deps.Parser.Parse(in.Payload)
+ 	if err != nil {
+ 		// 信封级整批拒绝：空 points 4001 / 超 500 / 缺 batchId / JSON 非法。
+ 		p.rejectWholeBatch(in, "")
+-		return
++		res.RejectedWhole = true
++		return res
+ 	}
+ 
+ 	// batchId 整批幂等（标记即接受，内核简化口径；崩溃安全归 TASK-0028）。
+ 	if p.deps.Batches.SeenBatch(env.BatchID) {
+ 		p.stats.DuplicateBatches.Add(1)
+-		return
++		res.Duplicate = true
++		res.Accepted = len(env.Points) // 重报按成功无操作报全部点数（首次接收时已受理）
++		return res
+ 	}
+ 	p.deps.Batches.MarkBatch(env.BatchID)
+ 
+@@ -297,17 +344,22 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) {
+ 		if !ok {
+ 			p.stats.DeadLettered.Add(1)
+ 			p.deps.Dead.OnDeadLetter(DeadLetterUnknownCode, in.Tenant, env.BatchID, pt)
++			res.Rejected++
++			res.Rejections = append(res.Rejections, SubmitRejection{PointCode: pt.PointCode, Ts: pt.Ts, Reason: DeadLetterUnknownCode})
+ 			continue
+ 		}
+ 		if cfgPt.Disabled() {
+ 			p.stats.DisabledDiscarded.Add(1)
+ 			p.deps.Dead.OnDeadLetter(DeadLetterDisabledPoint, in.Tenant, env.BatchID, pt)
++			res.Rejected++
++			res.Rejections = append(res.Rejections, SubmitRejection{PointCode: pt.PointCode, Ts: pt.Ts, Reason: DeadLetterDisabledPoint})
+ 			continue
+ 		}
+ 
+ 		// (pointCode, ts) 幂等键（内核简化口径同 batchId）。
+ 		if p.deps.Points.SeenPoint(pt.PointCode, pt.Ts) {
+ 			p.stats.DuplicatePoints.Add(1)
++			res.Accepted++ // QoS1 重报：幂等无操作，按受理计（不是拒绝）
+ 			continue
+ 		}
+ 		p.deps.Points.MarkPoint(pt.PointCode, pt.Ts)
+@@ -319,6 +371,8 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) {
+ 		if !ok {
+ 			p.stats.DeadLettered.Add(1)
+ 			p.deps.Dead.OnDeadLetter(DeadLetterInvalidConfig, in.Tenant, env.BatchID, pt)
++			res.Rejected++
++			res.Rejections = append(res.Rejections, SubmitRejection{PointCode: pt.PointCode, Ts: pt.Ts, Reason: DeadLetterInvalidConfig})
+ 			continue
+ 		}
+ 
+@@ -333,11 +387,13 @@ func (p *Pipeline) processOne(ctx context.Context, in Inbound) {
+ 			Value:      pt.Value,
+ 			Quality:    q,
+ 		})
++		res.Accepted++
+ 	}
+ 
+ 	for _, row := range rows {
+ 		p.push(row)
+ 	}
++	return res
+ }
+ 
+ func (p *Pipeline) rejectWholeBatch(in Inbound, batchID string) {
+diff --git a/ingest/internal/pipeline/pipeline_submit_contract_test.go b/ingest/internal/pipeline/pipeline_submit_contract_test.go
+new file mode 100644
+index 0000000..10fb906
+--- /dev/null
++++ b/ingest/internal/pipeline/pipeline_submit_contract_test.go
+@@ -0,0 +1,203 @@
++package pipeline_test
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/pipeline"
++)
++
++// TASK-0076：Submit 同步提交入口（HTTP 上报同构面）的契约符合性测试。
++//
++// 契约依据：统一消息模型 v1.1.0 §3.2（续）「响应返回接收条数、拒绝条数与拒绝明细」——
++// HTTP 上报响应需要逐点受理结果，故流水线须提供不经消息通道的同步提交入口；处理顺序
++// 必须与 Run 消费循环完全一致（同一五步冻结顺序，不得出现第二份流水线逻辑）。
++
++// 契约依据：§3.2 处理顺序五步 + §3.2（续）拒绝明细（未知编码）。
++// Submit 一次提交：未知编码 X99 死信（明细 reason=unknown_code）、禁用点位 S01 丢弃
++// （明细 reason=disabled_point）、已知编码 M01 正常受理并在攒批后写库——与 Run 路径
++// 完全同构（同一 processOne）。
++func TestContractSubmitSyncEntryMirrorsRunPath(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }() // flusher + 空闲消费源（HTTP 面不使用消息通道）
++
++	payload := fmt.Sprintf(
++		`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-SUBMIT-1","sentAt":1795212000000,"points":[%s,%s,%s]}`,
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 98231.4, 0),
++		pointJSON("X99", 1795211995000, 1, 0),                 // 未知编码（TC-0009 步骤 3）
++		pointJSON("F01_WS01_EQ001_S01", 1795211995000, 1, 0), // 禁用点位（快照 status=0）
++	)
++	res := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++
++	if res.Duplicate {
++		t.Errorf("Duplicate = true, want false（首发批次）")
++	}
++	if res.RejectedWhole {
++		t.Errorf("RejectedWhole = true, want false（信封合法）")
++	}
++	if res.Accepted != 1 {
++		t.Errorf("Accepted = %d, want 1（M01 受理；X99 死信、S01 禁用不计受理）", res.Accepted)
++	}
++	if res.Rejected != 2 {
++		t.Errorf("Rejected = %d, want 2（X99 未知编码 + S01 禁用）", res.Rejected)
++	}
++	if len(res.Rejections) != 2 {
++		t.Fatalf("len(Rejections) = %d, want 2", len(res.Rejections))
++	}
++	if res.Rejections[0].PointCode != "X99" || res.Rejections[0].Ts != 1795211995000 ||
++		res.Rejections[0].Reason != pipeline.DeadLetterUnknownCode {
++		t.Errorf("Rejections[0] = %+v, want {X99 1795211995000 unknown_code}", res.Rejections[0])
++	}
++	if res.Rejections[1].PointCode != "F01_WS01_EQ001_S01" ||
++		res.Rejections[1].Reason != pipeline.DeadLetterDisabledPoint {
++		t.Errorf("Rejections[1] = %+v, want {F01_WS01_EQ001_S01 disabled_point}", res.Rejections[1])
++	}
++
++	// 死信出口与 Run 路径同构：死信计数告警挂点收到两条记录。
++	if got := h.sink.byReason(pipeline.DeadLetterUnknownCode); got != 1 {
++		t.Errorf("dead letter unknown_code = %d, want 1", got)
++	}
++	if got := h.sink.byReason(pipeline.DeadLetterDisabledPoint); got != 1 {
++		t.Errorf("dead letter disabled_point = %d, want 1", got)
++	}
++
++	// 受理行经共享攒批缓冲写库（Run 的 flusher 承担）——同一路径，不另起写入口。
++	eventually(t, 2*time.Second, "M01 写库", func() bool { return len(h.executor.Calls()) == 1 })
++	sql := h.executor.Calls()[0].SQL
++	// 子表/库名经 0073 escapeIdentifier 确定性转义（`_`→_5f，BUG-0002 单射口径），
++	// INSERT 必须全限定（db.child USING db.stable——9750 教训在 0073 构造器已落实）。
++	if !strings.Contains(sql, "INSERT INTO iot_group_5fa.F01_5fWS01_5fEQ001_5fM01 USING iot_group_5fa.st_point_num") {
++		t.Errorf("SQL = %s, want 全限定名 INSERT（db.child USING db.stable）", sql)
++	}
++	if !strings.Contains(sql, "TAGS (1, 'F01_WS01_EQ001_M01'") {
++		t.Errorf("SQL = %s, want TAGS 保留原编码", sql)
++	}
++}
++
++// 契约依据：QoS1 batchId 整批幂等（REQ-0013 验收 3）——Submit 复发同 batchId：
++// Duplicate=true、无新增写库、受理数报全部点数（首次接收时已受理，重报为成功无操作）。
++func TestContractSubmitBatchIdDedupReportsDuplicate(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	payload := fmt.Sprintf(
++		`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-SUBMIT-DUP","sentAt":1795212000000,"points":[%s]}`,
++		pointJSON("F01_WS01_EQ001_M01", 1795211995000, 132.5, 0))
++
++	first := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++	if first.Duplicate || first.Accepted != 1 {
++		t.Fatalf("first = %+v, want Duplicate=false Accepted=1", first)
++	}
++	second := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++	if !second.Duplicate {
++		t.Errorf("second.Duplicate = false, want true（batchId 整批幂等命中）")
++	}
++	if second.Accepted != 1 {
++		t.Errorf("second.Accepted = %d, want 1（重报按成功无操作报全部点数）", second.Accepted)
++	}
++	if second.Rejected != 0 || len(second.Rejections) != 0 {
++		t.Errorf("second.Rejected/Rejections = %d/%v, want 0/空", second.Rejected, second.Rejections)
++	}
++	eventually(t, 2*time.Second, "仅首次写库", func() bool { return len(h.executor.Calls()) == 1 })
++}
++
++// 契约依据：QoS1 (pointCode, ts) 幂等键——同点位同时间戳经不同 batchId 重报：
++// 幂等无操作，计入受理（不进拒绝明细）、无新增写库。
++func TestContractSubmitPointTsDupCountedAccepted(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 1, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	point := pointJSON("F01_WS01_EQ001_M01", 1795211995000, 132.5, 0)
++	p1 := fmt.Sprintf(`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-DUP-1","sentAt":1795212000000,"points":[%s]}`, point)
++	p2 := fmt.Sprintf(`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-DUP-2","sentAt":1795212000001,"points":[%s]}`, point)
++
++	r1 := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(p1)})
++	r2 := h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(p2)})
++	if r1.Accepted != 1 || r2.Accepted != 1 {
++		t.Errorf("Accepted = %d/%d, want 1/1（重复点按幂等受理）", r1.Accepted, r2.Accepted)
++	}
++	if len(r2.Rejections) != 0 || r2.Rejected != 0 {
++		t.Errorf("r2 拒绝 = %d/%v, want 0/空（幂等不是拒绝）", r2.Rejected, r2.Rejections)
++	}
++	eventually(t, 2*time.Second, "仅一次写库", func() bool { return len(h.executor.Calls()) == 1 })
++}
++
++// 契约依据：§3.2 信封级纪律——Submit 缺租户/非法 JSON 整批拒绝（HTTP 面已在入口 400，
++// 此路径供 MQTT Run 与防御性直提交共用同一冻结顺序）。
++func TestContractSubmitEnvelopeRejectedWhole(t *testing.T) {
++	h := newHarness(t, pipeline.Config{})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	cases := []struct {
++		name    string
++		inbound pipeline.Inbound
++	}{
++		{"缺租户", pipeline.Inbound{Tenant: "", Payload: []byte(`{"tenant":"group_a","batchId":"B1","points":[]}`)}},
++		{"非法JSON", pipeline.Inbound{Tenant: "group_a", Payload: []byte(`{not-json`)}},
++	}
++	for _, c := range cases {
++		res := h.pipe.Submit(ctx, c.inbound)
++		if !res.RejectedWhole {
++			t.Errorf("%s: RejectedWhole = false, want true（整批拒绝）", c.name)
++		}
++		if res.Accepted != 0 || res.Rejected != 0 || len(res.Rejections) != 0 {
++			t.Errorf("%s: 结果 = %+v, want 全零（整批拒绝不产出逐点结果）", c.name, res)
++		}
++	}
++	if got := h.sink.byReason(pipeline.DeadLetterInvalidEnvelope); got != 2 {
++		t.Errorf("dead letter invalid_envelope = %d, want 2", got)
++	}
++}
++
++// 契约依据：Submit 与 Run 并发双入口——并发提交与消费循环共享受攒批缓冲/去重表，
++// 结果计数不串批（每个 Submit 结果只含自身批次的点）。
++func TestContractSubmitConcurrentWithRun(t *testing.T) {
++	h := newHarness(t, pipeline.Config{BatchSize: 500, FlushInterval: 10 * time.Millisecond})
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = h.pipe.Run(ctx) }()
++
++	const n = 32
++	results := make([]pipeline.SubmitResult, n)
++	done := make(chan struct{}, n)
++	for i := 0; i < n; i++ {
++		go func(i int) {
++			defer func() { done <- struct{}{} }()
++			payload := fmt.Sprintf(
++				`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-CONC-%02d","sentAt":1795212000000,"points":[%s]}`,
++				i, pointJSON(fmt.Sprintf("F01_WS01_EQ001_M%02d", i), 1795211995000+int64(i), float64(i), 0))
++			// 快照只预置 M01/M02/S01——M00/M03..M31 为未知编码，落死信明细。
++			results[i] = h.pipe.Submit(ctx, pipeline.Inbound{Tenant: "group_a", Payload: []byte(payload)})
++		}(i)
++	}
++	for i := 0; i < n; i++ {
++		select {
++		case <-done:
++		case <-time.After(2 * time.Second):
++			t.Fatal("并发 Submit 未在时限内返回")
++		}
++	}
++	var accepted, rejected int
++	for _, r := range results {
++		if r.Duplicate || r.RejectedWhole {
++			t.Fatalf("结果异常: %+v", r)
++		}
++		accepted += r.Accepted
++		rejected += r.Rejected
++	}
++	// M01/M02 命中快照受理，其余 30 个未知编码死信。
++	if accepted != 2 || rejected != 30 {
++		t.Errorf("accepted/rejected = %d/%d, want 2/30", accepted, rejected)
++	}
++}
+diff --git a/ingest/internal/tdengine/rest.go b/ingest/internal/tdengine/rest.go
+new file mode 100644
+index 0000000..024cc18
+--- /dev/null
++++ b/ingest/internal/tdengine/rest.go
+@@ -0,0 +1,173 @@
++package tdengine
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// TDengine REST 写客户端（TASK-0076 brief 决策 4）——真库写入归 0068 联调（fd 待修复），
++// 本实现以 httptest 假服务锁请求形态（全限定名 / Basic 认证 / 读超时 / 环境级失败口径）。
++//
++// TD-0053 实测教训（192.168.31.145，TDengine 3.4.3.9，2026-11-22 会话）：
++//   - REST /rest/sql/<db> 库上下文返回 9750——禁用库上下文路径，SQL 内一律全限定表名
++//     （db.child USING db.stable，InsertPointSQL 已落实）或 USE 多语句（EnsureSchema，
++//     复用附录 B DDL 构造器）；
++//   - DDL 响应延迟可达秒级以上——读超时配置化，默认 30s；
++//   - fd 不足时 code 24 Too many open files / 918 Database in creating status——
++//     环境级失败 fail-soft：识别 + WARN + 重试计数（由流水线写失败重排承担），不炸管道。
++
++const (
++	// RESTPath REST 执行路径：POST /rest/sql（无库上下文后缀——9750 教训）。
++	RESTPath = "/rest/sql"
++
++	// DefaultReadTimeout 默认读超时（TD-0053 实测：DDL 响应延迟可达秒级以上）。
++	DefaultReadTimeout = 30 * time.Second
++
++	// DefaultRESTUser / DefaultRESTPassword TDengine REST 默认账号（可配置覆盖）。
++	DefaultRESTUser     = "root"
++	DefaultRESTPassword = "taosdata"
++)
++
++// envErrorCodes 环境级失败码（TD-0053 实测口径）。
++//   24  Too many open files（fd 不足）
++//   918 Database in creating status（建库中）
++var envErrorCodes = map[int]bool{
++	24:  true,
++	918: true,
++}
++
++// EnvError 环境级失败（fail-soft 识别口径）：不炸管道——WARN + 重试计数
++// （流水线写失败重排 / 超上限死信计数承担有限重试），不得升级为致命错误。
++type EnvError struct {
++	Code int
++	Desc string
++}
++
++func (e *EnvError) Error() string {
++	return fmt.Sprintf("tdengine: 环境级失败（fail-soft 可重试）code=%d desc=%q", e.Code, e.Desc)
++}
++
++// SQLError 非 0 且非环境级的 SQL 执行失败（配置错误、语法错误、9750 库上下文类等）。
++type SQLError struct {
++	Code int
++	Desc string
++}
++
++func (e *SQLError) Error() string {
++	return fmt.Sprintf("tdengine: SQL 执行失败 code=%d desc=%q", e.Code, e.Desc)
++}
++
++// IsEnvError 报告 err 是否环境级失败（fail-soft 重试口径判定）。
++func IsEnvError(err error) bool {
++	var e *EnvError
++	return errors.As(err, &e)
++}
++
++// RESTConfig REST 写客户端配置。
++type RESTConfig struct {
++	// Endpoint REST 基址（如 http://192.168.31.145:6041）——请求固定 POST
++	// {Endpoint}/rest/sql（无 /rest/sql/<db> 库上下文——9750 教训）。
++	Endpoint string
++	// User / Password Basic 认证凭据；空取默认（root/taosdata）。
++	User     string
++	Password string
++	// Timeout 读超时（配置化）；<=0 → DefaultReadTimeout（30s，DDL 秒级延迟实测口径）。
++	Timeout time.Duration
++	// Logger 环境级失败 WARN 输出；nil → log.Default()。
++	Logger *log.Logger
++}
++
++// RESTClient TDengine REST 写客户端（Basic 认证）。实现 Executor——可直配
++// tdengine.Writer 进入 0073 攒批流水线（WritePoints 分组下发全限定名 INSERT）。
++type RESTClient struct {
++	cfg    RESTConfig
++	hc     *http.Client
++	logger *log.Logger
++}
++
++// NewRESTClient 构造 REST 客户端（Timeout<=0 取 DefaultReadTimeout）。
++func NewRESTClient(cfg RESTConfig) *RESTClient {
++	if cfg.Timeout <= 0 {
++		cfg.Timeout = DefaultReadTimeout
++	}
++	if cfg.User == "" {
++		cfg.User = DefaultRESTUser
++	}
++	if cfg.Password == "" {
++		cfg.Password = DefaultRESTPassword
++	}
++	logger := cfg.Logger
++	if logger == nil {
++		logger = log.Default()
++	}
++	return &RESTClient{
++		cfg:    cfg,
++		hc:     &http.Client{Timeout: cfg.Timeout},
++		logger: logger,
++	}
++}
++
++// ReadTimeout 生效读超时（观测/测试口径）。
++func (c *RESTClient) ReadTimeout() time.Duration { return c.cfg.Timeout }
++
++// restEnvelope taosadapter 响应信封：{"code":0,"desc":"succ","affected_rows":N,...}。
++type restEnvelope struct {
++	Code         int    `json:"code"`
++	Desc         string `json:"desc"`
++	AffectedRows int64  `json:"affected_rows"`
++}
++
++// Exec 实现 Executor：POST {Endpoint}/rest/sql，Basic 认证，body = SQL 文本。
++// 全限定名纪律由 SQL 构造侧保证（InsertPointSQL / EnsureSchema——9750 教训）。
++// 响应 code=0 成功；24/918 → *EnvError（WARN + fail-soft）；其余非零 → *SQLError。
++func (c *RESTClient) Exec(ctx context.Context, sql string) error {
++	endpoint := strings.TrimRight(c.cfg.Endpoint, "/") + RESTPath
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(sql))
++	if err != nil {
++		return fmt.Errorf("tdengine: 构造 REST 请求失败: %w", err)
++	}
++	req.SetBasicAuth(c.cfg.User, c.cfg.Password)
++	req.Header.Set("Content-Type", "text/plain")
++
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return fmt.Errorf("tdengine: REST 请求失败: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return fmt.Errorf("tdengine: 读取 REST 响应失败: %w", err)
++	}
++
++	var env restEnvelope
++	if err := json.Unmarshal(body, &env); err != nil {
++		return fmt.Errorf("tdengine: REST 响应解析失败 status=%d body=%s: %w", resp.StatusCode, truncateSQL(string(body)), err)
++	}
++	if env.Code == 0 {
++		if resp.StatusCode != http.StatusOK {
++			return &SQLError{Code: resp.StatusCode, Desc: env.Desc}
++		}
++		return nil
++	}
++	if envErrorCodes[env.Code] {
++		// 环境级失败 fail-soft：WARN 告警 + 以 EnvError 返回（重试计数归流水线重排）。
++		c.logger.Printf("tdengine: 环境级失败（fail-soft 重试计数）code=%d desc=%q sql=%s", env.Code, env.Desc, truncateSQL(sql))
++		return &EnvError{Code: env.Code, Desc: env.Desc}
++	}
++	return &SQLError{Code: env.Code, Desc: env.Desc}
++}
++
++// EnsureSchema 附录 B 建库建表（每租户一库）：单请求多语句下发——CREATE DATABASE +
++// USE + CREATE STABLE 串接（9750 教训第二路径「SQL 内 USE 多语句」，不用
++// /rest/sql/<db> 库上下文）；语句复用 0073 DDL 构造器逐字。
++func (c *RESTClient) EnsureSchema(ctx context.Context, tenantCode string) error {
++	stmts := append([]string{CreateDatabaseSQL(tenantCode), UseSQL(tenantCode)}, CreateStableSQL(tenantCode)...)
++	return c.Exec(ctx, strings.Join(stmts, "\n"))
++}
+diff --git a/ingest/internal/tdengine/rest_contract_test.go b/ingest/internal/tdengine/rest_contract_test.go
+new file mode 100644
+index 0000000..74b7ebf
+--- /dev/null
++++ b/ingest/internal/tdengine/rest_contract_test.go
+@@ -0,0 +1,307 @@
++package tdengine_test
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"io"
++	"log"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"net.otlab/ingest/internal/cache"
++	"net.otlab/ingest/internal/message"
++	"net.otlab/ingest/internal/pipeline"
++	"net.otlab/ingest/internal/snapshot"
++	"net.otlab/ingest/internal/tdengine"
++)
++
++// TASK-0076 TDengine REST 写客户端契约测试（brief 决策 4，真库写入归 0068）。
++//
++// 契约依据（TD-0053 实测教训，2026-11-22 会话）：
++//   - REST /rest/sql/<db> 库上下文在 3.4.3.9 返回 9750——必须全限定表名（db.stable）
++//     或 SQL 内 USE 多语句；本客户端固定 POST /rest/sql（无库上下文后缀）；
++//   - DDL 响应延迟可达秒级以上——读超时配置化，默认 30s；
++//   - fd 不足时 code 24 Too many open files / 918 Database in creating status
++//     识别为环境级失败 fail-soft 重试（WARN + 重试计数，不炸管道）；
++//   - REST 客户端 Basic 认证。
++
++// fakeTaosAdapter 假 TDengine REST 服务（taosadapter 形态）：记录请求，回放注入响应。
++type fakeTaosAdapter struct {
++	mu         sync.Mutex
++	path       string
++	auth       string
++	contType   string
++	body       string
++	sleep      time.Duration
++	respCode   int
++	respDesc   string
++	reqCount   int
++	alwaysFail bool
++}
++
++func (f *fakeTaosAdapter) handle(w http.ResponseWriter, r *http.Request) {
++	b, _ := io.ReadAll(r.Body)
++	f.mu.Lock()
++	f.path = r.URL.Path
++	f.auth = r.Header.Get("Authorization")
++	f.contType = r.Header.Get("Content-Type")
++	f.body = string(b)
++	f.reqCount++
++	sleep := f.sleep
++	code, desc := f.respCode, f.respDesc
++	f.mu.Unlock()
++
++	if sleep > 0 {
++		time.Sleep(sleep)
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]any{"code": code, "desc": desc, "affected_rows": 0})
++}
++
++func (f *fakeTaosAdapter) snapshot() (path, auth, body string, count int) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.path, f.auth, f.body, f.reqCount
++}
++
++func newClient(srvURL string, cfgOverride func(*tdengine.RESTConfig), logger *log.Logger) *tdengine.RESTClient {
++	cfg := tdengine.RESTConfig{Endpoint: srvURL, User: "root", Password: "taosdata"}
++	if cfgOverride != nil {
++		cfgOverride(&cfg)
++	}
++	if logger != nil {
++		cfg.Logger = logger
++	}
++	return tdengine.NewRESTClient(cfg)
++}
++
++func sampleRow() tdengine.PointRow {
++	return tdengine.PointRow{
++		TenantCode: "group_a", TenantID: 1, PointCode: "F01_WS01_EQ001_M01",
++		Kind: tdengine.KindInstant, DeptID: 3,
++		Ts: 1795211995000, Value: 98231.4, Quality: 0,
++	}
++}
++
++// 契约依据：9750 教训——请求固定 POST /rest/sql（无 /rest/sql/<db> 库上下文后缀）；
++// Basic 认证头；INSERT 全限定名（db.child USING db.stable，0073 InsertPointSQL 已落实，
++// 此处断言经 REST 通道下发后形态不变）。真库写入归 0068，本任务 httptest 断言请求形态。
++func TestContractRESTWriteFullyQualifiedNamesAndBasicAuth(t *testing.T) {
++	fake := &fakeTaosAdapter{}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	client := newClient(srv.URL, nil, nil)
++	writer := &tdengine.Writer{Ex: client}
++	if err := writer.WritePoints(context.Background(), []tdengine.PointRow{sampleRow()}); err != nil {
++		t.Fatalf("WritePoints error: %v", err)
++	}
++
++	path, auth, body, _ := fake.snapshot()
++	if path != "/rest/sql" {
++		t.Errorf("path = %q, want /rest/sql（禁用 /rest/sql/<db> 库上下文——9750 教训）", path)
++	}
++	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("root:taosdata"))
++	if auth != wantAuth {
++		t.Errorf("Authorization = %q, want %q（Basic 认证）", auth, wantAuth)
++	}
++	// 子表/库名经 0073 escapeIdentifier 转义（`_`→_5f，BUG-0002 单射口径）。
++	if !strings.Contains(body, "INSERT INTO iot_group_5fa.F01_5fWS01_5fEQ001_5fM01 USING iot_group_5fa.st_point_num") {
++		t.Errorf("body = %s, want 全限定名 INSERT（db.child USING db.stable）", body)
++	}
++	if !strings.Contains(body, "TAGS (1, 'F01_WS01_EQ001_M01', 'INSTANT', '', 3) VALUES (1795211995000, 98231.4, 0)") {
++		t.Errorf("body = %s, want TAGS 原编码 + VALUES 行", body)
++	}
++}
++
++// 契约依据：9750 教训「必须全限定表名（db.stable）或 SQL 内 USE 多语句」——附录 B DDL
++// 经 EnsureSchema 以单请求多语句（CREATE DATABASE + USE + CREATE STABLE）下发，
++// 复用 0073 DDL 构造器逐字语句。
++func TestContractRESTEnsureSchemaUsesUseMultiStatement(t *testing.T) {
++	fake := &fakeTaosAdapter{}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	client := newClient(srv.URL, nil, nil)
++	if err := client.EnsureSchema(context.Background(), "group_a"); err != nil {
++		t.Fatalf("EnsureSchema error: %v", err)
++	}
++
++	path, _, body, _ := fake.snapshot()
++	if path != "/rest/sql" {
++		t.Errorf("path = %q, want /rest/sql（不用 /rest/sql/<db>）", path)
++	}
++	for _, want := range []string{
++		"CREATE DATABASE IF NOT EXISTS iot_group_5fa KEEP 1825d DURATION 10d BUFFER 256;",
++		"USE iot_group_5fa;",
++		"CREATE STABLE IF NOT EXISTS st_point_num (ts TIMESTAMP, value DOUBLE, quality INT)",
++		"CREATE STABLE IF NOT EXISTS st_point_state (ts TIMESTAMP, value INT, quality INT)",
++	} {
++		if !strings.Contains(body, want) {
++			t.Errorf("body 缺附录 B 语句: %q\nbody = %s", want, body)
++		}
++	}
++}
++
++// 契约依据：TD-0053 实测——DDL 响应延迟可达秒级以上，读超时默认 30s（配置化可覆盖）。
++func TestContractRESTDefaultReadTimeoutIs30s(t *testing.T) {
++	fake := &fakeTaosAdapter{sleep: 80 * time.Millisecond}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	client := newClient(srv.URL, nil, nil)
++	if got := client.ReadTimeout(); got != tdengine.DefaultReadTimeout {
++		t.Errorf("ReadTimeout = %v, want %v（默认 30s）", got, tdengine.DefaultReadTimeout)
++	}
++	if err := client.Exec(context.Background(), "SELECT 1"); err != nil {
++		t.Errorf("Exec with default timeout error: %v（80ms 延迟应在 30s 读超时内成功）", err)
++	}
++}
++
++// 契约依据：读超时配置化——短超时下慢响应必须失败转错误（挂死不无限等）。
++func TestContractRESTConfiguredShortTimeoutFails(t *testing.T) {
++	fake := &fakeTaosAdapter{sleep: 300 * time.Millisecond}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	client := newClient(srv.URL, func(c *tdengine.RESTConfig) { c.Timeout = 50 * time.Millisecond }, nil)
++	err := client.Exec(context.Background(), "SELECT 1")
++	if err == nil {
++		t.Fatal("Exec error = nil, want 读超时错误")
++	}
++	if tdengine.IsEnvError(err) {
++		t.Errorf("超时错误被误判为环境级失败: %v", err)
++	}
++}
++
++// 契约依据：TD-0053 实测口径——code 24（Too many open files）/ 918（Database in
++// creating status）识别为环境级失败（fail-soft：可重试，不致命）；WARN 告警输出。
++func TestContractRESTEnvErrorRecognition24And918(t *testing.T) {
++	cases := []struct {
++		code int
++		desc string
++	}{
++		{24, "Too many open files"},
++		{918, "Database in creating status"},
++	}
++	for _, c := range cases {
++		fake := &fakeTaosAdapter{respCode: c.code, respDesc: c.desc}
++		srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++		var buf bytes.Buffer
++		client := newClient(srv.URL, nil, log.New(&buf, "", 0))
++		err := client.Exec(context.Background(), "INSERT INTO iot_group_5fa.t1 VALUES (1, 0, 0)")
++		srv.Close()
++		if err == nil {
++			t.Fatalf("code %d: Exec error = nil, want 环境级失败", c.code)
++		}
++		if !tdengine.IsEnvError(err) {
++			t.Errorf("code %d: IsEnvError = false, want true（fail-soft 识别）err=%v", c.code, err)
++		}
++		var envErr *tdengine.EnvError
++		if !errors.As(err, &envErr) || envErr.Code != c.code {
++			t.Errorf("code %d: EnvError.Code 不匹配, err=%v", c.code, err)
++		}
++		if !strings.Contains(buf.String(), "环境级失败") {
++			t.Errorf("code %d: WARN 日志缺「环境级失败」: %q", c.code, buf.String())
++		}
++	}
++}
++
++// 契约依据：9750（库上下文不可用）等非环境级码不得误判为 fail-soft——按普通 SQL
++// 执行失败处理（是否重试由调用方口径决定，不进环境级重试计数）。
++func TestContractRESTSQLErrorNonEnvCode9750(t *testing.T) {
++	fake := &fakeTaosAdapter{respCode: 9750, respDesc: "namespace not available"}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	client := newClient(srv.URL, nil, nil)
++	err := client.Exec(context.Background(), "SELECT 1")
++	if err == nil {
++		t.Fatal("Exec error = nil, want SQL 失败")
++	}
++	if tdengine.IsEnvError(err) {
++		t.Errorf("code 9750 被误判为环境级失败（fail-soft 扩容会掩盖配置错误）: %v", err)
++	}
++}
++
++// 契约依据：brief 决策 4 fail-soft——环境级失败（code 24）+ WARN + 重试计数，不炸管道：
++// 经 0073 攒批流水线（Writer{Ex: RESTClient}），持续环境级失败只消耗有界重试
++// （重排计数 → 超上限死信计数告警），流水线不 panic、不死循环、不无界增长。
++func TestContractRESTEnvFailSoftRetryCountThroughPipeline(t *testing.T) {
++	fake := &fakeTaosAdapter{respCode: 24, respDesc: "Too many open files"}
++	srv := httptest.NewServer(http.HandlerFunc(fake.handle))
++	defer srv.Close()
++
++	var logBuf bytes.Buffer
++	client := newClient(srv.URL, nil, log.New(&logBuf, "", 0))
++
++	const snapJSON = `{
++	  "schemaVersion": "1.0.1", "tenantId": 1, "scopeType": 1, "scopeId": 88, "version": 17,
++	  "points": [
++	    {"id":101,"tenantId":1,"pointCode":"F01_WS01_EQ001_M01","pointName":"P1","dataType":1,"valueType":"DOUBLE","deptId":3,"status":1}
++	  ]
++	}`
++	snap, err := snapshot.ParseSnapshot([]byte(snapJSON))
++	if err != nil {
++		t.Fatalf("快照解析失败: %v", err)
++	}
++	snapCache := snapshot.NewCache()
++	if err := snapCache.Replace(snap); err != nil {
++		t.Fatalf("快照替换失败: %v", err)
++	}
++
++	ch := make(chan pipeline.Inbound, 8)
++	p, err := pipeline.Assemble(pipeline.Config{BatchSize: 1, FlushInterval: 5 * time.Millisecond}, pipeline.Deps{
++		Consumer:  chanSourceOf(ch),
++		Parser:    message.Parser{},
++		Snapshots: snapCache,
++		Batches:   pipeline.NewMemoryBatchDeduper(0),
++		Points:    pipeline.NewMemoryPointDeduper(0),
++		Writer:    &tdengine.Writer{Ex: client},
++		Cache:     cache.NewMemoryPointCache(),
++	})
++	if err != nil {
++		t.Fatalf("Assemble error: %v", err)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	go func() { _ = p.Run(ctx) }()
++
++	ch <- pipeline.Inbound{Tenant: "group_a", Payload: []byte(
++		`{"tenant":"group_a","gateway":"GW_F01_01","batchId":"B-FAILSOFT","sentAt":1795212000000,` +
++			`"points":[{"pointCode":"F01_WS01_EQ001_M01","ts":1795211995000,"value":132.5,"quality":0}]}`)}
++
++	// 环境级失败持续：重试计数走满（初始下发 + 3 次重排后）转死信计数告警——不炸管道。
++	deadline := time.Now().Add(3 * time.Second)
++	for time.Now().Before(deadline) {
++		st := p.Stats()
++		if st.WriteRetriesExhausted == 1 && st.DeadLettered == 1 {
++			if st.WriteFailures != 4 {
++				t.Errorf("WriteFailures = %d, want 4（初始下发 + 3 次重排）", st.WriteFailures)
++			}
++			if st.RequeuedRows != 3 {
++				t.Errorf("RequeuedRows = %d, want 3（fail-soft 重试计数）", st.RequeuedRows)
++			}
++			if !strings.Contains(logBuf.String(), "环境级失败") {
++				t.Errorf("WARN 日志缺「环境级失败」: %q", logBuf.String())
++			}
++			return
++		}
++		time.Sleep(2 * time.Millisecond)
++	}
++	t.Fatalf("等待超时: 环境级失败未按 fail-soft 重试计数收敛（stats=%+v log=%q）", p.Stats(), logBuf.String())
++}
++
++// chanSource 有界通道消费源（0073 Consumer 接口适配）。
++type chanSource struct{ ch chan pipeline.Inbound }
++
++func chanSourceOf(ch chan pipeline.Inbound) *chanSource { return &chanSource{ch: ch} }
++
++func (c *chanSource) Messages() <-chan pipeline.Inbound { return c.ch }

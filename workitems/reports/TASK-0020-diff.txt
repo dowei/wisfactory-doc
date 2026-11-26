@@ -1,0 +1,1533 @@
+commit 36bcd1fb4556d3870e9ab3b8774446bbb8c1c80e
+Author: dowei <douwei@gmail.com>
+Date:   Sun Nov 22 11:46:58 2026 +0800
+
+    feat(iot): 网关离线事件消费与 LWT/graceful 三态区分——GatewayOfflineEvent 契约+监听器 fail-closed+占位发布器/内部桥接端点、iot_gateway 补 offline_reason 列（与上游差异登记）、心跳回写回在线清因、list 增 offlineReason 筛选、超时判定配置键落位（TASK-0020）
+    
+    TASK-0020 心跳超时事件的消费与展示（管理面消费端，ADR-0010 TD-0049 口径：不判定、不写 Redis）
+
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java
+index eabf67d..770feda 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayController.java
+@@ -46,7 +46,7 @@ public class IotGatewayController {
+     @Autowired
+     private IotGatewayService gatewayService;
+ 
+-    @Operation(summary = "网关分页列表（过滤 gatewayCode/gatewayName/status/onlineStatus；含在线状态与心跳时间列）")
++    @Operation(summary = "网关分页列表（过滤 gatewayCode/gatewayName/status/onlineStatus/offlineReason；含在线状态/离线原因与心跳时间列）")
+     @GetMapping("/list")
+     @SaCheckPermission("iot:gateway:list")
+     public Result<Page<IotGateway>> list(@RequestParam(value = "pageNum", defaultValue = "1") Integer pageNum,
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java
+index 6d7bc1e..d9d2594 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalController.java
+@@ -6,6 +6,8 @@ import jakarta.servlet.http.HttpServletRequest;
+ import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
+ import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
+ import net.otlab.core.annotation.Anonymous;
+ import net.otlab.core.exception.BusinessException;
+@@ -44,6 +46,14 @@ import java.util.Set;
+  * <p><b>不写操作日志</b>：本方法不挂 @OperateLog——心跳回写高频（默认周期 30 秒），落
+  * sys_operate_log 会淹没有效审计面（brief 明文口径，报告登记）。
+  *
++ * <p><b>离线事件桥接</b>（TASK-0020，POST /internal/v1/gateway/offline-event）：接入/
++ * 计算引擎侧已判定的离线事件（TIMEOUT/LWT_ABNORMAL/GRACEFUL，REQ-0009 验收 5 三态区分）
++ * 经此进入管理面进程 → 占位发布器 {@code GatewayOfflineEventPublisher} 发 Spring 应用事件 →
++ * {@code GatewayOfflineEventListener} 消费落展示态。<b>本端点不做超时判定、不写状态 Redis</b>
++ * （ADR-0010 TD-0049 口径——判定与状态落 Redis 归计算引擎）；键白名单
++ * tenantCode/gatewayCode/offlineReason/occurredAt（设备身份定位键同心跳回写口径，reason
++ * 未知名 fail-closed 400）。事件契约登记：{@code GatewayOfflineEvent} 类头。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -59,6 +69,10 @@ public class IotGatewayInternalController {
+     private static final Set<String> ITEM_KEYS = Set.of(
+             "gatewayCode", "onlineStatus", "lastHeartbeatTime", "ipAddr", "version", "configVersion");
+ 
++    /** 离线事件键白名单（TASK-0020）：定位键两个 + reason + 可选 occurredAt */
++    private static final Set<String> OFFLINE_EVENT_KEYS = Set.of(
++            "tenantCode", "gatewayCode", "offlineReason", "occurredAt");
++
+     /** 管理面日期时间口径（详细设计 §3 p20；字符串入参按此解析） */
+     private static final DateTimeFormatter DATETIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+ 
+@@ -87,6 +101,57 @@ public class IotGatewayInternalController {
+         return Result.success(gatewayService.writeHeartbeats(form));
+     }
+ 
++    /**
++     * 离线事件桥接（TASK-0020）：body {tenantCode, gatewayCode, offlineReason, occurredAt?}——
++     * 认证先于载荷处理（同心跳回写纵深）；reason 须为 TIMEOUT/LWT_ABNORMAL/GRACEFUL 精确名
++     * （未知名 fail-closed 400，不静默映射）；occurredAt 可选（字符串/毫秒，缺省服务层补 now）。
++     * 解析租户/网关后发布 Spring 应用事件；本端点不做超时判定（判定归接入/计算引擎）。
++     */
++    @Anonymous
++    @Operation(summary = "离线事件桥接（内部接口：接入/计算引擎已判定事件经此发布，管理面消费展示态；不做判定）")
++    @PostMapping("/offline-event")
++    public Result<Boolean> offlineEvent(HttpServletRequest request, @RequestBody Map<String, Object> body) {
++        internalAuthChecker.check(request);
++        GatewayOfflineEventForm form = parseOfflineEventForm(body);
++        return Result.success(gatewayService.publishOfflineEvent(form));
++    }
++
++    /** 离线事件原始 JSON 白名单校验 + 类型归一化（键越界/reason 未知名 fail-closed 400） */
++    private GatewayOfflineEventForm parseOfflineEventForm(Map<String, Object> body) {
++        if (body == null || body.isEmpty()) {
++            throw paramError("离线事件请求体为空");
++        }
++        Set<String> unknown = diffKeys(body.keySet(), OFFLINE_EVENT_KEYS);
++        if (!unknown.isEmpty()) {
++            throw paramError("回写字段越界（不支持的键: " + unknown + "）——仅允许 " + OFFLINE_EVENT_KEYS);
++        }
++        Object tenantRaw = body.get("tenantCode");
++        if (!(tenantRaw instanceof String tenantCode) || tenantCode.isBlank()) {
++            throw paramError("离线事件缺少 tenantCode（字符串）");
++        }
++        Object codeRaw = body.get("gatewayCode");
++        if (!(codeRaw instanceof String gatewayCode) || gatewayCode.isBlank()) {
++            throw paramError("离线事件缺少 gatewayCode（字符串）");
++        }
++        Object reasonRaw = body.get("offlineReason");
++        if (!(reasonRaw instanceof String reasonText) || reasonText.isBlank()) {
++            throw paramError("离线事件缺少 offlineReason（仅允许 " + GatewayOfflineReason.allowedNames() + "）");
++        }
++        GatewayOfflineReason reason = GatewayOfflineReason.fromName(reasonText);
++        if (reason == null) {
++            throw paramError("离线事件 offlineReason 未知名（仅允许 " + GatewayOfflineReason.allowedNames()
++                    + "）: " + reasonText);
++        }
++        GatewayOfflineEventForm form = new GatewayOfflineEventForm();
++        form.setTenantCode(tenantCode);
++        form.setGatewayCode(gatewayCode);
++        form.setOfflineReason(reason);
++        if (body.get("occurredAt") != null) {
++            form.setOccurredAt(parseHeartbeatTime(body.get("occurredAt"), gatewayCode));
++        }
++        return form;
++    }
++
+     /**
+      * 原始 JSON 层字段组白名单校验 + 类型归一化：越界键/越界类型/越界值在此直接拒绝，
+      * 产出只含白名单字段的 typed 载荷。
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayOfflineEventForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayOfflineEventForm.java
+new file mode 100644
+index 0000000..7f2b37f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/dto/GatewayOfflineEventForm.java
+@@ -0,0 +1,37 @@
++package net.otlab.admin.module.iot.gateway.dto;
++
++import lombok.Data;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
++
++import java.time.LocalDateTime;
++
++/**
++ * 离线事件桥接表单（TASK-0020，POST /internal/v1/gateway/offline-event 的 typed 载荷）。
++ *
++ * <p>控制器原始 JSON 层白名单（键：tenantCode/gatewayCode/offlineReason/occurredAt）解析
++ * 产出本表单：tenantCode/gatewayCode 为设备身份定位键（同心跳回写口径，接入侧不持 DB id）、
++ * offlineReason 已归一化为枚举（未知名在控制器层 fail-closed 400）、occurredAt 已归一化为
++ * {@link LocalDateTime}（缺省由服务层补 now）。服务层 {@code publishOfflineEvent} 解析
++ * 租户/网关后构建 {@link net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent} 发布。
++ *
++ * <p>本接口<b>不做超时判定</b>（判定归接入/计算引擎，ADR-0010 TD-0049 口径）——reason
++ * 由调用方给出，管理面只消费。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++public class GatewayOfflineEventForm {
++
++    /** 租户编码（定位 sys_tenant，须存在且启用） */
++    private String tenantCode;
++
++    /** 网关编码（租户内唯一设备身份，定位 iot_gateway） */
++    private String gatewayCode;
++
++    /** 离线原因（调用方已判定的结论：TIMEOUT/LWT_ABNORMAL/GRACEFUL） */
++    private GatewayOfflineReason offlineReason;
++
++    /** 事件发生时间（可选；缺省服务层补 now） */
++    private LocalDateTime occurredAt;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java
+index 82c10b3..59c2b71 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/entity/IotGateway.java
+@@ -27,6 +27,12 @@ import java.time.LocalDateTime;
+  * 执行；status=0 禁用后拒绝接入（准入拦截归接入服务 /ingest/v1/auth/mqtt 链路，
+  * TASK-0020 交付）。
+  *
++ * <p>TASK-0020 增补列 offline_reason（上游附录 A p30 无此列，「与上游差异」登记于
++ * 20261122_iot_gateway_offline.sql 头注）：离线原因 TIMEOUT/LWT_ABNORMAL/GRACEFUL
++ * （NULL=在线，REQ-0009 验收 5 三态区分）——离线事件消费维护
++ * （{@code GatewayOfflineEventListener} → applyOfflineEvent），心跳回写 onlineStatus=1
++ * 回在线时清除为 NULL；管理面 CRUD 不开放写入（事件消费专属，同心跳回写组同纪律）。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -59,6 +65,11 @@ public class IotGateway extends BaseEntity {
+     @Schema(description = "在线状态 0 离线 1 在线（心跳回写维护，管理面只读）")
+     private Integer onlineStatus;
+ 
++    @Schema(description = "离线原因 TIMEOUT/LWT_ABNORMAL/GRACEFUL（NULL=在线；TASK-0020 离线事件消费维护，"
++            + "上游 DDL 无此列——REQ-0009 验收 5 三态区分，与上游差异登记见 20261122_iot_gateway_offline.sql；"
++            + "管理面 CRUD 不开放写入，心跳回写回在线时清除）")
++    private String offlineReason;
++
+     @Schema(description = "最后心跳时间（心跳回写维护，管理面只读）")
+     private LocalDateTime lastHeartbeatTime;
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEvent.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEvent.java
+new file mode 100644
+index 0000000..9107512
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEvent.java
+@@ -0,0 +1,55 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import java.time.LocalDateTime;
++
++/**
++ * 网关离线事件（TASK-0020 定义的网关域事件契约，登记处）。
++ *
++ * <p><b>事件契约</b>（brief 决策 2，REQ-0009 验收 2/5）：
++ * <ul>
++ * <li>事件类型：Spring 应用事件（进程内即达，与 0006 DataPermCacheEvictEvent 同范式）；
++ *     多实例跨节点传播不在本期（同 dataperm 口径，随集群形态任务裁决）；</li>
++ * <li>载荷四字段：{@code gatewayId}（iot_gateway.id）、{@code tenantId}（sys_tenant.id）、
++ *     {@code offlineReason}（{@link GatewayOfflineReason}：TIMEOUT/LWT_ABNORMAL/GRACEFUL）、
++ *     {@code occurredAt}（事件发生时间）；</li>
++ * <li>发布方：接入/计算引擎侧（离线判定与状态 Redis 写入归计算引擎，ADR-0010 TD-0049 /
++ *     ADR-0009 TD-0029 口径——本任务不判定、不写 Redis）。接线前由占位发布器
++ *     {@link GatewayOfflineEventPublisher} 承接（单测直接注入事件验证消费逻辑；dev 冒烟
++ *     经内部桥接端点 POST /internal/v1/gateway/offline-event 注入三类事件）；</li>
++ * <li>消费方：{@link GatewayOfflineEventListener} → IotGatewayService.applyOfflineEvent——
++ *     写管理面展示态 online_status=0 + offline_reason（禁用网关照落展示态，禁用与离线正交）；
++ *     心跳回写（POST /internal/v1/gateway/heartbeat，onlineStatus=1 回在线）清除
++ *     offline_reason 置在线；</li>
++ * <li><b>fail-closed</b>：缺任一字段的事件 WARN 忽略（不产生半截状态）；未知 gatewayId
++ *     WARN 忽略（不中断发布方）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public record GatewayOfflineEvent(Long gatewayId, Long tenantId, GatewayOfflineReason offlineReason,
++                                  LocalDateTime occurredAt) {
++
++    /**
++     * 全字段构造入口（桥接/单测注入统一走此工厂，字段语义见类头契约）
++     */
++    public static GatewayOfflineEvent of(Long gatewayId, Long tenantId, GatewayOfflineReason offlineReason,
++                                         LocalDateTime occurredAt) {
++        return new GatewayOfflineEvent(gatewayId, tenantId, offlineReason, occurredAt);
++    }
++
++    /** 心跳停止超阈值离线事件（TIMEOUT） */
++    public static GatewayOfflineEvent ofTimeout(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        return of(gatewayId, tenantId, GatewayOfflineReason.TIMEOUT, occurredAt);
++    }
++
++    /** LWT 异常断开事件（LWT_ABNORMAL） */
++    public static GatewayOfflineEvent ofLwtAbnormal(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        return of(gatewayId, tenantId, GatewayOfflineReason.LWT_ABNORMAL, occurredAt);
++    }
++
++    /** 正常下线事件（GRACEFUL） */
++    public static GatewayOfflineEvent ofGraceful(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        return of(gatewayId, tenantId, GatewayOfflineReason.GRACEFUL, occurredAt);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListener.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListener.java
+new file mode 100644
+index 0000000..2bfb019
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListener.java
+@@ -0,0 +1,47 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import org.springframework.context.event.EventListener;
++import org.springframework.stereotype.Component;
++
++/**
++ * 网关离线事件监听器（TASK-0020）：消费 {@link GatewayOfflineEvent}，委托
++ * {@link IotGatewayService#applyOfflineEvent} 落管理面展示态（online_status=0 +
++ * offline_reason，REQ-0009 验收 2/5）。
++ *
++ * <p><b>fail-closed</b>（brief 测试口径）：gatewayId/tenantId/offlineReason/occurredAt
++ * 任一缺失即 WARN 忽略——脏事件不产生半截状态；未知 gatewayId 由服务层 WARN 忽略。
++ *
++ * <p>消费动作绝不外溢异常（展示态属可重建数据——下次心跳回写回在线清因/事件纠偏；
++ * 同步事件监听器异常会炸穿发布方线程，照 0006 DataPermCacheEvictListener 同范式兜一层
++ * try/catch）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class GatewayOfflineEventListener {
++
++    private final IotGatewayService gatewayService;
++
++    public GatewayOfflineEventListener(IotGatewayService gatewayService) {
++        this.gatewayService = gatewayService;
++    }
++
++    @EventListener
++    public void onGatewayOffline(GatewayOfflineEvent event) {
++        if (event == null || event.gatewayId() == null || event.tenantId() == null
++                || event.offlineReason() == null || event.occurredAt() == null) {
++            log.warn("[GATEWAY-OFFLINE] 离线事件缺字段，fail-closed 忽略（gatewayId/tenantId/offlineReason/occurredAt 必填）: {}", event);
++            return;
++        }
++        try {
++            gatewayService.applyOfflineEvent(event);
++        } catch (Exception e) {
++            log.warn("[GATEWAY-OFFLINE] 离线事件消费失败（展示态兜底：心跳回写纠偏）gatewayId={} reason={} 摘要：{}",
++                    event.gatewayId(), event.offlineReason(), e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisher.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisher.java
+new file mode 100644
+index 0000000..fd6209b
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisher.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.context.ApplicationEventPublisher;
++import org.springframework.stereotype.Component;
++
++import java.time.LocalDateTime;
++
++/**
++ * 网关离线事件占位发布器（TASK-0020）：未来接入/计算引擎发布方的进程内接缝——
++ * 判定与状态 Redis 写入归计算引擎（ADR-0010 TD-0049 口径），本组件只做「已判定结论」
++ * 的事件发布，不含任何超时判定逻辑。
++ *
++ * <p>范式差异留痕（与 0006 DataPermCacheEvictPublisher 的「有理由的偏离」）：<b>立即发布、
++ * 不做 afterCommit 挂点</b>——0006 挂 afterCommit 是防「未提交先失效→并发事务回填脏数据」
++ * 的读后一致性危害；本事件的消费动作是写独立的管理面展示态（监听器自带事务），无该危害，
++ * 立即发布即正确路径（桥接端点无事务上下文，同 0006 的无事务分支）。
++ *
++ * <p>发布动作本身绝不抛出（异常收敛 WARN——展示态信号不得中断调用方流程；消费侧另有
++ * 心跳回写纠偏兜底）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class GatewayOfflineEventPublisher {
++
++    private final ApplicationEventPublisher publisher;
++
++    public GatewayOfflineEventPublisher(ApplicationEventPublisher publisher) {
++        this.publisher = publisher;
++    }
++
++    /** 心跳停止超阈值离线事件（判定结论由调用方给出） */
++    public void publishTimeout(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        publish(GatewayOfflineEvent.ofTimeout(gatewayId, tenantId, occurredAt));
++    }
++
++    /** LWT 异常断开事件 */
++    public void publishLwtAbnormal(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        publish(GatewayOfflineEvent.ofLwtAbnormal(gatewayId, tenantId, occurredAt));
++    }
++
++    /** 正常下线（graceful）事件 */
++    public void publishGraceful(Long gatewayId, Long tenantId, LocalDateTime occurredAt) {
++        publish(GatewayOfflineEvent.ofGraceful(gatewayId, tenantId, occurredAt));
++    }
++
++    /**
++     * 统一发布入口（现成事件对象直通；未来接入/计算引擎接线时替换/复用本方法，消费方不动）
++     */
++    public void publish(GatewayOfflineEvent event) {
++        try {
++            publisher.publishEvent(event);
++        } catch (Exception e) {
++            log.warn("[GATEWAY-OFFLINE] 离线事件发布失败（消费侧有心跳回写兜底）gatewayId={} reason={} 摘要：{}",
++                    event == null ? null : event.gatewayId(),
++                    event == null ? null : event.offlineReason(),
++                    e.getMessage());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineProperties.java
+new file mode 100644
+index 0000000..4be84df
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineProperties.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import jakarta.annotation.PostConstruct;
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Component;
++
++/**
++ * 网关离线判定配置键（TASK-0020 落键，brief 决策 4）：判定器本体不在本任务（归接入/
++ * 计算引擎侧接线，遗留登记）——本期只声明键与缺省值，未来判定器直接注入本组件消费。
++ *
++ * <p><b>交付形态说明</b>：application.yml 不在本任务改动范围声明内（0017 先例——IP 白名单
++ * 以 @Value 代码默认值交付），两键均 @Value 缺省 + 环境变量覆盖（Spring relaxed binding：
++ * {@code OT_GATEWAY_OFFLINE_TIMEOUT_MULTIPLIER} / {@code OT_GATEWAY_OFFLINE_CHECK_INTERVAL_SECONDS}）。
++ * 键名与 REQ-0009 口径一致：
++ * <ul>
++ * <li>{@code ot.gateway.offline-timeout-multiplier}（默认 3）：离线判定阈值=3 个心跳周期
++ *     （REQ-0009 口径「如 3 个心跳周期」；与点位超时共用判定链的口径由判定器落地时裁决）；</li>
++ * <li>{@code ot.gateway.offline-check-interval-seconds}（默认 30）：离线扫描间隔（秒）。</li>
++ * </ul>
++ *
++ * <p>误配防御（照 0006 dataperm cache-ttl 口径）：非正值回落缺省并 WARN，不放大误配。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class GatewayOfflineProperties {
++
++    /** 离线判定阈值（心跳周期倍数，REQ-0009 口径「如 3 个心跳周期」） */
++    @Value("${ot.gateway.offline-timeout-multiplier:3}")
++    private Integer offlineTimeoutMultiplier;
++
++    /** 离线扫描间隔（秒） */
++    @Value("${ot.gateway.offline-check-interval-seconds:30}")
++    private Integer offlineCheckIntervalSeconds;
++
++    private static final int DEFAULT_MULTIPLIER = 3;
++    private static final int DEFAULT_CHECK_INTERVAL_SECONDS = 30;
++
++    @PostConstruct
++    void normalize() {
++        if (offlineTimeoutMultiplier == null || offlineTimeoutMultiplier <= 0) {
++            log.warn("[GATEWAY-OFFLINE] ot.gateway.offline-timeout-multiplier 误配（{}），回落默认 {}",
++                    offlineTimeoutMultiplier, DEFAULT_MULTIPLIER);
++            offlineTimeoutMultiplier = DEFAULT_MULTIPLIER;
++        }
++        if (offlineCheckIntervalSeconds == null || offlineCheckIntervalSeconds <= 0) {
++            log.warn("[GATEWAY-OFFLINE] ot.gateway.offline-check-interval-seconds 误配（{}），回落默认 {}",
++                    offlineCheckIntervalSeconds, DEFAULT_CHECK_INTERVAL_SECONDS);
++            offlineCheckIntervalSeconds = DEFAULT_CHECK_INTERVAL_SECONDS;
++        }
++    }
++
++    public Integer getOfflineTimeoutMultiplier() {
++        return offlineTimeoutMultiplier;
++    }
++
++    public Integer getOfflineCheckIntervalSeconds() {
++        return offlineCheckIntervalSeconds;
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineReason.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineReason.java
+new file mode 100644
+index 0000000..ac44045
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineReason.java
+@@ -0,0 +1,53 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++/**
++ * 网关离线原因枚举（TASK-0020，REQ-0009 验收 5「LWT 异常断开与正常下线可区分」的落库值域）。
++ *
++ * <p>枚举名即 iot_gateway.offline_reason 列值（varchar(16)，NULL=在线）与事件
++ * {@link GatewayOfflineEvent} 的 reason 字段值——三值一一对应，列表筛选
++ * （GET /iot/gateway/list?offlineReason=）按列值精确匹配。
++ *
++ * <ul>
++ * <li>{@link #TIMEOUT}：心跳停止超阈值（ot.gateway.offline-timeout-multiplier 个心跳周期，
++ *     REQ-0009 口径「如 3 个心跳周期」）——判定由接入/计算引擎执行（ADR-0010 TD-0049 口径），
++ *     管理面只消费已判定的事件；</li>
++ * <li>{@link #LWT_ABNORMAL}：MQTT LWT（Last Will &amp; Testament）异常断开；</li>
++ * <li>{@link #GRACEFUL}：正常下线（graceful 标记/主动断开）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public enum GatewayOfflineReason {
++
++    /** 心跳停止超阈值（判定在接入/计算引擎侧，本域只消费事件） */
++    TIMEOUT,
++
++    /** MQTT LWT 异常断开 */
++    LWT_ABNORMAL,
++
++    /** 正常下线（graceful） */
++    GRACEFUL;
++
++    /**
++     * 枚举名精确解析（大小写敏感，防误配放行）：未知名/空白返回 null——调用方
++     * （内部桥接端点）据此 fail-closed 400，不做静默映射。
++     */
++    public static GatewayOfflineReason fromName(String raw) {
++        if (raw == null || raw.isBlank()) {
++            return null;
++        }
++        String trimmed = raw.trim();
++        for (GatewayOfflineReason reason : values()) {
++            if (reason.name().equals(trimmed)) {
++                return reason;
++            }
++        }
++        return null;
++    }
++
++    /** 值域说明（错误文案复用，与列注释一致；枚举名恒大写） */
++    public static String allowedNames() {
++        return String.join("/", java.util.Arrays.stream(values()).map(Enum::name).toArray(String[]::new));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java
+index 453a14d..251e57b 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/IotGatewayService.java
+@@ -2,12 +2,14 @@ package net.otlab.admin.module.iot.gateway.service;
+ 
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
++import net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
+ import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent;
+ 
+ /**
+- * 网关服务接口（TASK-0017）：管理面 CRUD + 内部心跳回写。
++ * 网关服务接口（TASK-0017：管理面 CRUD + 内部心跳回写；TASK-0020：离线事件消费与桥接）。
+  *
+  * <p>照实例/模板域范式：接口不继承 IService（实现类 ServiceImpl 承载通用方法），
+  * 领域方法显式声明。
+@@ -17,7 +19,7 @@ import net.otlab.admin.module.iot.gateway.entity.IotGateway;
+  */
+ public interface IotGatewayService {
+ 
+-    /** 分页查询网关（过滤 gatewayCode/gatewayName/status/onlineStatus，含在线状态与心跳时间列） */
++    /** 分页查询网关（过滤 gatewayCode/gatewayName/status/onlineStatus/offlineReason，含在线状态与心跳时间列） */
+     Page<IotGateway> selectGatewayList(Page<IotGateway> page, IotGateway query);
+ 
+     /** 新增网关（编码租户内唯一双道闸 4002；instance/dept 校验；heartbeat_period 默认 30） */
+@@ -33,9 +35,32 @@ public interface IotGatewayService {
+      * 心跳批量回写（内部接口）：字段组白名单只含
+      * online_status/last_heartbeat_time/ip_addr/version/config_version 五字段（REQ-0009 验收 4）；
+      * 按 body tenantCode + gatewayCode 定位，租户不存在/禁用拒、未知编码整批拒。
++     * TASK-0020 扩展：onlineStatus=1 回在线时追加 offline_reason=NULL 清除动作
++     * （REQ-0009 验收 5 三态区分的回在线纠偏）；onlineStatus=0 不触碰 offline_reason。
+      *
+      * @param form 已过控制器原始 JSON 字段组白名单校验的 typed 载荷
+      * @return 实际回写的网关数
+      */
+     int writeHeartbeats(GatewayHeartbeatForm form);
++
++    /**
++     * 离线事件消费（TASK-0020，{@link GatewayOfflineEventListener} 委托）：写管理面展示态
++     * online_status=0 + offline_reason=事件 reason（REQ-0009 验收 2/5）。禁用网关照落展示态
++     * （禁用与离线正交）；未知 gatewayId WARN 忽略返回 false（fail-closed 不中断发布方）；
++     * 缺字段拒（PARAM_ERROR，监听器已先做 fail-closed WARN，此处为服务层第二道保险）。
++     *
++     * @param event 离线事件（契约见 {@link GatewayOfflineEvent} 类头）
++     * @return 是否实际落库
++     */
++    boolean applyOfflineEvent(GatewayOfflineEvent event);
++
++    /**
++     * 离线事件桥接（TASK-0020，内部端点 POST /internal/v1/gateway/offline-event）：解析
++     * 租户/网关（fail-closed 400 同心跳回写口径）后经占位发布器发布 Spring 应用事件。
++     * <b>不做超时判定</b>（reason 由调用方给出，判定归接入/计算引擎，ADR-0010 TD-0049 口径）。
++     *
++     * @param form 已过控制器原始 JSON 白名单校验的 typed 载荷
++     * @return 发布成功（true）
++     */
++    boolean publishOfflineEvent(GatewayOfflineEventForm form);
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+index a633cf2..047ac9d 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImpl.java
+@@ -7,9 +7,13 @@ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import lombok.extern.slf4j.Slf4j;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
+ import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEventPublisher;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeMapper;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeRow;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
+@@ -30,6 +34,7 @@ import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
++import java.time.LocalDateTime;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -38,7 +43,7 @@ import java.util.function.Function;
+ import java.util.stream.Collectors;
+ 
+ /**
+- * 网关服务实现类（TASK-0017）
++ * 网关服务实现类（TASK-0017；TASK-0020 增离线事件消费/桥接与回写清因）
+  *
+  * <p><b>编码纪律</b>（REQ-0009 业务能力/核心规则）：gateway_code 即 MQTT 主题与设备身份
+  * 段——字符集 [A-Za-z0-9_]（表单 @Pattern + 服务层双保险）、长度 ≤64（DB varchar(64)）；
+@@ -68,9 +73,17 @@ import java.util.stream.Collectors;
+  * 条件（防御纵深：即使异常会话存在，插件条件与本显式条件叠加只会更严不会更宽）；租户
+  * 按 body tenantCode 解析（sys_tenant 非插件覆盖表，显式查询），不存在/禁用拒；服务层
+  * 构建更新集<b>只含五字段</b>（请求体多余字段已在控制器原始 JSON 层拒绝，此处为第二道
+- * 保险）；整批事务（fail-closed all-or-nothing）；禁用网关不拦回写（准入拦截在接入服务
++ * 保险）；TASK-0020 追加唯一清除动作：onlineStatus=1 回在线时 SET offline_reason=NULL
++ * （REQ-0009 验收 5 三态区分的回在线纠偏，MP 实体 null 不进 SET 故以 wrapper 强制）；
++ * 整批事务（fail-closed all-or-nothing）；禁用网关不拦回写（准入拦截在接入服务
+  * /ingest/v1/auth/mqtt 链路归 0020——禁用网关的 LWT/离线态仍应可落，保状态准确）。
+  *
++ * <p><b>离线事件</b>（TASK-0020，ADR-0010 TD-0049 口径——判定与状态 Redis 归计算引擎，
++ * 本域只消费事件维护管理面展示）：{@link GatewayOfflineEventListener} 委托
++ * {@link #applyOfflineEvent} 落 online_status=0 + offline_reason（禁用网关照落，禁用与离线
++ * 正交；未知 gatewayId WARN 忽略）；内部桥接端点经 {@link #publishOfflineEvent} 解析租户/
++ * 网关后经占位发布器发事件（不做判定）。事件契约登记：{@code GatewayOfflineEvent} 类头。
++ *
+  * @author dowei
+  * @date 2026-11-22
+  */
+@@ -111,6 +124,9 @@ public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGate
+     @Autowired
+     private GatewayReferenceGuard referenceGuard;
+ 
++    @Autowired
++    private GatewayOfflineEventPublisher offlineEventPublisher;
++
+     // ---------- 列表 ----------
+ 
+     @Override
+@@ -129,6 +145,11 @@ public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGate
+         if (query.getOnlineStatus() != null) {
+             wrapper.eq(IotGateway::getOnlineStatus, query.getOnlineStatus());
+         }
++        // TASK-0020：离线原因过滤（REQ-0009 验收 2 超阈值离线可筛出 / 验收 5 三态区分可筛；
++        // 值域 TIMEOUT/LWT_ABNORMAL/GRACEFUL——与 0017 status/onlineStatus 同款纯 eq 范式）
++        if (query.getOfflineReason() != null) {
++            wrapper.eq(IotGateway::getOfflineReason, query.getOfflineReason());
++        }
+         wrapper.orderByAsc(IotGateway::getId);
+         return this.page(page, wrapper);
+     }
+@@ -361,9 +382,14 @@ public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGate
+             throw paramError("网关编码不存在或已删除: " + missing);
+         }
+ 
+-        // 逐网关回写：服务层构建更新集<b>只含五字段</b>（REQ-0009 验收 4 第二道保险——
++        // 逐网关回写：服务层构建更新集只含五字段（REQ-0009 验收 4 第二道保险——
+         // 请求体多余字段已在控制器原始 JSON 层拒绝，typed 载荷亦只承载五字段）；null 字段
+         // 不进 SET（MP 跳过），更新 WHERE 显式 (id, tenant_id, gateway_code) 定位。
++        // TASK-0020 清除动作：onlineStatus=1 回在线时追加 SET offline_reason=NULL（brief
++        // 决策 3「心跳回写成功时清 offline_reason 置在线」——MP 实体 null 字段不进 SET，
++        // 强制置 NULL 只能 wrapper.set；回在线意味着重新可心跳，LWT/GRACEFUL/TIMEOUT 标记
++        // 均应清除）；onlineStatus=0 离线回写不触碰 offline_reason（展示原因由事件链维护，
++        // 回写不擦除，保 REQ-0009 验收 5 三态区分不被心跳冲掉）。
+         for (GatewayHeartbeatItem item : items) {
+             IotGateway target = gateways.get(item.getGatewayCode());
+             IotGateway upd = new IotGateway();
+@@ -372,14 +398,91 @@ public class IotGatewayServiceImpl extends ServiceImpl<IotGatewayMapper, IotGate
+             upd.setIpAddr(item.getIpAddr());
+             upd.setVersion(item.getVersion());
+             upd.setConfigVersion(item.getConfigVersion());
+-            this.update(upd, new LambdaUpdateWrapper<IotGateway>()
++            LambdaUpdateWrapper<IotGateway> wrapper = new LambdaUpdateWrapper<IotGateway>()
+                     .eq(IotGateway::getId, target.getId())
+                     .eq(IotGateway::getTenantId, tenant.getId())
+-                    .eq(IotGateway::getGatewayCode, item.getGatewayCode()));
++                    .eq(IotGateway::getGatewayCode, item.getGatewayCode());
++            if (item.getOnlineStatus() == 1) {
++                wrapper.set(IotGateway::getOfflineReason, null);
++            }
++            this.update(upd, wrapper);
+         }
+         return items.size();
+     }
+ 
++    // ---------- 离线事件（TASK-0020）：消费落展示态 + 内部桥接发布 ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean applyOfflineEvent(GatewayOfflineEvent event) {
++        // 服务层防御（监听器已 fail-closed WARN，此处第二道保险——直调服务不产生半截状态）
++        if (event == null || event.gatewayId() == null || event.tenantId() == null
++                || event.offlineReason() == null || event.occurredAt() == null) {
++            throw paramError("离线事件字段缺失（gatewayId/tenantId/offlineReason/occurredAt 必填）");
++        }
++        // 未知 gatewayId 忽略 WARN（brief 测试口径 fail-closed——不更新、不外溢异常中断发布方；
++        // 无 Sa-Token 会话链路，显式 (id, tenant_id) 条件即定位语义，防御纵深同心跳回写）
++        IotGateway existing = this.list(new LambdaQueryWrapper<IotGateway>()
++                        .select(IotGateway::getId, IotGateway::getStatus)
++                        .eq(IotGateway::getId, event.gatewayId())
++                        .eq(IotGateway::getTenantId, event.tenantId()))
++                .stream().findFirst().orElse(null);
++        if (existing == null) {
++            log.warn("[GATEWAY-OFFLINE] 未知网关，离线事件忽略 gatewayId={} tenantId={} reason={}",
++                    event.gatewayId(), event.tenantId(), event.offlineReason());
++            return false;
++        }
++        // 展示态更新集只含两字段：online_status=0 + offline_reason（禁用与离线正交——禁用
++        // 网关照落展示态保状态准确，0017 口径；occurredAt 不冒充 last_heartbeat_time，列语义守恒）
++        IotGateway upd = new IotGateway();
++        upd.setOnlineStatus(0);
++        upd.setOfflineReason(event.offlineReason().name());
++        return this.update(upd, new LambdaUpdateWrapper<IotGateway>()
++                .eq(IotGateway::getId, event.gatewayId())
++                .eq(IotGateway::getTenantId, event.tenantId()));
++    }
++
++    @Override
++    public boolean publishOfflineEvent(GatewayOfflineEventForm form) {
++        if (form.getTenantCode() == null || form.getTenantCode().isBlank()) {
++            throw paramError("离线事件缺少 tenantCode");
++        }
++        if (form.getGatewayCode() == null || form.getGatewayCode().isBlank()
++                || form.getGatewayCode().length() > MAX_LEN_GATEWAY_CODE) {
++            throw paramError("离线事件 gatewayCode 必填且长度不能超过 " + MAX_LEN_GATEWAY_CODE);
++        }
++        if (form.getOfflineReason() == null) {
++            throw paramError("离线事件 offlineReason 仅允许 " + GatewayOfflineReason.allowedNames());
++        }
++
++        // 租户/网关解析（fail-closed 400，同心跳回写口径；网关编码即设备身份，接入侧不持 DB id）
++        SysTenant tenant = tenantMapper.selectOne(new LambdaQueryWrapper<SysTenant>()
++                .eq(SysTenant::getTenantCode, form.getTenantCode()));
++        if (tenant == null) {
++            throw paramError("租户不存在: " + form.getTenantCode());
++        }
++        if (tenant.getStatus() == null || tenant.getStatus() != 1) {
++            throw paramError("租户已禁用: " + form.getTenantCode());
++        }
++        IotGateway gateway = this.list(new LambdaQueryWrapper<IotGateway>()
++                        .select(IotGateway::getId)
++                        .eq(IotGateway::getTenantId, tenant.getId())
++                        .eq(IotGateway::getGatewayCode, form.getGatewayCode()))
++                .stream().findFirst().orElse(null);
++        if (gateway == null) {
++            throw paramError("网关编码不存在或已删除: " + form.getGatewayCode());
++        }
++
++        // occurredAt 缺省补 now（不因缺时间戳拒事件——消息侧只给判定结论即可）
++        LocalDateTime occurredAt = form.getOccurredAt() != null ? form.getOccurredAt() : LocalDateTime.now();
++        // 只发事件不落库（消费归监听器→applyOfflineEvent 链路）；本方法刻意无 @Transactional：
++        // 同步事件监听器的消费事务自带（REQUIRED），桥接事务会把消费更新并入同一事务、
++        // 「消费失败收敛 WARN」与「提交语义」互相纠缠（UnexpectedRollbackException 风险）
++        offlineEventPublisher.publish(GatewayOfflineEvent.of(
++                gateway.getId(), tenant.getId(), form.getOfflineReason(), occurredAt));
++        return true;
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 占用行文案区分：活跃行「已存在」/已删行「已被删除记录占用，不可复用」（0011 修订轮口径） */
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java
+index 75e084e..1d02392 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayControllerTest.java
+@@ -157,6 +157,25 @@ class IotGatewayControllerTest {
+                 .andExpect(jsonPath("$.data.records[0].onlineStatus").value(1));
+     }
+ 
++    @Test
++    @DisplayName("分页列表 - offlineReason 过滤参数绑定进查询对象并透传服务层（TASK-0020，REQ-0009 验收 2/5）")
++    void testList_OfflineReasonBinding() throws Exception {
++        Page<IotGateway> page = new Page<>(1, 10);
++        page.setRecords(List.of(testGateway()));
++        when(gatewayService.selectGatewayList(any(), any(IotGateway.class))).thenReturn(page);
++
++        mockMvc.perform(get("/iot/gateway/list")
++                        .param("pageNum", "1")
++                        .param("pageSize", "10")
++                        .param("offlineReason", "TIMEOUT"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++
++        org.mockito.ArgumentCaptor<IotGateway> captor = org.mockito.ArgumentCaptor.forClass(IotGateway.class);
++        verify(gatewayService).selectGatewayList(any(), captor.capture());
++        assertEquals("TIMEOUT", captor.getValue().getOfflineReason(), "offlineReason 过滤参数须绑定进查询对象");
++    }
++
+     @Test
+     @DisplayName("新增 - POST /iot/gateway 正常返回 200")
+     void testAdd_Success() throws Exception {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java
+index 1d630ff..b7146f2 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/controller/IotGatewayInternalControllerTest.java
+@@ -1,6 +1,7 @@
+ package net.otlab.admin.module.iot.gateway.controller;
+ 
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import org.mockito.ArgumentCaptor;
+ import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
+ import net.otlab.admin.module.iot.gateway.auth.InternalAuthInterceptor;
+ import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
+@@ -277,4 +278,138 @@ class IotGatewayInternalControllerTest {
+ 
+         verify(internalAuthChecker, org.mockito.Mockito.times(1)).check(any());
+     }
++
++    // ---------- 离线事件桥接端点（TASK-0020，POST /internal/v1/gateway/offline-event） ----------
++
++    private static final String OFFLINE_EVENT_URL = "/internal/v1/gateway/offline-event";
++
++    private String offlineEventBody(String reason, Object occurredAt) {
++        String occurred = occurredAt == null ? "" : ", \"occurredAt\": " + (
++                occurredAt instanceof String s ? "\"" + s + "\"" : String.valueOf(occurredAt));
++        return """
++                {"tenantCode": "default", "gatewayCode": "GW_F01_01", "offlineReason": "%s"%s}
++                """.formatted(reason, occurred);
++    }
++
++    @Test
++    @DisplayName("离线事件注解契约 - @Anonymous 跳过管理面登录；无 @SaCheckPermission；无 @OperateLog；路由 POST /offline-event")
++    void testOfflineEvent_AnnotationContract() throws Exception {
++        Method offlineEvent = IotGatewayInternalController.class
++                .getMethod("offlineEvent", jakarta.servlet.http.HttpServletRequest.class, java.util.Map.class);
++        assertNotNull(offlineEvent.getAnnotation(Anonymous.class), "内部接口须 @Anonymous 跳过 Sa-Token 登录校验");
++        assertEquals(null, offlineEvent.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "内部接口不得挂管理面权限注解");
++        assertEquals(null, offlineEvent.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "内部接口不写操作日志（同心跳回写口径）");
++        assertTrue(offlineEvent.getAnnotation(org.springframework.web.bind.annotation.PostMapping.class).value()[0]
++                .startsWith("/offline-event"), "路由 POST /internal/v1/gateway/offline-event");
++    }
++
++    @Test
++    @DisplayName("离线事件 - 合法 TIMEOUT 事件：认证双调用 + typed 表单进服务层（字符串时间归一化）")
++    void testOfflineEvent_Success() throws Exception {
++        when(gatewayService.publishOfflineEvent(any())).thenReturn(true);
++
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(offlineEventBody("TIMEOUT", "2026-11-22 12:00:00")))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(true));
++
++        verify(internalAuthChecker, org.mockito.Mockito.times(2)).check(any());
++        ArgumentCaptor<net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm> captor =
++                ArgumentCaptor.forClass(net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm.class);
++        verify(gatewayService).publishOfflineEvent(captor.capture());
++        net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm form = captor.getValue();
++        assertEquals("default", form.getTenantCode());
++        assertEquals("GW_F01_01", form.getGatewayCode());
++        assertEquals(net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason.TIMEOUT, form.getOfflineReason());
++        assertEquals(java.time.LocalDateTime.of(2026, 11, 22, 12, 0, 0), form.getOccurredAt());
++    }
++
++    @Test
++    @DisplayName("离线事件 - occurredAt 毫秒时间戳归一化与缺省（缺省进服务层由其补 now）")
++    void testOfflineEvent_OccurredAtCoercion() throws Exception {
++        when(gatewayService.publishOfflineEvent(any())).thenReturn(true);
++
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(offlineEventBody("LWT_ABNORMAL", 1795291200000L)))
++                .andExpect(jsonPath("$.code").value(200));
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(offlineEventBody("GRACEFUL", null)))
++                .andExpect(jsonPath("$.code").value(200));
++
++        verify(gatewayService, org.mockito.Mockito.times(2)).publishOfflineEvent(any());
++    }
++
++    @Test
++    @DisplayName("离线事件 - reason 未知名 fail-closed 400（仅允许 TIMEOUT/LWT_ABNORMAL/GRACEFUL，服务层不触达）")
++    void testOfflineEvent_UnknownReasonRejected() throws Exception {
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(offlineEventBody("FOO", null)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("TIMEOUT/LWT_ABNORMAL/GRACEFUL")));
++
++        verify(gatewayService, never()).publishOfflineEvent(any());
++    }
++
++    @Test
++    @DisplayName("离线事件 - 白名单越界键拒绝（顶层混入 status → PARAM_ERROR 点名越界键）")
++    void testOfflineEvent_ExtraKeysRejected() throws Exception {
++        String body = """
++                {"tenantCode": "default", "gatewayCode": "GW_F01_01", "offlineReason": "TIMEOUT", "onlineStatus": 1}
++                """;
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(body))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("回写字段越界")))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("onlineStatus")));
++
++        verify(gatewayService, never()).publishOfflineEvent(any());
++    }
++
++    @Test
++    @DisplayName("离线事件 - 必填缺失拒绝：tenantCode/gatewayCode/offlineReason 缺一即 400")
++    void testOfflineEvent_MissingRequiredRejected() throws Exception {
++        String noTenant = """
++                {"gatewayCode": "GW_F01_01", "offlineReason": "TIMEOUT"}
++                """;
++        mockMvc.perform(post(OFFLINE_EVENT_URL).contentType(MediaType.APPLICATION_JSON).content(noTenant))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        String noCode = """
++                {"tenantCode": "default", "offlineReason": "TIMEOUT"}
++                """;
++        mockMvc.perform(post(OFFLINE_EVENT_URL).contentType(MediaType.APPLICATION_JSON).content(noCode))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        String noReason = """
++                {"tenantCode": "default", "gatewayCode": "GW_F01_01"}
++                """;
++        mockMvc.perform(post(OFFLINE_EVENT_URL).contentType(MediaType.APPLICATION_JSON).content(noReason))
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(gatewayService, never()).publishOfflineEvent(any());
++    }
++
++    @Test
++    @DisplayName("离线事件 - 服务层拒绝透传（未知网关 400），认证先于载荷处理")
++    void testOfflineEvent_ServiceRejectionTransparent() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "网关编码不存在或已删除: GW_GHOST"))
++                .when(gatewayService).publishOfflineEvent(any());
++
++        mockMvc.perform(post(OFFLINE_EVENT_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content(offlineEventBody("TIMEOUT", null)))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString("GW_GHOST")));
++    }
+ }
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListenerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListenerTest.java
+new file mode 100644
+index 0000000..c381354
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventListenerTest.java
+@@ -0,0 +1,130 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import net.otlab.admin.module.iot.gateway.service.IotGatewayService;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++
++import java.time.LocalDateTime;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 离线事件监听器单元测试（TASK-0020）：消费 {@link GatewayOfflineEvent} 委托服务层落
++ * 管理面展示态（online_status=0 + offline_reason）。
++ *
++ * <p>核心契约（brief 决策 2/6 + REQ-0009 验收 5）：
++ * <ul>
++ * <li>三类 reason（TIMEOUT/LWT_ABNORMAL/GRACEFUL）事件字段直通服务层；</li>
++ * <li><b>缺字段 fail-closed</b>（gatewayId/tenantId/offlineReason/occurredAt 任一缺失
++ *     即 WARN 忽略，不触达服务层——脏事件不产生半截状态）；</li>
++ * <li>消费动作绝不外溢异常（展示态属可重建数据——下次心跳回写/事件纠偏，照 0006
++ *     DataPermCacheEvictListener 同范式兜一层 try/catch）。</li>
++ * </ul>
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class GatewayOfflineEventListenerTest {
++
++    @Mock
++    private IotGatewayService gatewayService;
++
++    private GatewayOfflineEventListener listener;
++
++    private AutoCloseable mocks;
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        listener = new GatewayOfflineEventListener(gatewayService);
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        mocks.close();
++    }
++
++    private LocalDateTime occurredAt() {
++        return LocalDateTime.of(2026, 11, 22, 12, 0, 0);
++    }
++
++    @Test
++    @DisplayName("TIMEOUT 事件 - 字段直通服务层（心跳停止超阈值，REQ-0009 验收 2）")
++    void timeoutEvent_delegatesToService() {
++        GatewayOfflineEvent event = GatewayOfflineEvent.ofTimeout(7L, 1L, occurredAt());
++
++        listener.onGatewayOffline(event);
++
++        verify(gatewayService).applyOfflineEvent(event);
++    }
++
++    @Test
++    @DisplayName("LWT_ABNORMAL 事件 - 字段直通（异常断开，REQ-0009 验收 5 可区分）")
++    void lwtAbnormalEvent_delegatesToService() {
++        GatewayOfflineEvent event = GatewayOfflineEvent.ofLwtAbnormal(7L, 1L, occurredAt());
++
++        listener.onGatewayOffline(event);
++
++        verify(gatewayService).applyOfflineEvent(event);
++    }
++
++    @Test
++    @DisplayName("GRACEFUL 事件 - 字段直通（正常下线，REQ-0009 验收 5 可区分）")
++    void gracefulEvent_delegatesToService() {
++        GatewayOfflineEvent event = GatewayOfflineEvent.ofGraceful(7L, 1L, occurredAt());
++
++        listener.onGatewayOffline(event);
++
++        verify(gatewayService).applyOfflineEvent(event);
++    }
++
++    @Test
++    @DisplayName("缺字段 fail-closed - gatewayId/tenantId/reason/occurredAt 任一缺失均 WARN 忽略，服务层不被触达")
++    void missingField_failClosedIgnored() {
++        listener.onGatewayOffline(null);
++        listener.onGatewayOffline(GatewayOfflineEvent.of(null, 1L, GatewayOfflineReason.TIMEOUT, occurredAt()));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, null, GatewayOfflineReason.TIMEOUT, occurredAt()));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, 1L, null, occurredAt()));
++        listener.onGatewayOffline(GatewayOfflineEvent.of(7L, 1L, GatewayOfflineReason.TIMEOUT, null));
++
++        verify(gatewayService, never()).applyOfflineEvent(any(GatewayOfflineEvent.class));
++    }
++
++    @Test
++    @DisplayName("消费动作绝不外溢 - 服务层抛出被监听器兜住（展示态可重建，不炸穿发布方线程）")
++    void serviceFailure_swallowed() {
++        doThrow(new RuntimeException("db down")).when(gatewayService).applyOfflineEvent(any(GatewayOfflineEvent.class));
++
++        assertDoesNotThrow(() -> listener.onGatewayOffline(
++                GatewayOfflineEvent.ofTimeout(7L, 1L, occurredAt())));
++        assertThrows(RuntimeException.class, () -> gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.ofTimeout(7L, 1L, occurredAt())), "前置：mock 本身确实违约");
++    }
++
++    @Test
++    @DisplayName("事件 record 契约 - 语义工厂携带正确 reason 与 occurredAt 字段")
++    void eventFactories_carryReasonAndOccurredAt() {
++        LocalDateTime at = occurredAt();
++        ArgumentCaptor<GatewayOfflineEvent> captor = ArgumentCaptor.forClass(GatewayOfflineEvent.class);
++
++        listener.onGatewayOffline(GatewayOfflineEvent.of(9L, 2L, GatewayOfflineReason.LWT_ABNORMAL, at));
++
++        org.mockito.Mockito.verify(gatewayService).applyOfflineEvent(captor.capture());
++        GatewayOfflineEvent published = captor.getValue();
++        assertEquals(9L, published.gatewayId());
++        assertEquals(2L, published.tenantId());
++        assertEquals(GatewayOfflineReason.LWT_ABNORMAL, published.offlineReason());
++        assertEquals(at, published.occurredAt());
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisherTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisherTest.java
+new file mode 100644
+index 0000000..1c927e7
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/event/GatewayOfflineEventPublisherTest.java
+@@ -0,0 +1,117 @@
++package net.otlab.admin.module.iot.gateway.event;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.springframework.context.ApplicationEventPublisher;
++
++import java.time.LocalDateTime;
++
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.doThrow;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++
++/**
++ * 占位发布器单元测试（TASK-0020）：语义工厂（timeout/lwtAbnormal/graceful）→ 统一
++ * {@code publish(GatewayOfflineEvent)} 经 Spring {@link ApplicationEventPublisher} 进程内发布。
++ *
++ * <p>范式差异留痕（与 0006 DataPermCacheEvictPublisher 的「有理由的偏离」）：本发布器
++ * <b>不做 afterCommit 挂点、立即发布</b>——离线事件的消费动作是写管理面展示态（独立事务），
++ * 不存在 0006「未提交先失效→并发事务回填脏数据」的读后一致性危害；接入/计算引擎侧真实
++ * 发布方接线前，本组件即占位接缝（dev 冒烟经内部桥接端点注入三类事件）。
++ *
++ * <p>发布动作本身绝不抛出（异常收敛 WARN——事件属展示态信号，不得中断调用方流程）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class GatewayOfflineEventPublisherTest {
++
++    private ApplicationEventPublisher springPublisher;
++    private GatewayOfflineEventPublisher helper;
++
++    private final LocalDateTime occurredAt = LocalDateTime.of(2026, 11, 22, 12, 0, 0);
++
++    @BeforeEach
++    void setUp() {
++        springPublisher = mock(ApplicationEventPublisher.class);
++        helper = new GatewayOfflineEventPublisher(springPublisher);
++    }
++
++    @AfterEach
++    void tearDown() {
++        org.mockito.Mockito.reset(springPublisher);
++    }
++
++    private GatewayOfflineEvent capturePublishedEvent() {
++        ArgumentCaptor<GatewayOfflineEvent> captor = ArgumentCaptor.forClass(GatewayOfflineEvent.class);
++        verify(springPublisher).publishEvent(captor.capture());
++        return captor.getValue();
++    }
++
++    @Test
++    @DisplayName("publishTimeout - 发布 TIMEOUT 事件，四字段齐备")
++    void publishTimeout_carriesAllFields() {
++        helper.publishTimeout(7L, 1L, occurredAt);
++
++        GatewayOfflineEvent event = capturePublishedEvent();
++        assertEquals(7L, event.gatewayId());
++        assertEquals(1L, event.tenantId());
++        assertEquals(GatewayOfflineReason.TIMEOUT, event.offlineReason());
++        assertEquals(occurredAt, event.occurredAt());
++    }
++
++    @Test
++    @DisplayName("publishLwtAbnormal - 发布 LWT_ABNORMAL 事件（异常断开，REQ-0009 验收 5）")
++    void publishLwtAbnormal_carriesReason() {
++        helper.publishLwtAbnormal(7L, 1L, occurredAt);
++
++        assertEquals(GatewayOfflineReason.LWT_ABNORMAL, capturePublishedEvent().offlineReason());
++    }
++
++    @Test
++    @DisplayName("publishGraceful - 发布 GRACEFUL 事件（正常下线，REQ-0009 验收 5）")
++    void publishGraceful_carriesReason() {
++        helper.publishGraceful(7L, 1L, occurredAt);
++
++        assertEquals(GatewayOfflineReason.GRACEFUL, capturePublishedEvent().offlineReason());
++    }
++
++    @Test
++    @DisplayName("publish(generic) - 现成事件对象直通（未来接入/计算引擎接线的统一入口）")
++    void publishGenericEvent_passthrough() {
++        GatewayOfflineEvent event = GatewayOfflineEvent.of(9L, 2L, GatewayOfflineReason.GRACEFUL, occurredAt);
++
++        helper.publish(event);
++
++        ArgumentCaptor<GatewayOfflineEvent> captor = ArgumentCaptor.forClass(GatewayOfflineEvent.class);
++        verify(springPublisher).publishEvent(captor.capture());
++        assertEquals(event, captor.getValue());
++    }
++
++    @Test
++    @DisplayName("发布异常收敛 - 监听器违约抛出不炸穿发布方调用方（展示态信号不中断业务流程）")
++    void publishFailure_swallowed() {
++        doThrow(new RuntimeException("listener exploded")).when(springPublisher).publishEvent(any(GatewayOfflineEvent.class));
++
++        assertDoesNotThrow(() -> helper.publishTimeout(7L, 1L, occurredAt));
++        assertDoesNotThrow(() -> helper.publish(
++                GatewayOfflineEvent.ofGraceful(7L, 1L, occurredAt)));
++    }
++
++    @Test
++    @DisplayName("reason 枚举 fail-closed 解析 - 未知名返回 null（桥接层据此 400 拒，不静默映射）")
++    void reasonFromName_unknownReturnsNull() {
++        assertEquals(GatewayOfflineReason.TIMEOUT, GatewayOfflineReason.fromName("TIMEOUT"));
++        assertEquals(GatewayOfflineReason.LWT_ABNORMAL, GatewayOfflineReason.fromName("LWT_ABNORMAL"));
++        assertEquals(GatewayOfflineReason.GRACEFUL, GatewayOfflineReason.fromName("GRACEFUL"));
++        assertEquals(null, GatewayOfflineReason.fromName("FOO"));
++        assertEquals(null, GatewayOfflineReason.fromName(null));
++        assertEquals(null, GatewayOfflineReason.fromName("timeout"), "枚举名精确匹配（大小写敏感，防误配放行）");
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+index 80a8b49..c5d7446 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/gateway/service/impl/IotGatewayServiceImplTest.java
+@@ -8,9 +8,13 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import net.otlab.admin.module.iot.entity.SysTenant;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatForm;
+ import net.otlab.admin.module.iot.gateway.dto.GatewayHeartbeatItem;
++import net.otlab.admin.module.iot.gateway.dto.GatewayOfflineEventForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayCreateForm;
+ import net.otlab.admin.module.iot.gateway.dto.IotGatewayUpdateForm;
+ import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEvent;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineEventPublisher;
++import net.otlab.admin.module.iot.gateway.event.GatewayOfflineReason;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeMapper;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayCodeRow;
+ import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
+@@ -87,6 +91,9 @@ class IotGatewayServiceImplTest {
+     @Mock
+     private GatewayReferenceGuard referenceGuard;
+ 
++    @Mock
++    private GatewayOfflineEventPublisher offlineEventPublisher;
++
+     private IotGatewayServiceImpl gatewayService;
+ 
+     /** 创建/回写消费会话租户上下文（静态 mock，逐用例注入） */
+@@ -116,6 +123,7 @@ class IotGatewayServiceImplTest {
+         ReflectionTestUtils.setField(gatewayService, "deptMapper", deptMapper);
+         ReflectionTestUtils.setField(gatewayService, "tenantMapper", tenantMapper);
+         ReflectionTestUtils.setField(gatewayService, "referenceGuard", referenceGuard);
++        ReflectionTestUtils.setField(gatewayService, "offlineEventPublisher", offlineEventPublisher);
+         // 删除 guard 本期恒零引用（占位实现默认行为）；拒绝场景在各用例内显式覆盖
+         when(referenceGuard.countChannels(any())).thenReturn(0L);
+         when(referenceGuard.countPoints(any())).thenReturn(0L);
+@@ -188,6 +196,16 @@ class IotGatewayServiceImplTest {
+         return row;
+     }
+ 
++    /** 离线事件桥接表单夹具（TASK-0020；occurredAt 可再置 null 测缺省路径） */
++    private GatewayOfflineEventForm offlineForm(String tenantCode, String gatewayCode, GatewayOfflineReason reason) {
++        GatewayOfflineEventForm form = new GatewayOfflineEventForm();
++        form.setTenantCode(tenantCode);
++        form.setGatewayCode(gatewayCode);
++        form.setOfflineReason(reason);
++        form.setOccurredAt(LocalDateTime.of(2026, 11, 22, 12, 0, 0));
++        return form;
++    }
++
+     // ---------- 创建：唯一性双道闸 4002 ----------
+ 
+     @Test
+@@ -712,4 +730,217 @@ class IotGatewayServiceImplTest {
+         assertEquals(2, count);
+         verify(baseMapper, org.mockito.Mockito.times(2)).update(any(IotGateway.class), any(Wrapper.class));
+     }
++
++    // ---------- 离线事件消费（TASK-0020）：三态区分 + fail-closed ----------
++
++    @Test
++    @DisplayName("离线事件 - 三类 reason 各自落库：online_status=0 + offline_reason=事件 reason（REQ-0009 验收 5 可区分）")
++    void testApplyOfflineEvent_ThreeReasons() {
++        when(baseMapper.selectList(any())).thenReturn(List.of(existingGateway()));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        for (GatewayOfflineReason reason : GatewayOfflineReason.values()) {
++            org.mockito.Mockito.clearInvocations(baseMapper);
++            boolean applied = gatewayService.applyOfflineEvent(
++                    GatewayOfflineEvent.of(1L, 1L, reason, LocalDateTime.of(2026, 11, 22, 12, 0, 0)));
++            assertTrue(applied, "reason=" + reason + " 应消费成功");
++
++            ArgumentCaptor<IotGateway> entityCaptor = ArgumentCaptor.forClass(IotGateway.class);
++            ArgumentCaptor<Wrapper<IotGateway>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
++            verify(baseMapper).update(entityCaptor.capture(), wrapperCaptor.capture());
++            IotGateway upd = entityCaptor.getValue();
++            assertEquals(0, upd.getOnlineStatus(), "离线事件落 online_status=0: " + reason);
++            assertEquals(reason.name(), upd.getOfflineReason(), "落库 reason 与事件一致: " + reason);
++            // 展示态更新集白名单：仅两字段——id/编码/审计字段一律不进 SET
++            assertNull(upd.getId());
++            assertNull(upd.getGatewayCode());
++            assertNull(upd.getStatus(), "禁用位与离线正交，事件不改 status");
++            assertNull(upd.getLastHeartbeatTime(), "occurredAt 不冒充心跳时间（列语义守恒）");
++            LambdaUpdateWrapper<IotGateway> wrapper = (LambdaUpdateWrapper<IotGateway>) wrapperCaptor.getValue();
++            String segment = wrapper.getSqlSegment();
++            assertTrue(segment.contains("id ="), "WHERE 显式 id 定位: " + segment);
++            assertTrue(segment.contains("tenant_id ="), "WHERE 显式 tenant_id 定位（无会话链路防御纵深）: " + segment);
++        }
++    }
++
++    @Test
++    @DisplayName("离线事件 - 未知 gatewayId 忽略 WARN：不更新、返回 false（brief 测试口径 fail-closed）")
++    void testApplyOfflineEvent_UnknownGatewayIgnored() {
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++
++        boolean applied = gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(99L, 1L, GatewayOfflineReason.TIMEOUT, LocalDateTime.now()));
++
++        org.junit.jupiter.api.Assertions.assertFalse(applied);
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("离线事件 - 禁用网关事件仍落展示态（禁用与离线正交；0017 口径：禁用网关的离线态应可落保状态准确）")
++    void testApplyOfflineEvent_DisabledGatewayStillUpdated() {
++        IotGateway disabled = existingGateway();
++        disabled.setStatus(0);
++        when(baseMapper.selectList(any())).thenReturn(List.of(disabled));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        boolean applied = gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(1L, 1L, GatewayOfflineReason.GRACEFUL, LocalDateTime.now()));
++
++        assertTrue(applied, "禁用网关的离线事件照常落展示态");
++        verify(baseMapper).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("离线事件 - 服务层防御：缺字段（gatewayId/tenantId/reason/occurredAt/null 事件）即拒不触库（监听器 fail-closed 之外的第二道保险）")
++    void testApplyOfflineEvent_MissingFieldsRejected() {
++        LocalDateTime at = LocalDateTime.of(2026, 11, 22, 12, 0, 0);
++        assertThrows(BusinessException.class, () -> gatewayService.applyOfflineEvent(null));
++        assertThrows(BusinessException.class, () -> gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(null, 1L, GatewayOfflineReason.TIMEOUT, at)));
++        assertThrows(BusinessException.class, () -> gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(1L, null, GatewayOfflineReason.TIMEOUT, at)));
++        assertThrows(BusinessException.class, () -> gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(1L, 1L, null, at)));
++        assertThrows(BusinessException.class, () -> gatewayService.applyOfflineEvent(
++                GatewayOfflineEvent.of(1L, 1L, GatewayOfflineReason.TIMEOUT, null)));
++        verify(baseMapper, never()).selectList(any());
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    // ---------- 心跳回写清因（TASK-0020）：回在线清 offline_reason ----------
++
++    @Test
++    @DisplayName("回写清因 - onlineStatus=1 回在线：更新集追加 offline_reason=NULL（brief 决策 3，回写白名单扩清除动作）")
++    void testHeartbeat_OnlineClearsOfflineReason() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw = existingGateway();
++        gw.setOfflineReason(GatewayOfflineReason.LWT_ABNORMAL.name());
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        gatewayService.writeHeartbeats(heartbeatForm("default", heartbeatItem("GW_F01_01", 1)));
++
++        ArgumentCaptor<Wrapper<IotGateway>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).update(any(IotGateway.class), wrapperCaptor.capture());
++        LambdaUpdateWrapper<IotGateway> wrapper = (LambdaUpdateWrapper<IotGateway>) wrapperCaptor.getValue();
++        String sqlSet = wrapper.getSqlSet();
++        assertTrue(sqlSet != null && sqlSet.contains("offline_reason"),
++                "回在线必须显式 SET offline_reason=NULL（MP 实体 null 字段不进 SET，只能 wrapper 强制）: " + sqlSet);
++        assertTrue(wrapper.getParamNameValuePairs().containsValue(null),
++                "offline_reason 参数值为 NULL");
++    }
++
++    @Test
++    @DisplayName("回写保因 - onlineStatus=0 离线回写：不触碰 offline_reason（展示原因由事件链维护，回写不擦除）")
++    void testHeartbeat_OfflinePreservesOfflineReason() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        IotGateway gw = existingGateway();
++        gw.setOfflineReason(GatewayOfflineReason.TIMEOUT.name());
++        when(baseMapper.selectList(any())).thenReturn(List.of(gw));
++        when(baseMapper.update(any(IotGateway.class), any(Wrapper.class))).thenReturn(1);
++
++        gatewayService.writeHeartbeats(heartbeatForm("default", heartbeatItem("GW_F01_01", 0)));
++
++        ArgumentCaptor<Wrapper<IotGateway>> wrapperCaptor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).update(any(IotGateway.class), wrapperCaptor.capture());
++        LambdaUpdateWrapper<IotGateway> wrapper = (LambdaUpdateWrapper<IotGateway>) wrapperCaptor.getValue();
++        String sqlSet = wrapper.getSqlSet();
++        assertTrue(sqlSet == null || !sqlSet.contains("offline_reason"),
++                "离线回写不得擦除 offline_reason（否则三态区分被心跳冲掉）: " + sqlSet);
++    }
++
++    // ---------- 列表筛选扩展（TASK-0020）：offlineReason 过滤 ----------
++
++    @Test
++    @DisplayName("列表 - offlineReason 过滤接线：eq 条件进 wrapper（REQ-0009 验收 2 超阈值离线可筛出）")
++    void testList_OfflineReasonFilter() {
++        Page<IotGateway> page = new Page<>(1, 10);
++        when(baseMapper.selectPage(any(Page.class), any(Wrapper.class))).thenReturn(page);
++        IotGateway query = new IotGateway();
++        query.setOfflineReason(GatewayOfflineReason.TIMEOUT.name());
++
++        assertNotNull(gatewayService.selectGatewayList(new Page<>(1, 10), query));
++        ArgumentCaptor<Wrapper<IotGateway>> captor = ArgumentCaptor.forClass(Wrapper.class);
++        verify(baseMapper).selectPage(any(Page.class), captor.capture());
++        String segment = captor.getValue().getSqlSegment();
++        assertTrue(segment.contains("offline_reason ="), "离线原因过滤 eq: " + segment);
++        Map<String, Object> params = ((com.baomidou.mybatisplus.core.conditions.AbstractWrapper<?, ?, ?>) captor.getValue()).getParamNameValuePairs();
++        assertTrue(params.containsValue("TIMEOUT"), "过滤参数值: " + params.values());
++    }
++
++    // ---------- 内部桥接（TASK-0020）：离线事件解析与发布 ----------
++
++    @Test
++    @DisplayName("桥接 - 解析租户/网关后经占位发布器发事件：gatewayId/tenantId/reason/occurredAt 齐备")
++    void testPublishOfflineEvent_ResolvesAndPublishes() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        when(baseMapper.selectList(any())).thenReturn(List.of(existingGateway()));
++
++        GatewayOfflineEventForm form = offlineForm("default", "GW_F01_01", GatewayOfflineReason.TIMEOUT);
++        assertTrue(gatewayService.publishOfflineEvent(form));
++
++        ArgumentCaptor<GatewayOfflineEvent> captor = ArgumentCaptor.forClass(GatewayOfflineEvent.class);
++        verify(offlineEventPublisher).publish(captor.capture());
++        GatewayOfflineEvent event = captor.getValue();
++        assertEquals(1L, event.gatewayId(), "gatewayId 由 gatewayCode 解析");
++        assertEquals(1L, event.tenantId(), "tenantId 由 tenantCode 解析");
++        assertEquals(GatewayOfflineReason.TIMEOUT, event.offlineReason());
++        assertEquals(LocalDateTime.of(2026, 11, 22, 12, 0, 0), event.occurredAt());
++        // 桥接只发事件不落库（消费归监听器链路）
++        verify(baseMapper, never()).update(any(IotGateway.class), any(Wrapper.class));
++    }
++
++    @Test
++    @DisplayName("桥接 - occurredAt 未携带缺省 now（不因缺时间戳拒事件；消息侧只给判定结论即可）")
++    void testPublishOfflineEvent_DefaultOccurredAt() {
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        when(baseMapper.selectList(any())).thenReturn(List.of(existingGateway()));
++
++        GatewayOfflineEventForm form = offlineForm("default", "GW_F01_01", GatewayOfflineReason.GRACEFUL);
++        form.setOccurredAt(null);
++        assertTrue(gatewayService.publishOfflineEvent(form));
++
++        ArgumentCaptor<GatewayOfflineEvent> captor = ArgumentCaptor.forClass(GatewayOfflineEvent.class);
++        verify(offlineEventPublisher).publish(captor.capture());
++        assertNotNull(captor.getValue().occurredAt(), "缺省 occurredAt=now");
++    }
++
++    @Test
++    @DisplayName("桥接 - 租户不存在/禁用拒、未知网关拒（fail-closed，同回写接口口径）")
++    void testPublishOfflineEvent_FailClosed() {
++        GatewayOfflineEventForm form = offlineForm("ghost", "GW_F01_01", GatewayOfflineReason.TIMEOUT);
++
++        when(tenantMapper.selectOne(any())).thenReturn(null);
++        BusinessException e1 = assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(form));
++        assertTrue(e1.getMessage().contains("租户不存在: ghost"));
++
++        SysTenant disabled = activeTenant();
++        disabled.setStatus(0);
++        when(tenantMapper.selectOne(any())).thenReturn(disabled);
++        BusinessException e2 = assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(form));
++        assertTrue(e2.getMessage().contains("租户已禁用"));
++
++        when(tenantMapper.selectOne(any())).thenReturn(activeTenant());
++        when(baseMapper.selectList(any())).thenReturn(List.of());
++        BusinessException e3 = assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(form));
++        assertTrue(e3.getMessage().contains("网关编码不存在或已删除"));
++
++        verify(offlineEventPublisher, never()).publish(any(GatewayOfflineEvent.class));
++    }
++
++    @Test
++    @DisplayName("桥接 - 服务层防御：tenantCode/gatewayCode/reason 缺失即拒（控制器解析层之外的第二道保险）")
++    void testPublishOfflineEvent_MissingFieldsRejected() {
++        GatewayOfflineEventForm noTenant = offlineForm(null, "GW_F01_01", GatewayOfflineReason.TIMEOUT);
++        assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(noTenant));
++
++        GatewayOfflineEventForm noCode = offlineForm("default", " ", GatewayOfflineReason.TIMEOUT);
++        assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(noCode));
++
++        GatewayOfflineEventForm noReason = offlineForm("default", "GW_F01_01", null);
++        assertThrows(BusinessException.class, () -> gatewayService.publishOfflineEvent(noReason));
++
++        verify(offlineEventPublisher, never()).publish(any(GatewayOfflineEvent.class));
++        verify(tenantMapper, never()).selectOne(any());
++    }
+ }
+diff --git a/resources/sql/upgrade/20261122_iot_gateway_offline.sql b/resources/sql/upgrade/20261122_iot_gateway_offline.sql
+new file mode 100644
+index 0000000..7c2d1e7
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_gateway_offline.sql
+@@ -0,0 +1,67 @@
++-- ============================================================
++-- 存量库升级脚本：iot_gateway 补 offline_reason 离线原因列（TASK-0020 / FEAT-0006 / REQ-0009）
++--
++-- 用途：
++--   iot_gateway 补一列（REQ-0009 验收 5「LWT 异常断开与正常下线状态可区分」的落库承载，
++--   TASK-0020 离线事件消费维护）：
++--     `offline_reason` varchar(16) DEFAULT NULL COMMENT '离线原因 TIMEOUT/LWT_ABNORMAL/GRACEFUL（NULL=在线）'
++--   判存幂等：information_schema.COLUMNS 判列存在性，存在即跳过（PREPARE 动态执行），
++--   重复执行不报错、不重复加列。
++--
++-- 与上游差异（一处，随上游修订清单回写详细设计攒下一版小修订）：
++--   iot_gateway 较附录 A p30 逐字 DDL 增补一列 offline_reason（上游 DDL 仅 online_status
++--   0/1 无离线原因区分列；REQ-0009 验收 5 要求 LWT 异常断开与 graceful 正常下线可区分，
++--   brief 补列裁决——「与上游差异」头注登记）。其余列与索引不动、不改既有语义。
++--   值域与维护链路：
++--     TIMEOUT=心跳停止超阈值（判定归接入/计算引擎，ADR-0010 TD-0049——管理面只消费事件）；
++--     LWT_ABNORMAL=MQTT LWT 异常断开；GRACEFUL=正常下线；NULL=在线。
++--     写入方：离线事件消费（GatewayOfflineEventListener → applyOfflineEvent，置 0+reason）；
++--     清除方：心跳回写回在线（POST /internal/v1/gateway/heartbeat，onlineStatus=1 时
++--     SET offline_reason=NULL 置 online_status=1）。管理面 CRUD 不开放写入。
++--
++-- 接口对应（无新权限点；本列随既有接口出参/筛选）：
++--   GET /iot/gateway/list  响应增 offlineReason 字段、支持 offlineReason 过滤参数
++--     （照 0017 既有 list 范式，权限 iot:gateway:list 不变）；
++--   POST /internal/v1/gateway/offline-event（TASK-0020 新增内部桥接端点，@Anonymous +
++--     InternalAuthChecker 统一收口 /internal/v1/**，不挂权限标识——内部接口不走 sys_menu
++--     权限体系）：接入/计算引擎已判定离线事件经此发布，管理面消费（不做判定）。
++--
++-- 号段占用说明：本脚本不加 sys_menu 行（无新管理面权限点），不占用菜单号段。
++--
++-- 幂等口径：
++--   加列走 information_schema 判存（存在即跳过）——重复执行不报错、不重复加列、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（REQ-0009 / ADR-0009 TD-0029 / ADR-0010 TD-0049）：
++--   超时判定与状态 Redis 写入归计算引擎（本任务只做管理面事件消费端，不执行判定、
++--   不直写 Redis）；离线配置键 ot.gateway.offline-timeout-multiplier（默认 3，REQ-0009
++--   口径「如 3 个心跳周期」）与 ot.gateway.offline-check-interval-seconds（默认 30）以
++--   @Value 代码默认值交付（判定器接线登记遗留，归接入/计算引擎侧任务）。
++--
++-- 适用环境：
++--   已执行 20261122_iot_gateway_domain.sql（iot_gateway 在位）的存量库及全新库均可执行
++--   （全新库先建表后加列，判存幂等两脚本可任意顺序重复执行）。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。加列采用单行 SET @ddl = IF(...) + PREPARE/EXECUTE 动态执行，
++--   字符串内引号以双写单引号转义，语句行内不得出现行尾分号以外的分号。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++SET @col_offline_reason_exists = (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'iot_gateway' AND COLUMN_NAME = 'offline_reason');
++
++SET @ddl_offline_reason = IF(@col_offline_reason_exists = 0, 'ALTER TABLE `iot_gateway` ADD COLUMN `offline_reason` varchar(16) DEFAULT NULL COMMENT ''离线原因 TIMEOUT/LWT_ABNORMAL/GRACEFUL（NULL=在线）'' AFTER `online_status`', 'SELECT ''skip: offline_reason already exists'' AS note');
++
++PREPARE stmt_offline_reason FROM @ddl_offline_reason;
++
++EXECUTE stmt_offline_reason;
++
++DEALLOCATE PREPARE stmt_offline_reason;
++
++-- ============================================================
++-- 执行后核对（两次执行第二次应 skip；第一条应见新列）：
++--   SHOW COLUMNS FROM iot_gateway LIKE 'offline_reason';
++-- ============================================================

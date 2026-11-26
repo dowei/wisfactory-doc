@@ -1,0 +1,213 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java
+index 0d48d27..4dfea20 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/dto/PointImportRowResult.java
+@@ -51,6 +51,11 @@ public class PointImportRowResult {
+     /** 通道编码歧义（同码命中多个通道——uk 为 (gateway_id, channel_code)，租户内同码跨网关可并存） */
+     public static final String REASON_CHANNEL_AMBIGUOUS = "CHANNEL_AMBIGUOUS";
+ 
++    /** 归属引用不存在（修订轮 I-1：deptId/boundInstanceId 携带时必须存在/同租户/未删——与单点建档
++     * validateDept/validateInstance 契约对齐；同租户由多租户插件对 sys_dept/iot_model_instance 注入
++     * 会话租户条件保证，批内一次 IN 预检） */
++    public static final String REASON_INVALID_REF = "INVALID_REF";
++
+     /** 重复编码（批内互撞、库内活跃行占用与已删行占用同口径，均报此码） */
+     public static final String REASON_DUPLICATE_CODE = "DUPLICATE_CODE";
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+index a73a481..e6882ca 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/point/service/impl/IotPointServiceImpl.java
+@@ -642,14 +642,17 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         // 第二遍：库内级校验（一次 IN 查询，避免逐行往返的 10000 次放大）——
+         // ① unit 单位字典（TD-0045，携带 unit 的行批内一次查全）；② channelCode→id 解析
+         // （不存在拒、租户内同码命中多通道歧义拒——uk 为 (gateway_id, channel_code)，
+-        // 同码跨网关可并存，静默取首个会把点位挂错通道）；③ 编码占用预检（活跃行「已存在」
+-        // 与已删行「已被删除记录占用，不可复用」同口径拒绝——uk_tenant_point_code 不含
+-        // deleted 列，编码删除归档不复用；重导同文件整批 DUPLICATE_CODE 类拒绝即幂等口径，
+-        // TASK-0022 brief 裁决 3）
++        // 同码跨网关可并存，静默取首个会把点位挂错通道）；③ 归属引用存在性校验（修订轮
++        // 评审 I-1——deptId/boundInstanceId 携带时必须存在/同租户/未删，与单点建档
++        // validateDept/validateInstance 契约对齐，不放行悬空引用）；④ 编码占用预检（活跃行
++        // 「已存在」与已删行「已被删除记录占用，不可复用」同口径拒绝——uk_tenant_point_code
++        // 不含 deleted 列，编码删除归档不复用；重导同文件整批 DUPLICATE_CODE 类拒绝即幂等
++        // 口径，TASK-0022 brief 裁决 3）
+         Map<String, Long> channelIdByCode = Map.of();
+         if (!validRows.isEmpty()) {
+             markUnitViolations(rowResults, validRows);
+             channelIdByCode = markChannelViolations(rowResults, validRows);
++            markReferenceViolations(rowResults, validRows);
+             markOccupiedCodes(tenantId, rowResults, validRows);
+             validRows = validRows.stream()
+                     .filter(row -> Boolean.TRUE.equals(rowResultOf(rowResults, row).getSuccess()))
+@@ -867,6 +870,52 @@ public class IotPointServiceImpl extends ServiceImpl<IotPointMapper, IotPoint> i
+         return resolved;
+     }
+ 
++    /**
++     * 归属引用存在性校验（修订轮评审 I-1）：deptId/boundInstanceId 携带时必须命中本租户活跃行
++     * （{@code selectByIds}——sys_dept/iot_model_instance 在多租户插件覆盖清单内，会话租户条件
++     * 注入即同租户保证，@TableLogic 过滤已删行，与单点建档 validateDept/validateInstance 契约
++     * 同口径）；未命中标 {@code INVALID_REF}（悬空 id 会被后续数据权限裁剪与统计踩到）。批内
++     * 一次 IN 预检（去重后单查回填），未携带的行不触发校验（DDL 可空，与单点建档一致）。
++     */
++    private void markReferenceViolations(List<PointImportRowResult> rowResults, List<PointImportRow> validRows) {
++        Set<Long> deptIds = new HashSet<>();
++        Set<Long> instanceIds = new HashSet<>();
++        for (PointImportRow row : validRows) {
++            Long deptId = parseLong(row.getDeptId());
++            if (deptId != null) {
++                deptIds.add(deptId);
++            }
++            Long instanceId = parseLong(row.getBoundInstanceId());
++            if (instanceId != null) {
++                instanceIds.add(instanceId);
++            }
++        }
++        Set<Long> existingDeptIds = deptIds.isEmpty() ? Set.of()
++                : deptMapper.selectByIds(deptIds).stream()
++                        .map(SysDept::getId)
++                        .collect(Collectors.toSet());
++        Set<Long> existingInstanceIds = instanceIds.isEmpty() ? Set.of()
++                : instanceMapper.selectByIds(instanceIds).stream()
++                        .map(IotModelInstance::getId)
++                        .collect(Collectors.toSet());
++        for (PointImportRow row : validRows) {
++            List<String> missing = new ArrayList<>(2);
++            Long deptId = parseLong(row.getDeptId());
++            if (deptId != null && !existingDeptIds.contains(deptId)) {
++                missing.add("deptId(" + deptId + ")");
++            }
++            Long instanceId = parseLong(row.getBoundInstanceId());
++            if (instanceId != null && !existingInstanceIds.contains(instanceId)) {
++                missing.add("boundInstanceId(" + instanceId + ")");
++            }
++            if (!missing.isEmpty()) {
++                failRow(rowResults, row, PointImportRowResult.REASON_INVALID_REF,
++                        "归属引用不存在或已删除: " + String.join(", ", missing)
++                                + "（deptId/boundInstanceId 携带时必须存在且同租户——与单点建档同口径）");
++            }
++        }
++    }
++
+     /** 编码占用预检（含已删行旁路）：占用行标 DUPLICATE_CODE，文案区分活跃行/已删行（0021 口径）。 */
+     private void markOccupiedCodes(Long tenantId, List<PointImportRowResult> rowResults,
+                                    List<PointImportRow> validRows) {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java
+index f81c429..99014eb 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/point/service/impl/IotPointImportServiceTest.java
+@@ -257,6 +257,8 @@ class IotPointImportServiceTest {
+         dictReady();
+         when(dictDataMapper.selectList(any())).thenReturn(List.of(dictData("kWh")));
+         when(channelMapper.selectList(any())).thenReturn(List.of(channel(55L, "CH_MAIN")));
++        when(deptMapper.selectByIds(anyCollection())).thenReturn(List.of(dept(77L)));
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instanceRow(66L)));
+ 
+         PointImportReceipt receipt = pointService.importPoints(rows);
+ 
+@@ -265,8 +267,8 @@ class IotPointImportServiceTest {
+         verify(baseMapper).insert(captor.capture());
+         IotPoint saved = captor.getValue();
+         assertEquals(55L, saved.getChannelId(), "channelCode→id 解析回填");
+-        assertEquals(66L, saved.getBoundInstanceId());
+-        assertEquals(77L, saved.getDeptId());
++        assertEquals(66L, saved.getBoundInstanceId(), "引用命中落库");
++        assertEquals(77L, saved.getDeptId(), "引用命中落库");
+         assertEquals(new BigDecimal("0.5"), saved.getMinValue());
+         assertEquals(new BigDecimal("120"), saved.getMaxValue());
+         assertEquals(30, saved.getSamplePeriod());
+@@ -274,6 +276,70 @@ class IotPointImportServiceTest {
+         assertEquals("导入备注", saved.getRemark());
+     }
+ 
++    // ---------- 归属引用存在性校验（修订轮 I-1：与单点建档 validateDept/validateInstance 契约对齐） ----------
++
++    @Test
++    @DisplayName("导入 - 归属引用存在性校验（修订轮 I-1）：deptId 不存在/已删/跨租户 → INVALID_REF 该行失败"
++        + "整批拒（不放行悬空引用）")
++    void testImport_DepartmentRefNotFoundRejected() {
++        PointImportRow badDept = validRow(2, "F01.R1");
++        badDept.setDeptId("777");
++        PointImportRow okRow = validRow(3, "F01.R2");
++        when(deptMapper.selectByIds(anyCollection())).thenReturn(List.of()); // 777 无命中（已删/跨租户同口径不可见）
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(badDept, okRow))));
++
++        assertEquals(PointImportRowResult.REASON_INVALID_REF, rowOf(receipt, 2).getReasonCode());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("deptId"), "文案标注缺失归属列: " + rowOf(receipt, 2).getMessage());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("777"));
++        assertNull(rowOf(receipt, 3).getReasonCode(), "未携带 deptId 的行不触发引用校验");
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 归属引用存在性校验（修订轮 I-1）：boundInstanceId 不存在/已删/跨租户 → INVALID_REF"
++        + "整批拒（与单点建档 validateInstance 契约对齐）")
++    void testImport_BoundInstanceRefNotFoundRejected() {
++        PointImportRow badInstance = validRow(2, "F01.R3");
++        badInstance.setBoundInstanceId("888");
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of());
++
++        PointImportReceipt receipt = rejected(assertThrows(PointImportRejectException.class,
++                () -> pointService.importPoints(List.of(badInstance))));
++
++        assertEquals(PointImportRowResult.REASON_INVALID_REF, rowOf(receipt, 2).getReasonCode());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("boundInstanceId"), "文案标注缺失归属列: " + rowOf(receipt, 2).getMessage());
++        assertTrue(rowOf(receipt, 2).getMessage().contains("888"));
++        verify(baseMapper, never()).insert(any(IotPoint.class));
++    }
++
++    @Test
++    @DisplayName("导入 - 归属引用命中（修订轮 I-1 对照面）：deptId/boundInstanceId 均存在/同租户 → 放行落库；"
++        + "批内一次 IN 预检不逐行往返")
++    void testImport_ReferenceResolvedPassesWithBatchQuery() {
++        List<PointImportRow> rows = IntStream.rangeClosed(2, 301)
++                .mapToObj(i -> {
++                    PointImportRow r = validRow(i, "F01.R" + i);
++                    r.setDeptId("77");
++                    r.setBoundInstanceId("66");
++                    return r;
++                }).collect(Collectors.toList());
++        when(deptMapper.selectByIds(anyCollection())).thenReturn(List.of(dept(77L)));
++        when(instanceMapper.selectByIds(anyCollection())).thenReturn(List.of(instanceRow(66L)));
++
++        PointImportReceipt receipt = pointService.importPoints(rows);
++
++        assertTrue(receipt.getPersisted(), "引用命中整批放行");
++        assertEquals(300, receipt.getSuccessCount());
++        ArgumentCaptor<IotPoint> captor = ArgumentCaptor.forClass(IotPoint.class);
++        verify(baseMapper, times(300)).insert(captor.capture());
++        assertEquals(77L, captor.getAllValues().get(0).getDeptId());
++        assertEquals(66L, captor.getAllValues().get(0).getBoundInstanceId());
++        verify(deptMapper, times(1)).selectByIds(anyCollection());
++        verify(instanceMapper, times(1)).selectByIds(anyCollection());
++    }
++
+     // ---------- 字段级校验（逐行首个命中） ----------
+ 
+     @Test
+@@ -592,4 +658,22 @@ class IotPointImportServiceTest {
+         data.setStatus(1);
+         return data;
+     }
++
++    private net.otlab.admin.module.system.entity.SysDept dept(long id) {
++        net.otlab.admin.module.system.entity.SysDept dept = new net.otlab.admin.module.system.entity.SysDept();
++        dept.setId(id);
++        dept.setDeptName("部门-" + id);
++        dept.setStatus(1);
++        return dept;
++    }
++
++    private net.otlab.admin.module.iot.template.entity.IotModelInstance instanceRow(long id) {
++        net.otlab.admin.module.iot.template.entity.IotModelInstance inst =
++                new net.otlab.admin.module.iot.template.entity.IotModelInstance();
++        inst.setId(id);
++        inst.setTenantId(TENANT);
++        inst.setInstanceCode("F01.WS01.EQ00" + id);
++        inst.setInstanceName("实例-" + id);
++        return inst;
++    }
+ }

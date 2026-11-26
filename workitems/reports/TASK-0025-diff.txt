@@ -1,0 +1,2902 @@
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+index 76ff48c..2a6daad 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishProperties.java
+@@ -5,12 +5,15 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+- * 配置发布域属性（TASK-0024，配置键 {@code ot.publish.*}）。
++ * 配置发布域属性（TASK-0024 建立本类（仅 storage-path）；TASK-0025 扩展 ack- 与
++ * target- 键族，配置键 {@code ot.publish.*}）。
+  *
+- * <p>一期本地目录裁决（brief 存储裁决）：快照文件写本地目录，MinIO 对象存储二期登记。
+- * 配置键仅 {@code ot.publish.storage-path} 一个（application.yml 仅允许新增对象存储
+- * 配置键）；二期换 MinIO 时在 {@code SnapshotStorage} 实现位替换、本键族扩展，不动发布
+- * 流程其余件。
++ * <p>一期本地目录裁决（0024 brief 存储裁决）：快照文件写本地目录，MinIO 对象存储二期
++ * 登记；二期换 MinIO 时在 {@code SnapshotStorage} 实现位替换，不动发布流程其余件。
++ *
++ * <p>TASK-0025 新增键（brief 允许的新增范围：{@code ot.publish.ack-*} 与
++ * {@code ot.publish.target-*}）：下发回执超时扫描周期/超时窗、接入/计算下发目标标识
++ * （target_id 语义——网关行取 gateway_code，接入/计算行取本配置标识）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -28,4 +31,32 @@ public class PublishProperties {
+      * （与框架 ot.file.upload-dir 同口径）。
+      */
+     private String storagePath = "./data/snapshots";
++
++    /**
++     * ACK 超时扫描周期（秒，默认 60；{@code ot.publish.ack-scan-interval-seconds}）。
++     * 定时任务 fixedDelay（{@code PublishAckTimeoutScanner}，上次执行完毕后计时），
++     * 扫描逾窗未回执行置 2（幂等——已置 2 的不重复更新）。
++     */
++    private Integer ackScanIntervalSeconds = 60;
++
++    /**
++     * ACK 超时窗（秒，默认 300；{@code ot.publish.ack-timeout-seconds}）。
++     * ack_status=0 且 create_time 早于 now-本值 的行视为超时（扫描置 2 + error_msg 记
++     * 超时原因）；下发状态查询的派生字段 timedOut 同用本值（覆盖扫描间隔间隙）。
++     */
++    private Integer ackTimeoutSeconds = 300;
++
++    /**
++     * 接入服务下发目标标识（默认 ingest；{@code ot.publish.target-ingest-id}）。
++     * 网关 scope 发布落行的 target_type=2 行 target_id（接入服务以本标识定位自身待确认
++     * 版本，回执时按 (versionId, targetType=2, targetId=本值) 定位行）。
++     */
++    private String targetIngestId = "ingest";
++
++    /**
++     * 计算引擎下发目标标识（默认 calc；{@code ot.publish.target-calc-id}）。
++     * 计算 scope 发布落行的 target_type=3 行 target_id（计算引擎以本标识定位自身待确认
++     * 版本，回执时按 (versionId, targetType=3, targetId=本值) 定位行）。
++     */
++    private String targetCalcId = "calc";
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishSchedulingConfig.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishSchedulingConfig.java
+new file mode 100644
+index 0000000..97cbbba
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/config/PublishSchedulingConfig.java
+@@ -0,0 +1,20 @@
++package net.otlab.admin.module.iot.publish.config;
++
++import org.springframework.context.annotation.Configuration;
++import org.springframework.scheduling.annotation.EnableScheduling;
++
++/**
++ * 发布域定时任务开关（TASK-0025）——{@code @EnableScheduling} 挂发布域 config 类。
++ *
++ * <p>工程内无 quartz/xxl 依赖与既有 @Scheduled 先例（brief D3 裁决：Spring @Scheduled
++ * 即可）；本类启用调度后仅 {@code PublishAckTimeoutScanner} 一个任务注册（ACK 超时扫描，
++ * 周期 ot.publish.ack-scan-interval-seconds）。单测为 standalone Mockito（不起 Spring
++ * 上下文），调度器不随 mvn test 启动。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Configuration
++@EnableScheduling
++public class PublishSchedulingConfig {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java
+index 702c98a..400c217 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishController.java
+@@ -6,9 +6,13 @@ import io.swagger.v3.oas.annotations.Operation;
+ import io.swagger.v3.oas.annotations.tags.Tag;
+ import jakarta.validation.Valid;
+ import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.PublishLogListVO;
++import net.otlab.admin.module.iot.publish.dto.ResendForm;
+ import net.otlab.admin.module.iot.publish.dto.RollbackForm;
+ import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
+ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
+ import net.otlab.admin.module.iot.publish.service.IotPublishService;
+ import net.otlab.core.annotation.OperateLog;
+ import net.otlab.core.constant.BusinessType;
+@@ -22,21 +26,27 @@ import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+ 
+ /**
+- * 配置发布控制器（TASK-0024，配置发布页 4015 之下按钮权限行 4070-4073——发布链第一环）。
++ * 配置发布控制器（TASK-0024 建立四端点；TASK-0025 扩展下发状态查询与重发——配置发布页
++ * 4015 之下按钮权限行 4070-4073 + 4074）。
+  *
+- * <p>接口面四端点（权限标识与接口清单一一对应，升级脚本 20261122_iot_publish_domain.sql
+- * 头注登记）：
++ * <p>接口面六端点（权限标识与接口清单一一对应，升级脚本 20261122_iot_publish_domain.sql /
++ * 20261122_iot_publish_log.sql 头注登记）：
+  * <ul>
+  * <li>GET /iot/publish/list（iot:publish:list）——版本列表分页（version 降序）；</li>
+  * <li>GET /iot/publish/snapshot（iot:publish:query）——快照取回+哈希核对（version 缺省
+  *     最新版，照契约 §3.3）；</li>
+  * <li>POST /iot/publish/publish（iot:publish:publish）——发布生成单调新版本（并发
+  *     5001；确认门 NoOp 占位——TASK-0015 交付后接线）；</li>
+- * <li>POST /iot/publish/rollback（iot:publish:rollback）——回滚=新版本行复用旧快照。</li>
++ * <li>POST /iot/publish/rollback（iot:publish:rollback）——回滚=新版本行复用旧快照；</li>
++ * <li>GET /iot/publish/log/list（iot:publish:list 复用，不新增种子）——下发状态查询
++ *     （TASK-0025：行列表 + timedOut 派生 + 版本级 publishState 汇总）；</li>
++ * <li>POST /iot/publish/resend（iot:publish:resend，4074）——下发重发（TASK-0025：
++ *     失败/未回执行重置待确认并触发下发接缝；已生效 400）。</li>
+  * </ul>
+  *
+- * <p>发布/回滚属高危配置操作（REQ-0033「单独权限+审计」）：单独权限码 + 全量
+- * {@code @OperateLog} 审计。
++ * <p>发布/回滚/重发属高危配置操作（REQ-0033「单独权限+审计」）：单独权限码 + 全量
++ * {@code @OperateLog} 审计。下发 ACK 回执为内部端点（POST /internal/v1/config/ack，
++ * 见 IotPublishInternalController）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -49,6 +59,9 @@ public class IotPublishController {
+     @Autowired
+     private IotPublishService publishService;
+ 
++    @Autowired
++    private IotPublishLogService publishLogService;
++
+     @Operation(summary = "版本列表分页（version 降序；scope 必传——scopeType=1 网关 id / "
+             + "2 归一 0；数据权限防线：网关可见 / 计算管理员语义）")
+     @GetMapping("/list")
+@@ -88,4 +101,31 @@ public class IotPublishController {
+     public Result<IotConfigVersion> rollback(@Valid @RequestBody RollbackForm form) {
+         return Result.success(publishService.rollback(form));
+     }
++
++    /**
++     * 下发状态查询（TASK-0025，iot:publish:list 复用不新增种子）：versionId 或
++     * scopeType+scopeId+version 二选一——返回行列表（每版本目标数≤3，不分页）+ 每行派生
++     * timedOut + 版本级汇总 publishState（全部 ACK 生效为准，查询派生不改版本行状态）。
++     */
++    @Operation(summary = "下发状态查询（行列表不分页 + 每行 timedOut 派生 + 版本级 "
++            + "publishState 汇总：全部 ACK 生效=1 / 存在失败=2 / 下发中=0；versionId 或 "
++            + "scopeType+scopeId+version 二选一，都给以 versionId 为准校验一致性）")
++    @GetMapping("/log/list")
++    @SaCheckPermission("iot:publish:list")
++    public Result<PublishLogListVO> publishLog(@RequestParam(value = "versionId", required = false) Long versionId,
++                                               @RequestParam(value = "scopeType", required = false) Integer scopeType,
++                                               @RequestParam(value = "scopeId", required = false) Long scopeId,
++                                               @RequestParam(value = "version", required = false) Long version) {
++        return Result.success(publishLogService.listPublishLog(versionId, scopeType, scopeId, version));
++    }
++
++    @OperateLog(title = "配置发布", businessType = BusinessType.OTHER)
++    @Operation(summary = "下发重发（失败/未回执行重置待确认并触发下发接缝 NotifySender——"
++            + "NoOp 占位，TASK-0026 接线真实通知；已生效无需重发 400；versionId 或三元组 "
++            + "+ targetId 定位）")
++    @PostMapping("/resend")
++    @SaCheckPermission("iot:publish:resend")
++    public Result<IotConfigPublishLog> resend(@Valid @RequestBody ResendForm form) {
++        return Result.success(publishLogService.resend(form));
++    }
+ }
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java
+new file mode 100644
+index 0000000..2082681
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalController.java
+@@ -0,0 +1,64 @@
++package net.otlab.admin.module.iot.publish.controller;
++
++import io.swagger.v3.oas.annotations.Operation;
++import io.swagger.v3.oas.annotations.tags.Tag;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.validation.Valid;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.result.Result;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * 配置下发内部回执控制器（TASK-0025，POST /internal/v1/config/ack，详细设计 §3.3 p25）。
++ *
++ * <p><b>无 Sa-Token</b>：内部系统间接口（/internal/v1/**，详细设计 §3 p20 物理隔离）——
++ * {@code @Anonymous} 跳过管理面登录校验，认证由 InternalAuthChecker 承担：拦截器层
++ * {@code InternalAuthInterceptor} 先于本控制器执行（{@code GatewayInternalAuthConfig}
++ * 已覆盖 /internal/v1/**，本端点零注册成本接入），控制器内再显式调用一道（纵深防御，
++ * 0017/0019 同范式）；静态令牌 X-Internal-Token + IP 白名单，失败 401/403。
++ *
++ * <p><b>无管理面数据权限</b>（brief D7：内部令牌已收口）：回执定位 (version_id,
++ * target_type, target_id) 为内部服务（接入/计算引擎）已知坐标；ackStatus=1 生效（任意
++ * 旧态可置 1）/ 2 失败（errorMsg 必填，仅可从 0/2 覆盖——已生效 1 为终态不被失败回执
++ * 倒退）/ 0 拒绝 400。返回 data=true=已应用；data=false=忽略（已生效行收到过期失败
++ * 回执——终态不倒退，非错误）。
++ *
++ * <p>不挂 @OperateLog（内部运行链路，照 0017 心跳口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Tag(name = "配置下发内部回执（服务间）")
++@RestController
++@RequestMapping("/internal/v1/config")
++public class IotPublishInternalController {
++
++    @Autowired
++    private IotPublishLogService publishLogService;
++
++    @Autowired
++    private InternalAuthChecker internalAuthChecker;
++
++    /**
++     * 下发 ACK 回执：body {versionId 或 scopeType+scopeId+version 二选一, targetType(1/2/3),
++     * targetId, ackStatus(1 生效/2 失败), errorMsg}。
++     */
++    @Anonymous
++    @Operation(summary = "下发 ACK 回执（内部接口：静态令牌+IP 白名单；行定位 version_id+"
++            + "target_type+target_id；1 生效/2 失败（error_msg 必填，终态已生效不倒退）/"
++            + "0 拒绝；返回是否已应用）")
++    @PostMapping("/ack")
++    public Result<Boolean> ack(HttpServletRequest request, @Valid @RequestBody AckForm form) {
++        // 控制器层显式调用认证检查器（拦截器层已先行校验——纵深防御与 standalone 测试可达性；
++        // 认证先于一切载荷处理，0017/0019 内部端点同范式）
++        internalAuthChecker.check(request);
++        return Result.success(publishLogService.ack(form));
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/AckForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/AckForm.java
+new file mode 100644
+index 0000000..7db22ef
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/AckForm.java
+@@ -0,0 +1,63 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.NotNull;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 下发 ACK 回执请求表单（TASK-0025，POST /internal/v1/config/ack，详细设计 §3.3 p25）。
++ *
++ * <p>行定位 (version_id, target_type, target_id)：versionId 与 (scopeType+scopeId+version)
++ * 二选一——都给时以 versionId 为准校验一致性（三元组与版本行不符 400）。ackStatus 语义
++ * （服务层裁决）：1 生效（任意旧态可置 1，ack_time=NOW、error_msg 清空）；2 失败
++ * （errorMsg 必填，仅可从 0/2 覆盖——已生效 1 为终态不被失败回执倒退）；0 不接受（回执
++ * 只有生效/失败两种）→ 400。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "下发 ACK 回执表单（TASK-0025）")
++public class AckForm {
++
++    @Schema(description = "配置版本 ID（iot_config_version.id；与三元组二选一，都给以本字段为准校验一致性）")
++    private Long versionId;
++
++    @Min(value = 1, message = "scopeType 只允许 1 网关 2 计算")
++    @Max(value = 2, message = "scopeType 只允许 1 网关 2 计算")
++    @Schema(description = "范围 1 网关 2 计算（三元组定位用，与 versionId 二选一）")
++    private Integer scopeType;
++
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）")
++    private Long scopeId;
++
++    @Min(value = 1, message = "version 必须为正整数")
++    @Schema(description = "版本号（三元组定位用，与 versionId 二选一）")
++    private Long version;
++
++    @NotNull(message = "targetType 不能为空")
++    @Min(value = 1, message = "targetType 只允许 1 网关 2 接入 3 计算")
++    @Max(value = 3, message = "targetType 只允许 1 网关 2 接入 3 计算")
++    @Schema(description = "目标 1 网关 2 接入 3 计算", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer targetType;
++
++    @NotBlank(message = "targetId 不能为空")
++    @Size(max = 64, message = "targetId 上限 64 字符")
++    @Schema(description = "目标标识（网关=gateway_code；接入/计算=配置化服务标识）",
++            requiredMode = Schema.RequiredMode.REQUIRED)
++    private String targetId;
++
++    @NotNull(message = "ackStatus 不能为空")
++    @Min(value = 0, message = "ackStatus 只允许 0/1/2（0 拒绝）")
++    @Max(value = 2, message = "ackStatus 只允许 1 生效 2 失败（0 不接受）")
++    @Schema(description = "回执 1 生效 2 失败（0 不接受，400）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private Integer ackStatus;
++
++    @Size(max = 1000, message = "errorMsg 上限 1000 字符")
++    @Schema(description = "失败原因（ackStatus=2 必填；ackStatus=1 时忽略并清空存量）")
++    private String errorMsg;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogListVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogListVO.java
+new file mode 100644
+index 0000000..312eba1
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogListVO.java
+@@ -0,0 +1,51 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.util.List;
++
++/**
++ * 下发状态查询视图（TASK-0025，GET /iot/publish/log/list）——版本信封 + 行列表（每版本
++ * 目标数≤3，不分页）+ 版本级汇总 publishState。
++ *
++ * <p>publishState 口径（brief D6：「发布完成以全部 ACK 生效为准」为查询派生口径，不改
++ * iot_config_version.publish_status——TD-0034 生效以发布为准）：全部行 ack_status=1 →
++ * 1 已生效；存在 2 → 2 存在失败；否则（含 0 待确认与空行集）→ 0 下发中。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "下发状态查询视图（TASK-0025）")
++public class PublishLogListVO {
++
++    /** publishState：下发中（存在 0 待确认或空行集） */
++    public static final int STATE_DELIVERING = 0;
++    /** publishState：已生效（全部行 ack_status=1） */
++    public static final int STATE_EFFECTIVE = 1;
++    /** publishState：存在失败（任一行 ack_status=2） */
++    public static final int STATE_FAILED = 2;
++
++    @Schema(description = "配置版本 ID（iot_config_version.id）")
++    private Long versionId;
++
++    @Schema(description = "范围 1 网关 2 计算")
++    private Integer scopeType;
++
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度）")
++    private Long scopeId;
++
++    @Schema(description = "版本号")
++    private Long version;
++
++    @Schema(description = "版本级汇总 0 下发中 1 已生效（全部 ACK 生效）2 存在失败")
++    private Integer publishState;
++
++    @Schema(description = "下发记录行列表（每版本目标数≤3，不分页，target_type 升序）")
++    private List<PublishLogRowVO> rows;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogRowVO.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogRowVO.java
+new file mode 100644
+index 0000000..51bc3c0
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/PublishLogRowVO.java
+@@ -0,0 +1,53 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.NoArgsConstructor;
++
++import java.time.LocalDateTime;
++
++/**
++ * 下发记录行视图（TASK-0025，GET /iot/publish/log/list 行元素）。
++ *
++ * <p>派生字段 timedOut：ack_status=0（待确认）且 create_time 已超超时窗
++ * （ot.publish.ack-timeout-seconds）即 true——覆盖扫描间隔间隙（扫描周期内逾窗未及置 2
++ * 的行在查询侧即时标红），与扫描置 2 的终态互不替代（扫描才是落库事实，timedOut 只作
++ * 展示派生，不改行）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@Schema(description = "下发记录行视图（含 timedOut 派生）")
++public class PublishLogRowVO {
++
++    @Schema(description = "下发记录ID")
++    private Long id;
++
++    @Schema(description = "配置版本 ID")
++    private Long versionId;
++
++    @Schema(description = "目标 1 网关 2 接入 3 计算")
++    private Integer targetType;
++
++    @Schema(description = "目标标识")
++    private String targetId;
++
++    @Schema(description = "回执 0 待确认 1 生效 2 失败")
++    private Integer ackStatus;
++
++    @Schema(description = "回执时间")
++    private LocalDateTime ackTime;
++
++    @Schema(description = "失败原因（含超时原因）")
++    private String errorMsg;
++
++    @Schema(description = "落行时间（=发布/回滚版本落库时间）")
++    private LocalDateTime createTime;
++
++    @Schema(description = "派生：待确认且已超超时窗（扫描间隙内的即时标红，不改行）")
++    private Boolean timedOut;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ResendForm.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ResendForm.java
+new file mode 100644
+index 0000000..d7c5589
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/dto/ResendForm.java
+@@ -0,0 +1,45 @@
++package net.otlab.admin.module.iot.publish.dto;
++
++import io.swagger.v3.oas.annotations.media.Schema;
++import jakarta.validation.constraints.Min;
++import jakarta.validation.constraints.Max;
++import jakarta.validation.constraints.NotBlank;
++import jakarta.validation.constraints.Size;
++import lombok.Data;
++
++/**
++ * 下发重发请求表单（TASK-0025，POST /iot/publish/resend，iot:publish:resend 4074）。
++ *
++ * <p>行定位：versionId 或 (scopeType+scopeId+version) 三元组二选一（都给以 versionId 为准
++ * 校验一致性，同 ACK 口径）+ targetId 命中该版本下的下发记录行（须唯一——网关码与接入
++ * 标识撞名等多行命中 400）。前置：行 ack_status=2（含超时标红）或 0（未回执想重推）→
++ * 重置 ack_status=0、error_msg=NULL、update_time 刷新并触发下发接缝 NotifySender；
++ * ack_status=1 → 400「已生效无需重发」。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@Schema(description = "下发重发表单（TASK-0025）")
++public class ResendForm {
++
++    @Schema(description = "配置版本 ID（iot_config_version.id；与三元组二选一，都给以本字段为准校验一致性）")
++    private Long versionId;
++
++    @Min(value = 1, message = "scopeType 只允许 1 网关 2 计算")
++    @Max(value = 2, message = "scopeType 只允许 1 网关 2 计算")
++    @Schema(description = "范围 1 网关 2 计算（三元组定位用，与 versionId 二选一）")
++    private Integer scopeType;
++
++    @Schema(description = "范围对象 ID（1=网关 id；2=0 租户粒度，服务层归一）")
++    private Long scopeId;
++
++    @Min(value = 1, message = "version 必须为正整数")
++    @Schema(description = "版本号（三元组定位用，与 versionId 二选一）")
++    private Long version;
++
++    @NotBlank(message = "targetId 不能为空")
++    @Size(max = 64, message = "targetId 上限 64 字符")
++    @Schema(description = "目标标识（该版本下发记录行的 target_id）", requiredMode = Schema.RequiredMode.REQUIRED)
++    private String targetId;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigPublishLog.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigPublishLog.java
+new file mode 100644
+index 0000000..a54f5f6
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/entity/IotConfigPublishLog.java
+@@ -0,0 +1,69 @@
++package net.otlab.admin.module.iot.publish.entity;
++
++import com.baomidou.mybatisplus.annotation.IdType;
++import com.baomidou.mybatisplus.annotation.TableId;
++import com.baomidou.mybatisplus.annotation.TableName;
++import io.swagger.v3.oas.annotations.media.Schema;
++import lombok.AllArgsConstructor;
++import lombok.Data;
++import lombok.EqualsAndHashCode;
++import lombok.NoArgsConstructor;
++import net.otlab.core.base.BaseEntity;
++
++import java.time.LocalDateTime;
++
++/**
++ * 配置下发记录实体类（TASK-0025，详细设计附录 A p33 逐字 DDL）
++ *
++ * <p>iot_config_publish_log 表随本任务升级脚本（20261122_iot_publish_log.sql）建立，DDL
++ * 逐字照附录 A p33（与上游无列差异）。头注登记两点（升级脚本 20261122_iot_publish_log.sql）：
++ * <ul>
++ * <li>不追加 uk_version_target 唯一键——版本行由 {@code uk_scope_version} 单调保证，log 行
++ *     与版本同事务一次性写入、重发不新增行（重置原行 ack_status），无并发重复路径；</li>
++ * <li>target_id 语义：网关= gateway_code；接入/计算=配置化服务标识
++ *     （ot.publish.target-ingest-id / ot.publish.target-calc-id）。</li>
++ * </ul>
++ *
++ * <p><b>多租户特例</b>：本表无 tenant_id 列（上游逐字），下发记录经 version_id →
++ * iot_config_version（含 tenant_id）间接归属租户。{@link IotConfigPublishLogMapper} 以
++ * {@code @InterceptorIgnore(tenantLine = "true")} 旁路多租户插件，租户边界由服务层保证
++ * （管理面先按会话租户解析版本行再取本表行；内部 ACK 无管理面数据权限；超时扫描系统级
++ * 全表——见 mapper 与升级脚本头注）。
++ *
++ * <p>回执三态 ack_status：0 待确认（发布/回滚落行初值）→ 1 已生效（终态，任意旧态可置 1）
++ * / 2 失败（仅可从 0/2 覆盖——已生效 1 为终态不被失败回执倒退，防过期失败回执回归；
++ * 超时扫描把逾窗未回执的 0 置 2 并记 error_msg）。重发=重置原行 0 并触发下发接缝
++ * （{@code NotifySender}），不新增行。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Data
++@NoArgsConstructor
++@AllArgsConstructor
++@EqualsAndHashCode(callSuper = true)
++@TableName("iot_config_publish_log")
++@Schema(description = "配置下发记录（TASK-0025）")
++public class IotConfigPublishLog extends BaseEntity {
++    @TableId(type = IdType.AUTO)
++    @Schema(description = "下发记录ID")
++    private Long id;
++
++    @Schema(description = "配置版本 ID（iot_config_version.id）")
++    private Long versionId;
++
++    @Schema(description = "目标 1 网关 2 接入 3 计算")
++    private Integer targetType;
++
++    @Schema(description = "目标标识（网关=gateway_code；接入/计算=配置化服务标识）")
++    private String targetId;
++
++    @Schema(description = "回执 0 待确认 1 生效 2 失败")
++    private Integer ackStatus;
++
++    @Schema(description = "回执时间（置 1 生效时=NOW）")
++    private LocalDateTime ackTime;
++
++    @Schema(description = "失败原因（置 2 必填；置 1 清空；超时扫描记超时原因）")
++    private String errorMsg;
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigPublishLogMapper.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigPublishLogMapper.java
+new file mode 100644
+index 0000000..a0a828f
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/mapper/IotConfigPublishLogMapper.java
+@@ -0,0 +1,33 @@
++package net.otlab.admin.module.iot.publish.mapper;
++
++import com.baomidou.mybatisplus.annotation.InterceptorIgnore;
++import com.baomidou.mybatisplus.core.mapper.BaseMapper;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
++import org.apache.ibatis.annotations.Mapper;
++
++/**
++ * 配置下发记录 Mapper（TASK-0025）
++ *
++ * <p><b>旁路多租户插件（接口级 {@code @InterceptorIgnore(tenantLine = "true")}）</b>：
++ * iot_config_publish_log 为 iot_ 前缀表，会话租户存在时 OtTenantLineHandler 会对其注入
++ * tenant_id 条件/列——而本表按上游附录 A p33 逐字 DDL <b>无 tenant_id 列</b>（下发记录经
++ * version_id → iot_config_version（含 tenant_id、uk_scope_version）间接归属租户），不旁路
++ * 则全部语句报「Unknown column 'tenant_id'」。照 IotGatewayCodeMapper / IotDataItemRefMapper
++ * 既有显式条件旁路范式：租户边界由服务层保证——
++ * <ul>
++ * <li>管理面（下发状态查询 / 重发）：先按会话租户解析 version 行（iot_config_version 查询
++ *     带租户注入，跨租户 versionId 解析不到即 400）再按 version_id 取本表行；</li>
++ * <li>内部 ACK（/internal/v1/config/ack）：无管理面数据权限（内部令牌已收口，brief D7）；</li>
++ * <li>超时扫描：系统级定时任务（无会话），跨租户全表扫描即上游语义。</li>
++ * </ul>
++ *
++ * <p>@TableLogic 逻辑删对本表常规保留（deleted 恒 0——下发记录无删除途径，照
++ * IotConfigVersion 防御性保留口径）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Mapper
++@InterceptorIgnore(tenantLine = "true")
++public interface IotConfigPublishLogMapper extends BaseMapper<IotConfigPublishLog> {
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java
+new file mode 100644
+index 0000000..3a24daa
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NoOpNotifySender.java
+@@ -0,0 +1,28 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++import lombok.extern.slf4j.Slf4j;
++import org.springframework.stereotype.Component;
++
++/**
++ * 下发通知 NoOp 实现（TASK-0025 占位——恒空操作，<b>发布/重发不阻断</b>）。
++ *
++ * <p>config.changed 真实通知（MQTT/消息通道触发下游拉快照比对哈希）与
++ * /internal/v1/config/snapshot 快照拉取端点归 TASK-0026 交付——届时以真实现替换本 Bean
++ * （同类型唯一 Bean 覆盖或配置类显式装配），发布落行后 / 重发重置后的调用点不扩散
++ * （接口 {@link NotifySender} javadoc 载明接线义务）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class NoOpNotifySender implements NotifySender {
++
++    @Override
++    public void notify(Long versionId, Integer targetType, String targetId) {
++        // 占位空操作：TASK-0026 交付后替换为真实 config.changed 通知实现（REQ-0033——
++        // 通知只作触发信号，下游拉快照比对哈希）。本期发布/重发不阻断（brief D5/D8）。
++        log.debug("[PUBLISH-NOTIFY] NoOp notify versionId={} targetType={} targetId={}",
++                versionId, targetType, targetId);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java
+new file mode 100644
+index 0000000..ab8e503
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/NotifySender.java
+@@ -0,0 +1,30 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++/**
++ * 下发通知接缝（TASK-0025）——语义=触发 config.changed 下发（REQ-0033：通知只带版本号
++ * 与哈希、只作触发信号，下游必须拉快照比对哈希不得信任通知内容；真实通知归 TASK-0026）。
++ *
++ * <p><b>调用点（本期两处，brief D5）</b>：
++ * <ol>
++ * <li>发布/回滚落行后——每个目标行调用一次（网关 scope 两行=两次调用）；</li>
++ * <li>重发重置后——该目标行调用一次。</li>
++ * </ol>
++ *
++ * <p><b>接线义务（TASK-0026 交付时）</b>：以真实实现替换 {@link NoOpNotifySender}
++ * （同类型唯一 Bean 覆盖或配置类显式装配），调用点不扩散（接口即接缝，照 TASK-0024
++ * PublishConfirmGate NoOp 范式）。本期 {@code NoOp} 占位恒空操作，<b>发布/重发不阻断</b>。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface NotifySender {
++
++    /**
++     * 触发一次 config.changed 下发信号（本期 NoOp 占位）
++     *
++     * @param versionId  配置版本 ID（iot_config_version.id，= 下发记录 version_id）
++     * @param targetType 目标 1 网关 2 接入 3 计算
++     * @param targetId   目标标识（网关=gateway_code；接入/计算=配置化服务标识）
++     */
++    void notify(Long versionId, Integer targetType, String targetId);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PublishAckTimeoutScanner.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PublishAckTimeoutScanner.java
+new file mode 100644
+index 0000000..425c0a7
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/notify/PublishAckTimeoutScanner.java
+@@ -0,0 +1,50 @@
++package net.otlab.admin.module.iot.publish.notify;
++
++import lombok.extern.slf4j.Slf4j;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/**
++ * ACK 超时扫描定时任务（TASK-0025，brief D3）——Spring {@code @Scheduled}（无 quartz/xxl
++ * 依赖，{@code @EnableScheduling} 挂 {@code PublishSchedulingConfig}）。
++ *
++ * <p>周期 {@code ot.publish.ack-scan-interval-seconds}（默认 60 秒，fixedDelayString——
++ * 上次执行完毕后计时；配置为秒、注解须毫秒，SpEL {@code #{${...:60} * 1000}} 转换，
++ * initialDelay 同值避免启动即扫）。扫描 ack_status=0 且 create_time 早于
++ * now-{@code ot.publish.ack-timeout-seconds}（默认 300）的行 → 置 2 + error_msg 记超时
++ * 原因（幂等——按行条件更新 ack_status=0，已置 2 的不重复更新，重发回 0 行未逾窗不受
++ * 影响）。异常仅记 ERROR 不上抛（调度器健康优先，下轮重扫）。
++ *
++ * <p>无会话上下文（调度线程）→ 多租户插件跳过注入——扫描为系统级跨租户全表（上游 DDL
++ * 无 tenant_id 列的天然语义，mapper 头注登记）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Slf4j
++@Component
++public class PublishAckTimeoutScanner {
++
++    private final IotPublishLogService publishLogService;
++
++    public PublishAckTimeoutScanner(IotPublishLogService publishLogService) {
++        this.publishLogService = publishLogService;
++    }
++
++    /**
++     * ACK 超时扫描：逾窗未回执行置 2（返回标红行数>0 时记 INFO 供运维观察）。
++     */
++    @Scheduled(fixedDelayString = "#{${ot.publish.ack-scan-interval-seconds:60} * 1000}",
++            initialDelayString = "#{${ot.publish.ack-scan-interval-seconds:60} * 1000}")
++    public void scanAckTimeout() {
++        try {
++            int marked = publishLogService.markAckTimeout();
++            if (marked > 0) {
++                log.info("[PUBLISH-ACK] timeout scan marked {} publish-log row(s) as failed", marked);
++            }
++        } catch (Exception e) {
++            log.error("[PUBLISH-ACK] timeout scan failed (next round retries)", e);
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishLogService.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishLogService.java
+new file mode 100644
+index 0000000..da7df00
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/IotPublishLogService.java
+@@ -0,0 +1,97 @@
++package net.otlab.admin.module.iot.publish.service;
++
++import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.dto.PublishLogListVO;
++import net.otlab.admin.module.iot.publish.dto.ResendForm;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++
++/**
++ * 配置下发记录服务（TASK-0025，FEAT-0008/REQ-0033——发布链第二环：下发记录落行 + ACK
++ * 回执 + 超时扫描 + 重发 + 下发状态查询）。
++ *
++ * <p>落行：发布/回滚（=重新下发）版本落库后<b>同事务</b>按 scope 派生目标插入
++ * iot_config_publish_log（ack_status=0）并逐行触发通知接缝 NotifySender（NoOp 占位，
++ * TASK-0026 接真实 config.changed 通知——接口即接缝，本期不阻断）。
++ *
++ * <p>ACK 回执（内部接口，POST /internal/v1/config/ack）：行定位 (version_id,
++ * target_type, target_id)；ackStatus=1 生效（任意旧态可置 1，ack_time=NOW、error_msg
++ * 清空）/ 2 失败（error_msg 必填，仅可从 0/2 覆盖——已生效 1 为终态不被失败回执倒退，
++ * 防过期失败回执回归）/ 0 拒绝 400；versionId 与三元组都给以 versionId 为准校验一致性。
++ *
++ * <p>超时扫描（定时任务 {@code PublishAckTimeoutScanner}）：ack_status=0 且 create_time
++ * 逾 ot.publish.ack-timeout-seconds 窗 → 置 2 + error_msg 记超时原因（幂等——按行条件
++ * 更新，已置 2 的不重复更新）。
++ *
++ * <p>重发（管理面，POST /iot/publish/resend，iot:publish:resend 4074）：ack_status=2/0
++ * 行重置 0（error_msg=NULL、update_time 刷新）并触发通知接缝；已生效行 400。下发状态
++ * 查询（管理面，GET /iot/publish/log/list，iot:publish:list 复用）：行列表（不分页）+
++ * 每行派生 timedOut（覆盖扫描间隔间隙）+ 版本级汇总 publishState（全部 ACK 生效为准，
++ * 查询派生口径不改版本行状态——TD-0034）。
++ *
++ * <p>多租户：iot_config_publish_log 无 tenant_id 列（上游逐字 DDL），mapper 旁路多租户
++ * 插件；租户边界由服务层保证——管理面先按会话租户解析 version 行（跨租户 versionId
++ * 解析不到即 400）再按 version_id 取本表行；内部 ACK 无管理面数据权限（内部令牌已收口）；
++ * 扫描系统级全表（无会话，调度线程）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++public interface IotPublishLogService {
++
++    /**
++     * 下发记录落行（发布/回滚版本落库后同事务调用）：按 scope 派生目标并插入
++     * iot_config_publish_log（ack_status=0）+ 逐行调用 NotifySender。
++     *
++     * <p>派生规则：scope_type=1 网关 → 两行（targetType=1 targetId=网关 gatewayCode；
++     * targetType=2 targetId=ot.publish.target-ingest-id）；scope_type=2 计算 → 一行
++     * （targetType=3 targetId=ot.publish.target-calc-id）。
++     *
++     * @param version 已落库的版本行（id 即 version_id）
++     */
++    void recordDispatch(IotConfigVersion version);
++
++    /**
++     * ACK 回执（内部接口）：定位行并按 ackStatus 语义更新。
++     *
++     * @param form 回执表单（versionId 或三元组定位 + targetType/targetId/ackStatus/errorMsg）
++     * @return true=回执已应用；false=忽略（已生效行收到过期失败回执——终态不倒退，非错误）
++     * @throws net.otlab.core.exception.BusinessException 400：定位要素不全/行不存在/
++     *         ackStatus=0/失败回执缺 errorMsg/versionId 与三元组不一致/三元组跨租户不唯一
++     */
++    boolean ack(AckForm form);
++
++    /**
++     * ACK 超时扫描：逾窗（create_time < now - ack-timeout-seconds）未回执行置 2 +
++     * error_msg='ACK 超时（超过 N 秒未回执）'（N=配置超时秒）；幂等（已置 2 的不重复更新，
++     * 按行条件更新防与 ACK 生效竞态倒退）。
++     *
++     * @return 本轮标红行数
++     */
++    int markAckTimeout();
++
++    /**
++     * 重发（管理面）：ack_status=2（含超时标红）或 0 行重置 ack_status=0、error_msg=NULL、
++     * update_time 刷新，并调用通知接缝 NotifySender（触发 config.changed 下发）。
++     *
++     * @param form 重发表单（versionId 或三元组 + targetId）
++     * @return 重置后的下发记录行
++     * @throws net.otlab.core.exception.BusinessException 400：行不存在/targetId 命中多行/
++     *         已生效无需重发（ack_status=1）
++     */
++    IotConfigPublishLog resend(ResendForm form);
++
++    /**
++     * 下发状态查询（管理面）：版本信封 + 行列表（每版本目标数≤3，不分页）+ 每行派生
++     * timedOut + 版本级汇总 publishState（全部行已生效=1 / 存在失败=2 / 否则含空行集=0）。
++     *
++     * @param versionId 配置版本 ID（与三元组二选一，都给以本字段为准校验一致性）
++     * @param scopeType 三元组定位：范围 1 网关 2 计算
++     * @param scopeId   三元组定位：范围对象 ID（2 归一 0）
++     * @param version   三元组定位：版本号
++     * @return 下发状态查询视图
++     * @throws net.otlab.core.exception.BusinessException 400：定位要素不全/版本不存在
++     *         （含跨租户）/versionId 与三元组不一致
++     */
++    PublishLogListVO listPublishLog(Long versionId, Integer scopeType, Long scopeId, Long version);
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java
+new file mode 100644
+index 0000000..dbcfdd2
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImpl.java
+@@ -0,0 +1,384 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.dto.PublishLogListVO;
++import net.otlab.admin.module.iot.publish.dto.PublishLogRowVO;
++import net.otlab.admin.module.iot.publish.dto.ResendForm;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigPublishLogMapper;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.notify.NotifySender;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.utils.SecurityUtils;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++import java.time.LocalDateTime;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++
++/**
++ * 配置下发记录服务实现（TASK-0025，发布链第二环——下发记录落行 + ACK 回执 + 超时扫描 +
++ * 重发 + 下发状态查询）。
++ *
++ * <p><b>多租户边界</b>（mapper 头注登记）：iot_config_publish_log 无 tenant_id 列（上游
++ * 逐字 DDL），{@code IotConfigPublishLogMapper} 旁路多租户插件——本服务保证租户边界：
++ * 管理面（重发/查询）先按会话租户解析版本行（iot_config_version 查询带租户注入，跨租户
++ * versionId 解析不到即 400）再按 version_id 取本表行；内部 ACK 无管理面数据权限（内部
++ * 令牌已收口，brief D7）；超时扫描系统级全表（无会话，调度线程——上游语义）。
++ *
++ * <p><b>终态保护</b>：ack_status=1 已生效为终态——失败回执仅可从 0/2 覆盖（防过期失败
++ * 回执回归）；生效回执任意旧态可置 1（失败后补生效是正常恢复路径）。写更新全部带
++ * ack_status 条件（按行条件更新），与并发 ACK 竞态下不会把已生效行改写倒退。
++ *
++ * <p><b>定位口径</b>：versionId 与 (scopeType+scopeId+version) 三元组二选一——都给时以
++ * versionId 为准校验一致性（三元组须齐全且与版本行相符，不符 400）；三元组定位经
++ * selectList 检出跨租户同名多行（内部链路无租户注入时可能）→ 400 要求携带 versionId。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Service
++public class IotPublishLogServiceImpl implements IotPublishLogService {
++
++    private static final Logger log = LoggerFactory.getLogger(IotPublishLogServiceImpl.class);
++
++    /** 回执语义：0 待确认 1 生效 2 失败（附录 A p33 iot_config_publish_log.ack_status） */
++    private static final int ACK_PENDING = 0;
++    private static final int ACK_EFFECTIVE = 1;
++    private static final int ACK_FAILED = 2;
++
++    /** 目标 1 网关 2 接入 3 计算（附录 A p33 target_type） */
++    private static final int TARGET_GATEWAY = 1;
++    private static final int TARGET_INGEST = 2;
++    private static final int TARGET_CALC = 3;
++
++    private final IotConfigPublishLogMapper publishLogMapper;
++    private final IotConfigVersionMapper versionMapper;
++    private final IotGatewayMapper gatewayMapper;
++    private final PublishProperties properties;
++    private final PublishScopeGuard scopeGuard;
++    private final NotifySender notifySender;
++
++    public IotPublishLogServiceImpl(IotConfigPublishLogMapper publishLogMapper,
++                                    IotConfigVersionMapper versionMapper,
++                                    IotGatewayMapper gatewayMapper,
++                                    PublishProperties properties,
++                                    PublishScopeGuard scopeGuard,
++                                    NotifySender notifySender) {
++        this.publishLogMapper = publishLogMapper;
++        this.versionMapper = versionMapper;
++        this.gatewayMapper = gatewayMapper;
++        this.properties = properties;
++        this.scopeGuard = scopeGuard;
++        this.notifySender = notifySender;
++    }
++
++    // ---------- 下发记录落行（发布/回滚版本落库后同事务） ----------
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void recordDispatch(IotConfigVersion version) {
++        List<IotConfigPublishLog> targets = deriveTargets(version);
++        for (IotConfigPublishLog row : targets) {
++            publishLogMapper.insert(row);
++            notifySender.notify(version.getId(), row.getTargetType(), row.getTargetId());
++        }
++        log.info("[PUBLISH-LOG] dispatch rows written versionId={} scope={}-{} version={} rows={}",
++                version.getId(), version.getScopeType(), version.getScopeId(), version.getVersion(), targets.size());
++    }
++
++    /**
++     * 按 scope 派生下发目标（brief D1）：网关 scope → 两行（1/网关 gatewayCode +
++     * 2/接入服务标识）；计算 scope → 一行（3/计算引擎标识）。网关行经 IotGatewayMapper
++     * 读 gateway_code（会话租户注入过滤——与发布防线同源）。
++     */
++    private List<IotConfigPublishLog> deriveTargets(IotConfigVersion version) {
++        List<IotConfigPublishLog> targets = new ArrayList<>();
++        if (version.getScopeType() != null && version.getScopeType() == PublishScopeGuard.SCOPE_COMPUTE) {
++            targets.add(buildRow(version, TARGET_CALC, properties.getTargetCalcId()));
++            return targets;
++        }
++        IotGateway gateway = version.getScopeId() == null ? null
++                : gatewayOf(version.getScopeId());
++        if (gateway == null || gateway.getGatewayCode() == null || gateway.getGatewayCode().isBlank()) {
++            throw new BusinessException(ResultCode.ERROR.getCode(),
++                    "下发记录落行失败：网关不存在或缺少 gateway_code: " + version.getScopeId());
++        }
++        targets.add(buildRow(version, TARGET_GATEWAY, gateway.getGatewayCode()));
++        targets.add(buildRow(version, TARGET_INGEST, properties.getTargetIngestId()));
++        return targets;
++    }
++
++    /** 网关行目标读取（IotGatewayMapper 会话租户注入——跨租户 scopeId 取不到即 fail-closed） */
++    private IotGateway gatewayOf(Long scopeId) {
++        return gatewayMapper.selectById(scopeId);
++    }
++
++    private IotConfigPublishLog buildRow(IotConfigVersion version, int targetType, String targetId) {
++        IotConfigPublishLog row = new IotConfigPublishLog();
++        row.setVersionId(version.getId());
++        row.setTargetType(targetType);
++        row.setTargetId(targetId);
++        row.setAckStatus(ACK_PENDING);
++        return row;
++    }
++
++    // ---------- 定位（versionId 与三元组二选一，都给以 versionId 为准校验一致性） ----------
++
++    private IotConfigVersion resolveVersionRow(Long versionId, Integer scopeType, Long scopeId, Long version) {
++        boolean hasTriple = scopeType != null || scopeId != null || version != null;
++        if (versionId == null && !hasTriple) {
++            throw paramError("versionId 与 (scopeType+scopeId+version) 至少提供一种定位");
++        }
++        if (versionId != null) {
++            IotConfigVersion row = versionMapper.selectById(versionId);
++            if (row == null) {
++                // 管理面链路 selectById 带会话租户注入——跨租户 versionId 在此解析不到
++                throw paramError("下发记录所属版本不存在: " + versionId);
++            }
++            if (hasTriple) {
++                if (scopeType == null || scopeId == null || version == null) {
++                    throw paramError("三元组不全（scopeType+scopeId+version 须齐全），无法一致性校验");
++                }
++                Integer wantType = scopeGuard.normalizeScopeType(scopeType);
++                Long wantId = scopeGuard.normalizeScopeId(wantType, scopeId);
++                if (!wantType.equals(row.getScopeType()) || !wantId.equals(row.getScopeId())
++                        || !version.equals(row.getVersion())) {
++                    throw paramError("versionId 与 (scopeType+scopeId+version) 不一致");
++                }
++            }
++            return row;
++        }
++        // 三元组定位：三要素齐全（scopeId 按计算 scope 归一口径归一 0）
++        if (scopeType == null || version == null) {
++            throw paramError("定位要素不全（scopeType+scopeId+version 三元组须齐全）");
++        }
++        Integer type = scopeGuard.normalizeScopeType(scopeType);
++        Long id = scopeGuard.normalizeScopeId(type, scopeId);
++        List<IotConfigVersion> rows = versionMapper.selectList(new LambdaQueryWrapper<IotConfigVersion>()
++                .eq(IotConfigVersion::getScopeType, type)
++                .eq(IotConfigVersion::getScopeId, id)
++                .eq(IotConfigVersion::getVersion, version));
++        if (rows.isEmpty()) {
++            throw paramError("下发记录所属版本不存在: (scopeType=" + type + ", scopeId=" + id
++                    + ", version=" + version + ")");
++        }
++        if (rows.size() > 1) {
++            // 内部链路（无会话租户注入）三元组可能跨租户重名——拒绝歧义定位
++            throw paramError("三元组命中多个版本（跨租户同名），请携带 versionId 精确定位");
++        }
++        return rows.get(0);
++    }
++
++    // ---------- ACK 回执 ----------
++
++    @Override
++    public boolean ack(AckForm form) {
++        Integer ackStatus = form.getAckStatus();
++        if (ackStatus == null || ackStatus == ACK_PENDING) {
++            throw paramError("ackStatus=0 不接受（回执只有 1 生效 / 2 失败）");
++        }
++        boolean effective = ackStatus == ACK_EFFECTIVE;
++        String errorMsg = form.getErrorMsg() == null ? null : form.getErrorMsg().trim();
++        if (!effective && (errorMsg == null || errorMsg.isBlank())) {
++            throw paramError("失败回执 errorMsg 必填（ackStatus=2）");
++        }
++        IotConfigVersion version = resolveVersionRow(form.getVersionId(), form.getScopeType(),
++                form.getScopeId(), form.getVersion());
++
++        IotConfigPublishLog row = publishLogMapper.selectOne(new LambdaQueryWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getVersionId, version.getId())
++                .eq(IotConfigPublishLog::getTargetType, form.getTargetType())
++                .eq(IotConfigPublishLog::getTargetId, form.getTargetId()));
++        if (row == null) {
++            throw paramError("下发记录不存在: (versionId=" + version.getId()
++                    + ", targetType=" + form.getTargetType() + ", targetId=" + form.getTargetId() + ")");
++        }
++        if (!effective && row.getAckStatus() != null && row.getAckStatus() == ACK_EFFECTIVE) {
++            // 快路径终态保护：已生效行收到失败回执 → 忽略不倒退（零更新；并发窗口内的迟到
++            // 写入由下方条件更新 WHERE ack_status IN (0,2) 兜底）
++            log.info("[PUBLISH-ACK] expired failure receipt ignored (already effective) versionId={} targetId={}",
++                    version.getId(), form.getTargetId());
++            return false;
++        }
++
++        if (effective) {
++            // 生效：任意旧态可置 1——ack_status=1、ack_time=NOW、error_msg 清空（失败后补
++            // 生效是正常恢复路径；按行条件更新天然幂等）
++            publishLogMapper.update(null, new LambdaUpdateWrapper<IotConfigPublishLog>()
++                    .eq(IotConfigPublishLog::getId, row.getId())
++                    .set(IotConfigPublishLog::getAckStatus, ACK_EFFECTIVE)
++                    .set(IotConfigPublishLog::getAckTime, LocalDateTime.now())
++                    .set(IotConfigPublishLog::getErrorMsg, null)
++                    .set(IotConfigPublishLog::getUpdateTime, LocalDateTime.now()));
++            log.info("[PUBLISH-ACK] effective versionId={} targetType={} targetId={}",
++                    version.getId(), form.getTargetType(), form.getTargetId());
++            return true;
++        }
++
++        // 失败：仅可从 0/2 覆盖——已生效 1 为终态不被失败回执倒退（防过期失败回执回归）。
++        // 条件更新防竞态：SELECT 后、UPDATE 前并发生效回执写入 → WHERE ack_status IN (0,2)
++        // 不命中 → 复查按终态语义返回 false。
++        int affected = publishLogMapper.update(null, new LambdaUpdateWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getId, row.getId())
++                .in(IotConfigPublishLog::getAckStatus, List.of(ACK_PENDING, ACK_FAILED))
++                .set(IotConfigPublishLog::getAckStatus, ACK_FAILED)
++                .set(IotConfigPublishLog::getErrorMsg, errorMsg)
++                .set(IotConfigPublishLog::getUpdateTime, LocalDateTime.now()));
++        if (affected > 0) {
++            log.info("[PUBLISH-ACK] failed versionId={} targetType={} targetId={} msg={}",
++                    version.getId(), form.getTargetType(), form.getTargetId(), errorMsg);
++            return true;
++        }
++        IotConfigPublishLog latest = publishLogMapper.selectById(row.getId());
++        if (latest != null && latest.getAckStatus() == ACK_EFFECTIVE) {
++            log.info("[PUBLISH-ACK] expired failure receipt ignored (already effective) versionId={} targetId={}",
++                    version.getId(), form.getTargetId());
++            return false;
++        }
++        throw paramError("失败回执应用失败（并发状态变更，请重试）");
++    }
++
++    // ---------- ACK 超时扫描（PublishAckTimeoutScanner 调度） ----------
++
++    @Override
++    public int markAckTimeout() {
++        int timeoutSeconds = properties.getAckTimeoutSeconds() == null ? 300 : properties.getAckTimeoutSeconds();
++        LocalDateTime deadline = LocalDateTime.now().minusSeconds(timeoutSeconds);
++        List<IotConfigPublishLog> stale = publishLogMapper.selectList(new LambdaQueryWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getAckStatus, ACK_PENDING)
++                .lt(IotConfigPublishLog::getCreateTime, deadline));
++        if (stale.isEmpty()) {
++            return 0;
++        }
++        String message = "ACK 超时（超过 " + timeoutSeconds + " 秒未回执）";
++        int marked = 0;
++        for (IotConfigPublishLog row : stale) {
++            // 按行条件更新（WHERE ack_status=0）：幂等（已置 2 的不重复更新）且防与并发
++            // ACK 生效竞态倒退（生效后 WHERE 不命中即跳过）
++            marked += publishLogMapper.update(null, new LambdaUpdateWrapper<IotConfigPublishLog>()
++                    .eq(IotConfigPublishLog::getId, row.getId())
++                    .eq(IotConfigPublishLog::getAckStatus, ACK_PENDING)
++                    .set(IotConfigPublishLog::getAckStatus, ACK_FAILED)
++                    .set(IotConfigPublishLog::getErrorMsg, message)
++                    .set(IotConfigPublishLog::getUpdateTime, LocalDateTime.now()));
++        }
++        log.info("[PUBLISH-ACK] timeout scan marked {} stale row(s) timeoutSeconds={} candidate={}",
++                marked, timeoutSeconds, stale.size());
++        return marked;
++    }
++
++    // ---------- 重发（管理面） ----------
++
++    @Override
++    public IotConfigPublishLog resend(ResendForm form) {
++        IotConfigVersion version = resolveVersionRow(form.getVersionId(), form.getScopeType(),
++                form.getScopeId(), form.getVersion());
++        // 管理面数据权限防线（brief D7，照 0024 范式）：网关 scope 校验网关可见；计算 scope
++        // 仅管理员语义——按版本行自身 scope 裁剪（versionId 定位时请求侧无 scope 可校验）
++        scopeGuard.assertScopeReadable(version.getScopeType(), version.getScopeId(), SecurityUtils.getUserId());
++
++        List<IotConfigPublishLog> rows = publishLogMapper.selectList(new LambdaQueryWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getVersionId, version.getId())
++                .eq(IotConfigPublishLog::getTargetId, form.getTargetId()));
++        if (rows.isEmpty()) {
++            throw paramError("下发记录不存在: (versionId=" + version.getId()
++                    + ", targetId=" + form.getTargetId() + ")");
++        }
++        if (rows.size() > 1) {
++            throw paramError("targetId 命中多行下发记录（定位须唯一）: (versionId=" + version.getId()
++                    + ", targetId=" + form.getTargetId() + ")");
++        }
++        IotConfigPublishLog row = rows.get(0);
++        if (row.getAckStatus() != null && row.getAckStatus() == ACK_EFFECTIVE) {
++            throw paramError("已生效无需重发");
++        }
++
++        // 重置 ack_status=0、error_msg=NULL、update_time 刷新；条件更新防竞态（SELECT 后
++        // 并发生效回执写入 → WHERE ack_status != 1 不命中 → 按终态语义拒绝）
++        int affected = publishLogMapper.update(null, new LambdaUpdateWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getId, row.getId())
++                .ne(IotConfigPublishLog::getAckStatus, ACK_EFFECTIVE)
++                .set(IotConfigPublishLog::getAckStatus, ACK_PENDING)
++                .set(IotConfigPublishLog::getErrorMsg, null)
++                .set(IotConfigPublishLog::getUpdateTime, LocalDateTime.now()));
++        if (affected <= 0) {
++            throw paramError("已生效无需重发");
++        }
++        // 触发下发接缝（brief D5：重发重置后调用一次；NoOp 占位，TASK-0026 接真实通知）
++        notifySender.notify(version.getId(), row.getTargetType(), row.getTargetId());
++        log.info("[PUBLISH-LOG] resend reset row id={} versionId={} targetType={} targetId={}",
++                row.getId(), version.getId(), row.getTargetType(), row.getTargetId());
++        return publishLogMapper.selectById(row.getId());
++    }
++
++    // ---------- 下发状态查询（管理面） ----------
++
++    @Override
++    public PublishLogListVO listPublishLog(Long versionId, Integer scopeType, Long scopeId, Long version) {
++        IotConfigVersion versionRow = resolveVersionRow(versionId, scopeType, scopeId, version);
++        scopeGuard.assertScopeReadable(versionRow.getScopeType(), versionRow.getScopeId(),
++                SecurityUtils.getUserId());
++
++        List<IotConfigPublishLog> rows = publishLogMapper.selectList(new LambdaQueryWrapper<IotConfigPublishLog>()
++                .eq(IotConfigPublishLog::getVersionId, versionRow.getId())
++                .orderByAsc(IotConfigPublishLog::getTargetType)
++                .orderByAsc(IotConfigPublishLog::getId));
++
++        int timeoutSeconds = properties.getAckTimeoutSeconds() == null ? 300 : properties.getAckTimeoutSeconds();
++        LocalDateTime timeoutMark = LocalDateTime.now().minusSeconds(timeoutSeconds);
++        List<PublishLogRowVO> rowVos = new ArrayList<>(rows.size());
++        int effective = 0;
++        int failed = 0;
++        for (IotConfigPublishLog row : rows) {
++            PublishLogRowVO vo = new PublishLogRowVO();
++            vo.setId(row.getId());
++            vo.setVersionId(row.getVersionId());
++            vo.setTargetType(row.getTargetType());
++            vo.setTargetId(row.getTargetId());
++            vo.setAckStatus(row.getAckStatus());
++            vo.setAckTime(row.getAckTime());
++            vo.setErrorMsg(row.getErrorMsg());
++            vo.setCreateTime(row.getCreateTime());
++            // timedOut 派生（brief D6）：待确认且已超超时窗——覆盖扫描间隔间隙的即时标红，
++            // 不改行（扫描才是落库事实）
++            vo.setTimedOut(row.getAckStatus() != null && row.getAckStatus() == ACK_PENDING
++                    && row.getCreateTime() != null && row.getCreateTime().isBefore(timeoutMark));
++            if (row.getAckStatus() != null && row.getAckStatus() == ACK_EFFECTIVE) {
++                effective++;
++            }
++            if (row.getAckStatus() != null && row.getAckStatus() == ACK_FAILED) {
++                failed++;
++            }
++            rowVos.add(vo);
++        }
++        int state;
++        if (failed > 0) {
++            state = PublishLogListVO.STATE_FAILED;
++        } else if (!rows.isEmpty() && effective == rows.size()) {
++            state = PublishLogListVO.STATE_EFFECTIVE;
++        } else {
++            // 存在待确认或空行集（0024 冒烟遗留版本无下发记录）→ 下发中（保守口径）
++            state = PublishLogListVO.STATE_DELIVERING;
++        }
++        return new PublishLogListVO(versionRow.getId(), versionRow.getScopeType(), versionRow.getScopeId(),
++                versionRow.getVersion(), state, rowVos);
++    }
++
++    private BusinessException paramError(String message) {
++        return new BusinessException(ResultCode.PARAM_ERROR.getCode(), message);
++    }
++}
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+index bc11d6f..fa7a8b6 100644
+--- a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImpl.java
+@@ -5,12 +5,8 @@ import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+ import com.fasterxml.jackson.databind.json.JsonMapper;
+-import net.otlab.admin.module.iot.dataperm.DataPermService;
+-import net.otlab.admin.module.iot.dataperm.VisibleScope;
+ import net.otlab.admin.module.iot.dataitem.entity.IotDataItem;
+ import net.otlab.admin.module.iot.dataitem.mapper.IotDataItemMapper;
+-import net.otlab.admin.module.iot.gateway.entity.IotGateway;
+-import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
+ import net.otlab.admin.module.iot.point.entity.IotPoint;
+ import net.otlab.admin.module.iot.point.mapper.IotPointMapper;
+ import net.otlab.admin.module.iot.publish.dto.PublishForm;
+@@ -19,11 +15,13 @@ import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
+ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
+ import net.otlab.admin.module.iot.publish.gate.PublishConfirmGate;
+ import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
+ import net.otlab.admin.module.iot.publish.service.IotPublishService;
+ import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshot;
+ import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+ import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
+ import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -42,7 +40,8 @@ import java.util.List;
+ 
+ /**
+  * 配置发布服务实现（TASK-0024，发布链第一环——快照生成 + 版本落库 + 回滚 + 取回；
+- * 下发记录 ACK/超时重发/config.changed 通知归 TASK-0025/0026）。
++ * TASK-0025 扩展：版本落库后同事务下发记录落行；ACK 回执/超时扫描/重发/状态查询在
++ * {@link IotPublishLogService}，config.changed 真实通知归 TASK-0026）。
+  *
+  * <p>发布流程（brief D4）：组装（{@link ConfigSnapshotAssembler} 严格按契约 Schema
+  * v1.0.1；组装来源=实例有效版本——ADR-0008）→ 凭据终检（{@link SnapshotCredentialGuard}
+@@ -76,10 +75,17 @@ import java.util.List;
+  * <p><b>确认门（brief D7）</b>：发布流程调用 {@link PublishConfirmGate}
+  * （TASK-0015 接线位——NoOp 占位恒放行，本期不阻断）。
+  *
++ * <p><b>下发记录落行（TASK-0025）</b>：版本落库后同事务调用
++ * {@link IotPublishLogService#recordDispatch}——按 scope 派生目标插入
++ * iot_config_publish_log（ack_status=0 待确认；网关 scope 两行〔1/网关码 + 2/接入标识〕、
++ * 计算 scope 一行〔3/计算标识〕）并逐行触发通知接缝 NotifySender（NoOp 占位，TASK-0026
++ * 接线）；回滚=重新下发，新版本行同样落行。
++ *
+  * <p><b>数据权限防线（brief D9）</b>：发布/回滚为写操作（运营方动作）——网关 scope 校验
+  * 网关可见（dept/instance 锚点，NULL 不特判 fail-closed——ADR-0016 裁决 6）且存在启用；
+  * 计算 scope=全租户仅管理员语义（allTenant 即 scope=1 全部角色）；列表/取回同防线裁剪
+- * （照 0021 范式 resolve——读路径不要求启用）。
++ * （照 0021 范式 resolve——读路径不要求启用）。归一与防线实现位于共享组件
++ * {@link PublishScopeGuard}（TASK-0025 上提——下发状态查询/重发同防线，防两份漂移）。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -97,15 +103,9 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     /** publish_status 1 已发布（2 已回滚为上游 DDL 预留，本任务流程不产生——类注释） */
+     private static final int PUBLISH_STATUS_PUBLISHED = 1;
+ 
+-    /** 通道启用状态（iot_gateway.status 同值域 0 禁用 1 启用） */
+-    private static final int STATUS_ENABLED = 1;
+-
+     /** 回滚复用快照体解析用（id 提取——与组装侧确定性序列化独立，只读不产哈希） */
+     private static final JsonMapper BODY_MAPPER = JsonMapper.builder().build();
+ 
+-    @Autowired
+-    private IotGatewayMapper gatewayMapper;
+-
+     @Autowired
+     private IotPointMapper pointMapper;
+ 
+@@ -124,18 +124,23 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     @Autowired
+     private PublishConfirmGate confirmGate;
+ 
++    /** scope 归一与数据权限防线（TASK-0025 上提共享——下发状态查询/重发同防线） */
+     @Autowired
+-    private DataPermService dataPermService;
++    private PublishScopeGuard scopeGuard;
++
++    /** 下发记录落行接缝（TASK-0025）：版本落库后同事务派生目标落行 + 触发通知接缝 */
++    @Autowired
++    private IotPublishLogService publishLogService;
+ 
+     // ---------- 发布 ----------
+ 
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public IotConfigVersion publish(PublishForm form) {
+-        Integer scopeType = normalizeScopeType(form.getScopeType());
+-        Long scopeId = normalizeScopeId(scopeType, form.getScopeId());
++        Integer scopeType = scopeGuard.normalizeScopeType(form.getScopeType());
++        Long scopeId = scopeGuard.normalizeScopeId(scopeType, form.getScopeId());
+         Long tenantId = TenantContext.getTenantId();
+-        assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
++        scopeGuard.assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
+ 
+         Long lastVersion = baseMapper.selectMaxVersion(tenantId, scopeType, scopeId);
+         Long version = (lastVersion == null ? 0L : lastVersion) + 1;
+@@ -193,6 +198,8 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         }
+ 
+         writeBackConfigVersion(scopeType, version, pointIdsOf(snapshot), dataItemIdsOf(snapshot));
++        // 下发记录落行（TASK-0025）：版本落库后同事务派生目标落行（ack_status=0）+ 触发通知接缝
++        publishLogService.recordDispatch(row);
+         return row;
+     }
+ 
+@@ -248,10 +255,10 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     @Override
+     @Transactional(rollbackFor = Exception.class)
+     public IotConfigVersion rollback(RollbackForm form) {
+-        Integer scopeType = normalizeScopeType(form.getScopeType());
+-        Long scopeId = normalizeScopeId(scopeType, form.getScopeId());
++        Integer scopeType = scopeGuard.normalizeScopeType(form.getScopeType());
++        Long scopeId = scopeGuard.normalizeScopeId(scopeType, form.getScopeId());
+         Long tenantId = TenantContext.getTenantId();
+-        assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
++        scopeGuard.assertScopeWritable(scopeType, scopeId, SecurityUtils.getUserId());
+ 
+         IotConfigVersion target = baseMapper.selectOne(new LambdaQueryWrapper<IotConfigVersion>()
+                 .eq(IotConfigVersion::getScopeType, scopeType)
+@@ -292,6 +299,8 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+         }
+ 
+         writeBackConfigVersion(scopeType, version, reuseIds.pointIds, reuseIds.dataItemIds);
++        // 下发记录落行（TASK-0025）：回滚=重新下发，新版本行同样派生目标落行
++        publishLogService.recordDispatch(row);
+         return row;
+     }
+ 
+@@ -300,9 +309,9 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+     @Override
+     public Page<IotConfigVersion> selectVersionList(Integer pageNum, Integer pageSize,
+                                                     Integer scopeType, Long scopeId) {
+-        Integer normalizedType = normalizeScopeType(scopeType);
+-        Long normalizedId = normalizeScopeId(normalizedType, scopeId);
+-        assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
++        Integer normalizedType = scopeGuard.normalizeScopeType(scopeType);
++        Long normalizedId = scopeGuard.normalizeScopeId(normalizedType, scopeId);
++        scopeGuard.assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
+         int pn = pageNum == null || pageNum < 1 ? 1 : pageNum;
+         int ps = pageSize == null || pageSize < 1 ? 10 : pageSize;
+         return baseMapper.selectPage(new Page<>(pn, ps), new LambdaQueryWrapper<IotConfigVersion>()
+@@ -315,9 +324,9 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+ 
+     @Override
+     public SnapshotVO retrieveSnapshot(Integer scopeType, Long scopeId, Long version) {
+-        Integer normalizedType = normalizeScopeType(scopeType);
+-        Long normalizedId = normalizeScopeId(normalizedType, scopeId);
+-        assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
++        Integer normalizedType = scopeGuard.normalizeScopeType(scopeType);
++        Long normalizedId = scopeGuard.normalizeScopeId(normalizedType, scopeId);
++        scopeGuard.assertScopeReadable(normalizedType, normalizedId, SecurityUtils.getUserId());
+ 
+         LambdaQueryWrapper<IotConfigVersion> wrapper = new LambdaQueryWrapper<IotConfigVersion>()
+                 .eq(IotConfigVersion::getScopeType, normalizedType)
+@@ -359,73 +368,8 @@ public class IotPublishServiceImpl extends ServiceImpl<IotConfigVersionMapper, I
+                 row.getSnapshotHash(), new String(bytes, StandardCharsets.UTF_8));
+     }
+ 
+-    // ---------- scope 归一与防线 ----------
+-
+-    private Integer normalizeScopeType(Integer scopeType) {
+-        if (scopeType == null || (scopeType != SCOPE_GATEWAY && scopeType != SCOPE_COMPUTE)) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeType 只允许 1 网关 2 计算");
+-        }
+-        return scopeType;
+-    }
+-
+-    /** 计算 scope 归一 0（租户粒度——Schema v1.0.1 派生规则 7；请求携带值不参与存储键） */
+-    private Long normalizeScopeId(Integer scopeType, Long scopeId) {
+-        if (scopeId == null) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeId 不能为空");
+-        }
+-        return scopeType == SCOPE_COMPUTE ? 0L : scopeId;
+-    }
+-
+-    /** 写路径防线：网关 scope 存在+启用+可见；计算 scope 全租户仅管理员语义（brief D9） */
+-    private void assertScopeWritable(Integer scopeType, Long scopeId, Long userId) {
+-        VisibleScope visible = dataPermService.resolve(userId);
+-        if (scopeType == SCOPE_COMPUTE) {
+-            if (!visible.allTenant()) {
+-                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
+-                        "计算范围发布/回滚仅限全租户（管理员）语义角色");
+-            }
+-            return;
+-        }
+-        IotGateway gateway = gatewayMapper.selectById(scopeId);
+-        if (gateway == null) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
+-        }
+-        if (gateway.getStatus() == null || gateway.getStatus() != STATUS_ENABLED) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关已禁用，禁止发布/回滚: " + scopeId);
+-        }
+-        assertGatewayVisible(visible, gateway);
+-    }
+-
+-    /** 读路径防线：网关 scope 校验网关可见（不要求启用——读无害）；计算 scope 管理员语义 */
+-    private void assertScopeReadable(Integer scopeType, Long scopeId, Long userId) {
+-        VisibleScope visible = dataPermService.resolve(userId);
+-        if (scopeType == SCOPE_COMPUTE) {
+-            if (!visible.allTenant()) {
+-                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
+-                        "计算范围版本/快照仅限全租户（管理员）语义角色");
+-            }
+-            return;
+-        }
+-        IotGateway gateway = gatewayMapper.selectById(scopeId);
+-        if (gateway == null) {
+-            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
+-        }
+-        assertGatewayVisible(visible, gateway);
+-    }
+-
+-    /** 网关可见性：dept/instance 锚点任一命中；NULL 不特判 fail-closed（ADR-0016 裁决 6） */
+-    private void assertGatewayVisible(VisibleScope visible, IotGateway gateway) {
+-        if (visible.allTenant()) {
+-            return;
+-        }
+-        boolean deptVisible = gateway.getDeptId() != null && visible.deptIds().contains(gateway.getDeptId());
+-        boolean instanceVisible = gateway.getInstanceId() != null
+-                && visible.instanceIds().contains(gateway.getInstanceId());
+-        if (!deptVisible && !instanceVisible) {
+-            throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
+-                    "网关不在可见范围（数据权限 fail-closed）: " + gateway.getId());
+-        }
+-    }
++    // ---------- scope 归一与防线（TASK-0025 上提共享组件 PublishScopeGuard——发布/回滚/
++    // 列表/取回与下发状态查询/重发同防线，单一实现防两份漂移；行为逐字平移） ----------
+ 
+     // ---------- config_version 回写（0021/0013 建列时声明「由配置发布链路回写」的承接） ----------
+ 
+diff --git a/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/support/PublishScopeGuard.java b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/support/PublishScopeGuard.java
+new file mode 100644
+index 0000000..18b0259
+--- /dev/null
++++ b/backend/ot-admin/src/main/java/net/otlab/admin/module/iot/publish/support/PublishScopeGuard.java
+@@ -0,0 +1,106 @@
++package net.otlab.admin.module.iot.publish.support;
++
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import org.springframework.stereotype.Component;
++
++/**
++ * 发布域 scope 归一与数据权限防线（TASK-0025 从 IotPublishServiceImpl 私有方法上提为
++ * 共享组件——下发状态查询/重发（TASK-0025）与发布/回滚/列表/取回（TASK-0024）同防线，
++ * 单一实现防两份漂移；行为逐字平移，既有测试语义不变）。
++ *
++ * <p>写路径（发布/回滚）：网关 scope 存在+启用+可见；计算 scope 全租户仅管理员语义。
++ * 读路径（列表/取回/下发状态查询/重发）：网关 scope 校验网关可见（不要求启用——读无害）；
++ * 计算 scope 管理员语义。NULL 不特判 fail-closed（ADR-0016 裁决 6）。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++@Component
++public class PublishScopeGuard {
++
++    /** scope_type 1 网关 2 计算（附录 A p33 iot_config_version.scope_type） */
++    public static final int SCOPE_GATEWAY = 1;
++    public static final int SCOPE_COMPUTE = 2;
++
++    /** 通道启用状态（iot_gateway.status 同值域 0 禁用 1 启用） */
++    private static final int STATUS_ENABLED = 1;
++
++    private final IotGatewayMapper gatewayMapper;
++    private final DataPermService dataPermService;
++
++    public PublishScopeGuard(IotGatewayMapper gatewayMapper, DataPermService dataPermService) {
++        this.gatewayMapper = gatewayMapper;
++        this.dataPermService = dataPermService;
++    }
++
++    public Integer normalizeScopeType(Integer scopeType) {
++        if (scopeType == null || (scopeType != SCOPE_GATEWAY && scopeType != SCOPE_COMPUTE)) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeType 只允许 1 网关 2 计算");
++        }
++        return scopeType;
++    }
++
++    /** 计算 scope 归一 0（租户粒度——Schema v1.0.1 派生规则 7；请求携带值不参与存储键） */
++    public Long normalizeScopeId(Integer scopeType, Long scopeId) {
++        if (scopeId == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "scopeId 不能为空");
++        }
++        return scopeType == SCOPE_COMPUTE ? 0L : scopeId;
++    }
++
++    /** 写路径防线：网关 scope 存在+启用+可见；计算 scope 全租户仅管理员语义（brief D9） */
++    public void assertScopeWritable(Integer scopeType, Long scopeId, Long userId) {
++        VisibleScope visible = dataPermService.resolve(userId);
++        if (scopeType == SCOPE_COMPUTE) {
++            if (!visible.allTenant()) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                        "计算范围发布/回滚仅限全租户（管理员）语义角色");
++            }
++            return;
++        }
++        IotGateway gateway = gatewayMapper.selectById(scopeId);
++        if (gateway == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
++        }
++        if (gateway.getStatus() == null || gateway.getStatus() != STATUS_ENABLED) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关已禁用，禁止发布/回滚: " + scopeId);
++        }
++        assertGatewayVisible(visible, gateway);
++    }
++
++    /** 读路径防线：网关 scope 校验网关可见（不要求启用——读无害）；计算 scope 管理员语义 */
++    public void assertScopeReadable(Integer scopeType, Long scopeId, Long userId) {
++        VisibleScope visible = dataPermService.resolve(userId);
++        if (scopeType == SCOPE_COMPUTE) {
++            if (!visible.allTenant()) {
++                throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                        "计算范围版本/快照/下发状态仅限全租户（管理员）语义角色");
++            }
++            return;
++        }
++        IotGateway gateway = gatewayMapper.selectById(scopeId);
++        if (gateway == null) {
++            throw new BusinessException(ResultCode.PARAM_ERROR.getCode(), "网关不存在或已删除: " + scopeId);
++        }
++        assertGatewayVisible(visible, gateway);
++    }
++
++    /** 网关可见性：dept/instance 锚点任一命中；NULL 不特判 fail-closed（ADR-0016 裁决 6） */
++    private void assertGatewayVisible(VisibleScope visible, IotGateway gateway) {
++        if (visible.allTenant()) {
++            return;
++        }
++        boolean deptVisible = gateway.getDeptId() != null && visible.deptIds().contains(gateway.getDeptId());
++        boolean instanceVisible = gateway.getInstanceId() != null
++                && visible.instanceIds().contains(gateway.getInstanceId());
++        if (!deptVisible && !instanceVisible) {
++            throw new BusinessException(ResultCode.FORBIDDEN.getCode(),
++                    "网关不在可见范围（数据权限 fail-closed）: " + gateway.getId());
++        }
++    }
++}
+diff --git a/backend/ot-admin/src/main/resources/application.yml b/backend/ot-admin/src/main/resources/application.yml
+index 8ec3054..87ff357 100644
+--- a/backend/ot-admin/src/main/resources/application.yml
++++ b/backend/ot-admin/src/main/resources/application.yml
+@@ -47,6 +47,10 @@ ot:
+     realtime-cache-ttl-seconds: ${OT_OPENAPI_REALTIME_CACHE_TTL_SECONDS:60}   # 实时值回填键 TTL 秒数（修订轮 I-3，默认 60s）：回源 TDengine 命中后回填的键必须短 TTL 过期——键过期即回源，杜绝 ingest 停写后旧值长期充当「实时值」与键无限累积（BUG-0053 同危害类）
+   publish:
+     storage-path: ${OT_PUBLISH_STORAGE_PATH:./data/snapshots}   # 配置版本快照本地存储根目录（TASK-0024 一期本地目录裁决；文件布局 <root>/<tenant_id>/<scope_type>-<scope_id>-<version>.json，snapshot_uri 存相对路径）；MinIO 对象存储二期登记
++    ack-scan-interval-seconds: ${OT_PUBLISH_ACK_SCAN_INTERVAL_SECONDS:60}   # ACK 超时扫描周期（秒，TASK-0025 fixedDelay——上次执行完毕后计时；扫描逾窗未回执行置 2，幂等）
++    ack-timeout-seconds: ${OT_PUBLISH_ACK_TIMEOUT_SECONDS:300}   # ACK 超时窗（秒，TASK-0025）：ack_status=0 且 create_time 早于 now-本值 的行视为超时（扫描置 2 + error_msg 记超时原因）；下发状态查询派生 timedOut 同用本值（覆盖扫描间隔间隙）
++    target-ingest-id: ${OT_PUBLISH_TARGET_INGEST_ID:ingest}   # 接入服务下发目标标识（TASK-0025）：网关 scope 发布落行的 target_type=2 行 target_id；接入服务按 (versionId, targetType=2, 本值) 回执
++    target-calc-id: ${OT_PUBLISH_TARGET_CALC_ID:calc}   # 计算引擎下发目标标识（TASK-0025）：计算 scope 发布落行的 target_type=3 行 target_id；计算引擎按 (versionId, targetType=3, 本值) 回执
+   quota:
+     storage-warn-ratio: ${OT_QUOTA_STORAGE_WARN_RATIO:0.8}           # 存储软限告警阈值：usage/quota 达此比例发 [QUOTA-WARN]（ADR-0011 TD-0035：只告警不停写）；有效范围 (0,1]，越界视为关闭
+     fail-log-every-n-rounds: ${OT_QUOTA_FAIL_LOG_EVERY_N_ROUNDS:20}  # TDengine 不可用连续失败时的告警节流：仅首轮与每 N 轮记一次 WARN（防日志风暴）
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java
+index 9e9f2c9..1e3c2b9 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/config/IotPublishMenuPermissionGuardTest.java
+@@ -23,18 +23,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+ /**
+- * TASK-0024 守卫测试：配置发布域菜单权限（sys_menu 4070-4073 四行）与控制器接口对应。
++ * TASK-0024/0025 守卫测试：配置发布域菜单权限（sys_menu 4070-4074 五行）与控制器接口对应。
+  *
+  * <p>brief 硬要求「权限标识与接口清单一一对应」（照 IotStatusRuleMenuPermissionGuardTest
+  * 范式）。本测试锁定：
+  * <ul>
+- * <li>SQL 侧：升级脚本 20261122_iot_publish_domain.sql 的 sys_menu 四行种子
+- *     （id 4070-4073，parent_id=4015 配置发布页）权限码必须恰好等于预期的四值映射——
+- *     删行/换码/挪 parent 即红；</li>
+- * <li>代码侧：发布域 @RestController 全部 @SaCheckPermission 权限码必须恰好等于四值集合
+- *     （写错码/未登记码即红——越出集合的码在 sys_menu 无行，任何角色都无法获得）；</li>
++ * <li>SQL 侧：升级脚本 20261122_iot_publish_domain.sql（TASK-0024，4070-4073）与
++ *     20261122_iot_publish_log.sql（TASK-0025，4074 下发重发）的 sys_menu 种子行
++ *     （parent_id=4015 配置发布页）权限码必须恰好等于预期的五值映射——删行/换码/挪
++ *     parent 即红；</li>
++ * <li>代码侧：发布域 @RestController 全部 @SaCheckPermission 权限码必须恰好等于五值集合
++ *     （写错码/未登记码即红——越出集合的码在 sys_menu 无行，任何角色都无法获得；
++ *     /internal/v1/config/ack 为内部端点不挂管理面权限注解，不在本集合口径内）；</li>
+  * <li>uk_scope_version 差异登记：升级脚本头注含「与上游差异」声明（物理唯一键为单调
+- *     递增并发防护的物理保证）。</li>
++ *     递增并发防护的物理保证）；20261122_iot_publish_log.sql 头注含「无 tenant_id 列 →
++ *     mapper 旁路多租户插件」登记。</li>
+  * </ul>
+  *
+  * @author dowei
+@@ -42,24 +45,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
+  */
+ class IotPublishMenuPermissionGuardTest {
+ 
+-    /** 四行菜单种子的预期映射（id → perms），与升级脚本 4070-4073 一一对应 */
++    /** 五行菜单种子的预期映射（id → perms），与升级脚本 4070-4073/4074 一一对应 */
+     private static final Map<Long, String> EXPECTED_MENU_ROWS = Map.of(
+             4070L, "iot:publish:list",
+             4071L, "iot:publish:query",
+             4072L, "iot:publish:publish",
+-            4073L, "iot:publish:rollback");
++            4073L, "iot:publish:rollback",
++            4074L, "iot:publish:resend");
+ 
+     /** 升级脚本路径（从测试工作目录向上定位仓库根的 resources/sql） */
+-    private static final String SCRIPT_RELATIVE = "resources/sql/upgrade/20261122_iot_publish_domain.sql";
++    private static final String SCRIPT_0024 = "resources/sql/upgrade/20261122_iot_publish_domain.sql";
++    private static final String SCRIPT_0025 = "resources/sql/upgrade/20261122_iot_publish_log.sql";
+ 
+     /** 菜单种子行形如 (4070, 4015, 4, '发布版本查询', 3, NULL, NULL, NULL, 'iot:publish:list', ...) */
+     private static final Pattern MENU_ROW_PATTERN = Pattern.compile(
+             "\\((40[0-9]\\d),\\s*4015,\\s*4,\\s*'([^']*)',\\s*3,\\s*NULL,\\s*NULL,\\s*NULL,\\s*'([A-Za-z0-9:_-]+)'");
+ 
+     @Test
+-    @DisplayName("SQL 侧 - 升级脚本登记的发布域菜单行恰好等于预期四值映射（4070-4073，挂 4015）")
+-    void scriptRegistersExactlyTheFourMenuRows() throws Exception {
+-        Map<Long, String> actual = parseMenuRows(readScript());
++    @DisplayName("SQL 侧 - 升级脚本登记的发布域菜单行恰好等于预期五值映射（4070-4073/4074，挂 4015）")
++    void scriptRegistersExactlyTheFiveMenuRows() throws Exception {
++        Map<Long, String> actual = parseMenuRows(readScript(SCRIPT_0024) + "\n" + readScript(SCRIPT_0025));
+         Map<Long, String> actualFiltered = new TreeMap<>();
+         for (Map.Entry<Long, String> e : actual.entrySet()) {
+             if (EXPECTED_MENU_ROWS.containsKey(e.getKey())) {
+@@ -67,11 +72,11 @@ class IotPublishMenuPermissionGuardTest {
+             }
+         }
+         assertEquals(EXPECTED_MENU_ROWS, actualFiltered,
+-                "sys_menu 4070-4073 四行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
++                "sys_menu 4070-4074 五行权限码必须与预期一一对应（删行/换码/挪 parent_id 即失败）");
+     }
+ 
+     @Test
+-    @DisplayName("代码侧 - 发布控制器权限码恰好 = 四码（list/query/publish/rollback）")
++    @DisplayName("代码侧 - 发布控制器权限码恰好 = 五码（list/query/publish/rollback/resend）")
+     void controllerPermsExact() {
+         Set<String> perms = collectPerms();
+         assertEquals(Set.copyOf(EXPECTED_MENU_ROWS.values()), perms,
+@@ -81,13 +86,27 @@ class IotPublishMenuPermissionGuardTest {
+     @Test
+     @DisplayName("SQL 侧 - uk_scope_version 差异头注在位（单调递增并发防护的物理保证登记）")
+     void scriptRegistersUpstreamDifference() throws Exception {
+-        String script = readScript();
++        String script = readScript(SCRIPT_0024);
+         assertTrue(script.contains("uk_scope_version"), "唯一键在位");
+         assertTrue(script.contains("与上游差异"), "头注含与上游差异声明");
+         assertTrue(script.contains("物理唯一") && script.contains("5001"),
+                 "头注说明唯一键的并发防护语义（撞键转 5001）");
+     }
+ 
++    @Test
++    @DisplayName("SQL 侧 - 下发记录脚本头注登记：无 uk_version_target 依据 + target_id 语义 + 无 tenant_id 列旁路声明")
++    void publishLogScriptRegistersHeadNotes() throws Exception {
++        String script = readScript(SCRIPT_0025);
++        assertTrue(script.contains("不追加 uk_version_target"), "头注①：不追加唯一键及其依据在位");
++        assertTrue(script.contains("uk_scope_version") && script.contains("同事务"),
++                "头注①依据：版本行由 uk_scope_version 单调保证 + log 行同事务一次性写入");
++        assertTrue(script.contains("target_id 网关= gateway_code"), "头注②：目标标识语义在位");
++        assertTrue(script.contains("tenant_id") && script.contains("InterceptorIgnore"),
++                "多租户特例登记（无 tenant_id 列 → mapper 旁路，服务层保证租户边界）");
++        assertTrue(script.contains("iot:publish:resend") && script.contains("4074"),
++                "下发重发按钮权限行在位（4074）");
++    }
++
+     // ---------- 内部辅助 ----------
+ 
+     /** 反射收集控制器全部 @SaCheckPermission 权限码（去重） */
+@@ -99,17 +118,17 @@ class IotPublishMenuPermissionGuardTest {
+     }
+ 
+     /** 从测试工作目录逐级向上定位仓库根的升级脚本（照 IotStatusRuleMenuPermissionGuardTest 口径） */
+-    private String readScript() throws Exception {
++    private String readScript(String scriptRelative) throws Exception {
+         Path cwd = Paths.get("").toAbsolutePath();
+         Path p = cwd;
+         while (p != null) {
+-            Path candidate = p.resolve(SCRIPT_RELATIVE);
++            Path candidate = p.resolve(scriptRelative);
+             if (Files.exists(candidate)) {
+                 return Files.readString(candidate, StandardCharsets.UTF_8);
+             }
+             p = p.getParent();
+         }
+-        throw new IllegalStateException("升级脚本未找到: " + SCRIPT_RELATIVE + "（cwd=" + cwd + "）");
++        throw new IllegalStateException("升级脚本未找到: " + scriptRelative + "（cwd=" + cwd + "）");
+     }
+ 
+     private Map<Long, String> parseMenuRows(String script) {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java
+index 5303e5a..1f611a9 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishControllerTest.java
+@@ -3,9 +3,13 @@ package net.otlab.admin.module.iot.publish.controller;
+ import cn.dev33.satoken.annotation.SaCheckPermission;
+ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+ import net.otlab.admin.module.iot.publish.dto.PublishForm;
++import net.otlab.admin.module.iot.publish.dto.PublishLogListVO;
++import net.otlab.admin.module.iot.publish.dto.ResendForm;
+ import net.otlab.admin.module.iot.publish.dto.RollbackForm;
+ import net.otlab.admin.module.iot.publish.dto.SnapshotVO;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
+ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
+ import net.otlab.admin.module.iot.publish.service.IotPublishService;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.exception.GlobalExceptionHandler;
+@@ -28,6 +32,7 @@ import java.util.stream.Collectors;
+ 
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.ArgumentMatchers.isNull;
+@@ -39,11 +44,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+ 
+ /**
+- * 配置发布控制器测试（TASK-0024 接口层——standalone MockMvc + Mockito，权限注解以反射
+- * 断言，路由与参数校验走真实 MockMvc 请求，照 IotChannelControllerTest 范式）。
++ * 配置发布控制器测试（TASK-0024 四端点 + TASK-0025 扩展两端点——standalone MockMvc +
++ * Mockito，权限注解以反射断言，路由与参数校验走真实 MockMvc 请求，照
++ * IotChannelControllerTest 范式）。
+  *
+- * <p>接口面锁定四端点（4070-4073 权限行一一对应）：list（iot:publish:list）/ snapshot
+- * （iot:publish:query）/ publish（iot:publish:publish）/ rollback（iot:publish:rollback）。
++ * <p>接口面锁定六端点（4070-4073 + 4074 权限行一一对应；下发状态查询复用
++ * iot:publish:list 不新增种子）：list / snapshot / publish / rollback / log/list /
++ * resend。内部 ACK 回执端点（POST /internal/v1/config/ack）归 IotPublishInternalControllerTest。
+  *
+  * @author dowei
+  * @date 2026-11-22
+@@ -55,6 +62,9 @@ class IotPublishControllerTest {
+     @Mock
+     private IotPublishService publishService;
+ 
++    @Mock
++    private IotPublishLogService publishLogService;
++
+     private IotPublishController controller;
+ 
+     @BeforeEach
+@@ -62,6 +72,7 @@ class IotPublishControllerTest {
+         MockitoAnnotations.openMocks(this);
+         controller = new IotPublishController();
+         ReflectionTestUtils.setField(controller, "publishService", publishService);
++        ReflectionTestUtils.setField(controller, "publishLogService", publishLogService);
+         // standalone MockMvc 不自带 jakarta Validator——显式接 SpringValidatorAdapter 使 @Valid 生效
+         // （全局异常处理器把 MethodArgumentNotValidException 归一为 HTTP 200 + body.code=400——照
+         // GlobalExceptionHandler.handleMethodArgumentNotValidException 行为断言）
+@@ -74,11 +85,11 @@ class IotPublishControllerTest {
+     }
+ 
+     @Test
+-    @DisplayName("路由与权限注解 - 四端点路径与权限码一一对应（4070-4073）")
++    @DisplayName("路由与权限注解 - 六端点路径与权限码一一对应（4070-4073/4074，log/list 复用 list 码）")
+     void endpointsAndPermissions() {
+         assertEquals(Set.of("iot:publish:list", "iot:publish:query", "iot:publish:publish",
+-                        "iot:publish:rollback"),
+-                collectPerms(), "权限码集合必须恰为登记四码（多码/漏码/错码即红）");
++                        "iot:publish:rollback", "iot:publish:resend"),
++                collectPerms(), "权限码集合必须恰为登记五码（多码/漏码/错码即红）");
+     }
+ 
+     @Test
+@@ -163,16 +174,97 @@ class IotPublishControllerTest {
+     }
+ 
+     @Test
+-    @DisplayName("发布/回滚端点必须挂 @OperateLog（REQ-0033 高危操作审计）")
+-    void publishAndRollbackAreAudited() {
++    @DisplayName("发布/回滚/重发端点必须挂 @OperateLog（REQ-0033 高危操作审计；log/list 读路径不挂）")
++    void publishAndRollbackAndResendAreAudited() {
+         Method publish = Arrays.stream(IotPublishController.class.getDeclaredMethods())
+                 .filter(m -> "publish".equals(m.getName())).findFirst().orElseThrow();
+         Method rollback = Arrays.stream(IotPublishController.class.getDeclaredMethods())
+                 .filter(m -> "rollback".equals(m.getName())).findFirst().orElseThrow();
++        Method resend = Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> "resend".equals(m.getName())).findFirst().orElseThrow();
++        Method publishLog = Arrays.stream(IotPublishController.class.getDeclaredMethods())
++                .filter(m -> "publishLog".equals(m.getName())).findFirst().orElseThrow();
+         assertNotNull(publish.getAnnotation(net.otlab.core.annotation.OperateLog.class),
+                 "发布缺审计注解");
+         assertNotNull(rollback.getAnnotation(net.otlab.core.annotation.OperateLog.class),
+                 "回滚缺审计注解");
++        assertNotNull(resend.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "下发重发缺审计注解");
++        assertNull(publishLog.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "下发状态查询为读路径不挂审计注解");
++    }
++
++    // ---------- TASK-0025 扩展：下发状态查询 + 重发 ----------
++
++    @Test
++    @DisplayName("GET /iot/publish/log/list - versionId 定位透传（iot:publish:list 复用）")
++    void publishLogRouteByVersionId() throws Exception {
++        when(publishLogService.listPublishLog(5L, null, null, null)).thenReturn(new PublishLogListVO());
++        mockMvc.perform(get("/iot/publish/log/list").param("versionId", "5"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(publishLogService).listPublishLog(5L, null, null, null);
++    }
++
++    @Test
++    @DisplayName("GET /iot/publish/log/list - 三元组定位透传（scopeType+scopeId+version）")
++    void publishLogRouteByTriple() throws Exception {
++        when(publishLogService.listPublishLog(null, 1, 88L, 2L)).thenReturn(new PublishLogListVO());
++        mockMvc.perform(get("/iot/publish/log/list")
++                        .param("scopeType", "1").param("scopeId", "88").param("version", "2"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200));
++        verify(publishLogService).listPublishLog(null, 1, 88L, 2L);
++    }
++
++    @Test
++    @DisplayName("GET /iot/publish/log/list - 定位要素全缺 → 400（@NotBlank 类校验由服务层裁决，此处锁透传）")
++    void publishLogRouteMissingLocatorPassesThrough() throws Exception {
++        when(publishLogService.listPublishLog(isNull(), isNull(), isNull(), isNull()))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(),
++                        "versionId 与 (scopeType+scopeId+version) 至少提供一种定位"));
++        mockMvc.perform(get("/iot/publish/log/list"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400));
++    }
++
++    @Test
++    @DisplayName("POST /iot/publish/resend - body 校验（缺 targetId 400）与正常路径")
++    void resendRouteValidation() throws Exception {
++        when(publishLogService.resend(any(ResendForm.class))).thenAnswer(inv -> {
++            IotConfigPublishLog row = new IotConfigPublishLog();
++            row.setId(31L);
++            row.setVersionId(5L);
++            row.setTargetType(1);
++            row.setTargetId("GW01");
++            row.setAckStatus(0);
++            return row;
++        });
++
++        mockMvc.perform(post("/iot/publish/resend")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetId\":\"GW01\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.data.ackStatus").value(0));
++
++        mockMvc.perform(post("/iot/publish/resend")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400));
++    }
++
++    @Test
++    @DisplayName("POST /iot/publish/resend - 已生效无需重发 400 透传")
++    void resendEffectiveRejectedPassThrough() throws Exception {
++        when(publishLogService.resend(any(ResendForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "已生效无需重发"));
++        mockMvc.perform(post("/iot/publish/resend")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetId\":\"GW01\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(400))
++                .andExpect(jsonPath("$.message").value("已生效无需重发"));
+     }
+ 
+     private Set<String> collectPerms() {
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java
+new file mode 100644
+index 0000000..f733f0c
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/controller/IotPublishInternalControllerTest.java
+@@ -0,0 +1,174 @@
++package net.otlab.admin.module.iot.publish.controller;
++
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthChecker;
++import net.otlab.admin.module.iot.gateway.auth.InternalAuthInterceptor;
++import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
++import net.otlab.core.annotation.Anonymous;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.exception.GlobalExceptionHandler;
++import net.otlab.core.result.ResultCode;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.Mock;
++import org.mockito.MockitoAnnotations;
++import org.springframework.http.MediaType;
++import org.springframework.test.util.ReflectionTestUtils;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.lang.reflect.Method;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++/**
++ * 配置下发内部回执控制器测试（TASK-0025，POST /internal/v1/config/ack）
++ *
++ * <p>核心契约（详细设计 §3.3 p25 + brief D2/D7 + 0019 内部端点范式）：无 Sa-Token（@Anonymous
++ * 跳过管理面登录）但 InternalAuthChecker 双调用断言（拦截器层 + 控制器层同一实现）；无
++ * @SaCheckPermission / 无 @OperateLog；ackStatus=0 拒绝 400；服务层语义（终态不倒退等）
++ * 归 IotPublishLogServiceImplTest，此处锁路由/注解/认证接线/参数校验/透传。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPublishInternalControllerTest {
++
++    private static final String ACK_URL = "/internal/v1/config/ack";
++
++    @Mock
++    private IotPublishLogService publishLogService;
++
++    @Mock
++    private InternalAuthChecker internalAuthChecker;
++
++    private IotPublishInternalController internalController;
++
++    private MockMvc mockMvc;
++
++    @BeforeEach
++    void setUp() {
++        MockitoAnnotations.openMocks(this);
++        internalController = new IotPublishInternalController();
++        ReflectionTestUtils.setField(internalController, "publishLogService", publishLogService);
++        ReflectionTestUtils.setField(internalController, "internalAuthChecker", internalAuthChecker);
++        // 拦截器层接线（与 GatewayInternalAuthConfig 同构）：checker 先于控制器执行
++        mockMvc = MockMvcBuilders.standaloneSetup(internalController)
++                .setControllerAdvice(new GlobalExceptionHandler())
++                .addInterceptors(new InternalAuthInterceptor(internalAuthChecker))
++                .build();
++    }
++
++    // ---------- 注解与路由契约 ----------
++
++    @Test
++    @DisplayName("注解契约 - @Anonymous 跳过管理面登录；无 @SaCheckPermission；无 @OperateLog；POST /ack")
++    void testAnnotationContract() throws Exception {
++        Method ack = IotPublishInternalController.class
++                .getMethod("ack", jakarta.servlet.http.HttpServletRequest.class, AckForm.class);
++        assertNotNull(ack.getAnnotation(Anonymous.class), "内部接口须 @Anonymous 跳过 Sa-Token 登录校验");
++        assertEquals(null, ack.getAnnotation(cn.dev33.satoken.annotation.SaCheckPermission.class),
++                "内部接口不得挂管理面权限注解（准入=InternalAuthChecker 静态令牌）");
++        assertNull(ack.getAnnotation(net.otlab.core.annotation.OperateLog.class),
++                "内部回执不写操作日志（内部运行链路，照 0017 心跳口径）");
++        assertEquals("/ack", ack.getAnnotation(org.springframework.web.bind.annotation.PostMapping.class)
++                .value()[0], "路由 POST /internal/v1/config/ack");
++    }
++
++    // ---------- 认证接线 ----------
++
++    @Test
++    @DisplayName("内部认证 - InternalAuthChecker 双调用（拦截器层 + 控制器层纵深防御，0017/0019 范式）")
++    void testAck_InvokesAuthCheckerTwice() throws Exception {
++        when(publishLogService.ack(any(AckForm.class))).thenReturn(true);
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"targetId\":\"GW01\",\"ackStatus\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(true));
++
++        verify(internalAuthChecker, times(2)).check(any());
++    }
++
++    @Test
++    @DisplayName("内部认证 - 令牌无效（401）时服务层不被触达（fail-closed）")
++    void testAck_TokenRejectedBeforeService() throws Exception {
++        org.mockito.Mockito.doThrow(new BusinessException(ResultCode.UNAUTHORIZED.getCode(), "内部令牌无效"))
++                .when(internalAuthChecker).check(any());
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"targetId\":\"GW01\",\"ackStatus\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.UNAUTHORIZED.getCode()));
++
++        verify(publishLogService, never()).ack(any());
++    }
++
++    // ---------- 参数校验与服务透传 ----------
++
++    @Test
++    @DisplayName("参数校验 - targetType/targetId/ackStatus 缺失 → 400，服务层不被触达")
++    void testAck_ParamRequired() throws Exception {
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetId\":\"GW01\",\"ackStatus\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"ackStatus\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"targetId\":\"GW01\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()));
++
++        verify(publishLogService, never()).ack(any());
++    }
++
++    @Test
++    @DisplayName("透传 - 过期失败回执（已生效行不倒退）→ data=false 200（非错误语义）")
++    void testAck_IgnoredPassthrough() throws Exception {
++        when(publishLogService.ack(any(AckForm.class))).thenReturn(false);
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"targetId\":\"GW01\",\"ackStatus\":2,"
++                                + "\"errorMsg\":\"过期的失败回执\"}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(200))
++                .andExpect(jsonPath("$.data").value(false));
++    }
++
++    @Test
++    @DisplayName("透传 - 服务层 400（行不存在/ackStatus=0/定位不一致）原样返回")
++    void testAck_BusinessErrorPassthrough() throws Exception {
++        when(publishLogService.ack(any(AckForm.class)))
++                .thenThrow(new BusinessException(ResultCode.PARAM_ERROR.getCode(), "下发记录不存在"));
++
++        mockMvc.perform(post(ACK_URL)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .content("{\"versionId\":5,\"targetType\":1,\"targetId\":\"GW01\",\"ackStatus\":1}"))
++                .andExpect(status().isOk())
++                .andExpect(jsonPath("$.code").value(ResultCode.PARAM_ERROR.getCode()))
++                .andExpect(jsonPath("$.message").value("下发记录不存在"));
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java
+new file mode 100644
+index 0000000..0221a56
+--- /dev/null
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishLogServiceImplTest.java
+@@ -0,0 +1,594 @@
++package net.otlab.admin.module.iot.publish.service.impl;
++
++import com.baomidou.mybatisplus.core.MybatisConfiguration;
++import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
++import com.baomidou.mybatisplus.core.metadata.TableInfoHelper;
++import com.baomidou.mybatisplus.core.toolkit.CollectionUtils;
++import net.otlab.admin.module.iot.dataperm.DataPermService;
++import net.otlab.admin.module.iot.dataperm.VisibleScope;
++import net.otlab.admin.module.iot.gateway.entity.IotGateway;
++import net.otlab.admin.module.iot.gateway.mapper.IotGatewayMapper;
++import net.otlab.admin.module.iot.publish.config.PublishProperties;
++import net.otlab.admin.module.iot.publish.dto.AckForm;
++import net.otlab.admin.module.iot.publish.dto.PublishLogListVO;
++import net.otlab.admin.module.iot.publish.dto.PublishLogRowVO;
++import net.otlab.admin.module.iot.publish.dto.ResendForm;
++import net.otlab.admin.module.iot.publish.entity.IotConfigPublishLog;
++import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigPublishLogMapper;
++import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.notify.NotifySender;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
++import net.otlab.core.exception.BusinessException;
++import net.otlab.core.result.ResultCode;
++import net.otlab.core.tenant.TenantContext;
++import net.otlab.core.utils.SecurityUtils;
++import org.apache.ibatis.builder.MapperBuilderAssistant;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.Mock;
++import org.mockito.MockedStatic;
++import org.mockito.Mockito;
++import org.mockito.MockitoAnnotations;
++
++import java.time.LocalDateTime;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyLong;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * 配置下发记录服务单元测试（TASK-0025，brief 测试口径：落行派生 / ACK 三态语义 / 超时
++ * 扫描幂等 / 重发重置 / 状态查询三态汇总与 timedOut 派生 / 定位一致性 / 数据权限防线）。
++ *
++ * <p>standalone Mockito 范式（照 IotPublishServiceImplTest）：Mapper/NotifySender 全 mock，
++ * 真实 {@link PublishProperties}（超时窗/目标标识）与真实 {@link PublishScopeGuard}（防线
++ * mock 注入）。static mock 线程域：TenantContext/SecurityUtils 主线程注册。
++ *
++ * @author dowei
++ * @date 2026-11-22
++ */
++class IotPublishLogServiceImplTest {
++
++    private static final long TENANT = 1L;
++    private static final long USER_ID = 10L;
++    private static final long GATEWAY_ID = 88L;
++    private static final long VERSION_ROW_ID = 5L;
++
++    @Mock
++    private IotConfigPublishLogMapper publishLogMapper;
++
++    @Mock
++    private IotConfigVersionMapper versionMapper;
++
++    @Mock
++    private IotGatewayMapper gatewayMapper;
++
++    @Mock
++    private DataPermService dataPermService;
++
++    @Mock
++    private NotifySender notifySender;
++
++    private PublishProperties properties;
++
++    private IotPublishLogServiceImpl logService;
++
++    private AutoCloseable mocks;
++
++    private MockedStatic<TenantContext> tenantContext;
++
++    private MockedStatic<SecurityUtils> securityUtils;
++
++    @BeforeAll
++    static void initEntityMeta() {
++        MapperBuilderAssistant assistant = new MapperBuilderAssistant(new MybatisConfiguration(), "");
++        TableInfoHelper.initTableInfo(assistant, IotConfigPublishLog.class);
++        TableInfoHelper.initTableInfo(assistant, IotConfigVersion.class);
++        TableInfoHelper.initTableInfo(assistant, IotGateway.class);
++    }
++
++    @BeforeEach
++    void setUp() {
++        mocks = MockitoAnnotations.openMocks(this);
++        tenantContext = Mockito.mockStatic(TenantContext.class);
++        tenantContext.when(TenantContext::getTenantId).thenReturn(TENANT);
++        securityUtils = Mockito.mockStatic(SecurityUtils.class);
++        securityUtils.when(SecurityUtils::getUserId).thenReturn(USER_ID);
++
++        properties = new PublishProperties();
++        properties.setAckTimeoutSeconds(300);
++
++        PublishScopeGuard scopeGuard = new PublishScopeGuard(gatewayMapper, dataPermService);
++        logService = new IotPublishLogServiceImpl(publishLogMapper, versionMapper, gatewayMapper,
++                properties, scopeGuard, notifySender);
++
++        // 默认防线：全租户（管理员）语义；异常用例逐用例覆盖
++        when(dataPermService.resolve(USER_ID)).thenReturn(
++                new VisibleScope(true, Set.of(), Set.of(), false));
++        when(gatewayMapper.selectById(anyLong())).thenAnswer(inv -> enabledGateway(inv.getArgument(0, Long.class)));
++    }
++
++    @AfterEach
++    void tearDown() throws Exception {
++        tenantContext.close();
++        securityUtils.close();
++        mocks.close();
++    }
++
++    // ---------- 落行：scope 派生目标 ----------
++
++    @Test
++    @DisplayName("落行 - 网关 scope → 两行（1/网关 gatewayCode + 2/接入标识），ack_status=0，逐行触发通知")
++    void gatewayScopeWritesTwoDispatchRows() {
++        IotConfigVersion version = versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L);
++
++        logService.recordDispatch(version);
++
++        ArgumentCaptor<IotConfigPublishLog> captor = ArgumentCaptor.forClass(IotConfigPublishLog.class);
++        verify(publishLogMapper, times(2)).insert(captor.capture());
++        List<IotConfigPublishLog> rows = captor.getAllValues();
++        assertEquals(1, rows.get(0).getTargetType(), "第一行 targetType=1 网关");
++        assertEquals("GW01", rows.get(0).getTargetId(), "网关行 targetId=gateway_code（头注②语义）");
++        assertEquals(2, rows.get(1).getTargetType(), "第二行 targetType=2 接入");
++        assertEquals("ingest", rows.get(1).getTargetId(), "接入行 targetId=ot.publish.target-ingest-id");
++        for (IotConfigPublishLog row : rows) {
++            assertEquals(VERSION_ROW_ID, row.getVersionId());
++            assertEquals(0, row.getAckStatus(), "落行初值 0 待确认");
++            assertNull(row.getAckTime());
++            assertNull(row.getErrorMsg());
++        }
++        verify(notifySender, times(2)).notify(anyLong(), any(), any());
++        verify(notifySender).notify(VERSION_ROW_ID, 1, "GW01");
++        verify(notifySender).notify(VERSION_ROW_ID, 2, "ingest");
++    }
++
++    @Test
++    @DisplayName("落行 - 计算 scope → 一行（3/计算标识 calc）")
++    void computeScopeWritesOneDispatchRow() {
++        IotConfigVersion version = versionRow(VERSION_ROW_ID, 2, 0L, 3L);
++
++        logService.recordDispatch(version);
++
++        ArgumentCaptor<IotConfigPublishLog> captor = ArgumentCaptor.forClass(IotConfigPublishLog.class);
++        verify(publishLogMapper, times(1)).insert(captor.capture());
++        IotConfigPublishLog row = captor.getValue();
++        assertEquals(3, row.getTargetType(), "计算行 targetType=3");
++        assertEquals("calc", row.getTargetId(), "计算行 targetId=ot.publish.target-calc-id");
++        assertEquals(VERSION_ROW_ID, row.getVersionId());
++        assertEquals(0, row.getAckStatus());
++        verify(notifySender, times(1)).notify(VERSION_ROW_ID, 3, "calc");
++    }
++
++    @Test
++    @DisplayName("落行 - 网关行派生失败（网关不存在）→ 发布事务内抛错 fail-closed")
++    void gatewayMissingFailsDispatch() {
++        when(gatewayMapper.selectById(anyLong())).thenReturn(null);
++        IotConfigVersion version = versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L);
++        assertThrows(BusinessException.class, () -> logService.recordDispatch(version));
++        verify(publishLogMapper, never()).insert(any(IotConfigPublishLog.class));
++    }
++
++    // ---------- ACK 回执（POST /internal/v1/config/ack 语义） ----------
++
++    private AckForm ackForm(Long versionId, Integer scopeType, Long scopeId, Long version,
++                            Integer targetType, String targetId, Integer ackStatus, String errorMsg) {
++        AckForm form = new AckForm();
++        form.setVersionId(versionId);
++        form.setScopeType(scopeType);
++        form.setScopeId(scopeId);
++        form.setVersion(version);
++        form.setTargetType(targetType);
++        form.setTargetId(targetId);
++        form.setAckStatus(ackStatus);
++        form.setErrorMsg(errorMsg);
++        return form;
++    }
++
++    private IotConfigPublishLog logRow(long id, int targetType, String targetId, int ackStatus) {
++        IotConfigPublishLog row = new IotConfigPublishLog();
++        row.setId(id);
++        row.setVersionId(VERSION_ROW_ID);
++        row.setTargetType(targetType);
++        row.setTargetId(targetId);
++        row.setAckStatus(ackStatus);
++        return row;
++    }
++
++    @Test
++    @DisplayName("ACK - 生效（ackStatus=1）：任意旧态可置 1，ack_time=NOW、error_msg 清空")
++    void ackSuccessSetsEffectiveAndClearsError() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        IotConfigPublishLog stale = logRow(11L, 1, "GW01", 0);
++        stale.setErrorMsg("旧的失败原因");
++        when(publishLogMapper.selectOne(any())).thenReturn(stale);
++
++        boolean applied = logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 1, "GW01", 1, null));
++
++        assertTrue(applied, "生效回执已应用");
++        ArgumentCaptor<LambdaUpdateWrapper> captor = ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(publishLogMapper).update(Mockito.isNull(), captor.capture());
++        LambdaUpdateWrapper<IotConfigPublishLog> wrapper = captor.getValue();
++        String sqlSet = wrapper.getSqlSet();
++        assertTrue(sqlSet.contains("ack_status") && sqlSet.contains("ack_time") && sqlSet.contains("error_msg"),
++                "更新集=ack_status/ack_time/error_msg（生效清空失败原因）: " + sqlSet);
++        // 先渲染 WHERE 段（MP 条件参数惰性求值——渲染后 eq 条件参数才落入 paramNameValuePairs）
++        String where = wrapper.getSqlSegment();
++        assertTrue(where.contains("id"), "按行 id 定位: " + where);
++        Map<String, Object> params = wrapper.getParamNameValuePairs();
++        assertTrue(params.containsValue(1), "ack_status 置 1: " + params);
++        assertTrue(params.containsValue(11L), "按行定位 id=11: " + params);
++    }
++
++    @Test
++    @DisplayName("ACK - 失败（ackStatus=2）置 2 且 error_msg 必填（缺失 400）")
++    void ackFailureRequiresErrorMsg() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectOne(any())).thenReturn(logRow(11L, 2, "ingest", 0));
++        when(publishLogMapper.update(any(), any())).thenReturn(1);
++
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 2, "ingest", 2, "   ")));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode(), "失败回执缺 errorMsg → 400");
++        verify(publishLogMapper, never()).update(any(), any());
++
++        boolean applied = logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 2, "ingest", 2,
++                "解析失败：快照哈希不符"));
++        assertTrue(applied);
++        ArgumentCaptor<LambdaUpdateWrapper> captor = ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(publishLogMapper).update(Mockito.isNull(), captor.capture());
++        // 先渲染 WHERE 段（MP 条件参数惰性求值）——断言按行条件更新带 ack_status IN (0,2) 守卫
++        String where = captor.getValue().getSqlSegment();
++        assertTrue(where.contains("id") && where.contains("ack_status"),
++                "按行条件更新（WHERE id + ack_status 守卫，终态不倒退）: " + where);
++        Map<String, Object> params = captor.getValue().getParamNameValuePairs();
++        assertTrue(params.containsValue(2), "ack_status 置 2: " + params);
++        assertTrue(params.containsValue("解析失败：快照哈希不符"), "error_msg 落失败原因: " + params);
++    }
++
++    @Test
++    @DisplayName("ACK - 已生效行收到失败回执 → 忽略不倒退（终态保护，返回 false，零更新）")
++    void ackFailureOnEffectiveRowIsIgnored() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectOne(any())).thenReturn(logRow(11L, 1, "GW01", 1));
++
++        boolean applied = logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 1, "GW01", 2,
++                "过期的失败回执"));
++
++        assertFalse(applied, "已生效为终态——过期失败回执不应用");
++        verify(publishLogMapper, never()).update(any(), any());
++    }
++
++    @Test
++    @DisplayName("ACK - 行不存在 → 400（(version_id, target_type, target_id) 定位失败）")
++    void ackRowNotFound400() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectOne(any())).thenReturn(null);
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 1, "GW-UNKNOWN", 1, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    @Test
++    @DisplayName("ACK - ackStatus=0 拒绝（回执只有生效/失败两种）→ 400")
++    void ackStatusZeroRejected() {
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(VERSION_ROW_ID, null, null, null, 1, "GW01", 0, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        verify(publishLogMapper, never()).selectOne(any());
++    }
++
++    @Test
++    @DisplayName("ACK - versionId 与三元组都给：以 versionId 为准，三元组不符 → 400")
++    void ackVersionIdTripleMismatch400() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++
++        BusinessException mismatch = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(VERSION_ROW_ID, 1, 99L, 2L, 1, "GW01", 1, null)),
++                "三元组 scopeId=99 与版本行 scopeId=88 不一致");
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), mismatch.getCode());
++        verify(publishLogMapper, never()).selectOne(any());
++
++        // 三元组齐全且一致 → 通过一致性校验继续定位
++        when(publishLogMapper.selectOne(any())).thenReturn(logRow(11L, 1, "GW01", 0));
++        assertTrue(logService.ack(ackForm(VERSION_ROW_ID, 1, GATEWAY_ID, 2L, 1, "GW01", 1, null)));
++    }
++
++    @Test
++    @DisplayName("ACK - 三元组定位（无 versionId）：命中唯一版本行成功；跨租户重名多行 → 400")
++    void ackTripleResolution() {
++        when(versionMapper.selectList(any())).thenReturn(List.of(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L)));
++        when(publishLogMapper.selectOne(any())).thenReturn(logRow(11L, 1, "GW01", 0));
++
++        assertTrue(logService.ack(ackForm(null, 1, GATEWAY_ID, 2L, 1, "GW01", 1, null)),
++                "三元组 (1,88,2) 唯一命中 → 生效");
++
++        when(versionMapper.selectList(any())).thenReturn(List.of(
++                versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L),
++                versionRow(999L, 1, GATEWAY_ID, 2L)));
++        BusinessException ambiguous = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(null, 1, GATEWAY_ID, 2L, 1, "GW01", 1, null)),
++                "三元组命中多版本（跨租户同名）→ 400 要求携带 versionId");
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ambiguous.getCode());
++    }
++
++    @Test
++    @DisplayName("ACK - 定位要素全缺（无 versionId 无三元组）→ 400")
++    void ackNoLocator400() {
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> logService.ack(ackForm(null, null, null, null, 1, "GW01", 1, null)));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++    }
++
++    // ---------- 超时扫描 ----------
++
++    @Test
++    @DisplayName("扫描 - 逾窗待确认行置 2 + error_msg='ACK 超时（超过 N 秒未回执）'，按行条件更新防 ACK 竞态倒退")
++    void scanMarksStaleRowsAsFailed() {
++        properties.setAckTimeoutSeconds(300);
++        IotConfigPublishLog stale = logRow(21L, 1, "GW01", 0);
++        stale.setCreateTime(LocalDateTime.now().minusSeconds(400));
++        when(publishLogMapper.selectList(any())).thenReturn(List.of(stale));
++        when(publishLogMapper.update(any(), any())).thenReturn(1);
++
++        int marked = logService.markAckTimeout();
++
++        assertEquals(1, marked);
++        ArgumentCaptor<LambdaUpdateWrapper> captor = ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(publishLogMapper).update(Mockito.isNull(), captor.capture());
++        LambdaUpdateWrapper<IotConfigPublishLog> wrapper = captor.getValue();
++        // 先渲染 WHERE 段（MP 条件参数惰性求值——渲染后 eq 条件参数才落入 paramNameValuePairs）
++        String where = wrapper.getSqlSegment();
++        assertTrue(where.contains("id") && where.contains("ack_status"),
++                "WHERE 条件带 id + ack_status=0 守卫（幂等+防 ACK 生效竞态倒退）: " + where);
++        Map<String, Object> params = wrapper.getParamNameValuePairs();
++        assertTrue(params.containsValue("ACK 超时（超过 300 秒未回执）"), "error_msg 记超时原因（N=配置值）: " + params);
++        assertTrue(params.containsValue(21L), "按行 id 更新: " + params);
++        assertTrue(params.containsValue(0), "WHERE 条件带 ack_status=0 守卫（防与 ACK 生效竞态倒退）: " + params);
++    }
++
++    @Test
++    @DisplayName("扫描 - 无逾窗行（幂等）：零更新零标红")
++    void scanIdempotentWhenNothingStale() {
++        when(publishLogMapper.selectList(any())).thenReturn(List.of());
++
++        int marked = logService.markAckTimeout();
++
++        assertEquals(0, marked);
++        verify(publishLogMapper, never()).update(any(), any());
++    }
++
++    // ---------- 重发（POST /iot/publish/resend） ----------
++
++    private ResendForm resendForm(Long versionId, Integer scopeType, Long scopeId, Long version, String targetId) {
++        ResendForm form = new ResendForm();
++        form.setVersionId(versionId);
++        form.setScopeType(scopeType);
++        form.setScopeId(scopeId);
++        form.setVersion(version);
++        form.setTargetId(targetId);
++        return form;
++    }
++
++    @Test
++    @DisplayName("重发 - 失败行（2）重置 0（error_msg=NULL、update_time 刷新）+ NotifySender 触发")
++    void resendResetsFailedRowAndNotifies() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        IotConfigPublishLog failed = logRow(31L, 1, "GW01", 2);
++        failed.setErrorMsg("ACK 超时（超过 300 秒未回执）");
++        when(publishLogMapper.selectList(any())).thenReturn(List.of(failed));
++        when(publishLogMapper.update(any(), any())).thenReturn(1);
++        IotConfigPublishLog refreshed = logRow(31L, 1, "GW01", 0);
++        when(publishLogMapper.selectById(31L)).thenReturn(refreshed);
++
++        IotConfigPublishLog result = logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "GW01"));
++
++        assertEquals(0, result.getAckStatus(), "重置后 ack_status=0 待确认");
++        ArgumentCaptor<LambdaUpdateWrapper> captor = ArgumentCaptor.forClass(LambdaUpdateWrapper.class);
++        verify(publishLogMapper).update(Mockito.isNull(), captor.capture());
++        String sqlSet = captor.getValue().getSqlSet();
++        assertTrue(sqlSet.contains("ack_status") && sqlSet.contains("error_msg"),
++                "重置集=ack_status/error_msg: " + sqlSet);
++        // 先渲染 WHERE 段（MP 条件参数惰性求值）——断言按行条件更新带 ack_status != 1 守卫
++        String where = captor.getValue().getSqlSegment();
++        assertTrue(where.contains("id") && where.contains("ack_status"),
++                "按行条件更新（WHERE id + ack_status != 1 守卫，防并发生效竞态倒退）: " + where);
++        Map<String, Object> params = captor.getValue().getParamNameValuePairs();
++        assertTrue(params.containsValue(0), "重置 0: " + params);
++        assertTrue(params.containsValue(31L), "按行定位: " + params);
++        verify(notifySender, times(1)).notify(VERSION_ROW_ID, 1, "GW01");
++    }
++
++    @Test
++    @DisplayName("重发 - 未回执行（0）同样可重推（重置+通知）")
++    void resendAlsoForPendingRow() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectList(any())).thenReturn(List.of(logRow(31L, 2, "ingest", 0)));
++        when(publishLogMapper.update(any(), any())).thenReturn(1);
++        IotConfigPublishLog refreshed = logRow(31L, 2, "ingest", 0);
++        when(publishLogMapper.selectById(31L)).thenReturn(refreshed);
++
++        IotConfigPublishLog result = logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "ingest"));
++
++        assertEquals(0, result.getAckStatus());
++        verify(notifySender).notify(VERSION_ROW_ID, 2, "ingest");
++    }
++
++    @Test
++    @DisplayName("重发 - 已生效行（1）→ 400「已生效无需重发」，零更新零通知")
++    void resendEffectiveRowRejected400() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectList(any())).thenReturn(List.of(logRow(31L, 1, "GW01", 1)));
++
++        BusinessException ex = assertThrows(BusinessException.class,
++                () -> logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "GW01")));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ex.getCode());
++        assertTrue(ex.getMessage().contains("已生效"), "文案指认终态: " + ex.getMessage());
++        verify(publishLogMapper, never()).update(any(), any());
++        verify(notifySender, never()).notify(anyLong(), any(), any());
++    }
++
++    @Test
++    @DisplayName("重发 - 行不存在 → 400；targetId 命中多行 → 400（定位须唯一）")
++    void resendNotFoundOrAmbiguous400() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectList(any())).thenReturn(List.of());
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "GW01")));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        when(publishLogMapper.selectList(any())).thenReturn(List.of(
++                logRow(31L, 1, "GW01", 2), logRow(32L, 2, "GW01", 2)));
++        BusinessException ambiguous = assertThrows(BusinessException.class,
++                () -> logService.resend(resendForm(VERSION_ROW_ID, null, null, null, "GW01")),
++                "网关码与接入标识撞名多行命中 → 400");
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), ambiguous.getCode());
++    }
++
++    // ---------- 下发状态查询（GET /iot/publish/log/list） ----------
++
++    @Test
++    @DisplayName("查询 - 三态汇总口径：全部行已生效 → publishState=1")
++    void queryAllEffectiveStateOne() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        IotConfigPublishLog gw = logRow(41L, 1, "GW01", 1);
++        gw.setAckTime(LocalDateTime.now());
++        IotConfigPublishLog ingest = logRow(42L, 2, "ingest", 1);
++        ingest.setAckTime(LocalDateTime.now());
++        when(publishLogMapper.selectList(any())).thenReturn(new java.util.ArrayList<>(List.of(gw, ingest)));
++
++        PublishLogListVO vo = logService.listPublishLog(VERSION_ROW_ID, null, null, null);
++
++        assertEquals(PublishLogListVO.STATE_EFFECTIVE, vo.getPublishState(), "全部 ACK 生效 → 已生效");
++        assertEquals(2, vo.getRows().size());
++        assertEquals(VERSION_ROW_ID, vo.getVersionId());
++        assertEquals(2L, vo.getVersion());
++        for (PublishLogRowVO row : vo.getRows()) {
++            assertFalse(row.getTimedOut(), "已生效行 timedOut=false");
++        }
++    }
++
++    @Test
++    @DisplayName("查询 - 三态汇总口径：存在失败 → publishState=2（存在失败优先于部分生效）")
++    void queryAnyFailureStateTwo() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        IotConfigPublishLog gw = logRow(41L, 1, "GW01", 1);
++        IotConfigPublishLog ingest = logRow(42L, 2, "ingest", 2);
++        ingest.setErrorMsg("解析失败");
++        when(publishLogMapper.selectList(any())).thenReturn(new java.util.ArrayList<>(List.of(gw, ingest)));
++
++        PublishLogListVO vo = logService.listPublishLog(VERSION_ROW_ID, null, null, null);
++
++        assertEquals(PublishLogListVO.STATE_FAILED, vo.getPublishState());
++    }
++
++    @Test
++    @DisplayName("查询 - 三态汇总口径：存在待确认 → publishState=0 下发中；timedOut 派生覆盖扫描间隙")
++    void queryPendingStateZeroWithTimedOutDerivation() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        IotConfigPublishLog fresh = logRow(41L, 1, "GW01", 0);
++        fresh.setCreateTime(LocalDateTime.now().minusSeconds(10));
++        IotConfigPublishLog stale = logRow(42L, 2, "ingest", 0);
++        stale.setCreateTime(LocalDateTime.now().minusSeconds(400));
++        when(publishLogMapper.selectList(any())).thenReturn(new java.util.ArrayList<>(List.of(fresh, stale)));
++
++        PublishLogListVO vo = logService.listPublishLog(VERSION_ROW_ID, null, null, null);
++
++        assertEquals(PublishLogListVO.STATE_DELIVERING, vo.getPublishState());
++        assertTrue(vo.getRows().get(0).getTimedOut() == Boolean.FALSE
++                        || Boolean.FALSE.equals(vo.getRows().get(0).getTimedOut()),
++                "在窗内待确认行 timedOut=false");
++        assertTrue(vo.getRows().get(1).getTimedOut(), "逾窗待确认行 timedOut=true（扫描间隙即时标红）");
++    }
++
++    @Test
++    @DisplayName("查询 - 空行集（0024 冒烟遗留版本无下发记录）→ publishState=0 下发中（保守口径）")
++    void queryEmptyRowsDelivering() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        when(publishLogMapper.selectList(any())).thenReturn(new java.util.ArrayList<>());
++
++        PublishLogListVO vo = logService.listPublishLog(VERSION_ROW_ID, null, null, null);
++
++        assertEquals(PublishLogListVO.STATE_DELIVERING, vo.getPublishState());
++        assertTrue(CollectionUtils.isEmpty(vo.getRows()));
++    }
++
++    @Test
++    @DisplayName("查询 - 三元组定位 + 数据权限（网关 scope 可见校验 / 计算 scope 仅管理员语义）")
++    void queryTripleLocatorAndScopeGuards() {
++        when(versionMapper.selectList(any())).thenReturn(List.of(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L)));
++        when(publishLogMapper.selectList(any())).thenReturn(new java.util.ArrayList<>());
++        PublishLogListVO vo = logService.listPublishLog(null, 1, GATEWAY_ID, 2L);
++        assertEquals(VERSION_ROW_ID, vo.getVersionId());
++        assertEquals(1, vo.getScopeType());
++        assertEquals(GATEWAY_ID, vo.getScopeId());
++
++        // 网关 scope 不可见 → 403 fail-closed
++        when(dataPermService.resolve(USER_ID)).thenReturn(new VisibleScope(false, Set.of(), Set.of(), false));
++        BusinessException forbidden = assertThrows(BusinessException.class,
++                () -> logService.listPublishLog(null, 1, GATEWAY_ID, 2L));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), forbidden.getCode());
++
++        // 计算 scope 非全租户语义 → 403
++        when(dataPermService.resolve(USER_ID)).thenReturn(new VisibleScope(false, Set.of(101L), Set.of(501L), false));
++        BusinessException computeForbidden = assertThrows(BusinessException.class,
++                () -> logService.listPublishLog(null, 2, 0L, 1L));
++        assertEquals(ResultCode.FORBIDDEN.getCode(), computeForbidden.getCode());
++    }
++
++    @Test
++    @DisplayName("查询 - 版本不存在（含跨租户 versionId）→ 400；versionId 与三元组不一致 → 400")
++    void queryVersionMissingOrMismatch400() {
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(null);
++        BusinessException missing = assertThrows(BusinessException.class,
++                () -> logService.listPublishLog(VERSION_ROW_ID, null, null, null));
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), missing.getCode());
++
++        when(versionMapper.selectById(VERSION_ROW_ID)).thenReturn(versionRow(VERSION_ROW_ID, 1, GATEWAY_ID, 2L));
++        BusinessException mismatch = assertThrows(BusinessException.class,
++                () -> logService.listPublishLog(VERSION_ROW_ID, 2, 0L, 1L),
++                "versionId 对应网关 scope，三元组给计算 scope → 不一致 400");
++        assertEquals(ResultCode.PARAM_ERROR.getCode(), mismatch.getCode());
++    }
++
++    // ---------- 夹具 ----------
++
++    private IotConfigVersion versionRow(long id, int scopeType, long scopeId, long version) {
++        IotConfigVersion row = new IotConfigVersion();
++        row.setId(id);
++        row.setTenantId(TENANT);
++        row.setScopeType(scopeType);
++        row.setScopeId(scopeId);
++        row.setVersion(version);
++        row.setPublishStatus(1);
++        return row;
++    }
++
++    private IotGateway enabledGateway(Long id) {
++        IotGateway gateway = new IotGateway();
++        gateway.setId(id);
++        gateway.setTenantId(TENANT);
++        gateway.setGatewayCode("GW01");
++        gateway.setGatewayName("一号网关");
++        gateway.setStatus(1);
++        return gateway;
++    }
++}
+diff --git a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+index 2d1820e..7fd7369 100644
+--- a/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
++++ b/backend/ot-admin/src/test/java/net/otlab/admin/module/iot/publish/service/impl/IotPublishServiceImplTest.java
+@@ -24,9 +24,11 @@ import net.otlab.admin.module.iot.publish.entity.IotConfigVersion;
+ import net.otlab.admin.module.iot.publish.gate.NoOpPublishConfirmGate;
+ import net.otlab.admin.module.iot.publish.gate.PublishConfirmGate;
+ import net.otlab.admin.module.iot.publish.mapper.IotConfigVersionMapper;
++import net.otlab.admin.module.iot.publish.service.IotPublishLogService;
+ import net.otlab.admin.module.iot.publish.snapshot.ConfigSnapshotAssembler;
+ import net.otlab.admin.module.iot.publish.snapshot.SnapshotCredentialGuard;
+ import net.otlab.admin.module.iot.publish.storage.SnapshotStorage;
++import net.otlab.admin.module.iot.publish.support.PublishScopeGuard;
+ import net.otlab.core.exception.BusinessException;
+ import net.otlab.core.result.ResultCode;
+ import net.otlab.core.tenant.TenantContext;
+@@ -127,6 +129,9 @@ class IotPublishServiceImplTest {
+     @Mock
+     private DataPermService dataPermService;
+ 
++    @Mock
++    private IotPublishLogService publishLogService;
++
+     private IotPublishServiceImpl publishService;
+ 
+     private SnapshotStorage storage;
+@@ -175,16 +180,19 @@ class IotPublishServiceImplTest {
+ 
+         confirmGate = new NoOpPublishConfirmGate();
+ 
++        // scope 归一与防线（TASK-0025 上提共享组件）——同一组防线 mock 注入 guard
++        PublishScopeGuard scopeGuard = new PublishScopeGuard(gatewayMapper, dataPermService);
++
+         publishService = new IotPublishServiceImpl();
+         ReflectionTestUtils.setField(publishService, "baseMapper", versionMapper);
+-        ReflectionTestUtils.setField(publishService, "gatewayMapper", gatewayMapper);
+         ReflectionTestUtils.setField(publishService, "pointMapper", pointMapper);
+         ReflectionTestUtils.setField(publishService, "dataItemMapper", dataItemMapper);
+         ReflectionTestUtils.setField(publishService, "assembler", assembler);
+         ReflectionTestUtils.setField(publishService, "credentialGuard", new SnapshotCredentialGuard());
+         ReflectionTestUtils.setField(publishService, "snapshotStorage", storage);
+         ReflectionTestUtils.setField(publishService, "confirmGate", confirmGate);
+-        ReflectionTestUtils.setField(publishService, "dataPermService", dataPermService);
++        ReflectionTestUtils.setField(publishService, "scopeGuard", scopeGuard);
++        ReflectionTestUtils.setField(publishService, "publishLogService", publishLogService);
+ 
+         // 默认防线与数据（异常用例逐用例覆盖）
+         when(dataPermService.resolve(USER_ID)).thenReturn(
+@@ -278,6 +286,71 @@ class IotPublishServiceImplTest {
+         verify(pointMapper).update(isNull(), any());
+     }
+ 
++    // ---------- 下发记录落行接线（TASK-0025，recordDispatch 在 IotPublishLogServiceImplTest） ----------
++
++    @Test
++    @DisplayName("落行接线 - 发布成功后同事务调用 recordDispatch（网关 scope）")
++    void publishTriggersDispatchRecording() {
++        mockGatewayScopeData();
++        IotConfigVersion row = publishService.publish(gatewayForm());
++        ArgumentCaptor<IotConfigVersion> captor = ArgumentCaptor.forClass(IotConfigVersion.class);
++        verify(publishLogService).recordDispatch(captor.capture());
++        assertEquals(row, captor.getValue(), "落行入参=本次发布落库的版本行（version_id 即其 id）");
++    }
++
++    @Test
++    @DisplayName("落行接线 - 计算 scope 发布同样落行")
++    void computePublishTriggersDispatchRecording() {
++        PublishForm form = new PublishForm();
++        form.setScopeType(2);
++        form.setScopeId(0L);
++        IotDataItem item = new IotDataItem();
++        item.setId(601L);
++        item.setTenantId(TENANT);
++        item.setInstanceId(501L);
++        item.setDataCode("ELEC_ENERGY");
++        item.setFullKey("F01.WS01.EQ001.ELEC_ENERGY");
++        item.setSourceType(2);
++        item.setEnabled(1);
++        item.setStatus(1);
++        when(dataItemMapper.selectList(any())).thenReturn(List.of(item));
++        publishService.publish(form);
++        verify(publishLogService).recordDispatch(any(IotConfigVersion.class));
++    }
++
++    @Test
++    @DisplayName("落行接线 - 回滚=重新下发，新版本行同样落行")
++    void rollbackTriggersDispatchRecording() throws Exception {
++        String targetJson = "{\"schemaVersion\":\"1.0.1\",\"tenantId\":1,\"scopeType\":1,\"scopeId\":88,"
++                + "\"version\":1,\"points\":[],\"channels\":[]}";
++        String targetHash = SnapshotStorage.sha256Hex(targetJson.getBytes(StandardCharsets.UTF_8));
++        String targetUri = stageAndPromoteFixture(TENANT, 1, GATEWAY_ID, 1L, targetJson);
++        IotConfigVersion target = new IotConfigVersion();
++        target.setId(1L);
++        target.setTenantId(TENANT);
++        target.setScopeType(1);
++        target.setScopeId(GATEWAY_ID);
++        target.setVersion(1L);
++        target.setSnapshotHash(targetHash);
++        target.setSnapshotUri(targetUri);
++        target.setPublishStatus(1);
++        when(versionMapper.selectOne(any())).thenReturn(target);
++        when(versionMapper.selectMaxVersion(TENANT, 1, GATEWAY_ID)).thenReturn(1L);
++
++        publishService.rollback(rollbackForm(1L));
++        verify(publishLogService).recordDispatch(any(IotConfigVersion.class));
++    }
++
++    @Test
++    @DisplayName("落行接线 - recordDispatch 失败即发布失败（同事务 fail-fast，rollbackFor=Exception 回滚版本行）")
++    void dispatchFailureFailsPublish() {
++        mockGatewayScopeData();
++        org.mockito.Mockito.doThrow(new RuntimeException("publish_log insert down"))
++                .when(publishLogService).recordDispatch(any(IotConfigVersion.class));
++        assertThrows(RuntimeException.class, () -> publishService.publish(gatewayForm()),
++                "落行异常上抛使 @Transactional 回滚（版本行与下发记录同事务）");
++    }
++
+     // ---------- 并发发布 5001（验收项；修订轮 I-1：真两线程同 scope，栅栏对齐 ×30 轮） ----------
+ 
+     /**
+diff --git a/resources/sql/upgrade/20261122_iot_publish_log.sql b/resources/sql/upgrade/20261122_iot_publish_log.sql
+new file mode 100644
+index 0000000..d931c08
+--- /dev/null
++++ b/resources/sql/upgrade/20261122_iot_publish_log.sql
+@@ -0,0 +1,107 @@
++-- ============================================================
++-- 存量库升级脚本：iot_config_publish_log 配置下发记录表 + 下发重发按钮权限种子
++--   （TASK-0025 / FEAT-0008 / REQ-0033 / ADR-0006、ADR-0008）
++--
++-- 用途：
++--   1) 建 iot_config_publish_log 配置下发记录表（DDL 逐字来自《工厂数据采集系统详细设计》
++--      V1.1 附录 A p33，brief 已提取；字形规范化不改语义）；
++--   2) sys_menu 登记配置发布页（4015「配置发布」）之下的下发重发按钮权限行
++--      （menu_type=3）：iot:publish:resend（下发状态查询复用 iot:publish:list，
++--      不新增种子）；
++--   3) sys_role_menu 将该行授予超级管理员（role_id=1；照 20261122_iot_publish_domain.sql
++--      范式）。
++--
++-- 与上游无列差异（逐字）；头注登记两点：
++--   ①**不追加 uk_version_target 唯一键**——版本行由 iot_config_version.uk_scope_version
++--   单调保证（同 (tenant, scope) 版本号唯一），log 行与版本同事务一次性写入、重发不新增行
++--   （重置原行 ack_status），无并发重复路径；(version_id, target_type, target_id) 定位
++--   唯一由写入路径保证，物理唯一键无必要。
++--   ②**目标标识语义**：target_id 网关= gateway_code（iot_gateway.gateway_code，租户内
++--   唯一）；接入/计算=配置化服务标识（ot.publish.target-ingest-id 默认 ingest /
++--   ot.publish.target-calc-id 默认 calc）。
++--
++-- 接口对应（详细设计 §3.1 p22 下发状态查询 + §3.3 p25 POST /internal/v1/config/ack）：
++--   POST /iot/publish/resend        iot:publish:resend（4074）——重发：ack_status=2/0
++--                                     行重置 0 + 触发下发接缝 NotifySender；已生效行 400
++--   GET  /iot/publish/log/list      iot:publish:list（复用 4070，不新增种子）——下发
++--                                     状态查询：行列表（每版本目标数≤3，不分页）+
++--                                     每行派生 timedOut + 版本级汇总 publishState
++--                                     （全部行已生效=1 / 存在失败=2 / 否则下发中=0——
++--                                     「发布完成以全部 ACK 生效为准」为查询派生口径，
++--                                     不改 iot_config_version.publish_status）
++--   POST /internal/v1/config/ack    无管理面权限（/internal/v1/** 内部拦截器
++--                                     StaticTokenInternalAuthChecker 静态令牌+IP 白名单
++--                                     统一收口，@Anonymous 零注册接入）——ACK 回执：
++--                                     行定位 (version_id, target_type, target_id)，
++--                                     ackStatus=1 生效（任意旧态可置 1）/ ackStatus=2
++--                                     失败（error_msg 必填，仅可从 0/2 覆盖，已生效
++--                                     1 为终态不被失败回执倒退）/ ackStatus=0 拒绝 400
++--
++-- 多租户口径（本表特例，登记）：
++--   上游 p33 逐字 DDL 无 tenant_id 列（下发记录经 version_id → iot_config_version
++--   （含 tenant_id，uk_scope_version）间接归属租户）。本表属 iot_ 前缀，会话租户存在时
++--   OtTenantLineHandler 会注入 tenant_id 条件导致 SQL 报错——故 IotConfigPublishLogMapper
++--   以 @InterceptorIgnore(tenantLine = "true") 旁路多租户插件（照 IotGatewayCodeMapper /
++--   IotDataItemRefMapper 既有旁路范式），租户边界由服务层保证：管理面（状态查询/重发）
++--   先按会话租户解析 version 行（iot_config_version 查询带租户注入）再按 version_id 取
++--   本表行，跨租户 versionId 解析不到即 400；内部 ACK 无管理面数据权限（内部令牌已收口，
++--   brief D7）；超时扫描为系统级定时任务（无会话，跨租户全表扫描即上游语义）。
++--
++-- 号段占用说明（后续任务不得复用）：
++--   sys_menu id 4074：本任务（TASK-0025）占用（一行，parent_id=4015），连续取号；
++--   4070-4073 已被 TASK-0024 占用。
++--
++-- 幂等口径：
++--   CREATE TABLE IF NOT EXISTS + INSERT IGNORE + 显式 id——重复执行不报错、不重复插入、
++--   不改已有行。可安全重复执行。
++--
++-- 业务纪律（REQ-0033 / FEAT-0008 / ADR-0006、ADR-0008 / 本任务 brief）：
++--   下发记录只在发布/回滚（=重新下发）版本落库后同事务落行（ack_status=0 待确认）；
++--   回执三态 0 待确认 1 已生效 2 失败；已生效为终态（过期失败回执不倒退）；超时未 ACK
++--   扫描置 2（error_msg 记超时原因）标红可重发；发布完成以全部 ACK 生效为准（查询派生，
++--   不改版本行状态——TD-0034 生效以发布为准）。
++--
++-- 适用环境：
++--   已执行 01_base.sql（+ 02_survey.sql / 03_wechat.sql）、20261121_iot_console_menus.sql
++--   （4015 在位）、20261122_iot_publish_domain.sql（iot_config_version 在位）的存量库
++--   及全新库均可直接执行。
++--
++-- 注意（兼容 backend/scripts/sql-exec.sh）：
++--   该执行器按「行尾分号」切分语句块，并逐行剥除以 -- 开头的注释行——语句区不挂
++--   -- 注释行（保持语句与注释分离纪律）。说明文字全部集中在本头部与文件尾；
++--   语句间只允许空行分隔。
++-- ============================================================
++
++SET NAMES utf8mb4;
++
++CREATE TABLE IF NOT EXISTS `iot_config_publish_log` (
++  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '下发记录 ID',
++  `version_id` bigint NOT NULL COMMENT '配置版本 ID',
++  `target_type` tinyint NOT NULL COMMENT '目标 1 网关 2 接入 3 计算',
++  `target_id` varchar(64) NOT NULL COMMENT '目标标识',
++  `ack_status` tinyint DEFAULT '0' COMMENT '回执 0 待确认 1 生效 2 失败',
++  `ack_time` datetime DEFAULT NULL COMMENT '回执时间',
++  `error_msg` varchar(1000) DEFAULT NULL COMMENT '失败原因',
++  `create_time` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
++  `create_by` bigint DEFAULT NULL COMMENT '创建者 ID',
++  `update_time` datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
++  `update_by` bigint DEFAULT NULL COMMENT '修改者 ID',
++  `deleted` tinyint DEFAULT '0' COMMENT '删除标识',
++  PRIMARY KEY (`id`),
++  KEY `idx_version` (`version_id`),
++  KEY `idx_ack` (`ack_status`,`ack_time`)
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='配置下发记录表';
++
++INSERT IGNORE INTO `sys_menu`
++  (`id`, `parent_id`, `module_id`, `menu_name`, `menu_type`, `path`, `component`, `query`, `perms`, `icon`, `sort`, `visible`, `status`, `cache_flag`, `frame_flag`, `frame_url`, `create_time`, `create_by`, `update_time`, `update_by`, `deleted`)
++VALUES
++  (4074, 4015, 4, '下发重发', 3, NULL, NULL, NULL, 'iot:publish:resend', NULL, 5, 1, 1, 0, 0, NULL, NOW(), NULL, NOW(), NULL, 0);
++
++INSERT IGNORE INTO `sys_role_menu` (`role_id`, `menu_id`) VALUES (1, 4074);
++
++-- ============================================================
++-- 执行后核对（第一条应见表结构含 idx_version/idx_ack、第二条应 1 行、第三条应 1 行）：
++--   SHOW CREATE TABLE iot_config_publish_log;
++--   SELECT id, menu_name, menu_type, perms FROM sys_menu WHERE id = 4074;
++--   SELECT role_id, menu_id FROM sys_role_menu WHERE menu_id = 4074;
++-- ============================================================
